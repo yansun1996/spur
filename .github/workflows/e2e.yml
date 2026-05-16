@@ -124,13 +124,9 @@ jobs:
     name: Push Image to Registry
     runs-on: ubuntu-latest
     if: github.event.workflow_run.conclusion == 'success'
-    outputs:
-      image_tag: ${{ steps.tag.outputs.value }}
+    env:
+      IMAGE_TAG: ${{ secrets.REGISTRY }}/spur:${{ github.event.workflow_run.head_sha }}
     steps:
-      - name: Set image tag
-        id: tag
-        run: echo "value=${{ secrets.REGISTRY }}/spur:${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
-
       - name: Download image artifact
         uses: actions/download-artifact@v4
         with:
@@ -148,8 +144,8 @@ jobs:
       - name: Load, retag, and push
         run: |
           docker load -i /tmp/spur-image.tar
-          docker tag spur:ci ${{ steps.tag.outputs.value }}
-          docker push ${{ steps.tag.outputs.value }}
+          docker tag spur:ci "$IMAGE_TAG"
+          docker push "$IMAGE_TAG"
 
   k8s:
     name: K8s Integration
@@ -161,7 +157,7 @@ jobs:
     env:
       KUBECONFIG: /home/amd/.kube/config
       SPUR_TEST_NS: spur-ci-${{ github.event.workflow_run.id }}
-      SPUR_CI_IMAGE: ${{ needs.push-image.outputs.image_tag }}
+      SPUR_CI_IMAGE: ${{ secrets.REGISTRY }}/spur:${{ github.event.workflow_run.head_sha }}
       RUST_LOG: info
     steps:
       - name: Set pending status
