@@ -26,7 +26,6 @@ spec:
       labels:
         app: spurdbd
     spec:
-      serviceAccountName: spur-operator
       containers:
         - name: spurdbd
           image: spur:latest

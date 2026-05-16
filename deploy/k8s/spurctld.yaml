@@ -31,7 +31,6 @@ spec:
       labels:
         app: spurctld
     spec:
-      serviceAccountName: spur-operator
       containers:
         - name: spurctld
           image: spur:latest

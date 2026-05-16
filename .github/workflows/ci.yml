@@ -10,35 +10,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# All jobs run on ephemeral GitHub-hosted runners.
+# Zero secrets, zero self-hosted runners — safe for fork PRs.
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install protobuf compiler
-        run: sudo apt-get install -y protobuf-compiler
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Build
-        run: cargo build --all-targets
-
-      - name: Test
-        run: cargo test
-
   fmt:
     runs-on: ubuntu-latest
     steps:
@@ -75,212 +49,97 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --exclude spur-ffi --all-targets -- -W clippy::all -D unused
 
-  cluster:
-    name: Cluster Tests (2x MI300X)
-    runs-on: [self-hosted, mi300x, primary]
-    needs: [build-and-test, fmt, clippy]
-    # Only one cluster run at a time; cancel older runs on the same ref.
-    concurrency:
-      group: cluster-${{ github.ref }}
-      cancel-in-progress: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build release binaries
-        run: |
-          export PATH="$HOME/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-          export PROTOC="$HOME/bin/protoc"
-          export PROTOC_INCLUDE="$HOME/protoc-install/include"
-          cargo build --release -j 4
-
-      - name: Stop any running cluster and clear state
-        run: |
-          ssh mi300-2 '~/spur/etc/stop-agent.sh' 2>/dev/null || true
-          ~/spur/etc/stop-all.sh 2>/dev/null || true
-          sleep 2
-          # Clear WAL and snapshots so ghost Running jobs from previous
-          # runs don't pollute the new cluster.
-          rm -rf ~/spur/state/*
-          ssh mi300-2 'rm -rf ~/spur/state/*' 2>/dev/null || true
-
-      - name: Deploy fresh binaries and test scripts
-        run: |
-          cp target/release/spur target/release/spurctld target/release/spurd \
-             target/release/spurdbd target/release/spurrestd \
-             target/release/spur-k8s-operator ~/spur/bin/
-          rsync -a --checksum \
-            target/release/spur \
-            target/release/spurd \
-            mi300-2:~/spur/bin/
-          # Keep test scripts in sync with the repo on both nodes
-          chmod +x deploy/bare-metal/inference_job.sh deploy/bare-metal/distributed_job.sh
-          rsync -a --checksum \
-            deploy/bare-metal/inference_test.py \
-            deploy/bare-metal/inference_job.sh \
-            deploy/bare-metal/distributed_test.py \
-            deploy/bare-metal/distributed_job.sh \
-            ~/spur/
-          rsync -a --checksum \
-            deploy/bare-metal/inference_test.py \
-            deploy/bare-metal/inference_job.sh \
-            deploy/bare-metal/distributed_test.py \
-            deploy/bare-metal/distributed_job.sh \
-            mi300-2:~/spur/
-
-      - name: Start cluster
-        run: |
-          ~/spur/etc/start-controller.sh
-          ssh mi300-2 '~/spur/etc/start-agent.sh'
-          sleep 5
-
-      - name: Verify both nodes idle
-        run: |
-          ~/spur/bin/sinfo
-          if ! ~/spur/bin/sinfo | grep -qE "2\s+idle"; then
-            echo "ERROR: Expected 2 idle nodes, got:"
-            ~/spur/bin/sinfo
-            exit 1
-          fi
-
-      - name: Run integration tests
-        run: bash deploy/bare-metal/cluster_test.sh
-
-      - name: Stop cluster
-        if: always()
-        run: |
-          ssh mi300-2 '~/spur/etc/stop-agent.sh' || true
-          ~/spur/etc/stop-all.sh || true
-
-  build-docker-image:
-    name: Build Docker Image
+  build:
+    needs: [fmt, clippy]
     runs-on: ubuntu-latest
-    needs: [build-and-test, fmt, clippy]
-    outputs:
-      image_tag: ${{ steps.tag.outputs.value }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set image tag
-        id: tag
-        run: echo "value=${{ secrets.REGISTRY }}/spur:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+      - name: Install protobuf compiler
+        run: sudo apt-get install -y protobuf-compiler
 
-      - name: Log in to registry
-        uses: docker/login-action@v3
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
         with:
-          username: ${{ secrets.REGISTRY_USERNAME }}
-          password: ${{ secrets.REGISTRY_PASSWORD }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --all-targets
+
+  test:
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Test
+        run: cargo test
+
+  build-e2e-artifacts:
+    name: Build E2E Artifacts
+    needs: [test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build and push
+      - name: Build Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: deploy/Dockerfile
-          push: true
-          tags: ${{ steps.tag.outputs.value }}
+          push: false
+          tags: spur:ci
+          outputs: type=docker,dest=/tmp/spur-image.tar
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  k8s-integration:
-    name: K8s Integration
-    runs-on: [self-hosted, amd-aac02-rocm]
-    needs: build-docker-image
-    concurrency:
-      group: k8s-integration
-      cancel-in-progress: true
-    env:
-      KUBECONFIG: /home/amd/.kube/config
-      SPUR_TEST_NS: spur-ci-${{ github.run_id }}
-      SPUR_CI_IMAGE: ${{ secrets.REGISTRY }}/spur:${{ github.sha }}
-      RUST_LOG: info
-    steps:
-      - uses: actions/checkout@v4
+      - name: Upload Docker image
+        uses: actions/upload-artifact@v4
+        with:
+          name: spur-image
+          path: /tmp/spur-image.tar
+          retention-days: 1
 
-      - name: Select kubectl context
-        run: kubectl config use-context kubernetes-admin@kubernetes
-
-      - name: Remove leftover spur-ci namespaces
+      - name: Extract release binaries from image
         run: |
-          set -euo pipefail
-          leftover=$(kubectl get ns -o jsonpath='{.items[*].metadata.name}' \
-            | tr ' ' '\n' | grep '^spur-ci-' || true)
-          if [ -z "$leftover" ]; then
-            echo "No leftover spur-ci namespaces"
-            exit 0
-          fi
-          echo "Deleting leftover spur-ci namespaces (cluster-scoped operator/RBAC contention):"
-          echo "$leftover"
-          for ns in $leftover; do
-            kubectl delete ns "$ns" --ignore-not-found --wait=false
+          docker load -i /tmp/spur-image.tar
+          CID=$(docker create spur:ci)
+          mkdir -p /tmp/release-binaries
+          for bin in spur spurctld spurd spurdbd spurrestd spur-k8s-operator; do
+            docker cp "$CID:/usr/local/bin/$bin" "/tmp/release-binaries/$bin"
           done
-          deadline=$((SECONDS + 120))
-          while [ "$SECONDS" -lt "$deadline" ]; do
-            remaining=$(kubectl get ns -o jsonpath='{.items[*].metadata.name}' \
-              | tr ' ' '\n' | grep '^spur-ci-' || true)
-            if [ -z "$remaining" ]; then
-              echo "All spur-ci namespaces removed"
-              exit 0
-            fi
-            echo "Waiting for namespaces to terminate: $remaining"
-            sleep 5
-          done
-          echo "ERROR: timed out after 2m waiting for spur-ci namespace deletion:"
-          kubectl get ns -o wide $(echo "$remaining" | tr '\n' ' ')
-          exit 1
+          docker rm "$CID"
 
-      - name: Clean cluster-scoped Spur RBAC (pre)
-        run: |
-          set -euo pipefail
-          kubectl delete clusterrolebinding spur-operator --ignore-not-found
-          kubectl delete clusterrole spur-operator --ignore-not-found
-
-      - name: Create test namespace
-        run: |
-          kubectl create namespace "$SPUR_TEST_NS" \
-            --dry-run=client -o yaml | kubectl apply -f -
-
-      - name: Create registry pull secret
-        env:
-          REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          kubectl create secret docker-registry regcred \
-            --docker-server="https://index.docker.io/v1/" \
-            --docker-username="$REGISTRY_USERNAME" \
-            --docker-password="$REGISTRY_PASSWORD" \
-            -n "$SPUR_TEST_NS" \
-            --dry-run=client -o yaml | kubectl apply -f -
-          kubectl patch serviceaccount default -n "$SPUR_TEST_NS" \
-            -p '{"imagePullSecrets": [{"name": "regcred"}]}'
-
-      - name: Verify cluster can pull CI image
-        run: |
-          set -euo pipefail
-          kubectl run image-pull-check \
-            --namespace="$SPUR_TEST_NS" \
-            --image="$SPUR_CI_IMAGE" \
-            --restart=Never \
-            --command -- sleep 30
-          if ! kubectl wait --namespace="$SPUR_TEST_NS" \
-            --for=condition=Ready pod/image-pull-check --timeout=120s; then
-            echo "ERROR: cluster failed to pull $SPUR_CI_IMAGE"
-            kubectl describe pod image-pull-check -n "$SPUR_TEST_NS" || true
-            kubectl get events -n "$SPUR_TEST_NS" --sort-by='.lastTimestamp' | tail -30 || true
-            exit 1
-          fi
-          kubectl delete pod image-pull-check -n "$SPUR_TEST_NS" --ignore-not-found --wait=true
-
-      - name: Run K8s integration tests
-        run: bash deploy/bare-metal/k8s_test.sh
-
-      - name: Cleanup test resources
-        if: always()
-        run: |
-          set -euo pipefail
-          kubectl delete namespace "$SPUR_TEST_NS" --ignore-not-found --timeout=120s || true
-          kubectl delete clusterrolebinding spur-operator --ignore-not-found
-          kubectl delete clusterrole spur-operator --ignore-not-found
-          kubectl delete crd spurjobs.spur.ai --ignore-not-found --timeout=120s || true
+      - name: Upload release binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: /tmp/release-binaries/
+          retention-days: 1

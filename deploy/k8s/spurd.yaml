@@ -12,7 +12,6 @@ spec:
       labels:
         app: spurd
     spec:
-      serviceAccountName: spur-operator
       nodeSelector:
         spur.ai/compute: "true"
       tolerations:
