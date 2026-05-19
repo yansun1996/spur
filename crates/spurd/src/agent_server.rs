@@ -1309,4 +1309,83 @@ mod tests {
         let observed_canonical = std::fs::canonicalize(resp.stdout.trim()).unwrap();
         assert_eq!(observed_canonical, tmp_canonical);
     }
+
+    /// Helper: poll until the job is removed from `running` (by the monitor).
+    async fn wait_job_reaped(svc: &AgentService, job_id: u32, timeout_ms: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
+        while tokio::time::Instant::now() < deadline {
+            if svc.running.lock().await.get(&job_id).is_none() {
+                return true;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn graceful_cancel_sigterm_responsive() {
+        let svc = AgentService::new(test_reporter());
+        svc.start_monitor("http://127.0.0.1:1".into());
+
+        let job_id = 900;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+
+        svc.graceful_cancel(job_id).await;
+
+        assert!(
+            wait_job_reaped(&svc, job_id, 5_000).await,
+            "monitor should reap SIGTERM-killed job within 5s"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_cancel_escalates_to_sigkill() {
+        let svc = AgentService::new(test_reporter());
+        svc.start_monitor("http://127.0.0.1:1".into());
+
+        let job_id = 901;
+        let child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; while true; do sleep 1; done"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn SIGTERM-trapping process");
+        let tracked = TrackedJob {
+            job: executor::RunningJob::Managed {
+                child,
+                cgroup_path: None,
+            },
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            allocation: None,
+            stdout_path: "/dev/null".into(),
+            stderr_path: "/dev/null".into(),
+            has_pid_namespace: false,
+        };
+        svc.insert_test_job(job_id, tracked).await;
+
+        svc.graceful_cancel(job_id).await;
+
+        // 5s grace + up to 2s monitor tick + buffer
+        assert!(
+            wait_job_reaped(&svc, job_id, 10_000).await,
+            "monitor should reap job after SIGKILL escalation"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_explicit_signal_kills_job() {
+        let svc = AgentService::new(test_reporter());
+        svc.start_monitor("http://127.0.0.1:1".into());
+
+        let job_id = 902;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+
+        svc.send_explicit_signal(job_id, 9).await; // SIGKILL
+
+        assert!(
+            wait_job_reaped(&svc, job_id, 5_000).await,
+            "monitor should reap SIGKILL'd job within 5s"
+        );
+    }
 }
