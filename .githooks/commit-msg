@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#
+# Validates that the commit message subject follows conventional commits:
+#   type(scope): description
+#
+# Enforced in CI via .github/workflows/pr-lint.yml; this hook gives
+# immediate local feedback. Bypass with: git commit --no-verify
+
+PATTERN="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9_-]+\))?!?: .+$"
+
+subject=$(head -1 "$1")
+
+if ! echo "$subject" | grep -Eq "$PATTERN"; then
+  echo "commit-msg: subject does not match conventional commits format."
+  echo ""
+  echo "  Got:      $subject"
+  echo "  Expected: type(scope): description"
+  echo "  Example:  feat(spur-cli): add magic option"
+  echo ""
+  echo "Valid types: feat fix docs style refactor perf test build ci chore revert"
+  echo "Bypass with: git commit --no-verify"
+  exit 1
+fi
