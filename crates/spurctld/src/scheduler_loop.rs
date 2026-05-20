@@ -748,6 +748,21 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
     }
 }
 
+fn spawn_power_command(cmd: &str, node_name: &str, action: &str) {
+    let cmd = cmd.to_owned();
+    let node_name = node_name.to_owned();
+    let action = action.to_owned();
+    tokio::spawn(async move {
+        if let Err(e) = tokio::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .status()
+            .await
+        {
+            warn!(node = %node_name, error = %e, action = %action, "power command failed");
+        }
+    });
+}
+
 /// Power management: suspend idle nodes and resume them when jobs are pending.
 ///
 /// Disabled when `power.suspend_timeout_secs` is not set in the config.
@@ -772,34 +787,23 @@ async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
         // Suspend idle nodes that have been idle longer than the timeout
         for node in &nodes {
-            if node.state == spur_core::node::NodeState::Idle {
-                if let Some(last_busy) = node.last_busy {
-                    if (now - last_busy).num_seconds() as u64 > suspend_timeout {
-                        info!(node = %node.name, "suspending idle node (power saving)");
-                        let _ = cluster.update_node_state(
-                            &node.name,
-                            spur_core::node::NodeState::Suspended,
-                            Some("Power saving".into()),
-                        );
-                        if let Some(ref cmd) = cluster.config.power.suspend_command {
-                            let cmd = cmd.replace("{node}", &node.name);
-                            let node_name = node.name.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = tokio::process::Command::new("sh")
-                                    .args(["-c", &cmd])
-                                    .status()
-                                    .await
-                                {
-                                    warn!(
-                                        node = %node_name,
-                                        error = %e,
-                                        "suspend command failed"
-                                    );
-                                }
-                            });
-                        }
-                    }
-                }
+            if node.state != spur_core::node::NodeState::Idle {
+                continue;
+            }
+            let Some(last_busy) = node.last_busy else {
+                continue;
+            };
+            if (now - last_busy).num_seconds() as u64 <= suspend_timeout {
+                continue;
+            }
+            info!(node = %node.name, "suspending idle node (power saving)");
+            let _ = cluster.update_node_state(
+                &node.name,
+                spur_core::node::NodeState::Suspended,
+                Some("Power saving".into()),
+            );
+            if let Some(ref cmd) = cluster.config.power.suspend_command {
+                spawn_power_command(&cmd.replace("{node}", &node.name), &node.name, "suspend");
             }
         }
 
@@ -807,30 +811,14 @@ async fn manage_power(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let pending = cluster.pending_jobs();
         if !pending.is_empty() {
             for node in &nodes {
-                if node.state == spur_core::node::NodeState::Suspended {
-                    info!(node = %node.name, "resuming suspended node for pending jobs");
-                    let _ = cluster.update_node_state(
-                        &node.name,
-                        spur_core::node::NodeState::Idle,
-                        None,
-                    );
-                    if let Some(ref cmd) = cluster.config.power.resume_command {
-                        let cmd = cmd.replace("{node}", &node.name);
-                        let node_name = node.name.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = tokio::process::Command::new("sh")
-                                .args(["-c", &cmd])
-                                .status()
-                                .await
-                            {
-                                warn!(
-                                    node = %node_name,
-                                    error = %e,
-                                    "resume command failed"
-                                );
-                            }
-                        });
-                    }
+                if node.state != spur_core::node::NodeState::Suspended {
+                    continue;
+                }
+                info!(node = %node.name, "resuming suspended node for pending jobs");
+                let _ =
+                    cluster.update_node_state(&node.name, spur_core::node::NodeState::Idle, None);
+                if let Some(ref cmd) = cluster.config.power.resume_command {
+                    spawn_power_command(&cmd.replace("{node}", &node.name), &node.name, "resume");
                 }
             }
         }
