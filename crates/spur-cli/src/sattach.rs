@@ -222,6 +222,7 @@ async fn interactive_attach(
 /// - Keystrokes are forwarded immediately (no buffering until Enter)
 /// - Special keys (Ctrl-C, Ctrl-Z) are sent as bytes instead of signals
 /// - No local echo (the remote shell handles echo)
+///
 /// RAII guard that sets the terminal to raw mode and restores it on drop.
 pub(crate) struct RawModeGuard {
     fd: i32,

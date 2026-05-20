@@ -1862,7 +1862,7 @@ mod tests {
     /// single-node Raft has self-elected.
     fn settle(cm: &ClusterManager, job_id: JobId, expected: JobState) {
         wait_for(&format!("job {job_id} -> {expected:?}"), || {
-            cm.get_job(job_id).map_or(false, |j| j.state == expected)
+            cm.get_job(job_id).is_some_and(|j| j.state == expected)
         });
     }
 
@@ -2205,7 +2205,7 @@ mod tests {
 
         cm.hold_job(id).unwrap();
         wait_for("hold applied", || {
-            cm.get_job(id).map_or(false, |j| j.priority == 0)
+            cm.get_job(id).is_some_and(|j| j.priority == 0)
         });
         let job = cm.get_job(id).unwrap();
         assert_eq!(job.priority, 0);
@@ -2213,7 +2213,7 @@ mod tests {
 
         cm.release_job(id).unwrap();
         wait_for("release applied", || {
-            cm.get_job(id).map_or(false, |j| j.priority > 0)
+            cm.get_job(id).is_some_and(|j| j.priority > 0)
         });
         let job = cm.get_job(id).unwrap();
         assert_eq!(job.priority, 1000);
@@ -2229,7 +2229,7 @@ mod tests {
         cm.update_job(id, None, Some(5000), None, None, None, None)
             .unwrap();
         wait_for("priority updated", || {
-            cm.get_job(id).map_or(false, |j| j.priority == 5000)
+            cm.get_job(id).is_some_and(|j| j.priority == 5000)
         });
         assert_eq!(cm.get_job(id).unwrap().priority, 5000);
     }
@@ -2244,7 +2244,7 @@ mod tests {
             .unwrap();
         wait_for("node drain applied", || {
             cm.get_node("n1")
-                .map_or(false, |n| n.state == NodeState::Drain)
+                .is_some_and(|n| n.state == NodeState::Drain)
         });
         let node = cm.get_node("n1").unwrap();
         assert_eq!(node.state, NodeState::Drain);
@@ -2265,7 +2265,7 @@ mod tests {
         cm.check_node_health(90);
         wait_for("health check applied", || {
             cm.get_node("stale")
-                .map_or(false, |n| n.state == NodeState::Down)
+                .is_some_and(|n| n.state == NodeState::Down)
         });
         let node = cm.get_node("stale").unwrap();
         assert_eq!(node.state, NodeState::Down);
@@ -2296,7 +2296,7 @@ mod tests {
             .unwrap();
         wait_for("draining applied", || {
             cm.get_node("locked")
-                .map_or(false, |n| n.state == NodeState::Draining)
+                .is_some_and(|n| n.state == NodeState::Draining)
         });
         assert!(cm.get_node("locked").unwrap().admin_locked);
 
@@ -2307,7 +2307,7 @@ mod tests {
         cm.check_node_health(90);
         wait_for("health check applied", || {
             cm.get_node("locked")
-                .map_or(false, |n| n.state == NodeState::Down)
+                .is_some_and(|n| n.state == NodeState::Down)
         });
         let node = cm.get_node("locked").unwrap();
         assert_eq!(node.state, NodeState::Down);

@@ -41,8 +41,8 @@ mod tests {
         let lines: Vec<&str> = script.lines().collect();
         assert_eq!(lines[0], "#!/bin/bash");
         assert_eq!(lines[1], "#SBATCH --job-name=test");
-        assert!(lines.iter().any(|l| *l == "echo hello"));
-        assert!(lines.iter().any(|l| *l == "echo world"));
+        assert!(lines.contains(&"echo hello"));
+        assert!(lines.contains(&"echo world"));
     }
 
     // ── T17.3: Job spec defaults ─────────────────────────────────

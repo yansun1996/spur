@@ -207,6 +207,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_read_only_covers_system_paths() {
         // Verify READ_ONLY includes execute + read
         assert!(READ_ONLY & LANDLOCK_ACCESS_FS_EXECUTE != 0);
@@ -217,6 +218,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn test_read_write_covers_all_operations() {
         assert!(READ_WRITE & LANDLOCK_ACCESS_FS_EXECUTE != 0);
         assert!(READ_WRITE & LANDLOCK_ACCESS_FS_WRITE_FILE != 0);

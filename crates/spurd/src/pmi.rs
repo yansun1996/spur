@@ -85,18 +85,12 @@ async fn handle_pmi_command(
     }
 
     match params.get("cmd").copied() {
-        Some("init") => {
-            format!("cmd=response_to_init pmi_version=1 pmi_subversion=1 rc=0\n")
-        }
+        Some("init") => "cmd=response_to_init pmi_version=1 pmi_subversion=1 rc=0\n".to_string(),
         Some("get_maxes") => {
-            format!("cmd=maxes kvsname_max=256 keylen_max=256 vallen_max=256\n")
+            "cmd=maxes kvsname_max=256 keylen_max=256 vallen_max=256\n".to_string()
         }
-        Some("get_appnum") => {
-            format!("cmd=appnum appnum=0\n")
-        }
-        Some("get_my_kvsname") => {
-            format!("cmd=my_kvsname kvsname=spur_kvs\n")
-        }
+        Some("get_appnum") => "cmd=appnum appnum=0\n".to_string(),
+        Some("get_my_kvsname") => "cmd=my_kvsname kvsname=spur_kvs\n".to_string(),
         Some("get_universe_size") => {
             format!("cmd=universe_size size={}\n", num_ranks)
         }
@@ -128,9 +122,7 @@ async fn handle_pmi_command(
             "cmd=barrier_out\n".to_string()
         }
         Some("finalize") => "cmd=finalize_ack\n".to_string(),
-        _ => {
-            format!("cmd=error rc=-1 msg=unknown_command\n")
-        }
+        _ => "cmd=error rc=-1 msg=unknown_command\n".to_string(),
     }
 }
 

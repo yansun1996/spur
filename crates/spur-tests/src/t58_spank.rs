@@ -60,7 +60,7 @@ mod tests {
         writeln!(f, "# SPANK plugins").unwrap();
         writeln!(f, "required /usr/lib/spank/renice.so nice=10").unwrap();
         writeln!(f, "optional /usr/lib/spank/logger.so").unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         writeln!(f, "# another comment").unwrap();
         drop(f);
 

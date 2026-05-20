@@ -166,6 +166,7 @@ mod tests {
     // ── T01.14: Special step IDs ─────────────────────────────────
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn t01_14_special_step_ids() {
         assert_ne!(STEP_BATCH, STEP_EXTERN);
         assert_ne!(STEP_BATCH, STEP_INTERACTIVE);
@@ -212,7 +213,7 @@ mod tests {
         // Multi-node: 2 nodes, 4 tasks per node
         // Node 0: task_offset=0, Node 1: task_offset=4
         let tasks_per_node = 4u32;
-        let node_rank_0 = 0u32 / tasks_per_node;
+        let node_rank_0 = 0u32;
         let node_rank_1 = 4u32 / tasks_per_node;
         assert_eq!(node_rank_0, 0);
         assert_eq!(node_rank_1, 1);

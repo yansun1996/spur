@@ -5,7 +5,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
-use prost_types;
 use tracing::{debug, error, info, warn};
 
 use spur_proto::proto::slurm_agent_client::SlurmAgentClient;
@@ -921,11 +920,13 @@ mod tests {
 
     #[test]
     fn exclusive_job_bumps_cpus_to_node_total() {
-        let mut spec = JobSpec::default();
-        spec.cpus_per_task = 2;
-        spec.num_tasks = 1;
-        spec.num_nodes = 1;
-        spec.exclusive = true;
+        let spec = JobSpec {
+            cpus_per_task: 2,
+            num_tasks: 1,
+            num_nodes: 1,
+            exclusive: true,
+            ..Default::default()
+        };
         let job = job_with_spec(spec);
 
         let nodes = vec!["n1".to_string()];
@@ -942,10 +943,12 @@ mod tests {
 
     #[test]
     fn exclusive_job_bumps_cpus_across_multiple_nodes() {
-        let mut spec = JobSpec::default();
-        spec.cpus_per_task = 1;
-        spec.num_nodes = 2;
-        spec.exclusive = true;
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            num_nodes: 2,
+            exclusive: true,
+            ..Default::default()
+        };
         let job = job_with_spec(spec);
 
         let nodes = vec!["n1".to_string(), "n2".to_string()];
@@ -960,8 +963,10 @@ mod tests {
 
     #[test]
     fn exclusive_job_takes_all_gpus_from_each_node() {
-        let mut spec = JobSpec::default();
-        spec.exclusive = true;
+        let spec = JobSpec {
+            exclusive: true,
+            ..Default::default()
+        };
         let job = job_with_spec(spec);
 
         let nodes = vec!["n1".to_string()];
@@ -983,10 +988,12 @@ mod tests {
     fn exclusive_job_keeps_memory_at_request_not_node_total() {
         // Slurm semantics: exclusive nodes give all CPUs/GRES but only
         // the requested memory.
-        let mut spec = JobSpec::default();
-        spec.cpus_per_task = 1;
-        spec.exclusive = true;
-        spec.memory_per_node_mb = Some(4096);
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            exclusive: true,
+            memory_per_node_mb: Some(4096),
+            ..Default::default()
+        };
         let job = job_with_spec(spec);
 
         let nodes = vec!["n1".to_string()];
@@ -1000,8 +1007,10 @@ mod tests {
 
     #[test]
     fn exclusive_job_sums_generic_gres_from_each_node() {
-        let mut spec = JobSpec::default();
-        spec.exclusive = true;
+        let spec = JobSpec {
+            exclusive: true,
+            ..Default::default()
+        };
         let job = job_with_spec(spec);
 
         let mut gen_a = HashMap::new();
@@ -1035,11 +1044,13 @@ mod tests {
     #[test]
     fn non_exclusive_job_records_request_not_node_total() {
         // Regression guard: don't accidentally bump non-exclusive jobs.
-        let mut spec = JobSpec::default();
-        spec.cpus_per_task = 2;
-        spec.num_tasks = 1;
-        spec.num_nodes = 1;
-        spec.exclusive = false;
+        let spec = JobSpec {
+            cpus_per_task: 2,
+            num_tasks: 1,
+            num_nodes: 1,
+            exclusive: false,
+            ..Default::default()
+        };
         let job = job_with_spec(spec);
 
         let nodes = vec!["n1".to_string()];
@@ -1055,8 +1066,10 @@ mod tests {
     fn exclusive_job_handles_missing_node_metadata() {
         // If a node was deregistered between schedule and start, that
         // node's contribution is zero — don't panic.
-        let mut spec = JobSpec::default();
-        spec.exclusive = true;
+        let spec = JobSpec {
+            exclusive: true,
+            ..Default::default()
+        };
         let job = job_with_spec(spec);
 
         let nodes = vec!["n1".to_string(), "ghost".to_string()];

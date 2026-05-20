@@ -292,7 +292,7 @@ fn cmd_list() -> Result<()> {
     let mut images: Vec<(String, u64)> = Vec::new();
     for entry in std::fs::read_dir(image_dir)?.flatten() {
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "sqsh") {
+        if path.extension().is_some_and(|ext| ext == "sqsh") {
             let name = path
                 .file_stem()
                 .map(|s| s.to_string_lossy().to_string())

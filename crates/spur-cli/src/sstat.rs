@@ -68,7 +68,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     // Print header
     if !args.noheader {
-        let headers: Vec<String> = fields.iter().map(|f| format_header(f)).collect();
+        let headers: Vec<String> = fields.iter().map(format_header).collect();
         if args.parsable {
             println!("{}|", headers.join(delimiter));
         } else {

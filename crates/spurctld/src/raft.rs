@@ -102,7 +102,7 @@ impl SpurStore {
         if let Ok(entries) = std::fs::read_dir(&log_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "json") {
+                if path.extension().is_some_and(|e| e == "json") {
                     match std::fs::read_to_string(&path) {
                         Ok(data) => match serde_json::from_str::<Entry<SpurTypeConfig>>(&data) {
                             Ok(e) => {
@@ -216,7 +216,7 @@ impl RaftSnapshotBuilder<SpurTypeConfig> for Arc<SpurStore> {
             StorageError::from_io_error(
                 openraft::ErrorSubject::Store,
                 openraft::ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
+                std::io::Error::other(e),
             )
         })?;
 

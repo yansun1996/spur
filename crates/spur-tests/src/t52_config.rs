@@ -224,6 +224,7 @@ state_dir = "/tmp/spur"
     }
 
     #[test]
+    #[allow(clippy::unnecessary_literal_unwrap)]
     fn t52_17_cli_listen_overrides_config() {
         // When --listen CLI arg is provided it wins; when absent, config value is used.
         // This tests the merging logic introduced to fix #37.

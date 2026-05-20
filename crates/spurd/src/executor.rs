@@ -822,6 +822,7 @@ async fn launch_container_job(
 /// The `bb` string contains semicolon-separated directives:
 ///   - `stage_in:<cmd>` — run before the job
 ///   - `stage_out:<cmd>` — run after the job (best-effort, ignores failures)
+///
 /// Build the bash wrapper that runs inside the unshare PID/mount namespace.
 ///
 /// The wrapper executes as root (the same uid as spurd), so it can perform
@@ -905,7 +906,7 @@ fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
     wrapper.push_str("# User script\n");
     // Remove shebang from user script if present to avoid nested shebangs
     let user_body = if script.starts_with("#!") {
-        script.splitn(2, '\n').nth(1).unwrap_or("")
+        script.split_once('\n').map(|x| x.1).unwrap_or("")
     } else {
         script
     };

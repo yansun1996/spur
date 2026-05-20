@@ -464,7 +464,7 @@ mod tests {
             "should forward when local can't schedule all"
         );
 
-        let should_forward_no_peers = false && assigned_count < pending_count;
+        let should_forward_no_peers = false;
         assert!(!should_forward_no_peers, "no peers → no forward");
     }
 

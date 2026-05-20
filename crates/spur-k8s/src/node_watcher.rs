@@ -192,7 +192,7 @@ fn is_node_not_ready(node: &K8sNode) -> bool {
     node.spec
         .as_ref()
         .and_then(|s| s.taints.as_ref())
-        .map_or(false, |taints| {
+        .is_some_and(|taints| {
             taints
                 .iter()
                 .any(|t| t.key == "node.kubernetes.io/not-ready" && t.effect == "NoSchedule")

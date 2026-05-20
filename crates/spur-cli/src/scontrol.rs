@@ -408,13 +408,13 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                 println!("No federation peers configured.");
             } else {
                 println!("FEDERATION PEERS");
-                println!("{:<20} {}", "CLUSTER", "ADDRESS");
+                println!("{:<20} ADDRESS", "CLUSTER");
                 for peer in &inner.federation_peers {
                     // Format is "name@address"
                     if let Some((name, addr)) = peer.split_once('@') {
                         println!("{:<20} {}", name, addr);
                     } else {
-                        println!("{:<20} {}", peer, "(unknown)");
+                        println!("{:<20} (unknown)", peer);
                     }
                 }
             }

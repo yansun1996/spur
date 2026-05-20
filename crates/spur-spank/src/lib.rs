@@ -92,6 +92,12 @@ pub struct SpankContext {
     pub task_pid: u32,
 }
 
+impl Default for SpankHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SpankHost {
     pub fn new() -> Self {
         Self {
@@ -438,7 +444,7 @@ mod tests {
         writeln!(f, "# comment line").unwrap();
         writeln!(f, "required /usr/lib/spank/plugin1.so arg1 arg2").unwrap();
         writeln!(f, "optional /usr/lib/spank/plugin2.so").unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         drop(f);
 
         let entries = parse_plugstack(&conf_path).unwrap();

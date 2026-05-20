@@ -116,7 +116,7 @@ pub fn discover_resources() -> ResourceSet {
 fn discover_cpus() -> u32 {
     // Try /sys/devices/system/cpu/online first
     if let Ok(online) = std::fs::read_to_string("/sys/devices/system/cpu/online") {
-        if let Some(count) = parse_cpu_range(&online.trim()) {
+        if let Some(count) = parse_cpu_range(online.trim()) {
             return count;
         }
     }

@@ -222,16 +222,12 @@ pub fn apply_seccomp_filter() -> Result<(), String> {
     //   3. Default: BPF_RET | SECCOMP_RET_ERRNO(EPERM)
     //   4. ALLOW: BPF_RET | SECCOMP_RET_ALLOW
 
-    let mut filter: Vec<libc::sock_filter> = Vec::new();
-
-    // Validate architecture (x86_64 = AUDIT_ARCH_X86_64 = 0xC000003E)
-    // BPF_LD | BPF_W | BPF_ABS: load arch from seccomp_data.arch (offset 4)
-    filter.push(bpf_stmt(0x20, 4)); // LD arch
-    filter.push(bpf_jump(0x15, 0xC000003E, 1, 0)); // JEQ x86_64 → skip kill
-    filter.push(bpf_stmt(0x06, 0)); // RET KILL (wrong arch)
-
-    // Load syscall number from seccomp_data.nr (offset 0)
-    filter.push(bpf_stmt(0x20, 0)); // LD nr
+    let mut filter: Vec<libc::sock_filter> = vec![
+        bpf_stmt(0x20, 4),                // LD arch
+        bpf_jump(0x15, 0xC000003E, 1, 0), // JEQ x86_64 → skip kill
+        bpf_stmt(0x06, 0),                // RET KILL (wrong arch)
+        bpf_stmt(0x20, 0),                // LD nr
+    ];
 
     // Deduplicate and sort allowed syscalls
     let mut allowed: Vec<u32> = ALLOWED_SYSCALLS.to_vec();
@@ -354,11 +350,12 @@ mod tests {
         allowed.sort_unstable();
         allowed.dedup();
 
-        let mut filter = Vec::new();
-        filter.push(bpf_stmt(0x20, 4));
-        filter.push(bpf_jump(0x15, 0xC000003E, 1, 0));
-        filter.push(bpf_stmt(0x06, 0));
-        filter.push(bpf_stmt(0x20, 0));
+        let mut filter = vec![
+            bpf_stmt(0x20, 4),
+            bpf_jump(0x15, 0xC000003E, 1, 0),
+            bpf_stmt(0x06, 0),
+            bpf_stmt(0x20, 0),
+        ];
 
         for (i, &nr) in allowed.iter().enumerate() {
             let jump = (allowed.len() - 1 - i) as u8;

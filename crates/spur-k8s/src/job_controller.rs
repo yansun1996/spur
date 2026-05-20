@@ -364,10 +364,8 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
 
             // Detect Pending pods rejected by kubelet (UnexpectedAdmissionError, ImagePullBackOff)
             let pending_failure = if phase == "Pending" {
-                pod.status
-                    .as_ref()
-                    .and_then(|s| s.reason.as_deref())
-                    .map_or(false, |r| r == "UnexpectedAdmissionError")
+                (pod.status.as_ref().and_then(|s| s.reason.as_deref())
+                    == Some("UnexpectedAdmissionError"))
                     || pod
                         .status
                         .as_ref()
@@ -376,7 +374,7 @@ async fn watch_pods(ctx: Arc<JobControllerCtx>) -> anyhow::Result<()> {
                         .and_then(|cs| cs.state.as_ref())
                         .and_then(|st| st.waiting.as_ref())
                         .and_then(|w| w.reason.as_deref())
-                        .map_or(false, |r| r == "ImagePullBackOff" || r == "ErrImagePull")
+                        .is_some_and(|r| r == "ImagePullBackOff" || r == "ErrImagePull")
             } else {
                 false
             };

@@ -1103,7 +1103,7 @@ address = "http://peer-a:6817"
         // (colon and slash replaced with +)
         let name = "ubuntu:22.04";
         let expected = "ubuntu+22.04";
-        let sanitized = name.replace('/', "+").replace(':', "+");
+        let sanitized = name.replace(['/', ':'], "+");
         assert_eq!(sanitized, expected);
         assert_eq!(format!("{}.sqsh", sanitized), basename);
     }

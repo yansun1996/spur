@@ -184,7 +184,7 @@ async fn get_jobs(
         .into_inner()
         .jobs
         .iter()
-        .map(|j| job_info_to_json(j))
+        .map(job_info_to_json)
         .collect();
 
     Ok(ApiResponse::ok(JobsData { jobs }))
@@ -320,7 +320,7 @@ async fn get_nodes(
         .into_inner()
         .nodes
         .iter()
-        .map(|n| node_info_to_json(n))
+        .map(node_info_to_json)
         .collect();
 
     Ok(ApiResponse::ok(NodesData { nodes }))
@@ -368,7 +368,7 @@ async fn get_partitions(
         .into_inner()
         .partitions
         .iter()
-        .map(|p| partition_info_to_json(p))
+        .map(partition_info_to_json)
         .collect();
 
     Ok(ApiResponse::ok(PartitionsData { partitions }))

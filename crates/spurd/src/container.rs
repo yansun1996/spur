@@ -886,7 +886,7 @@ pub fn run_hooks(rootfs: &Path) -> anyhow::Result<HashMap<String, String>> {
             let mut scripts: Vec<PathBuf> = Vec::new();
             while let Some(Ok(entry)) = entries.next() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "sh") {
+                if path.extension().is_some_and(|e| e == "sh") {
                     scripts.push(path);
                 }
             }
@@ -929,7 +929,7 @@ pub fn run_hooks(rootfs: &Path) -> anyhow::Result<HashMap<String, String>> {
             let mut files: Vec<PathBuf> = Vec::new();
             while let Some(Ok(entry)) = entries.next() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "env") {
+                if path.extension().is_some_and(|e| e == "env") {
                     files.push(path);
                 }
             }
@@ -957,7 +957,7 @@ pub fn run_hooks(rootfs: &Path) -> anyhow::Result<HashMap<String, String>> {
             let mut files: Vec<PathBuf> = Vec::new();
             while let Some(Ok(entry)) = entries.next() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "fstab") {
+                if path.extension().is_some_and(|e| e == "fstab") {
                     files.push(path);
                 }
             }
@@ -1199,7 +1199,7 @@ pub fn list_images() -> Vec<(String, u64)> {
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "sqsh") {
+            if path.extension().is_some_and(|ext| ext == "sqsh") {
                 let name = path
                     .file_stem()
                     .map(|s| s.to_string_lossy().to_string())
@@ -1226,9 +1226,7 @@ pub fn remove_image(name: &str) -> anyhow::Result<()> {
 
 /// Sanitize an image name for use as a filename.
 fn sanitize_name(name: &str) -> String {
-    name.replace("docker://", "")
-        .replace('/', "+")
-        .replace(':', "+")
+    name.replace("docker://", "").replace(['/', ':'], "+")
 }
 
 #[cfg(test)]

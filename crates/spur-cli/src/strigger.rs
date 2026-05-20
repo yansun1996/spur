@@ -140,8 +140,8 @@ fn list_triggers() -> Result<()> {
     }
 
     println!(
-        "{:<10} {:<15} {:<10} {:<10} {}",
-        "TRIG_ID", "TYPE", "JOB_ID", "NODE", "PROGRAM"
+        "{:<10} {:<15} {:<10} {:<10} PROGRAM",
+        "TRIG_ID", "TYPE", "JOB_ID", "NODE"
     );
     for (i, t) in triggers.iter().enumerate() {
         println!(

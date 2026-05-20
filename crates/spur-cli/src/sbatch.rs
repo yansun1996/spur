@@ -312,7 +312,7 @@ fn convert_pbs_to_sbatch(pbs_arg: &str) -> Option<String> {
         "q" => value.map(|v| format!("--partition={}", v)),
         "l" => {
             // PBS resource specs like "walltime=4:00:00" or "nodes=2:ppn=8"
-            value.and_then(|v| convert_pbs_resource(v))
+            value.and_then(convert_pbs_resource)
         }
         "o" => value.map(|v| format!("--output={}", v)),
         "e" => value.map(|v| format!("--error={}", v)),

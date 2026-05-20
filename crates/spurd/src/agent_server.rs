@@ -768,9 +768,9 @@ impl SlurmAgent for AgentService {
             unsafe {
                 cmd.pre_exec(move || {
                     nix::unistd::setgid(nix::unistd::Gid::from_raw(target_gid))
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                        .map_err(std::io::Error::other)?;
                     nix::unistd::setuid(nix::unistd::Uid::from_raw(target_uid))
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                        .map_err(std::io::Error::other)?;
                     Ok(())
                 });
             }
@@ -836,24 +836,21 @@ impl SlurmAgent for AgentService {
             let mut offset = 0u64;
             loop {
                 // Read new data from the file
-                match tokio::fs::read(&file_path).await {
-                    Ok(data) => {
-                        if data.len() as u64 > offset {
-                            let new_data = data[offset as usize..].to_vec();
-                            offset = data.len() as u64;
-                            if tx
-                                .send(Ok(StreamJobOutputChunk {
-                                    data: new_data,
-                                    eof: false,
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                break; // Client disconnected
-                            }
+                if let Ok(data) = tokio::fs::read(&file_path).await {
+                    if data.len() as u64 > offset {
+                        let new_data = data[offset as usize..].to_vec();
+                        offset = data.len() as u64;
+                        if tx
+                            .send(Ok(StreamJobOutputChunk {
+                                data: new_data,
+                                eof: false,
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break; // Client disconnected
                         }
                     }
-                    Err(_) => {} // File not ready yet
                 }
 
                 // Check if job is still running
@@ -1005,10 +1002,8 @@ impl SlurmAgent for AgentService {
             // Task: read from client stream → child stdin
             let stdin_task = tokio::spawn(async move {
                 while let Ok(Some(msg)) = in_stream.message().await {
-                    if !msg.data.is_empty() {
-                        if child_stdin.write_all(&msg.data).await.is_err() {
-                            break;
-                        }
+                    if !msg.data.is_empty() && child_stdin.write_all(&msg.data).await.is_err() {
+                        break;
                     }
                 }
                 drop(child_stdin); // EOF to child

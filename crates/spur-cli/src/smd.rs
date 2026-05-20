@@ -60,8 +60,8 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
         println!("=== Node Health Report ({}) ===", now);
         println!(
-            "{:<20} {:<10} {:<8} {:<12} {}",
-            "NODE", "STATE", "LOAD", "FREE_MEM_MB", "REASON"
+            "{:<20} {:<10} {:<8} {:<12} REASON",
+            "NODE", "STATE", "LOAD", "FREE_MEM_MB"
         );
 
         let mut unhealthy_count = 0u32;

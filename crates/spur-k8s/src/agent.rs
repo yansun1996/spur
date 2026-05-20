@@ -197,7 +197,7 @@ impl SlurmAgent for VirtualAgent {
         if let Some(ref alloc) = req.allocated {
             if !alloc.gpus.is_empty() {
                 let gpu_type = alloc.gpus.first().map(|g| g.gpu_type.as_str());
-                if gpu_type.map_or(true, |t| !is_nvidia_gpu(t)) {
+                if gpu_type.is_none_or(|t| !is_nvidia_gpu(t)) {
                     // AMD/ROCm: set HIP and RCCL env vars
                     env_vars.push(EnvVar {
                         name: "GPU_ENABLE_PAL".into(),
@@ -706,7 +706,7 @@ fn parse_mounts(mounts: &[String]) -> (Vec<Volume>, Vec<VolumeMount>) {
                     persistent_volume_claim: Some(
                         k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
                             claim_name: parts[1].to_string(),
-                            read_only: Some(parts.get(3).map_or(false, |&v| v == "ro")),
+                            read_only: Some(parts.get(3).is_some_and(|&v| v == "ro")),
                         },
                     ),
                     ..Default::default()
@@ -714,14 +714,14 @@ fn parse_mounts(mounts: &[String]) -> (Vec<Volume>, Vec<VolumeMount>) {
                 volume_mounts.push(VolumeMount {
                     name: vol_name,
                     mount_path: parts[2].to_string(),
-                    read_only: Some(parts.get(3).map_or(false, |&v| v == "ro")),
+                    read_only: Some(parts.get(3).is_some_and(|&v| v == "ro")),
                     ..Default::default()
                 });
             }
         } else if parts.len() >= 2 {
             // hostPath mount: "/src:/dst[:ro]"
             let vol_name = format!("hostpath-{}", i);
-            let read_only = parts.get(2).map_or(false, |&v| v == "ro");
+            let read_only = parts.get(2).is_some_and(|&v| v == "ro");
             volumes.push(Volume {
                 name: vol_name.clone(),
                 host_path: Some(HostPathVolumeSource {
