@@ -78,8 +78,19 @@ impl<T: Serialize> ApiResponse<T> {
 }
 
 fn error_response(msg: &str) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    api_error_response(StatusCode::INTERNAL_SERVER_ERROR, msg)
+}
+
+fn bad_request_response(msg: &str) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    api_error_response(StatusCode::BAD_REQUEST, msg)
+}
+
+fn api_error_response(
+    status: StatusCode,
+    msg: &str,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
     (
-        StatusCode::INTERNAL_SERVER_ERROR,
+        status,
         Json(ApiResponse {
             meta: meta(),
             errors: vec![ApiError {
@@ -161,13 +172,10 @@ async fn get_jobs(
         .await
         .map_err(|e| error_response(&format!("connection failed: {}", e)))?;
 
-    let states: Vec<i32> = query
-        .state
-        .iter()
-        .flat_map(|s| s.split(','))
-        .filter_map(|s| parse_job_state(s.trim()))
-        .map(|s| s as i32)
-        .collect();
+    let states: Vec<i32> = match query.state.as_deref() {
+        Some(s) => parse_states_query(s).map_err(|e| bad_request_response(&e))?,
+        None => Vec::new(),
+    };
 
     let resp = client
         .get_jobs(spur_proto::proto::GetJobsRequest {
@@ -440,47 +448,62 @@ fn partition_info_to_json(p: &spur_proto::proto::PartitionInfo) -> serde_json::V
 }
 
 fn state_name(state: i32) -> &'static str {
-    match state {
-        0 => "PENDING",
-        1 => "RUNNING",
-        2 => "COMPLETING",
-        3 => "COMPLETED",
-        4 => "FAILED",
-        5 => "CANCELLED",
-        6 => "TIMEOUT",
-        7 => "NODE_FAIL",
-        8 => "PREEMPTED",
-        9 => "SUSPENDED",
-        _ => "UNKNOWN",
-    }
+    spur_core::job::JobState::from_proto_i32(state)
+        .map(|s| s.display())
+        .unwrap_or("UNKNOWN")
 }
 
 fn node_state_name(state: i32) -> &'static str {
-    match state {
-        0 => "idle",
-        1 => "allocated",
-        2 => "mixed",
-        3 => "down",
-        4 => "drained",
-        5 => "draining",
-        6 => "error",
-        _ => "unknown",
-    }
+    spur_core::node::NodeState::from_proto_i32(state)
+        .map(|s| s.display())
+        .unwrap_or("unknown")
 }
 
-fn parse_job_state(s: &str) -> Option<spur_proto::proto::JobState> {
-    use spur_proto::proto::JobState;
-    match s.to_uppercase().as_str() {
-        "PD" | "PENDING" => Some(JobState::JobPending),
-        "R" | "RUNNING" => Some(JobState::JobRunning),
-        "CG" | "COMPLETING" => Some(JobState::JobCompleting),
-        "CD" | "COMPLETED" => Some(JobState::JobCompleted),
-        "F" | "FAILED" => Some(JobState::JobFailed),
-        "CA" | "CANCELLED" => Some(JobState::JobCancelled),
-        "TO" | "TIMEOUT" => Some(JobState::JobTimeout),
-        "NF" | "NODE_FAIL" => Some(JobState::JobNodeFail),
-        "PR" | "PREEMPTED" => Some(JobState::JobPreempted),
-        "S" | "SUSPENDED" => Some(JobState::JobSuspended),
-        _ => None,
+fn parse_states_query(s: &str) -> Result<Vec<i32>, String> {
+    use spur_core::job::JobState;
+
+    let trimmed = s.trim();
+    if trimmed.eq_ignore_ascii_case("all") {
+        return Ok(Vec::new());
+    }
+
+    let tokens: Vec<&str> = trimmed
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    if tokens.is_empty() {
+        return Err("Invalid job state specified: (empty)".into());
+    }
+
+    let mut states = Vec::with_capacity(tokens.len());
+    for token in tokens {
+        let core = JobState::from_code_or_name(token)
+            .ok_or_else(|| format!("Invalid job state specified: {token}"))?;
+        states.push(core.to_proto_i32());
+    }
+    Ok(states)
+}
+
+#[cfg(test)]
+mod state_filter_tests {
+    use super::*;
+
+    #[test]
+    fn parse_states_query_accepts_valid_tokens() {
+        let states = parse_states_query("RUNNING,PD").unwrap();
+        assert_eq!(states.len(), 2);
+    }
+
+    #[test]
+    fn parse_states_query_rejects_unknown() {
+        assert!(parse_states_query("BOGUS").is_err());
+        assert!(parse_states_query("R,BOGUS").is_err());
+    }
+
+    #[test]
+    fn parse_states_query_all_means_no_filter() {
+        assert!(parse_states_query("all").unwrap().is_empty());
     }
 }
