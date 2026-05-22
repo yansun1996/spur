@@ -70,6 +70,75 @@ impl JobState {
     pub fn is_active(&self) -> bool {
         matches!(self, Self::Running | Self::Completing | Self::Suspended)
     }
+
+    /// Every core variant, in proto discriminant order for iteration only.
+    pub const ALL: [JobState; 10] = [
+        Self::Pending,
+        Self::Running,
+        Self::Completing,
+        Self::Completed,
+        Self::Failed,
+        Self::Cancelled,
+        Self::Timeout,
+        Self::NodeFail,
+        Self::Preempted,
+        Self::Suspended,
+    ];
+
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Convert a prost `JobState` enum to core.
+    pub fn from_proto(p: spur_proto::proto::JobState) -> Self {
+        match p {
+            spur_proto::proto::JobState::JobPending => Self::Pending,
+            spur_proto::proto::JobState::JobRunning => Self::Running,
+            spur_proto::proto::JobState::JobCompleting => Self::Completing,
+            spur_proto::proto::JobState::JobCompleted => Self::Completed,
+            spur_proto::proto::JobState::JobFailed => Self::Failed,
+            spur_proto::proto::JobState::JobCancelled => Self::Cancelled,
+            spur_proto::proto::JobState::JobTimeout => Self::Timeout,
+            spur_proto::proto::JobState::JobNodeFail => Self::NodeFail,
+            spur_proto::proto::JobState::JobPreempted => Self::Preempted,
+            spur_proto::proto::JobState::JobSuspended => Self::Suspended,
+        }
+    }
+
+    /// Convert core state to prost `JobState`.
+    pub fn to_proto(self) -> spur_proto::proto::JobState {
+        match self {
+            Self::Pending => spur_proto::proto::JobState::JobPending,
+            Self::Running => spur_proto::proto::JobState::JobRunning,
+            Self::Completing => spur_proto::proto::JobState::JobCompleting,
+            Self::Completed => spur_proto::proto::JobState::JobCompleted,
+            Self::Failed => spur_proto::proto::JobState::JobFailed,
+            Self::Cancelled => spur_proto::proto::JobState::JobCancelled,
+            Self::Timeout => spur_proto::proto::JobState::JobTimeout,
+            Self::NodeFail => spur_proto::proto::JobState::JobNodeFail,
+            Self::Preempted => spur_proto::proto::JobState::JobPreempted,
+            Self::Suspended => spur_proto::proto::JobState::JobSuspended,
+        }
+    }
+
+    /// Convert a proto wire discriminant to core.
+    pub fn from_proto_i32(v: i32) -> Option<Self> {
+        spur_proto::proto::JobState::try_from(v)
+            .ok()
+            .map(Self::from_proto)
+    }
+
+    /// Core state as proto wire discriminant.
+    pub fn to_proto_i32(self) -> i32 {
+        self.to_proto() as i32
+    }
+
+    /// Parse from a Slurm state code ("PD", "R") or full name ("PENDING", "RUNNING").
+    pub fn from_code_or_name(s: &str) -> Option<Self> {
+        let upper = s.to_uppercase();
+        Self::ALL
+            .iter()
+            .find(|st| st.code() == upper || st.display() == upper)
+            .copied()
+    }
 }
 
 impl std::fmt::Display for JobState {
@@ -508,9 +577,68 @@ mod tests {
     }
 
     #[test]
-    fn test_state_codes() {
-        assert_eq!(JobState::Pending.code(), "PD");
-        assert_eq!(JobState::Running.code(), "R");
-        assert_eq!(JobState::Completed.code(), "CD");
+    fn all_is_complete_and_ordered() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        assert_eq!(JobState::ALL.len(), JobState::COUNT);
+        for state in &JobState::ALL {
+            assert!(seen.insert(state), "duplicate variant in ALL: {state}");
+        }
+    }
+
+    #[test]
+    fn job_state_proto_discriminants_match_core() {
+        use spur_proto::proto::JobState as P;
+
+        const TABLE: &[(P, JobState)] = &[
+            (P::JobPending, JobState::Pending),
+            (P::JobRunning, JobState::Running),
+            (P::JobCompleting, JobState::Completing),
+            (P::JobCompleted, JobState::Completed),
+            (P::JobFailed, JobState::Failed),
+            (P::JobCancelled, JobState::Cancelled),
+            (P::JobTimeout, JobState::Timeout),
+            (P::JobNodeFail, JobState::NodeFail),
+            (P::JobPreempted, JobState::Preempted),
+            (P::JobSuspended, JobState::Suspended),
+        ];
+
+        assert_eq!(TABLE.len(), JobState::COUNT);
+        for &(proto, core) in TABLE {
+            let wire = proto as i32;
+            assert_eq!(P::try_from(wire).ok(), Some(proto));
+            assert_eq!(JobState::from_proto_i32(wire), Some(core));
+            assert_eq!(
+                JobState::ALL.iter().position(|&s| s == core),
+                Some(wire as usize),
+                "ALL position for {core:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn job_state_proto_try_from_unknown_wire_values() {
+        use spur_proto::proto::JobState as P;
+
+        for bad in [-1, JobState::COUNT as i32, 99, i32::MAX] {
+            assert_eq!(JobState::from_proto_i32(bad), None);
+            assert!(P::try_from(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn job_state_core_proto_roundtrip() {
+        for &core in &JobState::ALL {
+            assert_eq!(JobState::from_proto_i32(core.to_proto_i32()), Some(core));
+            assert_eq!(JobState::from_proto(core.to_proto()), core);
+        }
+    }
+
+    #[test]
+    fn job_state_from_code_or_name_roundtrip() {
+        for &state in &JobState::ALL {
+            assert_eq!(JobState::from_code_or_name(state.code()), Some(state));
+            assert_eq!(JobState::from_code_or_name(state.display()), Some(state));
+        }
     }
 }

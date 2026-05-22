@@ -94,6 +94,21 @@ impl NodeState {
         }
     }
 
+    /// Uppercase display for scontrol output (Slurm convention).
+    pub fn display_upper(&self) -> &'static str {
+        match self {
+            Self::Idle => "IDLE",
+            Self::Allocated => "ALLOCATED",
+            Self::Mixed => "MIXED",
+            Self::Down => "DOWN",
+            Self::Drain => "DRAINED",
+            Self::Draining => "DRAINING",
+            Self::Error => "ERROR",
+            Self::Unknown => "UNKNOWN",
+            Self::Suspended => "SUSPENDED",
+        }
+    }
+
     /// Short suffix used in sinfo (e.g., "idle", "alloc", "mix").
     pub fn short(&self) -> &'static str {
         match self {
@@ -111,6 +126,64 @@ impl NodeState {
 
     pub fn is_available(&self) -> bool {
         matches!(self, Self::Idle | Self::Mixed)
+    }
+
+    /// Every core variant, in proto discriminant order for iteration only.
+    /// Wire conversion uses [`from_proto`](Self::from_proto) / [`to_proto`](Self::to_proto), not array index.
+    pub const ALL: [NodeState; 9] = [
+        Self::Idle,
+        Self::Allocated,
+        Self::Mixed,
+        Self::Down,
+        Self::Drain,
+        Self::Draining,
+        Self::Error,
+        Self::Unknown,
+        Self::Suspended,
+    ];
+
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Convert a prost `NodeState` enum to core.
+    pub fn from_proto(p: spur_proto::proto::NodeState) -> Self {
+        match p {
+            spur_proto::proto::NodeState::NodeIdle => Self::Idle,
+            spur_proto::proto::NodeState::NodeAllocated => Self::Allocated,
+            spur_proto::proto::NodeState::NodeMixed => Self::Mixed,
+            spur_proto::proto::NodeState::NodeDown => Self::Down,
+            spur_proto::proto::NodeState::NodeDrain => Self::Drain,
+            spur_proto::proto::NodeState::NodeDraining => Self::Draining,
+            spur_proto::proto::NodeState::NodeError => Self::Error,
+            spur_proto::proto::NodeState::NodeUnknown => Self::Unknown,
+            spur_proto::proto::NodeState::NodeSuspended => Self::Suspended,
+        }
+    }
+
+    /// Convert core state to prost `NodeState`.
+    pub fn to_proto(self) -> spur_proto::proto::NodeState {
+        match self {
+            Self::Idle => spur_proto::proto::NodeState::NodeIdle,
+            Self::Allocated => spur_proto::proto::NodeState::NodeAllocated,
+            Self::Mixed => spur_proto::proto::NodeState::NodeMixed,
+            Self::Down => spur_proto::proto::NodeState::NodeDown,
+            Self::Drain => spur_proto::proto::NodeState::NodeDrain,
+            Self::Draining => spur_proto::proto::NodeState::NodeDraining,
+            Self::Error => spur_proto::proto::NodeState::NodeError,
+            Self::Unknown => spur_proto::proto::NodeState::NodeUnknown,
+            Self::Suspended => spur_proto::proto::NodeState::NodeSuspended,
+        }
+    }
+
+    /// Convert a proto wire discriminant to core.
+    pub fn from_proto_i32(v: i32) -> Option<Self> {
+        spur_proto::proto::NodeState::try_from(v)
+            .ok()
+            .map(Self::from_proto)
+    }
+
+    /// Core state as proto wire discriminant.
+    pub fn to_proto_i32(self) -> i32 {
+        self.to_proto() as i32
     }
 }
 
@@ -244,18 +317,6 @@ impl Node {
 mod tests {
     use super::*;
 
-    const ALL_STATES: &[NodeState] = &[
-        NodeState::Idle,
-        NodeState::Allocated,
-        NodeState::Mixed,
-        NodeState::Down,
-        NodeState::Drain,
-        NodeState::Draining,
-        NodeState::Error,
-        NodeState::Unknown,
-        NodeState::Suspended,
-    ];
-
     #[test]
     fn register_from_unknown_yields_idle() {
         assert_eq!(
@@ -266,7 +327,7 @@ mod tests {
 
     #[test]
     fn register_from_non_unknown_is_noop() {
-        for &s in ALL_STATES.iter().filter(|s| **s != NodeState::Unknown) {
+        for &s in NodeState::ALL.iter().filter(|s| **s != NodeState::Unknown) {
             assert_eq!(
                 s.transition(&NodeEvent::Register, false),
                 None,
@@ -358,8 +419,8 @@ mod tests {
 
     #[test]
     fn admin_can_force_any_state() {
-        for &from in ALL_STATES {
-            for &to in ALL_STATES {
+        for &from in &NodeState::ALL {
+            for &to in &NodeState::ALL {
                 assert_eq!(
                     from.transition(&NodeEvent::AdminSetState(to), false),
                     Some(to),
@@ -371,7 +432,7 @@ mod tests {
 
     #[test]
     fn power_suspend_from_any_state() {
-        for &s in ALL_STATES {
+        for &s in &NodeState::ALL {
             assert_eq!(
                 s.transition(&NodeEvent::PowerSuspend, false),
                 Some(NodeState::Suspended),
@@ -386,7 +447,10 @@ mod tests {
             NodeState::Suspended.transition(&NodeEvent::PowerResume, false),
             Some(NodeState::Idle),
         );
-        for &s in ALL_STATES.iter().filter(|s| **s != NodeState::Suspended) {
+        for &s in NodeState::ALL
+            .iter()
+            .filter(|s| **s != NodeState::Suspended)
+        {
             assert_eq!(
                 s.transition(&NodeEvent::PowerResume, false),
                 None,
@@ -415,6 +479,63 @@ mod tests {
         }
         for &s in &non_holds {
             assert!(!s.is_admin_hold(), "{s:?} should not be admin hold");
+        }
+    }
+
+    #[test]
+    fn all_is_complete_and_ordered() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        assert_eq!(NodeState::ALL.len(), NodeState::COUNT);
+        for state in &NodeState::ALL {
+            assert!(seen.insert(state), "duplicate variant in ALL: {state}");
+        }
+    }
+
+    #[test]
+    fn node_state_proto_discriminants_match_core() {
+        use spur_proto::proto::NodeState as P;
+
+        const TABLE: &[(P, NodeState)] = &[
+            (P::NodeIdle, NodeState::Idle),
+            (P::NodeAllocated, NodeState::Allocated),
+            (P::NodeMixed, NodeState::Mixed),
+            (P::NodeDown, NodeState::Down),
+            (P::NodeDrain, NodeState::Drain),
+            (P::NodeDraining, NodeState::Draining),
+            (P::NodeError, NodeState::Error),
+            (P::NodeUnknown, NodeState::Unknown),
+            (P::NodeSuspended, NodeState::Suspended),
+        ];
+
+        assert_eq!(TABLE.len(), NodeState::COUNT);
+        for &(proto, core) in TABLE {
+            let wire = proto as i32;
+            assert_eq!(P::try_from(wire).ok(), Some(proto));
+            assert_eq!(NodeState::from_proto_i32(wire), Some(core));
+            assert_eq!(
+                NodeState::ALL.iter().position(|&s| s == core),
+                Some(wire as usize),
+                "ALL position for {core:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_state_proto_try_from_unknown_wire_values() {
+        use spur_proto::proto::NodeState as P;
+
+        for bad in [-1, NodeState::COUNT as i32, 99, i32::MAX] {
+            assert_eq!(NodeState::from_proto_i32(bad), None);
+            assert!(P::try_from(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn node_state_core_proto_roundtrip() {
+        for &core in &NodeState::ALL {
+            assert_eq!(NodeState::from_proto_i32(core.to_proto_i32()), Some(core));
+            assert_eq!(NodeState::from_proto(core.to_proto()), core);
         }
     }
 }
