@@ -169,7 +169,7 @@ impl SlurmController for ControllerService {
         let states: Vec<spur_core::job::JobState> = req
             .states
             .iter()
-            .filter_map(|s| proto_to_job_state(*s))
+            .filter_map(|s| spur_core::job::JobState::from_proto_i32(*s))
             .collect();
 
         let user = if req.user.is_empty() {
@@ -375,7 +375,7 @@ impl SlurmController for ControllerService {
 
         let req = request.into_inner();
         if let Some(state) = req.state {
-            let node_state = proto_to_node_state(state)
+            let node_state = spur_core::node::NodeState::from_proto_i32(state)
                 .ok_or_else(|| Status::invalid_argument("invalid node state"))?;
             self.cluster
                 .update_node_state(&req.name, node_state, req.reason)
@@ -517,7 +517,7 @@ impl SlurmController for ControllerService {
         }
 
         let req = request.into_inner();
-        let state = proto_to_job_state(req.state)
+        let state = spur_core::job::JobState::from_proto_i32(req.state)
             .ok_or_else(|| Status::invalid_argument("invalid job state"))?;
 
         if state.is_terminal() {
@@ -1164,37 +1164,6 @@ fn proto_to_job_spec(spec: JobSpec) -> Result<spur_core::job::JobSpec, Status> {
     })
 }
 
-fn proto_to_job_state(s: i32) -> Option<spur_core::job::JobState> {
-    match s {
-        0 => Some(spur_core::job::JobState::Pending),
-        1 => Some(spur_core::job::JobState::Running),
-        2 => Some(spur_core::job::JobState::Completing),
-        3 => Some(spur_core::job::JobState::Completed),
-        4 => Some(spur_core::job::JobState::Failed),
-        5 => Some(spur_core::job::JobState::Cancelled),
-        6 => Some(spur_core::job::JobState::Timeout),
-        7 => Some(spur_core::job::JobState::NodeFail),
-        8 => Some(spur_core::job::JobState::Preempted),
-        9 => Some(spur_core::job::JobState::Suspended),
-        _ => None,
-    }
-}
-
-fn proto_to_node_state(s: i32) -> Option<spur_core::node::NodeState> {
-    match s {
-        0 => Some(spur_core::node::NodeState::Idle),
-        1 => Some(spur_core::node::NodeState::Allocated),
-        2 => Some(spur_core::node::NodeState::Mixed),
-        3 => Some(spur_core::node::NodeState::Down),
-        4 => Some(spur_core::node::NodeState::Drain),
-        5 => Some(spur_core::node::NodeState::Draining),
-        6 => Some(spur_core::node::NodeState::Error),
-        7 => Some(spur_core::node::NodeState::Unknown),
-        8 => Some(spur_core::node::NodeState::Suspended),
-        _ => None,
-    }
-}
-
 fn proto_to_resource_set(r: spur_proto::proto::ResourceSet) -> spur_core::resource::ResourceSet {
     spur_core::resource::ResourceSet {
         cpus: r.cpus,
@@ -1228,7 +1197,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
         uid: job.spec.uid,
         partition: job.spec.partition.clone().unwrap_or_default(),
         account: job.spec.account.clone().unwrap_or_default(),
-        state: job_state_to_proto(job.state) as i32,
+        state: job.state.to_proto_i32(),
         state_reason: job.pending_reason.display().to_string(),
         submit_time: Some(datetime_to_proto(job.submit_time)),
         start_time: job.start_time.map(datetime_to_proto),
@@ -1275,7 +1244,7 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
 fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
     NodeInfo {
         name: node.name.clone(),
-        state: node_state_to_proto(node.state) as i32,
+        state: node.state.to_proto_i32(),
         state_reason: node.state_reason.clone().unwrap_or_default(),
         partition: node.partitions.first().cloned().unwrap_or_default(),
         total_resources: Some(resource_to_proto(&node.total_resources)),
@@ -1348,35 +1317,6 @@ pub(crate) fn resource_to_proto(
             })
             .collect(),
         generic: r.generic.clone(),
-    }
-}
-
-pub(crate) fn job_state_to_proto(s: spur_core::job::JobState) -> spur_proto::proto::JobState {
-    match s {
-        spur_core::job::JobState::Pending => spur_proto::proto::JobState::JobPending,
-        spur_core::job::JobState::Running => spur_proto::proto::JobState::JobRunning,
-        spur_core::job::JobState::Completing => spur_proto::proto::JobState::JobCompleting,
-        spur_core::job::JobState::Completed => spur_proto::proto::JobState::JobCompleted,
-        spur_core::job::JobState::Failed => spur_proto::proto::JobState::JobFailed,
-        spur_core::job::JobState::Cancelled => spur_proto::proto::JobState::JobCancelled,
-        spur_core::job::JobState::Timeout => spur_proto::proto::JobState::JobTimeout,
-        spur_core::job::JobState::NodeFail => spur_proto::proto::JobState::JobNodeFail,
-        spur_core::job::JobState::Preempted => spur_proto::proto::JobState::JobPreempted,
-        spur_core::job::JobState::Suspended => spur_proto::proto::JobState::JobSuspended,
-    }
-}
-
-fn node_state_to_proto(s: spur_core::node::NodeState) -> spur_proto::proto::NodeState {
-    match s {
-        spur_core::node::NodeState::Idle => spur_proto::proto::NodeState::NodeIdle,
-        spur_core::node::NodeState::Allocated => spur_proto::proto::NodeState::NodeAllocated,
-        spur_core::node::NodeState::Mixed => spur_proto::proto::NodeState::NodeMixed,
-        spur_core::node::NodeState::Down => spur_proto::proto::NodeState::NodeDown,
-        spur_core::node::NodeState::Drain => spur_proto::proto::NodeState::NodeDrain,
-        spur_core::node::NodeState::Draining => spur_proto::proto::NodeState::NodeDraining,
-        spur_core::node::NodeState::Error => spur_proto::proto::NodeState::NodeError,
-        spur_core::node::NodeState::Unknown => spur_proto::proto::NodeState::NodeUnknown,
-        spur_core::node::NodeState::Suspended => spur_proto::proto::NodeState::NodeSuspended,
     }
 }
 

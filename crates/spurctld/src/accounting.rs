@@ -10,7 +10,7 @@ use spur_core::resource::ResourceSet;
 use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::{RecordJobEndRequest, RecordJobStartRequest};
 
-use crate::server::{datetime_to_proto, job_state_to_proto, resource_to_proto};
+use crate::server::{datetime_to_proto, resource_to_proto};
 
 pub struct AccountingNotifier {
     client: SlurmAccountingClient<Channel>,
@@ -61,7 +61,7 @@ impl AccountingNotifier {
     ) {
         let req = RecordJobEndRequest {
             job_id,
-            final_state: job_state_to_proto(state) as i32,
+            final_state: state.to_proto_i32(),
             exit_code,
             end_time: Some(datetime_to_proto(end_time)),
         };
