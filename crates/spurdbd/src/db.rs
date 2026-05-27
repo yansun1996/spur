@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, QueryBuilder, Row};
 use tracing::{info, warn};
 
 /// Connect to PostgreSQL and return a connection pool.
@@ -276,63 +276,38 @@ pub async fn get_job_history(
     states: &[String],
     limit: u32,
 ) -> anyhow::Result<Vec<JobRecord>> {
-    // Build dynamic query
-    let mut query = String::from(
+    let mut qb = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT job_id, name, user_name, account, partition_name, state, exit_code, \
          num_nodes, num_tasks, nodelist, submit_time, start_time, end_time \
          FROM jobs WHERE 1=1",
     );
-    let mut params: Vec<String> = Vec::new();
-    let mut idx = 1;
 
-    if let Some(u) = user {
-        if !u.is_empty() {
-            query.push_str(&format!(" AND user_name = ${}", idx));
-            params.push(u.to_string());
-            idx += 1;
-        }
+    if let Some(u) = user.filter(|u| !u.is_empty()) {
+        qb.push(" AND user_name = ").push_bind(u);
     }
-    if let Some(a) = account {
-        if !a.is_empty() {
-            query.push_str(&format!(" AND account = ${}", idx));
-            params.push(a.to_string());
-            idx += 1;
-        }
+    if let Some(a) = account.filter(|a| !a.is_empty()) {
+        qb.push(" AND account = ").push_bind(a);
     }
     if let Some(after) = start_after {
-        query.push_str(&format!(" AND start_time >= ${}", idx));
-        params.push(after.to_rfc3339());
-        idx += 1;
+        qb.push(" AND start_time >= ").push_bind(after);
     }
     if let Some(before) = start_before {
-        query.push_str(&format!(" AND start_time <= ${}", idx));
-        params.push(before.to_rfc3339());
-        idx += 1;
+        qb.push(" AND start_time <= ").push_bind(before);
     }
     if !states.is_empty() {
-        let placeholders: Vec<String> = states
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("${}", idx + i))
-            .collect();
-        query.push_str(&format!(" AND state IN ({})", placeholders.join(",")));
+        qb.push(" AND state IN (");
+        let mut sep = qb.separated(", ");
         for s in states {
-            params.push(s.clone());
+            sep.push_bind(s.clone());
         }
+        sep.push_unseparated(")");
     }
 
-    query.push_str(" ORDER BY submit_time DESC");
-    let effective_limit = if limit > 0 { limit } else { 1000 };
-    query.push_str(&format!(" LIMIT {}", effective_limit));
+    qb.push(" ORDER BY submit_time DESC");
+    let effective_limit: i64 = if limit > 0 { limit.into() } else { 1000 };
+    qb.push(" LIMIT ").push_bind(effective_limit);
 
-    // Execute with dynamic params — using raw query for simplicity
-    // In production, use sqlx query builder or sea-query
-    let mut q = sqlx::query(&query);
-    for p in &params {
-        q = q.bind(p);
-    }
-
-    let rows = q.fetch_all(pool).await?;
+    let rows = qb.build().fetch_all(pool).await?;
 
     let records = rows
         .iter()
@@ -640,4 +615,112 @@ pub struct QosRecord {
     pub max_jobs_per_user: Option<i32>,
     pub max_wall_min: Option<i32>,
     pub max_tres_per_job: Option<String>,
+}
+
+#[cfg(test)]
+mod job_history_tests {
+    use super::*;
+    use chrono::Duration;
+
+    fn test_job_id(slot: u32) -> i32 {
+        const BASE: i32 = 9_000_000;
+        BASE + (std::process::id() as i32 % 10_000) * 10 + slot as i32
+    }
+
+    async fn test_pool() -> anyhow::Result<PgPool> {
+        let url = std::env::var("DATABASE_URL")?;
+        let pool = connect(&url).await?;
+        migrate(&pool).await?;
+        Ok(pool)
+    }
+
+    async fn delete_jobs(pool: &PgPool, ids: &[i32]) -> anyhow::Result<()> {
+        for id in ids {
+            sqlx::query("DELETE FROM jobs WHERE job_id = $1")
+                .bind(id)
+                .execute(pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn get_job_history_query_builder() -> anyhow::Result<()> {
+        let pool = test_pool().await?;
+        let id0 = test_job_id(0);
+        let id1 = test_job_id(1);
+        let id2 = test_job_id(2);
+        let ids = [id0, id1, id2];
+
+        let pid = std::process::id();
+        let user_a = format!("spur_hist_a_{pid}");
+        let user_b = format!("spur_hist_b_{pid}");
+        let account_one = format!("spur_acct1_{pid}");
+        let account_two = format!("spur_acct2_{pid}");
+
+        let t1 = Utc::now() - Duration::hours(2);
+        let t2 = Utc::now() - Duration::hours(1);
+
+        delete_jobs(&pool, &ids).await.ok();
+
+        record_job_start(&pool, id0, &user_a, &account_one, "debug", 1, 1, 1, 0, t1).await?;
+        record_job_end(&pool, id0, "COMPLETED", 0, t1 + Duration::minutes(5)).await?;
+
+        record_job_start(&pool, id1, &user_b, &account_one, "debug", 1, 1, 1, 0, t1).await?;
+        record_job_end(&pool, id1, "FAILED", 1, t1 + Duration::minutes(5)).await?;
+
+        record_job_start(&pool, id2, &user_a, &account_two, "debug", 1, 1, 1, 0, t2).await?;
+        record_job_end(&pool, id2, "COMPLETED", 0, t2 + Duration::minutes(5)).await?;
+
+        let by_user = get_job_history(&pool, Some(&user_a), None, None, None, &[], 100).await?;
+        assert_eq!(by_user.len(), 2);
+        assert!(by_user.iter().all(|r| r.user_name == user_a));
+
+        let by_account =
+            get_job_history(&pool, None, Some(&account_one), None, None, &[], 100).await?;
+        assert_eq!(
+            by_account
+                .iter()
+                .filter(|r| ids.contains(&r.job_id))
+                .count(),
+            2
+        );
+
+        let completed = get_job_history(
+            &pool,
+            Some(&user_a),
+            None,
+            None,
+            None,
+            &[String::from("COMPLETED")],
+            100,
+        )
+        .await?;
+        assert_eq!(completed.len(), 2);
+
+        let failed = get_job_history(
+            &pool,
+            Some(&user_b),
+            None,
+            None,
+            None,
+            &[String::from("FAILED")],
+            100,
+        )
+        .await?;
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].job_id, id1);
+
+        let after = get_job_history(&pool, Some(&user_a), None, Some(t2), None, &[], 100).await?;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].job_id, id2);
+
+        let limited = get_job_history(&pool, Some(&user_a), None, None, None, &[], 1).await?;
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].job_id, id2);
+
+        delete_jobs(&pool, &ids).await?;
+        Ok(())
+    }
 }
