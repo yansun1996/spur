@@ -2920,11 +2920,8 @@ mod tests {
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into()],
-            resources: ResourceSet {
-                cpus: 6,
-                memory_mb: 12000,
-                ..Default::default()
-            },
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
         });
 
         cm.node_complete(1, "n1", 0, 9).unwrap();
@@ -2969,11 +2966,8 @@ mod tests {
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into()],
-            resources: ResourceSet {
-                cpus: 6,
-                memory_mb: 12000,
-                ..Default::default()
-            },
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
         });
 
         // Step 2: the same call the RPC handler makes after validation — note the
@@ -3006,11 +3000,8 @@ mod tests {
         cm.apply_operation(&WalOperation::JobStart {
             job_id: 1,
             nodes: vec!["n1".into()],
-            resources: ResourceSet {
-                cpus: 6,
-                memory_mb: 12000,
-                ..Default::default()
-            },
+            resources: scalar_alloc(6, 12000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
         });
 
         cm.node_complete(1, "n1", 42, 0).unwrap();
@@ -3930,6 +3921,7 @@ mod tests {
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: id,
             exit_code,
+            signal: 0,
             state,
         });
     }
