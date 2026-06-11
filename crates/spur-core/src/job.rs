@@ -518,6 +518,10 @@ impl Job {
     /// `DerivedExitCode` is the max exit code across all nodes. State is
     /// `Failed` if the primary exited non-zero or was signaled, else `Completed`.
     ///
+    /// If `primary_node` is not present in the map, `ExitCode` falls back to the
+    /// worst completion (max exit code, or any signaled node) so a failure is
+    /// never masked.
+    ///
     /// Returns `(state, exit_code, exit_signal, derived_exit_code)`.
     pub fn derived_completion(
         node_completions: &HashMap<String, NodeCompletion>,
@@ -778,6 +782,32 @@ mod tests {
         assert_eq!(state, JobState::Failed);
         assert_eq!(code, 4);
         assert_eq!(derived, 4);
+    }
+
+    #[test]
+    fn derived_completion_empty_map_is_clean() {
+        let nc = HashMap::new();
+        let (state, code, signal, derived) = Job::derived_completion(&nc, "n0");
+        assert_eq!(state, JobState::Completed);
+        assert_eq!((code, signal, derived), (0, 0, 0));
+    }
+
+    #[test]
+    fn derived_completion_primary_mixed_code_and_signal() {
+        // A single node that both exited non-zero AND was signaled: both propagate.
+        let mut nc = HashMap::new();
+        nc.insert(
+            "n0".to_string(),
+            NodeCompletion {
+                code: 5,
+                signal: 11,
+            },
+        );
+        let (state, code, signal, derived) = Job::derived_completion(&nc, "n0");
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(code, 5);
+        assert_eq!(signal, 11);
+        assert_eq!(derived, 5);
     }
 
     #[test]
