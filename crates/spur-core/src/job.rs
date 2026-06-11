@@ -475,9 +475,8 @@ pub struct Job {
     /// Terminating signal of the primary node's process (0 = none).
     #[serde(default)]
     pub exit_signal: Option<i32>,
-    /// Slurm `DerivedExitCode`: the running max over the job's srun step exit
-    /// codes, accumulated by `WalOperation::JobStepComplete`. `None`/0 for a job
-    /// with no srun steps.
+    /// Slurm `DerivedExitCode`: running max over srun step exit codes (via
+    /// `JobStepComplete`); `None`/0 when the job ran no srun steps.
     #[serde(default)]
     pub derived_exit_code: Option<i32>,
 
@@ -542,16 +541,12 @@ impl Job {
     /// signal); state is `Failed` if the primary exited non-zero or was
     /// signaled, else `Completed`.
     ///
-    /// If `primary_node` is absent from the map, falls back to the worst
-    /// completion (a signaled node, or the highest exit code) so a failure is
-    /// never reported as success.
+    /// If `primary_node` is absent, falls back to the worst completion (a
+    /// signaled node, or the highest exit code) so a failure isn't masked.
     ///
-    /// The 4th return value is a node-based max kept only for backward
-    /// compatibility; the job's real Slurm `DerivedExitCode` is the running max
-    /// over srun *steps*, maintained separately via `JobStepComplete`. Callers
-    /// finalizing a job should NOT use this value for `derived_exit_code`.
-    ///
-    /// Returns `(state, exit_code, exit_signal, node_max_exit)`.
+    /// Returns `(state, exit_code, exit_signal, node_max_exit)`. The 4th value
+    /// is a legacy node-based max — NOT the job's DerivedExitCode, which is the
+    /// running max over srun steps maintained via `JobStepComplete`.
     pub fn derived_completion(
         node_completions: &HashMap<String, NodeCompletion>,
         primary_node: &str,
