@@ -118,7 +118,22 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
-        // round-trip new form (WalOperation does not derive PartialEq)
-        let _ = (op, back);
+        // New form round-trips through serde (WalOperation has no PartialEq, so
+        // assert the fields rather than the whole value).
+        let _ = op;
+        match back {
+            WalOperation::JobNodeComplete {
+                job_id,
+                node_name,
+                exit_code,
+                signal,
+            } => {
+                assert_eq!(job_id, 1);
+                assert_eq!(node_name, "n0");
+                assert_eq!(exit_code, 0);
+                assert_eq!(signal, 9);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

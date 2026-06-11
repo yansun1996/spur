@@ -475,7 +475,9 @@ pub struct Job {
     /// Terminating signal of the primary node's process (0 = none).
     #[serde(default)]
     pub exit_signal: Option<i32>,
-    /// Max exit code across all node completions (Slurm DerivedExitCode).
+    /// Slurm `DerivedExitCode`: the running max over the job's srun step exit
+    /// codes, accumulated by `WalOperation::JobStepComplete`. `None`/0 for a job
+    /// with no srun steps.
     #[serde(default)]
     pub derived_exit_code: Option<i32>,
 
@@ -535,16 +537,21 @@ impl Job {
         }
     }
 
-    /// Derive the final job outcome from per-node completions, matching Slurm:
-    /// `ExitCode` is the primary node's raw wait status (exit_code, signal);
-    /// `DerivedExitCode` is the max exit code across all nodes. State is
-    /// `Failed` if the primary exited non-zero or was signaled, else `Completed`.
+    /// Derive a job's `ExitCode` and state from per-node completions, matching
+    /// Slurm: `ExitCode` is the primary node's raw wait status (exit_code,
+    /// signal); state is `Failed` if the primary exited non-zero or was
+    /// signaled, else `Completed`.
     ///
-    /// If `primary_node` is not present in the map, `ExitCode` falls back to the
-    /// worst completion (max exit code, or any signaled node) so a failure is
-    /// never masked.
+    /// If `primary_node` is absent from the map, falls back to the worst
+    /// completion (a signaled node, or the highest exit code) so a failure is
+    /// never reported as success.
     ///
-    /// Returns `(state, exit_code, exit_signal, derived_exit_code)`.
+    /// The 4th return value is a node-based max kept only for backward
+    /// compatibility; the job's real Slurm `DerivedExitCode` is the running max
+    /// over srun *steps*, maintained separately via `JobStepComplete`. Callers
+    /// finalizing a job should NOT use this value for `derived_exit_code`.
+    ///
+    /// Returns `(state, exit_code, exit_signal, node_max_exit)`.
     pub fn derived_completion(
         node_completions: &HashMap<String, NodeCompletion>,
         primary_node: &str,
@@ -557,10 +564,13 @@ impl Job {
             .unwrap_or(0);
 
         let primary = node_completions.get(primary_node).copied().or_else(|| {
+            // No primary completion (shouldn't happen once all nodes report).
+            // Pick the worst failure so the outcome is never masked: rank a
+            // signaled node above a plain non-zero exit, then by exit code.
             node_completions
                 .values()
                 .filter(|c| c.code != 0 || c.signal != 0)
-                .max_by_key(|c| c.code)
+                .max_by_key(|c| (c.signal != 0, c.code, c.signal))
                 .copied()
         });
 

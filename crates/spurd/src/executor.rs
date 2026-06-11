@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context};
-use nix::sys::signal::{self, Signal};
+use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::unistd::Pid;
 use tokio::process::Command;
 use tracing::{debug, info, warn};
@@ -429,8 +429,16 @@ async fn spawn_job_process(
     // start with default handlers.
     unsafe {
         cmd.pre_exec(|| {
-            for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGPIPE] {
-                libc::signal(sig, libc::SIG_DFL);
+            // Use sigaction (async-signal-safe) rather than signal() to reset
+            // dispositions; pre_exec runs post-fork in a multi-threaded process.
+            let dfl = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+            for sig in [
+                Signal::SIGINT,
+                Signal::SIGQUIT,
+                Signal::SIGHUP,
+                Signal::SIGPIPE,
+            ] {
+                let _ = signal::sigaction(sig, &dfl);
             }
             Ok(())
         });
