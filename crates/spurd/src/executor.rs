@@ -422,6 +422,20 @@ async fn spawn_job_process(
         .stderr(stderr_file.into_std().await)
         .stdin(Stdio::null());
 
+    // Reset signal dispositions to default before exec. spurd is launched in the
+    // background (SIGINT/SIGQUIT/SIGHUP set to SIG_IGN), and a child inherits that
+    // ignore mask — which would make a job's own `kill -INT $$` a no-op and break
+    // Slurm-parity signal reporting (e.g. SIGINT -> RaisedSignal:2). The job must
+    // start with default handlers.
+    unsafe {
+        cmd.pre_exec(|| {
+            for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGPIPE] {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+            Ok(())
+        });
+    }
+
     // Issue #99, #107: Run job as the submitting user (not root).
     // Must set supplementary groups (video, render) via initgroups()
     // so the process can access GPU device nodes.
