@@ -97,7 +97,7 @@ pub fn decode_wait_status(status: nix::sys::wait::WaitStatus) -> (i32, i32) {
     match status {
         nix::sys::wait::WaitStatus::Exited(_, code) => (code, 0),
         nix::sys::wait::WaitStatus::Signaled(_, sig, _) => (0, sig as i32),
-        _ => (-1, 0),
+        _ => (-1, 0), // unreachable from try_wait (only Exited/Signaled reach here); -1 = shouldn't-happen sentinel
     }
 }
 
@@ -973,6 +973,15 @@ mod tests {
             )),
             (0, 9)
         );
+        assert_eq!(
+            decode_wait_status(WaitStatus::Signaled(
+                p,
+                nix::sys::signal::Signal::SIGTERM,
+                false
+            )),
+            (0, 15)
+        );
+        assert_eq!(decode_wait_status(WaitStatus::StillAlive), (-1, 0));
     }
 
     #[test]
