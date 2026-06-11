@@ -419,6 +419,16 @@ impl Default for JobSpec {
     }
 }
 
+/// One node's completion outcome for a job: the raw process wait status,
+/// split into exit code and terminating signal (0 = none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NodeCompletion {
+    #[serde(default)]
+    pub code: i32,
+    #[serde(default)]
+    pub signal: i32,
+}
+
 /// Internal job record held by the controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Job {
@@ -440,6 +450,13 @@ pub struct Job {
 
     pub exit_code: Option<i32>,
 
+    /// Terminating signal of the primary node's process (0 = none).
+    #[serde(default)]
+    pub exit_signal: Option<i32>,
+    /// Max exit code across all node completions (Slurm DerivedExitCode).
+    #[serde(default)]
+    pub derived_exit_code: Option<i32>,
+
     /// Number of times this job has been requeued.
     #[serde(default)]
     pub requeue_count: u32,
@@ -454,7 +471,7 @@ pub struct Job {
 
     /// Per-node exit codes reported while the job is in Completing.
     #[serde(default)]
-    pub node_completions: HashMap<String, i32>,
+    pub node_completions: HashMap<String, NodeCompletion>,
 }
 
 impl Job {
@@ -487,6 +504,8 @@ impl Job {
             allocated_resources: None,
             per_node_alloc: HashMap::new(),
             exit_code: None,
+            exit_signal: None,
+            derived_exit_code: None,
             requeue_count: 0,
             het_job_id: None,
             het_group: None,
@@ -494,16 +513,43 @@ impl Job {
         }
     }
 
-    /// Derive final job state and exit code from per-node completion reports.
-    pub fn derived_completion(node_completions: &HashMap<String, i32>) -> (JobState, i32) {
-        let exit_code = node_completions
+    /// Derive the final job outcome from per-node completions, matching Slurm:
+    /// `ExitCode` is the primary node's raw wait status (exit_code, signal);
+    /// `DerivedExitCode` is the max exit code across all nodes. State is
+    /// `Failed` if the primary exited non-zero or was signaled, else `Completed`.
+    ///
+    /// Returns `(state, exit_code, exit_signal, derived_exit_code)`.
+    pub fn derived_completion(
+        node_completions: &HashMap<String, NodeCompletion>,
+        primary_node: &str,
+    ) -> (JobState, i32, i32, i32) {
+        let derived = node_completions
             .values()
-            .copied()
+            .map(|c| c.code)
             .filter(|c| *c != 0)
             .max()
             .unwrap_or(0);
-        let state = JobState::completion_state_for_exit_code(exit_code);
-        (state, exit_code)
+
+        let primary = node_completions.get(primary_node).copied().or_else(|| {
+            node_completions
+                .values()
+                .filter(|c| c.code != 0 || c.signal != 0)
+                .max_by_key(|c| c.code)
+                .copied()
+        });
+
+        match primary {
+            Some(c) => {
+                let failed = c.code != 0 || c.signal != 0;
+                let state = if failed {
+                    JobState::Failed
+                } else {
+                    JobState::Completed
+                };
+                (state, c.code, c.signal, derived)
+            }
+            None => (JobState::Completed, 0, 0, derived),
+        }
     }
 
     pub fn all_nodes_completed(&self) -> bool {
@@ -673,18 +719,65 @@ mod tests {
     }
 
     #[test]
-    fn derived_completion_uses_worst_exit_code() {
-        let mut completions = HashMap::new();
-        completions.insert("n1".into(), 0);
-        completions.insert("n2".into(), 42);
-        let (state, code) = Job::derived_completion(&completions);
-        assert_eq!(state, JobState::Failed);
-        assert_eq!(code, 42);
+    fn node_completion_defaults_and_construct() {
+        let c = NodeCompletion { code: 7, signal: 0 };
+        assert_eq!(c.code, 7);
+        assert_eq!(c.signal, 0);
+        let d = NodeCompletion::default();
+        assert_eq!(d.code, 0);
+        assert_eq!(d.signal, 0);
+    }
 
-        completions.insert("n2".into(), 0);
-        let (state, code) = Job::derived_completion(&completions);
+    #[test]
+    fn job_has_exit_signal_field_default_none() {
+        let job = Job::new(1, JobSpec::default());
+        assert_eq!(job.exit_signal, None);
+        assert_eq!(job.derived_exit_code, None);
+        assert!(job.node_completions.is_empty());
+    }
+
+    #[test]
+    fn derived_completion_primary_exit_and_max_derived() {
+        let mut nc = HashMap::new();
+        nc.insert("n0".to_string(), NodeCompletion { code: 2, signal: 0 });
+        nc.insert("n1".to_string(), NodeCompletion { code: 7, signal: 0 });
+        let (state, code, signal, derived) = Job::derived_completion(&nc, "n0");
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(code, 2);
+        assert_eq!(signal, 0);
+        assert_eq!(derived, 7);
+    }
+
+    #[test]
+    fn derived_completion_primary_signaled() {
+        let mut nc = HashMap::new();
+        nc.insert("n0".to_string(), NodeCompletion { code: 0, signal: 9 });
+        let (state, code, signal, derived) = Job::derived_completion(&nc, "n0");
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(code, 0);
+        assert_eq!(signal, 9);
+        assert_eq!(derived, 0);
+    }
+
+    #[test]
+    fn derived_completion_clean_success() {
+        let mut nc = HashMap::new();
+        nc.insert("n0".to_string(), NodeCompletion { code: 0, signal: 0 });
+        let (state, code, signal, derived) = Job::derived_completion(&nc, "n0");
         assert_eq!(state, JobState::Completed);
         assert_eq!(code, 0);
+        assert_eq!(signal, 0);
+        assert_eq!(derived, 0);
+    }
+
+    #[test]
+    fn derived_completion_missing_primary_falls_back() {
+        let mut nc = HashMap::new();
+        nc.insert("nX".to_string(), NodeCompletion { code: 4, signal: 0 });
+        let (state, code, _signal, derived) = Job::derived_completion(&nc, "n0");
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(code, 4);
+        assert_eq!(derived, 4);
     }
 
     #[test]
