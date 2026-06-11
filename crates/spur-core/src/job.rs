@@ -817,6 +817,25 @@ mod tests {
     }
 
     #[test]
+    fn derived_completion_missing_primary_prefers_signaled() {
+        // Missing primary, a signaled node and a higher plain-exit node: the
+        // signaled node wins so the signal isn't masked by the higher code.
+        let mut nc = HashMap::new();
+        nc.insert("a".to_string(), NodeCompletion { code: 9, signal: 0 });
+        nc.insert(
+            "b".to_string(),
+            NodeCompletion {
+                code: 0,
+                signal: 11,
+            },
+        );
+        let (state, code, signal, _derived) = Job::derived_completion(&nc, "missing");
+        assert_eq!(state, JobState::Failed);
+        assert_eq!(code, 0);
+        assert_eq!(signal, 11);
+    }
+
+    #[test]
     fn derived_completion_empty_map_is_clean() {
         let nc = HashMap::new();
         let (state, code, signal, derived) = Job::derived_completion(&nc, "n0");
