@@ -181,9 +181,11 @@ mod tests {
             },
         );
         let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
+        // A QOS wall-clock cap maps to the QOS reason, not the partition one:
+        // Slurm reports WAIT_QOS_MAX_WALL_PER_JOB ("QOSMaxWallDurationPerJobLimit").
         assert_eq!(
             result,
-            QosCheckResult::Blocked(PendingReason::PartitionTimeLimit)
+            QosCheckResult::Blocked(PendingReason::QosMaxWallDurationPerJobLimit)
         );
     }
 
@@ -210,7 +212,12 @@ mod tests {
             },
         );
         let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
-        assert_eq!(result, QosCheckResult::Blocked(PendingReason::Resources));
+        // A QOS MaxTRESPerJob (CPU) cap maps to the specific QOS reason:
+        // Slurm reports WAIT_QOS_MAX_CPU_PER_JOB ("QOSMaxCpuPerJobLimit").
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxCpuPerJobLimit)
+        );
     }
 
     // ── T21.14: QOS priority adjustment ──────────────────────────

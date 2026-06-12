@@ -40,7 +40,9 @@ pub fn check_qos_limits(
     // Max submit jobs per user
     if let Some(max) = limits.max_submit_jobs_per_user {
         if user_submitted_count >= max {
-            return QosCheckResult::Blocked(PendingReason::QoSMaxJobsPerUser);
+            // Slurm distinguishes the submit-job cap (WAIT_QOS_MAX_SUB_JOB,
+            // "QOSMaxSubmitJobPerUserLimit") from the running-job cap above.
+            return QosCheckResult::Blocked(PendingReason::QosMaxSubmitJobPerUserLimit);
         }
     }
 
@@ -48,7 +50,9 @@ pub fn check_qos_limits(
     if let Some(max_wall) = limits.max_wall_minutes {
         if let Some(job_wall) = job.spec.time_limit {
             if job_wall.num_minutes() > max_wall as i64 {
-                return QosCheckResult::Blocked(PendingReason::PartitionTimeLimit);
+                // This is a QOS wall cap, not a partition cap: Slurm reports
+                // WAIT_QOS_MAX_WALL_PER_JOB ("QOSMaxWallDurationPerJobLimit").
+                return QosCheckResult::Blocked(PendingReason::QosMaxWallDurationPerJobLimit);
             }
         }
     }
@@ -57,13 +61,15 @@ pub fn check_qos_limits(
     if let Some(ref max_tres) = limits.max_tres_per_job {
         let job_cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
         if max_tres.get(TresType::Cpu) > 0 && job_cpus > max_tres.get(TresType::Cpu) {
-            return QosCheckResult::Blocked(PendingReason::Resources);
+            // WAIT_QOS_MAX_CPU_PER_JOB ("QOSMaxCpuPerJobLimit").
+            return QosCheckResult::Blocked(PendingReason::QosMaxCpuPerJobLimit);
         }
 
         if let Some(mem) = job.spec.memory_per_node_mb {
             let total_mem = mem * job.spec.num_nodes as u64;
             if max_tres.get(TresType::Memory) > 0 && total_mem > max_tres.get(TresType::Memory) {
-                return QosCheckResult::Blocked(PendingReason::Resources);
+                // WAIT_QOS_MAX_MEM_PER_JOB ("QOSMaxMemoryPerJob").
+                return QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerJob);
             }
         }
     }
@@ -73,7 +79,8 @@ pub fn check_qos_limits(
         let job_cpus = (job.spec.num_tasks * job.spec.cpus_per_task) as u64;
         let new_total_cpu = user_running_tres.get(TresType::Cpu) + job_cpus;
         if max_tres.get(TresType::Cpu) > 0 && new_total_cpu > max_tres.get(TresType::Cpu) {
-            return QosCheckResult::Blocked(PendingReason::Resources);
+            // WAIT_QOS_MAX_CPU_PER_USER ("QOSMaxCpuPerUserLimit").
+            return QosCheckResult::Blocked(PendingReason::QosMaxCpuPerUserLimit);
         }
     }
 
@@ -152,7 +159,7 @@ mod tests {
         let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
         assert_eq!(
             result,
-            QosCheckResult::Blocked(PendingReason::PartitionTimeLimit)
+            QosCheckResult::Blocked(PendingReason::QosMaxWallDurationPerJobLimit)
         );
     }
 
@@ -170,7 +177,72 @@ mod tests {
         };
         let job = make_test_job(); // 4 CPUs
         let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
-        assert_eq!(result, QosCheckResult::Blocked(PendingReason::Resources));
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxCpuPerJobLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_max_mem_per_job() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Memory, 1024); // Max 1 GiB per job
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_job: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut job = make_test_job();
+        job.spec.num_nodes = 1;
+        job.spec.memory_per_node_mb = Some(2048); // 2 GiB
+        let result = check_qos_limits(&job, &qos, 0, 0, &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxMemoryPerJob)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_max_cpu_per_user() {
+        let mut tres = TresRecord::new();
+        tres.set(TresType::Cpu, 8); // Max 8 CPUs across the user's running jobs
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_tres_per_user: Some(tres),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let job = make_test_job(); // needs 4 CPUs
+        let mut running = TresRecord::new();
+        running.set(TresType::Cpu, 6); // already using 6; 6 + 4 > 8
+        let result = check_qos_limits(&job, &qos, 0, 0, &running);
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxCpuPerUserLimit)
+        );
+    }
+
+    #[test]
+    fn test_blocked_by_max_submit_jobs_per_user() {
+        let qos = Qos {
+            name: "restricted".into(),
+            limits: QosLimits {
+                max_submit_jobs_per_user: Some(3),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let job = make_test_job();
+        let result = check_qos_limits(&job, &qos, 0, 3, &TresRecord::new());
+        assert_eq!(
+            result,
+            QosCheckResult::Blocked(PendingReason::QosMaxSubmitJobPerUserLimit)
+        );
     }
 
     #[test]
