@@ -1225,84 +1225,22 @@ impl ClusterManager {
             true
         });
 
-        // QoS enforcement: check per-user limits for jobs with a QoS
-        pending.retain(|job| {
-            if job.spec.qos.is_none() {
-                return true; // No QoS — skip check
-            }
-
-            let user = &job.spec.user;
-
-            let running_count = jobs
-                .values()
-                .filter(|j| j.state == JobState::Running && j.spec.user == *user)
-                .count() as u32;
-
-            let submitted_count = jobs
-                .values()
-                .filter(|j| {
-                    (j.state == JobState::Pending || j.state == JobState::Running)
-                        && j.spec.user == *user
-                })
-                .count() as u32;
-
-            // Compute running TRES for this user (total CPUs from running jobs)
-            let mut running_tres = TresRecord::new();
-            let running_cpus: u64 = jobs
-                .values()
-                .filter(|j| j.state == JobState::Running && j.spec.user == *user)
-                .map(|j| (j.spec.num_tasks * j.spec.cpus_per_task) as u64)
-                .sum();
-            running_tres.set(TresType::Cpu, running_cpus);
-
-            // Use a default QoS (no limits) — real QoS definitions would come
-            // from the accounting database; for now this wires the enforcement
-            // path so it's ready when QoS configs are populated.
-            let qos = Qos::default();
-
-            match check_qos_limits(job, &qos, running_count, submitted_count, &running_tres) {
-                QosCheckResult::Allowed => true,
-                QosCheckResult::Blocked(_reason) => false,
-            }
-        });
+        // QoS enforcement: check per-user limits for jobs with a QoS. Shares
+        // the eligibility logic with tag_blocked_pending_reasons() via
+        // qos_block_for() so the drop decision and the displayed reason agree.
+        pending.retain(|job| qos_block_for(job, &jobs).is_none());
 
         // License enforcement: check cluster-wide license pool
         {
             let pool = self.license_pool.read();
-            pending.retain(|job| {
-                let lic_req = extract_license_requirements(&job.spec);
-                for (lic, count) in &lic_req {
-                    let available = pool.get(lic).copied().unwrap_or(0);
-                    if available < *count {
-                        return false; // Not enough licenses
-                    }
-                }
-                true
-            });
+            pending.retain(|job| license_block(job, &pool).is_none());
         }
 
         // Reservation validation: reject jobs targeting expired/nonexistent reservations
         {
             let reservations = self.get_reservations();
             let now = Utc::now();
-            pending.retain(|job| {
-                if let Some(ref res_name) = job.spec.reservation {
-                    if res_name.is_empty() {
-                        return true;
-                    }
-                    match reservations.iter().find(|r| r.name == *res_name) {
-                        Some(r) => {
-                            if !r.is_active(now) {
-                                return false; // Reservation not active yet or expired
-                            }
-                            r.allows_user(&job.spec.user, job.spec.account.as_deref())
-                        }
-                        None => false, // Reservation doesn't exist
-                    }
-                } else {
-                    true
-                }
-            });
+            pending.retain(|job| reservation_block(job, &reservations, now).is_none());
         }
 
         // Recompute effective priority with age + partition tier
@@ -1420,6 +1358,58 @@ impl ClusterManager {
             }
         }
         cancelled
+    }
+
+    /// Set `pending_reason` for jobs held out of scheduling by QoS, license, or
+    /// reservation limits. `pending_jobs()` drops these jobs from the schedule
+    /// set, so they never reach `update_pending_reasons()` and their reason
+    /// would otherwise never reflect the real cause (the user would see a stale
+    /// or generic reason instead of `Reservation`/`Licenses`/a QoS reason).
+    /// Leader-only; takes the write lock the read-locked `pending_jobs()` scan
+    /// cannot. Mirrors `cancel_unsatisfiable_dependency_jobs()`.
+    pub fn tag_blocked_pending_reasons(&self) {
+        use spur_core::job::PendingReason;
+
+        // Evaluate under read locks; release before taking the write lock.
+        // Lock order (jobs -> license_pool) matches pending_jobs(); reservations
+        // are cloned out first so no two locks are held across the pool read.
+        let blocked: Vec<(JobId, PendingReason)> = {
+            let jobs = self.jobs.read();
+            let reservations = self.get_reservations();
+            let now = Utc::now();
+            let pool = self.license_pool.read();
+            jobs.values()
+                .filter(|job| {
+                    job.state == JobState::Pending
+                        && job.pending_reason != PendingReason::Held
+                        && job.pending_reason != PendingReason::DeadLine
+                })
+                .filter_map(|job| {
+                    reservation_block(job, &reservations, now)
+                        .or_else(|| license_block(job, &pool))
+                        .or_else(|| qos_block_for(job, &jobs))
+                        .map(|reason| (job.job_id, reason))
+                })
+                .collect()
+        };
+
+        if blocked.is_empty() {
+            return;
+        }
+
+        let mut jobs = self.jobs.write();
+        for (id, reason) in blocked {
+            if let Some(j) = jobs.get_mut(&id) {
+                // Re-check under the write lock: the read snapshot was released,
+                // so the job may have started or been held/deadlined since.
+                if j.state == JobState::Pending
+                    && j.pending_reason != PendingReason::Held
+                    && j.pending_reason != PendingReason::DeadLine
+                {
+                    j.pending_reason = reason;
+                }
+            }
+        }
     }
 
     /// Create a new reservation.
@@ -1554,7 +1544,13 @@ impl ClusterManager {
                 continue;
             }
 
-            let all_down = nodes_in_partition.iter().all(|n| !n.state.is_available());
+            // A node that is merely `Allocated` (fully busy) is still UP — that
+            // is a `Resources` wait, not `NodeDown`. Only genuine admin/system
+            // down states (Down/Drain/Draining/Error/Unknown/Suspended) count
+            // toward NodeDown, matching Slurm which reports `Resources` for a
+            // busy-but-up cluster. Using `is_available()` here (Idle|Mixed
+            // only) wrongly flagged a fully-allocated cluster as NodeDown.
+            let all_down = nodes_in_partition.iter().all(|n| !n.state.is_up());
 
             if all_down {
                 job_entry.pending_reason = PendingReason::NodeDown;
@@ -2362,6 +2358,78 @@ impl StateMachineApply for ClusterManager {
                 "restored cluster state from Raft snapshot"
             );
         }
+    }
+}
+
+/// Reason a job is ineligible to run because of its `--reservation`, or `None`
+/// if it has no reservation or the reservation admits it. Covers an absent,
+/// inactive/expired, or access-denied reservation — all reported as
+/// `Reservation` (Slurm `WAIT_RESERVATION`). Shared by `pending_jobs()` (drop
+/// decision) and `tag_blocked_pending_reasons()` (displayed reason).
+fn reservation_block(
+    job: &Job,
+    reservations: &[Reservation],
+    now: chrono::DateTime<Utc>,
+) -> Option<spur_core::job::PendingReason> {
+    use spur_core::job::PendingReason;
+    let res_name = job.spec.reservation.as_ref()?;
+    if res_name.is_empty() {
+        return None;
+    }
+    match reservations.iter().find(|r| r.name == *res_name) {
+        Some(r)
+            if r.is_active(now) && r.allows_user(&job.spec.user, job.spec.account.as_deref()) =>
+        {
+            None
+        }
+        _ => Some(PendingReason::Reservation),
+    }
+}
+
+/// Reason a job is ineligible because the cluster license pool cannot satisfy
+/// its `license:` GRES requests, or `None`. Reported as `Licenses`.
+fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::job::PendingReason> {
+    use spur_core::job::PendingReason;
+    let lic_req = extract_license_requirements(&job.spec);
+    for (lic, count) in &lic_req {
+        if pool.get(lic).copied().unwrap_or(0) < *count {
+            return Some(PendingReason::Licenses);
+        }
+    }
+    None
+}
+
+/// QoS pending reason for a job (the specific `QOS*` limit it trips), or `None`
+/// if it has no QoS or is within limits. QoS definitions are not yet sourced
+/// from the accounting DB, so a default (limitless) QoS is used — the path is
+/// wired so the specific Slurm reason surfaces once real QoS configs are
+/// populated. Shared by `pending_jobs()` and `tag_blocked_pending_reasons()`.
+fn qos_block_for(job: &Job, jobs: &HashMap<JobId, Job>) -> Option<spur_core::job::PendingReason> {
+    // No QoS -> no QoS-based block.
+    job.spec.qos.as_ref()?;
+    let user = &job.spec.user;
+    let running_count = jobs
+        .values()
+        .filter(|j| j.state == JobState::Running && j.spec.user == *user)
+        .count() as u32;
+    let submitted_count = jobs
+        .values()
+        .filter(|j| {
+            (j.state == JobState::Pending || j.state == JobState::Running) && j.spec.user == *user
+        })
+        .count() as u32;
+    let mut running_tres = TresRecord::new();
+    let running_cpus: u64 = jobs
+        .values()
+        .filter(|j| j.state == JobState::Running && j.spec.user == *user)
+        .map(|j| (j.spec.num_tasks * j.spec.cpus_per_task) as u64)
+        .sum();
+    running_tres.set(TresType::Cpu, running_cpus);
+
+    let qos = Qos::default();
+    match check_qos_limits(job, &qos, running_count, submitted_count, &running_tres) {
+        QosCheckResult::Allowed => None,
+        QosCheckResult::Blocked(reason) => Some(reason),
     }
 }
 
@@ -3970,6 +4038,104 @@ mod tests {
 
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.pending_reason, PendingReason::DeadLine);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fully_allocated_cluster_reports_resources_not_nodedown() {
+        // Regression: a job waiting on a fully-busy cluster must report
+        // Resources (matching Slurm), not NodeDown. An `Allocated` node is up,
+        // just full; only genuine down/drain/error states are NodeDown.
+        use spur_core::node::NodeState;
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let job_id = submit_and_wait(&cm, basic_spec("busy"));
+        let snapshot = cm.get_job(job_id).unwrap();
+
+        // Fully-allocated (busy but UP) node -> Resources.
+        let mut node = cm.get_node("n1").unwrap();
+        node.state = NodeState::Allocated;
+        node.alloc_resources = scalar_alloc(4, 8000);
+        let nodes = vec![node];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::Resources
+        );
+
+        // Genuinely down node -> NodeDown.
+        let mut down = cm.get_node("n1").unwrap();
+        down.state = NodeState::Down;
+        let nodes = vec![down];
+        let state = spur_sched::traits::ClusterState {
+            nodes: &nodes,
+            partitions: &[],
+            reservations: &[],
+            topology: None,
+        };
+        cm.update_pending_reasons(&[&snapshot], &state);
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::NodeDown
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_reservation_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("resv");
+        spec.reservation = Some("does-not-exist".into());
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::Reservation
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_sets_licenses_reason() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("lic");
+        // Request a license with an empty cluster pool -> shortfall.
+        spec.gres = vec!["license:flexlm:1".into()];
+        let job_id = submit_and_wait(&cm, spec);
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::Licenses
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_preserves_held_reason() {
+        // A user-held job blocked by a reservation must stay Held, not get
+        // reclassified to Reservation.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let mut spec = basic_spec("held");
+        spec.reservation = Some("does-not-exist".into());
+        let job_id = submit_and_wait(&cm, spec);
+        {
+            let mut jobs = cm.jobs.write();
+            jobs.get_mut(&job_id).unwrap().pending_reason = PendingReason::Held;
+        }
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(job_id).unwrap().pending_reason,
+            PendingReason::Held
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -130,6 +130,16 @@ impl NodeState {
         matches!(self, Self::Idle | Self::Mixed)
     }
 
+    /// Whether the node is operationally up — `Idle`/`Mixed`/`Allocated`. An
+    /// `Allocated` node is fully busy but still up (a `Resources` wait, not a
+    /// node-down condition), so this is broader than [`is_available`]. Used to
+    /// distinguish "cluster busy" (Slurm `Resources`) from "cluster down"
+    /// (Slurm `NodeDown`); admin/system-down states (Down/Drain/Draining/
+    /// Error/Unknown/Suspended) are not up.
+    pub fn is_up(&self) -> bool {
+        matches!(self, Self::Idle | Self::Mixed | Self::Allocated)
+    }
+
     /// Every core variant, in proto discriminant order for iteration only.
     /// Wire conversion uses [`from_proto`](Self::from_proto) / [`to_proto`](Self::to_proto), not array index.
     pub const ALL: [NodeState; 9] = [
