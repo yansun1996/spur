@@ -231,6 +231,86 @@ pub enum PendingReason {
     InvalidQOS,
     BootFail,
     OutOfMemory,
+
+    // --- Reservation / partition / system (WAIT_*/FAIL_* in Slurm) ---
+    /// Requested reservation is not available (`WAIT_RESERVATION`).
+    Reservation,
+    /// Generic partition configuration reason (`WAIT_PART_CONFIG`).
+    PartitionConfig,
+    /// Slurm system failure (`FAIL_SYSTEM`).
+    SystemFailure,
+    /// Generic accounting policy reason (`WAIT_ACCOUNT_POLICY`).
+    AccountingPolicy,
+
+    // --- Association coarse limits (Assoc* family) ---
+    /// User/account job limit reached (`WAIT_ASSOC_JOB_LIMIT`).
+    AssociationJobLimit,
+    /// User/account resource limit reached (`WAIT_ASSOC_RESOURCE_LIMIT`).
+    AssociationResourceLimit,
+    /// User/account time limit reached (`WAIT_ASSOC_TIME_LIMIT`).
+    AssociationTimeLimit,
+
+    // --- Association Grp/Max TRES limits ---
+    /// ASSOC GrpTRES exceeded (CPU) (`WAIT_ASSOC_GRP_CPU`).
+    AssocGrpCpuLimit,
+    /// ASSOC GrpTRES exceeded (Memory) (`WAIT_ASSOC_GRP_MEM`).
+    AssocGrpMemLimit,
+    /// ASSOC GrpTRES exceeded (Node) (`WAIT_ASSOC_GRP_NODE`).
+    AssocGrpNodeLimit,
+    /// ASSOC GrpJobs exceeded (`WAIT_ASSOC_GRP_JOB`).
+    AssocGrpJobsLimit,
+    /// ASSOC GrpSubmitJobs exceeded (`WAIT_ASSOC_GRP_SUB_JOB`).
+    AssocGrpSubmitJobsLimit,
+    /// ASSOC GrpWall exceeded (`WAIT_ASSOC_GRP_WALL`).
+    AssocGrpWallLimit,
+    /// ASSOC MaxJobs exceeded (`WAIT_ASSOC_MAX_JOBS`).
+    AssocMaxJobsLimit,
+    /// ASSOC MaxTRESPerJob exceeded (CPU) (`WAIT_ASSOC_MAX_CPU_PER_JOB`).
+    AssocMaxCpuPerJobLimit,
+    /// ASSOC MaxTRESPerJob exceeded (Node) (`WAIT_ASSOC_MAX_NODE_PER_JOB`).
+    AssocMaxNodePerJobLimit,
+    /// ASSOC MaxWallDurationPerJob exceeded (`WAIT_ASSOC_MAX_WALL_PER_JOB`).
+    AssocMaxWallDurationPerJobLimit,
+
+    // --- QOS coarse limits ---
+    /// QOS job limit reached (`WAIT_QOS_JOB_LIMIT`).
+    QosJobLimit,
+    /// QOS resource limit reached (`WAIT_QOS_RESOURCE_LIMIT`).
+    QosResourceLimit,
+    /// QOS time limit reached (`WAIT_QOS_TIME_LIMIT`).
+    QosTimeLimit,
+
+    // --- QOS Grp/Max TRES limits ---
+    /// QOS GrpTRES exceeded (CPU) (`WAIT_QOS_GRP_CPU`).
+    QosGrpCpuLimit,
+    /// QOS GrpTRES exceeded (Memory) (`WAIT_QOS_GRP_MEM`).
+    QosGrpMemLimit,
+    /// QOS GrpTRES exceeded (Node) (`WAIT_QOS_GRP_NODE`).
+    QosGrpNodeLimit,
+    /// QOS GrpJobs exceeded (`WAIT_QOS_GRP_JOB`).
+    QosGrpJobsLimit,
+    /// QOS GrpSubmitJobs exceeded (`WAIT_QOS_GRP_SUB_JOB`).
+    QosGrpSubmitJobsLimit,
+    /// QOS GrpWall exceeded (`WAIT_QOS_GRP_WALL`).
+    QosGrpWallLimit,
+    /// QOS MaxTRESPerJob exceeded (CPU) (`WAIT_QOS_MAX_CPU_PER_JOB`).
+    QosMaxCpuPerJobLimit,
+    /// QOS MaxTRESPerJob exceeded (Node) (`WAIT_QOS_MAX_NODE_PER_JOB`).
+    QosMaxNodePerJobLimit,
+    /// QOS MaxWallDurationPerJob exceeded (`WAIT_QOS_MAX_WALL_PER_JOB`).
+    QosMaxWallDurationPerJobLimit,
+    /// QOS MaxTRESPerJob exceeded (Memory) (`WAIT_QOS_MAX_MEM_PER_JOB`).
+    QosMaxMemoryPerJob,
+    /// QOS MaxTRESPerUser exceeded (CPU) (`WAIT_QOS_MAX_CPU_PER_USER`).
+    QosMaxCpuPerUserLimit,
+    /// QOS MaxSubmitJobsPerUser exceeded (`WAIT_QOS_MAX_SUB_JOB`).
+    QosMaxSubmitJobPerUserLimit,
+
+    // --- Burst buffer ---
+    /// Burst buffer resources unavailable (`WAIT_BURST_BUFFER_RESOURCE`).
+    BurstBufferResources,
+    /// Burst buffer file stage-in in progress (`WAIT_BURST_BUFFER_STAGING`).
+    BurstBufferStageIn,
 }
 
 impl PendingReason {
@@ -261,6 +341,52 @@ impl PendingReason {
             Self::InvalidQOS => "InvalidQOS",
             Self::BootFail => "BootFailure",
             Self::OutOfMemory => "OutOfMemory",
+
+            // Reservation / partition / system
+            Self::Reservation => "Reservation",
+            Self::PartitionConfig => "PartitionConfig",
+            Self::SystemFailure => "SystemFailure",
+            Self::AccountingPolicy => "AccountingPolicy",
+
+            // Association coarse limits
+            Self::AssociationJobLimit => "AssociationJobLimit",
+            Self::AssociationResourceLimit => "AssociationResourceLimit",
+            Self::AssociationTimeLimit => "AssociationTimeLimit",
+
+            // Association Grp/Max TRES limits
+            Self::AssocGrpCpuLimit => "AssocGrpCpuLimit",
+            Self::AssocGrpMemLimit => "AssocGrpMemLimit",
+            Self::AssocGrpNodeLimit => "AssocGrpNodeLimit",
+            Self::AssocGrpJobsLimit => "AssocGrpJobsLimit",
+            Self::AssocGrpSubmitJobsLimit => "AssocGrpSubmitJobsLimit",
+            Self::AssocGrpWallLimit => "AssocGrpWallLimit",
+            Self::AssocMaxJobsLimit => "AssocMaxJobsLimit",
+            Self::AssocMaxCpuPerJobLimit => "AssocMaxCpuPerJobLimit",
+            Self::AssocMaxNodePerJobLimit => "AssocMaxNodePerJobLimit",
+            Self::AssocMaxWallDurationPerJobLimit => "AssocMaxWallDurationPerJobLimit",
+
+            // QOS coarse limits
+            Self::QosJobLimit => "QOSJobLimit",
+            Self::QosResourceLimit => "QOSResourceLimit",
+            Self::QosTimeLimit => "QOSTimeLimit",
+
+            // QOS Grp/Max TRES limits
+            Self::QosGrpCpuLimit => "QOSGrpCpuLimit",
+            Self::QosGrpMemLimit => "QOSGrpMemLimit",
+            Self::QosGrpNodeLimit => "QOSGrpNodeLimit",
+            Self::QosGrpJobsLimit => "QOSGrpJobsLimit",
+            Self::QosGrpSubmitJobsLimit => "QOSGrpSubmitJobsLimit",
+            Self::QosGrpWallLimit => "QOSGrpWallLimit",
+            Self::QosMaxCpuPerJobLimit => "QOSMaxCpuPerJobLimit",
+            Self::QosMaxNodePerJobLimit => "QOSMaxNodePerJobLimit",
+            Self::QosMaxWallDurationPerJobLimit => "QOSMaxWallDurationPerJobLimit",
+            Self::QosMaxMemoryPerJob => "QOSMaxMemoryPerJob",
+            Self::QosMaxCpuPerUserLimit => "QOSMaxCpuPerUserLimit",
+            Self::QosMaxSubmitJobPerUserLimit => "QOSMaxSubmitJobPerUserLimit",
+
+            // Burst buffer
+            Self::BurstBufferResources => "BurstBufferResources",
+            Self::BurstBufferStageIn => "BurstBufferStageIn",
         }
     }
 }
@@ -1099,6 +1225,107 @@ mod tests {
         // Slurm reports this exact string ("DeadLine", note the cap D and L).
         // squeue scrapers and Slurm-compat clients pattern-match on it.
         assert_eq!(PendingReason::DeadLine.display(), "DeadLine");
+    }
+
+    /// Every (variant, exact Slurm string) pair added for reason-code parity.
+    ///
+    /// Strings are verified byte-for-byte against Slurm 25.11.6's
+    /// `job_reason_string()` table in `src/common/job_state_reason.c`
+    /// (compiled into `job_state_reason.o`). See
+    /// `docs/design/2026-06-12-reason-code-vocab.md` for the live evidence.
+    const REASON_VOCAB: &[(PendingReason, &str)] = &[
+        // Reservation / partition / system / accounting
+        (PendingReason::Reservation, "Reservation"),
+        (PendingReason::PartitionConfig, "PartitionConfig"),
+        (PendingReason::SystemFailure, "SystemFailure"),
+        (PendingReason::AccountingPolicy, "AccountingPolicy"),
+        // Association coarse limits
+        (PendingReason::AssociationJobLimit, "AssociationJobLimit"),
+        (
+            PendingReason::AssociationResourceLimit,
+            "AssociationResourceLimit",
+        ),
+        (PendingReason::AssociationTimeLimit, "AssociationTimeLimit"),
+        // Association Grp/Max TRES limits
+        (PendingReason::AssocGrpCpuLimit, "AssocGrpCpuLimit"),
+        (PendingReason::AssocGrpMemLimit, "AssocGrpMemLimit"),
+        (PendingReason::AssocGrpNodeLimit, "AssocGrpNodeLimit"),
+        (PendingReason::AssocGrpJobsLimit, "AssocGrpJobsLimit"),
+        (
+            PendingReason::AssocGrpSubmitJobsLimit,
+            "AssocGrpSubmitJobsLimit",
+        ),
+        (PendingReason::AssocGrpWallLimit, "AssocGrpWallLimit"),
+        (PendingReason::AssocMaxJobsLimit, "AssocMaxJobsLimit"),
+        (
+            PendingReason::AssocMaxCpuPerJobLimit,
+            "AssocMaxCpuPerJobLimit",
+        ),
+        (
+            PendingReason::AssocMaxNodePerJobLimit,
+            "AssocMaxNodePerJobLimit",
+        ),
+        (
+            PendingReason::AssocMaxWallDurationPerJobLimit,
+            "AssocMaxWallDurationPerJobLimit",
+        ),
+        // QOS coarse limits
+        (PendingReason::QosJobLimit, "QOSJobLimit"),
+        (PendingReason::QosResourceLimit, "QOSResourceLimit"),
+        (PendingReason::QosTimeLimit, "QOSTimeLimit"),
+        // QOS Grp/Max TRES limits
+        (PendingReason::QosGrpCpuLimit, "QOSGrpCpuLimit"),
+        (PendingReason::QosGrpMemLimit, "QOSGrpMemLimit"),
+        (PendingReason::QosGrpNodeLimit, "QOSGrpNodeLimit"),
+        (PendingReason::QosGrpJobsLimit, "QOSGrpJobsLimit"),
+        (
+            PendingReason::QosGrpSubmitJobsLimit,
+            "QOSGrpSubmitJobsLimit",
+        ),
+        (PendingReason::QosGrpWallLimit, "QOSGrpWallLimit"),
+        (PendingReason::QosMaxCpuPerJobLimit, "QOSMaxCpuPerJobLimit"),
+        (
+            PendingReason::QosMaxNodePerJobLimit,
+            "QOSMaxNodePerJobLimit",
+        ),
+        (
+            PendingReason::QosMaxWallDurationPerJobLimit,
+            "QOSMaxWallDurationPerJobLimit",
+        ),
+        (PendingReason::QosMaxMemoryPerJob, "QOSMaxMemoryPerJob"),
+        (
+            PendingReason::QosMaxCpuPerUserLimit,
+            "QOSMaxCpuPerUserLimit",
+        ),
+        (
+            PendingReason::QosMaxSubmitJobPerUserLimit,
+            "QOSMaxSubmitJobPerUserLimit",
+        ),
+        // Burst buffer
+        (PendingReason::BurstBufferResources, "BurstBufferResources"),
+        (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
+    ];
+
+    #[test]
+    fn reason_vocab_display_matches_slurm_25_11() {
+        // The reason column is scraped by Slurm-compat clients and CI gates,
+        // so each Display string must equal Slurm 25.11.6 byte-for-byte.
+        for (reason, expected) in REASON_VOCAB {
+            assert_eq!(reason.display(), *expected, "Display for {reason:?}");
+            // Display impl must agree with display().
+            assert_eq!(format!("{reason}"), *expected, "fmt for {reason:?}");
+        }
+    }
+
+    #[test]
+    fn reason_vocab_serde_roundtrips() {
+        // pending_reason is persisted in the Raft snapshot, so serde must be
+        // lossless for every new variant.
+        for (reason, _) in REASON_VOCAB {
+            let json = serde_json::to_string(reason).expect("serialize reason");
+            let back: PendingReason = serde_json::from_str(&json).expect("deserialize reason");
+            assert_eq!(&back, reason, "serde roundtrip for {reason:?}");
+        }
     }
 
     #[test]

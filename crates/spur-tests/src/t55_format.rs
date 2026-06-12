@@ -119,6 +119,20 @@ mod tests {
             (PendingReason::Resources, "Resources"),
             (PendingReason::Dependency, "Dependency"),
             (PendingReason::Held, "JobHeldUser"),
+            // Reason-code vocabulary parity (Slurm 25.11.6 job_reason_string).
+            (PendingReason::Reservation, "Reservation"),
+            (PendingReason::PartitionConfig, "PartitionConfig"),
+            (PendingReason::SystemFailure, "SystemFailure"),
+            (PendingReason::AccountingPolicy, "AccountingPolicy"),
+            (PendingReason::AssociationJobLimit, "AssociationJobLimit"),
+            (PendingReason::QosGrpCpuLimit, "QOSGrpCpuLimit"),
+            (
+                PendingReason::QosMaxWallDurationPerJobLimit,
+                "QOSMaxWallDurationPerJobLimit",
+            ),
+            (PendingReason::AssocMaxJobsLimit, "AssocMaxJobsLimit"),
+            (PendingReason::BurstBufferResources, "BurstBufferResources"),
+            (PendingReason::BurstBufferStageIn, "BurstBufferStageIn"),
         ];
         for (reason, display) in expected {
             assert_eq!(reason.display(), display);
