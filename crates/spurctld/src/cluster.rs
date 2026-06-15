@@ -1378,6 +1378,38 @@ impl ClusterManager {
             let reservations = self.get_reservations();
             let now = Utc::now();
             let pool = self.license_pool.read();
+
+            // Dependency is dropped by pending_jobs() ahead of QoS/Licenses/
+            // Reservation, and cancel_unsatisfiable_dependency_jobs() tags waiting
+            // jobs with PendingReason::Dependency earlier in the same scheduler
+            // tick. Re-evaluate it here, with the same closures pending_jobs()
+            // uses, so this pass cannot clobber that higher-precedence reason.
+            use spur_core::dependency::{check_dependencies, DependencyResult};
+            let get_job = |id: JobId| -> Option<Job> { jobs.get(&id).cloned() };
+            let get_array_tasks = |id: JobId| -> Vec<Job> {
+                jobs.values()
+                    .filter(|j| j.spec.array_job_id == Some(id))
+                    .cloned()
+                    .collect()
+            };
+            let get_jobs_by_name_user = |name: &str, user: &str| -> Vec<Job> {
+                jobs.values()
+                    .filter(|j| j.spec.name == name && j.spec.user == user)
+                    .cloned()
+                    .collect()
+            };
+            let dependency_block = |job: &Job| -> Option<PendingReason> {
+                if job.spec.dependency.is_empty() {
+                    return None;
+                }
+                match check_dependencies(job, &get_job, &get_array_tasks, &get_jobs_by_name_user) {
+                    DependencyResult::Waiting | DependencyResult::Failed => {
+                        Some(PendingReason::Dependency)
+                    }
+                    DependencyResult::Satisfied => None,
+                }
+            };
+
             jobs.values()
                 .filter(|job| {
                     job.state == JobState::Pending
@@ -1386,10 +1418,12 @@ impl ClusterManager {
                 })
                 .filter_map(|job| {
                     // Precedence must match the order pending_jobs() applies its
-                    // retain() filters (QoS -> Licenses -> Reservation): that is the
-                    // check that actually drops the job from the schedulable set, so
-                    // the displayed reason cannot diverge from the drop decision.
-                    qos_block_for(job, &jobs)
+                    // retain() filters (Dependency -> QoS -> Licenses ->
+                    // Reservation): that is the check that actually drops the job
+                    // from the schedulable set, so the displayed reason cannot
+                    // diverge from the drop decision.
+                    dependency_block(job)
+                        .or_else(|| qos_block_for(job, &jobs))
                         .or_else(|| license_block(job, &pool))
                         .or_else(|| reservation_block(job, &reservations, now))
                         .map(|reason| (job.job_id, reason))
@@ -4139,6 +4173,41 @@ mod tests {
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::Held
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_blocked_dependency_takes_precedence_over_reservation() {
+        // A job blocked by BOTH an unsatisfied dependency and an absent
+        // reservation must surface Dependency: pending_jobs() drops it at the
+        // dependency filter (ahead of reservation), so tag_blocked_pending_reasons()
+        // must not clobber it with the lower-precedence Reservation reason.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        // Parent running -> child's afterok dependency is Waiting (not satisfied).
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("parent")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+        });
+
+        let mut child = basic_spec("child");
+        child.dependency = vec!["afterok:1".into()];
+        child.reservation = Some("does-not-exist".into());
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 2,
+            spec: Box::new(child),
+        });
+
+        cm.tag_blocked_pending_reasons();
+        assert_eq!(
+            cm.get_job(2).unwrap().pending_reason,
+            PendingReason::Dependency
         );
     }
 
