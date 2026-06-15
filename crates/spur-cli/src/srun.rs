@@ -187,10 +187,9 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
     if let Some(gpus) = &args.gpus {
         gres.push(format!("gpu:{}", gpus));
     }
-    // Append licenses as GRES entries (license:<name>:<count>)
-    for lic in &args.licenses {
-        gres.push(format!("license:{}", lic));
-    }
+    // Licenses are sent in the dedicated `licenses` field; the controller folds
+    // them into GRES (proto_to_job_spec). Don't also push them here or each would
+    // be counted twice.
 
     let time_limit = args
         .time

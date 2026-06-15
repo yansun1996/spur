@@ -516,10 +516,9 @@ pub async fn main_with_args(cli_args: Vec<String>) -> Result<()> {
     if let Some(gpn) = &args.gpus_per_node {
         gres.push(format!("gpu:{}", gpn));
     }
-    // Append licenses as GRES entries (license:<name>:<count>)
-    for lic in &args.licenses {
-        gres.push(format!("license:{}", lic));
-    }
+    // Licenses are sent in the dedicated `licenses` field; the controller folds
+    // them into GRES (proto_to_job_spec). Don't also push them here or each would
+    // be counted twice.
 
     // Parse time limit — use parse_time_seconds so that short values like
     // "0:00:10" (10 seconds) are stored with full second precision instead of

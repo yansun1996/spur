@@ -51,6 +51,9 @@ pub struct ClusterManager {
     next_job_id: AtomicU32,
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
+    /// Configured cluster-wide license totals (immutable; from config). Current
+    /// availability is derived as total minus the licenses held by active jobs
+    /// (see `available_licenses`), so it cannot drift or diverge from config.
     license_pool: RwLock<HashMap<String, u64>>,
     tokens: RwLock<HashMap<String, spur_core::admission::AdmissionToken>>,
     raft: RwLock<Option<SpurRaft>>,
@@ -1230,11 +1233,9 @@ impl ClusterManager {
         // qos_block_for() so the drop decision and the displayed reason agree.
         pending.retain(|job| qos_block_for(job, &jobs).is_none());
 
-        // License enforcement: check cluster-wide license pool
-        {
-            let pool = self.license_pool.read();
-            pending.retain(|job| license_block(job, &pool).is_none());
-        }
+        // License enforcement is applied after the priority sort below, so scarce
+        // licenses are reserved highest-priority-first and a single pass cannot
+        // over-subscribe the pool.
 
         // Reservation validation: reject jobs targeting expired/nonexistent reservations
         {
@@ -1267,7 +1268,75 @@ impl ClusterManager {
         }
 
         pending.sort_by_key(|j| std::cmp::Reverse(j.priority));
+
+        // License reservation, in priority order. `remaining` starts from current
+        // availability (config total minus licenses held by running jobs) and each
+        // kept job reserves its licenses so lower-priority jobs in the same pass see
+        // the reduced availability — preventing a single pass from over-subscribing.
+        // An absolute shortage is also reported as `Licenses` by
+        // tag_blocked_pending_reasons() via license_block().
+        {
+            let mut remaining = self.available_licenses_with(&jobs);
+            pending.retain(|job| {
+                let req = extract_license_requirements(&job.spec);
+                if req
+                    .iter()
+                    .any(|(lic, n)| remaining.get(lic).copied().unwrap_or(0) < *n)
+                {
+                    return false;
+                }
+                for (lic, n) in &req {
+                    if let Some(avail) = remaining.get_mut(lic) {
+                        *avail = avail.saturating_sub(*n);
+                    }
+                }
+                true
+            });
+        }
+
         pending
+    }
+
+    /// Licenses held by jobs actively occupying resources
+    /// (Running/Suspended/Completing). Pending and terminal jobs hold none.
+    fn licenses_in_use(jobs: &HashMap<JobId, Job>) -> HashMap<String, u64> {
+        let mut used: HashMap<String, u64> = HashMap::new();
+        for job in jobs.values() {
+            if matches!(
+                job.state,
+                JobState::Running | JobState::Suspended | JobState::Completing
+            ) {
+                for (lic, n) in extract_license_requirements(&job.spec) {
+                    *used.entry(lic).or_insert(0) += n;
+                }
+            }
+        }
+        used
+    }
+
+    /// Currently-available licenses: configured total minus licenses in use.
+    /// Derived from the live job set, so it always reflects config and cannot
+    /// drift (no mutable pool). Caller supplies the already-locked jobs map.
+    fn available_licenses_with(&self, jobs: &HashMap<JobId, Job>) -> HashMap<String, u64> {
+        let total = self.license_pool.read();
+        let used = Self::licenses_in_use(jobs);
+        total
+            .iter()
+            .map(|(lic, tot)| {
+                (
+                    lic.clone(),
+                    tot.saturating_sub(used.get(lic).copied().unwrap_or(0)),
+                )
+            })
+            .collect()
+    }
+
+    /// Currently-available licenses (locks the job table). See
+    /// [`available_licenses_with`](Self::available_licenses_with).
+    #[cfg(test)]
+    fn available_licenses(&self) -> HashMap<String, u64> {
+        let jobs = self.jobs.read();
+        self.available_licenses_with(&jobs)
     }
 
     /// Cancel pending jobs whose dependencies can never be satisfied (Slurm's
@@ -1368,13 +1437,11 @@ impl ClusterManager {
         use spur_core::job::PendingReason;
 
         // Evaluate under read locks; release before taking the write lock.
-        // Lock order (jobs -> license_pool) matches pending_jobs(); reservations
-        // are cloned out first so no two locks are held across the pool read.
         let blocked: Vec<(JobId, PendingReason)> = {
             let jobs = self.jobs.read();
             let reservations = self.get_reservations();
             let now = Utc::now();
-            let pool = self.license_pool.read();
+            let available = self.available_licenses_with(&jobs);
 
             // Dependency outranks QoS/Licenses/Reservation in pending_jobs() and
             // is tagged just before this pass, so re-check it first (same closures).
@@ -1415,7 +1482,7 @@ impl ClusterManager {
                     // the one that actually removed it: Dep -> QoS -> Lic -> Resv.
                     dependency_block(job)
                         .or_else(|| qos_block_for(job, &jobs))
-                        .or_else(|| license_block(job, &pool))
+                        .or_else(|| license_block(job, &available))
                         .or_else(|| reservation_block(job, &reservations, now))
                         .map(|reason| (job.job_id, reason))
                 })
@@ -1738,12 +1805,7 @@ impl ClusterManager {
 
     /// Persist a mutation via Raft consensus. The apply callback
     /// (`StateMachineApply`) handles in-memory state on all nodes.
-    fn complete_job_steps_and_licenses(
-        &self,
-        job_id: &JobId,
-        exit_code: i32,
-        timestamp: DateTime<Utc>,
-    ) {
+    fn complete_job_steps(&self, job_id: &JobId, exit_code: i32, timestamp: DateTime<Utc>) {
         let mut steps = self.steps.write();
         for step in steps.values_mut() {
             if step.job_id == *job_id && !step.state.is_terminal() {
@@ -1757,18 +1819,8 @@ impl ClusterManager {
             }
         }
         drop(steps);
-
-        let lic_req = if let Some(job) = self.jobs.read().get(job_id) {
-            extract_license_requirements(&job.spec)
-        } else {
-            HashMap::new()
-        };
-        if !lic_req.is_empty() {
-            let mut pool = self.license_pool.write();
-            for (lic, count) in &lic_req {
-                *pool.entry(lic.clone()).or_insert(0) += count;
-            }
-        }
+        // Licenses are not returned here: usage is derived from running jobs, so a
+        // job leaving the running set frees its licenses automatically.
     }
 
     #[allow(clippy::result_large_err)]
@@ -1862,7 +1914,6 @@ impl ClusterManager {
                 resources,
                 per_node_alloc,
             } => {
-                let spec = jobs.get(job_id).map(|j| j.spec.clone());
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.start_time = Some(timestamp);
                     job.allocated_nodes = node_names.clone();
@@ -1884,22 +1935,9 @@ impl ClusterManager {
                         node.update_state_from_alloc();
                     }
                 }
-                // Subtract licenses
-                if let Some(ref spec) = spec {
-                    let lic_req = extract_license_requirements(spec);
-                    if !lic_req.is_empty() {
-                        drop(jobs);
-                        drop(nodes);
-                        let mut pool = self.license_pool.write();
-                        for (lic, count) in &lic_req {
-                            if let Some(avail) = pool.get_mut(lic) {
-                                *avail = avail.saturating_sub(*count);
-                            }
-                        }
-                        self.next_job_id.store(next_id, Ordering::Relaxed);
-                        return ClientResponse::default();
-                    }
-                }
+                // Licenses are not mutated here: usage is derived on demand from
+                // running jobs (see available_licenses()), so the config total is
+                // authoritative and cannot drift.
             }
             WalOperation::JobNodeComplete {
                 job_id,
@@ -2014,7 +2052,7 @@ impl ClusterManager {
                 if let Some((final_state, final_exit)) = finalized {
                     drop(jobs);
                     drop(nodes);
-                    self.complete_job_steps_and_licenses(job_id, final_exit, timestamp);
+                    self.complete_job_steps(job_id, final_exit, timestamp);
                     self.next_job_id.store(next_id, Ordering::Relaxed);
                     return ClientResponse {
                         job_finalized: Some(JobFinalized {
@@ -2098,7 +2136,7 @@ impl ClusterManager {
                 }
                 drop(jobs);
                 drop(nodes);
-                self.complete_job_steps_and_licenses(job_id, *exit_code, timestamp);
+                self.complete_job_steps(job_id, *exit_code, timestamp);
             }
             WalOperation::JobStepComplete {
                 job_id,
@@ -2363,7 +2401,10 @@ impl StateMachineApply for ClusterManager {
                 steps.insert((step.job_id, step.step_id), step);
             }
 
-            *self.license_pool.write() = snap.license_pool;
+            // license_pool is the configured total (immutable); it is intentionally
+            // NOT restored from the snapshot so config stays authoritative and any
+            // historical drift in old snapshots is discarded. Availability is
+            // derived from the restored jobs.
 
             let mut tokens = self.tokens.write();
             tokens.clear();
@@ -2409,8 +2450,9 @@ fn reservation_block(
     }
 }
 
-/// Reason a job is ineligible because the cluster license pool cannot satisfy
-/// its `license:` GRES requests, or `None`. Reported as `Licenses`.
+/// Reason a job is ineligible because currently-available licenses cannot satisfy
+/// its `license:` GRES requests, or `None`. Reported as `Licenses`. `available`
+/// is the configured total minus licenses held by active jobs.
 fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::job::PendingReason> {
     use spur_core::job::PendingReason;
     let lic_req = extract_license_requirements(&job.spec);
@@ -4136,6 +4178,107 @@ mod tests {
         assert_eq!(
             cm.get_job(job_id).unwrap().pending_reason,
             PendingReason::Licenses
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn running_job_license_consumption_blocks_next_job() {
+        // Concurrent license accounting: a running job holding all of a license
+        // must make a second job requesting that license ineligible, even though
+        // each request alone is within the configured total.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.license_pool.write().insert("fluent".into(), 2);
+
+        let mut s1 = basic_spec("j1");
+        s1.gres = vec!["license:fluent:2".into()];
+        let j1 = submit_and_wait(&cm, s1);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            j1,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, j1, JobState::Running);
+
+        assert_eq!(
+            cm.available_licenses().get("fluent").copied(),
+            Some(0),
+            "running job's licenses should count as in use (none available)"
+        );
+
+        let mut s2 = basic_spec("j2");
+        s2.gres = vec!["license:fluent:1".into()];
+        let j2 = submit_and_wait(&cm, s2);
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        assert!(
+            !pending.contains(&j2),
+            "j2 must be blocked while the license pool is exhausted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_job_frees_its_licenses_without_drifting_total() {
+        // Derived accounting: a job releases its licenses the moment it leaves the
+        // active set, and the configured total is never mutated (no drift).
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.license_pool.write().insert("fluent".into(), 2);
+
+        let mut s = basic_spec("j");
+        s.gres = vec!["license:fluent:2".into()];
+        let id = submit_and_wait(&cm, s);
+        let res = scalar_alloc(1, 1000);
+        cm.start_job(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+        )
+        .unwrap();
+        settle(&cm, id, JobState::Running);
+        assert_eq!(cm.available_licenses().get("fluent").copied(), Some(0));
+
+        cm.cancel_job(id, "testuser").unwrap();
+        settle(&cm, id, JobState::Cancelled);
+        assert_eq!(
+            cm.available_licenses().get("fluent").copied(),
+            Some(2),
+            "licenses must be freed when the job leaves the active set"
+        );
+        assert_eq!(
+            *cm.license_pool.read().get("fluent").unwrap(),
+            2,
+            "configured total must never be mutated"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_jobs_does_not_overallocate_licenses_within_one_pass() {
+        // Two pending jobs each request fluent:1 but the pool holds only 1.
+        // A single pending_jobs() pass must not return both — otherwise the
+        // scheduler would allocate both and over-subscribe the license.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.license_pool.write().insert("fluent".into(), 1);
+
+        let mut s1 = basic_spec("a");
+        s1.gres = vec!["license:fluent:1".into()];
+        let a = submit_and_wait(&cm, s1);
+        let mut s2 = basic_spec("b");
+        s2.gres = vec!["license:fluent:1".into()];
+        let b = submit_and_wait(&cm, s2);
+
+        let pending: Vec<JobId> = cm.pending_jobs().iter().map(|j| j.job_id).collect();
+        let granted = [a, b].iter().filter(|id| pending.contains(id)).count();
+        assert_eq!(
+            granted, 1,
+            "pending_jobs() returned {granted} fluent jobs but the pool holds only 1"
         );
     }
 
