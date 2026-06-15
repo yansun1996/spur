@@ -1227,12 +1227,9 @@ mod tests {
         assert_eq!(PendingReason::DeadLine.display(), "DeadLine");
     }
 
-    /// Every (variant, exact Slurm string) pair added for reason-code parity.
-    ///
-    /// Strings are verified byte-for-byte against Slurm 25.11.6's
-    /// `job_reason_string()` table in `src/common/job_state_reason.c`
-    /// (compiled into `job_state_reason.o`). See
-    /// `docs/design/2026-06-12-reason-code-vocab.md` for the live evidence.
+    /// Every (variant, exact Slurm string) pair added for reason-code parity,
+    /// verified byte-for-byte against Slurm 25.11.6 `job_reason_string()`
+    /// (`src/common/job_state_reason.c`). Evidence in the design doc.
     const REASON_VOCAB: &[(PendingReason, &str)] = &[
         // Reservation / partition / system / accounting
         (PendingReason::Reservation, "Reservation"),

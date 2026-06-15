@@ -1360,13 +1360,10 @@ impl ClusterManager {
         cancelled
     }
 
-    /// Set `pending_reason` for jobs held out of scheduling by QoS, license, or
-    /// reservation limits. `pending_jobs()` drops these jobs from the schedule
-    /// set, so they never reach `update_pending_reasons()` and their reason
-    /// would otherwise never reflect the real cause (the user would see a stale
-    /// or generic reason instead of `Reservation`/`Licenses`/a QoS reason).
-    /// Leader-only; takes the write lock the read-locked `pending_jobs()` scan
-    /// cannot. Mirrors `cancel_unsatisfiable_dependency_jobs()`.
+    /// Set `pending_reason` for jobs `pending_jobs()` drops from scheduling
+    /// (dependency/QoS/license/reservation), which never reach
+    /// `update_pending_reasons()` and would otherwise show a stale reason.
+    /// Leader-only; mirrors `cancel_unsatisfiable_dependency_jobs()`.
     pub fn tag_blocked_pending_reasons(&self) {
         use spur_core::job::PendingReason;
 
@@ -1379,11 +1376,8 @@ impl ClusterManager {
             let now = Utc::now();
             let pool = self.license_pool.read();
 
-            // Dependency is dropped by pending_jobs() ahead of QoS/Licenses/
-            // Reservation, and cancel_unsatisfiable_dependency_jobs() tags waiting
-            // jobs with PendingReason::Dependency earlier in the same scheduler
-            // tick. Re-evaluate it here, with the same closures pending_jobs()
-            // uses, so this pass cannot clobber that higher-precedence reason.
+            // Dependency outranks QoS/Licenses/Reservation in pending_jobs() and
+            // is tagged just before this pass, so re-check it first (same closures).
             use spur_core::dependency::{check_dependencies, DependencyResult};
             let get_job = |id: JobId| -> Option<Job> { jobs.get(&id).cloned() };
             let get_array_tasks = |id: JobId| -> Vec<Job> {
@@ -1417,11 +1411,8 @@ impl ClusterManager {
                         && job.pending_reason != PendingReason::DeadLine
                 })
                 .filter_map(|job| {
-                    // Precedence must match the order pending_jobs() applies its
-                    // retain() filters (Dependency -> QoS -> Licenses ->
-                    // Reservation): that is the check that actually drops the job
-                    // from the schedulable set, so the displayed reason cannot
-                    // diverge from the drop decision.
+                    // Same order pending_jobs() drops jobs, so the shown reason is
+                    // the one that actually removed it: Dep -> QoS -> Lic -> Resv.
                     dependency_block(job)
                         .or_else(|| qos_block_for(job, &jobs))
                         .or_else(|| license_block(job, &pool))
@@ -1582,12 +1573,8 @@ impl ClusterManager {
                 continue;
             }
 
-            // A node that is merely `Allocated` (fully busy) is still UP — that
-            // is a `Resources` wait, not `NodeDown`. Only genuine admin/system
-            // down states (Down/Drain/Draining/Error/Unknown/Suspended) count
-            // toward NodeDown, matching Slurm which reports `Resources` for a
-            // busy-but-up cluster. Using `is_available()` here (Idle|Mixed
-            // only) wrongly flagged a fully-allocated cluster as NodeDown.
+            // is_up() (not is_available()) so a fully-`Allocated` busy cluster
+            // counts as up — that's a `Resources` wait, not `NodeDown`.
             let all_down = nodes_in_partition.iter().all(|n| !n.state.is_up());
 
             if all_down {
@@ -2399,11 +2386,9 @@ impl StateMachineApply for ClusterManager {
     }
 }
 
-/// Reason a job is ineligible to run because of its `--reservation`, or `None`
-/// if it has no reservation or the reservation admits it. Covers an absent,
-/// inactive/expired, or access-denied reservation — all reported as
-/// `Reservation` (Slurm `WAIT_RESERVATION`). Shared by `pending_jobs()` (drop
-/// decision) and `tag_blocked_pending_reasons()` (displayed reason).
+/// `Reservation` if the job's `--reservation` is absent/inactive/expired or
+/// denies it, else `None`. Shared by `pending_jobs()` (drop) and
+/// `tag_blocked_pending_reasons()` (displayed reason) so the two agree.
 fn reservation_block(
     job: &Job,
     reservations: &[Reservation],
@@ -2437,11 +2422,10 @@ fn license_block(job: &Job, pool: &HashMap<String, u64>) -> Option<spur_core::jo
     None
 }
 
-/// QoS pending reason for a job (the specific `QOS*` limit it trips), or `None`
-/// if it has no QoS or is within limits. QoS definitions are not yet sourced
-/// from the accounting DB, so a default (limitless) QoS is used — the path is
-/// wired so the specific Slurm reason surfaces once real QoS configs are
-/// populated. Shared by `pending_jobs()` and `tag_blocked_pending_reasons()`.
+/// The specific `QOS*` limit a job trips, or `None` if within limits. QoS is not
+/// yet sourced from the accounting DB (a limitless default is used), so this is
+/// wired but inert until real QoS configs exist. Shared by `pending_jobs()` and
+/// `tag_blocked_pending_reasons()`.
 fn qos_block_for(job: &Job, jobs: &HashMap<JobId, Job>) -> Option<spur_core::job::PendingReason> {
     // No QoS -> no QoS-based block.
     job.spec.qos.as_ref()?;
@@ -4178,10 +4162,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tag_blocked_dependency_takes_precedence_over_reservation() {
-        // A job blocked by BOTH an unsatisfied dependency and an absent
-        // reservation must surface Dependency: pending_jobs() drops it at the
-        // dependency filter (ahead of reservation), so tag_blocked_pending_reasons()
-        // must not clobber it with the lower-precedence Reservation reason.
+        // Blocked by both a dependency and an absent reservation -> Dependency
+        // wins (pending_jobs() drops at the dependency filter, ahead of reservation).
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
