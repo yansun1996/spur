@@ -1385,9 +1385,13 @@ impl ClusterManager {
                         && job.pending_reason != PendingReason::DeadLine
                 })
                 .filter_map(|job| {
-                    reservation_block(job, &reservations, now)
+                    // Precedence must match the order pending_jobs() applies its
+                    // retain() filters (QoS -> Licenses -> Reservation): that is the
+                    // check that actually drops the job from the schedulable set, so
+                    // the displayed reason cannot diverge from the drop decision.
+                    qos_block_for(job, &jobs)
                         .or_else(|| license_block(job, &pool))
-                        .or_else(|| qos_block_for(job, &jobs))
+                        .or_else(|| reservation_block(job, &reservations, now))
                         .map(|reason| (job.job_id, reason))
                 })
                 .collect()

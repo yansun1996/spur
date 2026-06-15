@@ -186,7 +186,6 @@ task is vocabulary completeness, not new limit enforcement).
 
 `cargo build`, `cargo test` (full workspace: 29 test binaries ok, 1229 tests passed, 0 failed),
 `cargo clippy --all-targets` (0 warnings), `cargo fmt --all --check` (clean).
-</content>
 
 ## Update — emission wiring (follow-up commit)
 
