@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod exec;
+mod exit_fmt;
 mod format_engine;
 mod image;
 mod net;

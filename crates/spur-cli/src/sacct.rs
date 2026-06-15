@@ -6,6 +6,7 @@ use clap::Parser;
 use spur_proto::proto::slurm_accounting_client::SlurmAccountingClient;
 use spur_proto::proto::GetJobHistoryRequest;
 
+use crate::exit_fmt::format_exit;
 use crate::format_engine;
 
 /// Display accounting data for jobs.
@@ -180,7 +181,7 @@ fn resolve_sacct_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'T' | 't' => state_name(job.state),
         'M' => format_elapsed(job),
         'D' => job.num_nodes.to_string(),
-        'x' => format_exit_code(job.exit_code),
+        'x' => format_exit(job.exit_code, job.exit_signal),
         'S' => format_timestamp(job.start_time.as_ref()),
         'E' => format_timestamp(job.end_time.as_ref()),
         'V' => format_timestamp(job.submit_time.as_ref()),
@@ -230,15 +231,6 @@ fn format_duration(total_seconds: i64) -> String {
         format!("{}-{:02}:{:02}:{:02}", days, hours, minutes, seconds)
     } else {
         format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
-    }
-}
-
-fn format_exit_code(code: i32) -> String {
-    // Slurm format: exit_code:signal
-    if code >= 0 {
-        format!("{}:0", code)
-    } else {
-        format!("0:{}", -code)
     }
 }
 

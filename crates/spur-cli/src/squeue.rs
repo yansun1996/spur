@@ -147,7 +147,7 @@ fn resolve_job_field(job: &spur_proto::proto::JobInfo, spec: char) -> String {
         'a' => job.account.clone(),
         'p' => job.priority.to_string(),
         'q' => job.qos.clone(),
-        'r' => job.state_reason.clone(),
+        'r' => crate::exit_fmt::render_reason(&job.state_reason, job.exit_signal),
         'Z' => job.work_dir.clone(),
         'o' => job.command.clone(),
         'S' => format_timestamp(job.start_time.as_ref()),

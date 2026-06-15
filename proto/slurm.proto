@@ -183,10 +183,10 @@ message JobInfo {
   string command = 25;
 
   int32 exit_code = 30;
-  int32 exit_signal = 33;       // Terminating signal of primary node (0 = none)
-  int32 derived_exit_code = 34; // Running max over srun step exit codes (0 if no steps)
   string stdout_path = 31;
   string stderr_path = 32;
+  int32 exit_signal = 33;       // Terminating signal of primary node (0 = none)
+  int32 derived_exit_code = 34; // Running max over srun step exit codes (0 if no steps)
 
   ResourceAllocations resources = 40;
   uint32 priority = 41;

@@ -37,16 +37,12 @@ pub enum WalOperation {
     JobComplete {
         job_id: JobId,
         exit_code: i32,
-        // reserved; JobComplete paths carry no process signal (cancel/deadline/timeout)
-        #[serde(default)]
-        signal: i32,
         state: JobState,
     },
     JobNodeComplete {
         job_id: JobId,
         node_name: String,
         exit_code: i32,
-        #[serde(default)]
         signal: i32,
     },
     /// An srun job step finished. Records the step's exit code durably so the
@@ -97,7 +93,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn job_node_complete_carries_signal_and_old_logs_default_zero() {
+    fn job_node_complete_signal_round_trips() {
         let op = WalOperation::JobNodeComplete {
             job_id: 1,
             node_name: "n0".into(),
@@ -106,21 +102,7 @@ mod tests {
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
-        // Old log without `signal` deserializes with signal = 0.
-        let old = r#"{"JobNodeComplete":{"job_id":2,"node_name":"n1","exit_code":3}}"#;
-        let parsed: WalOperation = serde_json::from_str(old).unwrap();
-        match parsed {
-            WalOperation::JobNodeComplete {
-                signal, exit_code, ..
-            } => {
-                assert_eq!(signal, 0);
-                assert_eq!(exit_code, 3);
-            }
-            _ => panic!("wrong variant"),
-        }
-        // New form round-trips through serde (WalOperation has no PartialEq, so
-        // assert the fields rather than the whole value).
-        let _ = op;
+        // WalOperation has no PartialEq, so assert the fields rather than the value.
         match back {
             WalOperation::JobNodeComplete {
                 job_id,

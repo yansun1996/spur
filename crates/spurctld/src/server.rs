@@ -1300,8 +1300,8 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
             })
             .unwrap_or_default(),
         exit_code: job.exit_code.unwrap_or(0),
-        exit_signal: job.exit_signal.unwrap_or(0),
-        derived_exit_code: job.derived_exit_code.unwrap_or(0),
+        exit_signal: job.exit_signal,
+        derived_exit_code: job.derived_exit_code,
         stdout_path: job.resolved_stdout(),
         stderr_path: job.resolved_stderr(),
         resources: job.allocated_resources.as_ref().map(allocations_to_proto),

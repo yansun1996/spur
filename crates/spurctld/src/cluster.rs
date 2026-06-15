@@ -349,7 +349,6 @@ impl ClusterManager {
         let resp = self.propose(WalOperation::JobComplete {
             job_id,
             exit_code: -1,
-            signal: 0,
             state: JobState::Deadline,
         })?;
         if let Some(f) = resp.job_finalized {
@@ -378,7 +377,6 @@ impl ClusterManager {
         let resp = self.propose(WalOperation::JobComplete {
             job_id,
             exit_code: -1,
-            signal: 0,
             state: JobState::Cancelled,
         })?;
         if let Some(f) = resp.job_finalized {
@@ -556,7 +554,6 @@ impl ClusterManager {
         let resp = self.propose(WalOperation::JobComplete {
             job_id,
             exit_code,
-            signal: 0,
             state,
         })?;
         if let Some(f) = resp.job_finalized {
@@ -688,7 +685,6 @@ impl ClusterManager {
         self.propose(WalOperation::JobComplete {
             job_id,
             exit_code: -1,
-            signal: 0,
             state: JobState::Failed,
         })?;
 
@@ -1338,7 +1334,6 @@ impl ClusterManager {
             match self.propose(WalOperation::JobComplete {
                 job_id: id,
                 exit_code: -1,
-                signal: 0,
                 state: JobState::Cancelled,
             }) {
                 Ok(resp) => {
@@ -1849,17 +1844,16 @@ impl ClusterManager {
                         // none allocated, where derived_completion falls back to
                         // the worst completion.
                         let primary = job.allocated_nodes.first().cloned().unwrap_or_default();
-                        let (final_state, final_exit, final_signal, _node_derived) =
+                        let (final_state, final_exit, final_signal) =
                             Job::derived_completion(&job.node_completions, &primary);
                         match job.transition(final_state) {
                             Ok(()) => {
                                 job.exit_code = Some(final_exit);
-                                job.exit_signal = Some(final_signal);
+                                job.exit_signal = final_signal;
                                 // DerivedExitCode is the running max over srun
-                                // steps, accumulated live by JobStepComplete.
-                                // Preserve it; a job with no srun steps keeps
-                                // 0:0 (Slurm parity), not the batch exit.
-                                job.derived_exit_code = Some(job.derived_exit_code.unwrap_or(0));
+                                // steps, accumulated live by JobStepComplete; a
+                                // job with no srun steps keeps 0 (Slurm parity),
+                                // not the batch exit. Left as-is here.
                                 job.pending_reason = if final_signal != 0 {
                                     PendingReason::RaisedSignal
                                 } else if final_exit != 0 {
@@ -1902,7 +1896,6 @@ impl ClusterManager {
             WalOperation::JobComplete {
                 job_id,
                 exit_code,
-                signal: _,
                 state,
             } => {
                 let freed_nodes;
@@ -1994,8 +1987,7 @@ impl ClusterManager {
                 // mid-run, matching Slurm.
                 if *step_id < STEP_RESERVED_MIN {
                     if let Some(job) = jobs.get_mut(job_id) {
-                        let cur = job.derived_exit_code.unwrap_or(0);
-                        job.derived_exit_code = Some(cur.max(*exit_code));
+                        job.derived_exit_code = job.derived_exit_code.max(*exit_code);
                     }
                 }
             }
@@ -2533,7 +2525,6 @@ mod tests {
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
             exit_code: 0,
-            signal: 0,
             state: JobState::Completed,
         });
 
@@ -2776,7 +2767,7 @@ mod tests {
         // DerivedExitCode is the max over srun *steps* (Slurm parity), not node
         // completions. This job ran no srun steps, so it is 0 — the non-primary
         // node's exit 42 does not surface here.
-        assert_eq!(job.derived_exit_code, Some(0));
+        assert_eq!(job.derived_exit_code, 0);
         for name in ["n1", "n2", "n3"] {
             assert_eq!(cm.get_node(name).unwrap().alloc_resources.cpus, 0);
         }
@@ -2811,20 +2802,20 @@ mod tests {
             step_id: 0,
             exit_code: 7,
         });
-        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, Some(7));
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
             step_id: 1,
             exit_code: 3,
         });
         // 3 < 7, running max stays 7.
-        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, Some(7));
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
             step_id: 2,
             exit_code: 2,
         });
-        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, Some(7));
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
 
         // Batch script exits 2 -> ExitCode=2:0, DerivedExitCode preserved at 7.
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -2836,7 +2827,7 @@ mod tests {
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(2));
-        assert_eq!(job.derived_exit_code, Some(7));
+        assert_eq!(job.derived_exit_code, 7);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2863,7 +2854,7 @@ mod tests {
             exit_code: 9,
         });
         // Reserved step id -> derived untouched.
-        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, None);
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2940,7 +2931,6 @@ mod tests {
         let resp = cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
             exit_code: 0,
-            signal: 0,
             state: JobState::Completed,
         });
         let f = resp.job_finalized.expect("JobComplete should finalize");
@@ -2975,7 +2965,6 @@ mod tests {
         let first = cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
             exit_code: 0,
-            signal: 0,
             state: JobState::Completed,
         });
         first
@@ -2988,7 +2977,6 @@ mod tests {
         let second = cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
             exit_code: -1,
-            signal: 0,
             state: JobState::Cancelled,
         });
         assert!(second.job_finalized.is_none());
@@ -3066,8 +3054,8 @@ mod tests {
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(0));
-        assert_eq!(job.exit_signal, Some(9));
-        assert_eq!(job.derived_exit_code, Some(0));
+        assert_eq!(job.exit_signal, 9);
+        assert_eq!(job.derived_exit_code, 0);
         assert_eq!(job.pending_reason, PendingReason::RaisedSignal);
     }
 
@@ -3108,7 +3096,7 @@ mod tests {
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(0));
-        assert_eq!(job.exit_signal, Some(9));
+        assert_eq!(job.exit_signal, 9);
         assert_eq!(job.pending_reason, PendingReason::RaisedSignal);
     }
 
@@ -3139,10 +3127,10 @@ mod tests {
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(42));
-        assert_eq!(job.exit_signal, Some(0));
+        assert_eq!(job.exit_signal, 0);
         // No srun steps ran, so DerivedExitCode is 0 (Slurm parity) — the batch
         // exit (42) surfaces as ExitCode, not DerivedExitCode.
-        assert_eq!(job.derived_exit_code, Some(0));
+        assert_eq!(job.derived_exit_code, 0);
         assert_eq!(job.pending_reason, PendingReason::NonZeroExitCode);
     }
 
@@ -3657,7 +3645,6 @@ mod tests {
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: id,
             exit_code: -1,
-            signal: 0,
             state: JobState::Timeout,
         });
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Timeout);
@@ -4054,7 +4041,6 @@ mod tests {
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: id,
             exit_code,
-            signal: 0,
             state,
         });
     }

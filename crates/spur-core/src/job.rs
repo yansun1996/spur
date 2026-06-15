@@ -445,9 +445,7 @@ impl Default for JobSpec {
 /// split into exit code and terminating signal (0 = none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct NodeCompletion {
-    #[serde(default)]
     pub code: i32,
-    #[serde(default)]
     pub signal: i32,
 }
 
@@ -474,11 +472,11 @@ pub struct Job {
 
     /// Terminating signal of the primary node's process (0 = none).
     #[serde(default)]
-    pub exit_signal: Option<i32>,
+    pub exit_signal: i32,
     /// Slurm `DerivedExitCode`: running max over srun step exit codes (via
-    /// `JobStepComplete`); `None`/0 when the job ran no srun steps.
+    /// `JobStepComplete`); 0 when the job ran no srun steps.
     #[serde(default)]
-    pub derived_exit_code: Option<i32>,
+    pub derived_exit_code: i32,
 
     /// Number of times this job has been requeued.
     #[serde(default)]
@@ -527,8 +525,8 @@ impl Job {
             allocated_resources: None,
             per_node_alloc: HashMap::new(),
             exit_code: None,
-            exit_signal: None,
-            derived_exit_code: None,
+            exit_signal: 0,
+            derived_exit_code: 0,
             requeue_count: 0,
             het_job_id: None,
             het_group: None,
@@ -544,20 +542,13 @@ impl Job {
     /// If `primary_node` is absent, falls back to the worst completion (a
     /// signaled node, or the highest exit code) so a failure isn't masked.
     ///
-    /// Returns `(state, exit_code, exit_signal, node_max_exit)`. The 4th value
-    /// is a legacy node-based max — NOT the job's DerivedExitCode, which is the
-    /// running max over srun steps maintained via `JobStepComplete`.
+    /// Returns `(state, exit_code, exit_signal)`. Note this does NOT compute the
+    /// job's DerivedExitCode — that is the running max over srun steps maintained
+    /// via `JobStepComplete`, not a node-based value.
     pub fn derived_completion(
         node_completions: &HashMap<String, NodeCompletion>,
         primary_node: &str,
-    ) -> (JobState, i32, i32, i32) {
-        let derived = node_completions
-            .values()
-            .map(|c| c.code)
-            .filter(|c| *c != 0)
-            .max()
-            .unwrap_or(0);
-
+    ) -> (JobState, i32, i32) {
         let primary = node_completions.get(primary_node).copied().or_else(|| {
             // No primary completion (shouldn't happen once all nodes report).
             // Pick the worst failure so the outcome is never masked: rank a
@@ -577,9 +568,9 @@ impl Job {
                 } else {
                     JobState::Completed
                 };
-                (state, c.code, c.signal, derived)
+                (state, c.code, c.signal)
             }
-            None => (JobState::Completed, 0, 0, derived),
+            None => (JobState::Completed, 0, 0),
         }
     }
 
@@ -762,53 +753,49 @@ mod tests {
     #[test]
     fn job_has_exit_signal_field_default_none() {
         let job = Job::new(1, JobSpec::default());
-        assert_eq!(job.exit_signal, None);
-        assert_eq!(job.derived_exit_code, None);
+        assert_eq!(job.exit_signal, 0);
+        assert_eq!(job.derived_exit_code, 0);
         assert!(job.node_completions.is_empty());
     }
 
     #[test]
-    fn derived_completion_primary_exit_and_max_derived() {
+    fn derived_completion_primary_exit() {
         let mut nc = HashMap::new();
         nc.insert("n0".to_string(), NodeCompletion { code: 2, signal: 0 });
         nc.insert("n1".to_string(), NodeCompletion { code: 7, signal: 0 });
-        let (state, code, signal, derived) = Job::derived_completion(&nc, "n0");
+        let (state, code, signal) = Job::derived_completion(&nc, "n0");
         assert_eq!(state, JobState::Failed);
         assert_eq!(code, 2);
         assert_eq!(signal, 0);
-        assert_eq!(derived, 7);
     }
 
     #[test]
     fn derived_completion_primary_signaled() {
         let mut nc = HashMap::new();
         nc.insert("n0".to_string(), NodeCompletion { code: 0, signal: 9 });
-        let (state, code, signal, derived) = Job::derived_completion(&nc, "n0");
+        let (state, code, signal) = Job::derived_completion(&nc, "n0");
         assert_eq!(state, JobState::Failed);
         assert_eq!(code, 0);
         assert_eq!(signal, 9);
-        assert_eq!(derived, 0);
     }
 
     #[test]
     fn derived_completion_clean_success() {
         let mut nc = HashMap::new();
         nc.insert("n0".to_string(), NodeCompletion { code: 0, signal: 0 });
-        let (state, code, signal, derived) = Job::derived_completion(&nc, "n0");
+        let (state, code, signal) = Job::derived_completion(&nc, "n0");
         assert_eq!(state, JobState::Completed);
         assert_eq!(code, 0);
         assert_eq!(signal, 0);
-        assert_eq!(derived, 0);
     }
 
     #[test]
     fn derived_completion_missing_primary_falls_back() {
         let mut nc = HashMap::new();
         nc.insert("nX".to_string(), NodeCompletion { code: 4, signal: 0 });
-        let (state, code, _signal, derived) = Job::derived_completion(&nc, "n0");
+        let (state, code, _signal) = Job::derived_completion(&nc, "n0");
         assert_eq!(state, JobState::Failed);
         assert_eq!(code, 4);
-        assert_eq!(derived, 4);
     }
 
     #[test]
@@ -824,7 +811,7 @@ mod tests {
                 signal: 11,
             },
         );
-        let (state, code, signal, _derived) = Job::derived_completion(&nc, "missing");
+        let (state, code, signal) = Job::derived_completion(&nc, "missing");
         assert_eq!(state, JobState::Failed);
         assert_eq!(code, 0);
         assert_eq!(signal, 11);
@@ -833,9 +820,9 @@ mod tests {
     #[test]
     fn derived_completion_empty_map_is_clean() {
         let nc = HashMap::new();
-        let (state, code, signal, derived) = Job::derived_completion(&nc, "n0");
+        let (state, code, signal) = Job::derived_completion(&nc, "n0");
         assert_eq!(state, JobState::Completed);
-        assert_eq!((code, signal, derived), (0, 0, 0));
+        assert_eq!((code, signal), (0, 0));
     }
 
     #[test]
@@ -849,11 +836,10 @@ mod tests {
                 signal: 11,
             },
         );
-        let (state, code, signal, derived) = Job::derived_completion(&nc, "n0");
+        let (state, code, signal) = Job::derived_completion(&nc, "n0");
         assert_eq!(state, JobState::Failed);
         assert_eq!(code, 5);
         assert_eq!(signal, 11);
-        assert_eq!(derived, 5);
     }
 
     #[test]
