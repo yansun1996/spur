@@ -566,15 +566,19 @@ pub async fn upsert_qos(
     max_jobs_per_user: Option<i32>,
     max_wall_min: Option<i32>,
     max_tres_per_job: Option<&str>,
+    max_submit_per_user: Option<i32>,
+    max_tres_per_user: Option<&str>,
 ) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         INSERT INTO qos (name, description, priority, preempt_mode, usage_factor,
-                         max_jobs_per_user, max_wall_min, max_tres_per_job)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                         max_jobs_per_user, max_wall_min, max_tres_per_job,
+                         max_submit_per_user, max_tres_per_user)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (name) DO UPDATE SET
             description = $2, priority = $3, preempt_mode = $4, usage_factor = $5,
-            max_jobs_per_user = $6, max_wall_min = $7, max_tres_per_job = $8
+            max_jobs_per_user = $6, max_wall_min = $7, max_tres_per_job = $8,
+            max_submit_per_user = $9, max_tres_per_user = $10
         "#,
     )
     .bind(name)
@@ -585,6 +589,8 @@ pub async fn upsert_qos(
     .bind(max_jobs_per_user)
     .bind(max_wall_min)
     .bind(max_tres_per_job)
+    .bind(max_submit_per_user)
+    .bind(max_tres_per_user)
     .execute(pool)
     .await?;
     Ok(())
@@ -602,7 +608,7 @@ pub async fn delete_qos(pool: &PgPool, name: &str) -> anyhow::Result<()> {
 /// List all QOS.
 pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
     let rows = sqlx::query(
-        "SELECT name, description, priority, preempt_mode, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job FROM qos ORDER BY name"
+        "SELECT name, description, priority, preempt_mode, usage_factor, max_jobs_per_user, max_wall_min, max_tres_per_job, max_submit_per_user, max_tres_per_user FROM qos ORDER BY name"
     ).fetch_all(pool).await?;
 
     Ok(rows
@@ -612,10 +618,13 @@ pub async fn list_qos(pool: &PgPool) -> anyhow::Result<Vec<QosRecord>> {
             description: r.get("description"),
             priority: r.get("priority"),
             preempt_mode: r.get("preempt_mode"),
-            usage_factor: r.get("usage_factor"),
+            // Column is REAL (f32) in the schema; widen to the struct's f64.
+            usage_factor: r.get::<f32, _>("usage_factor") as f64,
             max_jobs_per_user: r.get("max_jobs_per_user"),
             max_wall_min: r.get("max_wall_min"),
             max_tres_per_job: r.get("max_tres_per_job"),
+            max_submit_per_user: r.get("max_submit_per_user"),
+            max_tres_per_user: r.get("max_tres_per_user"),
         })
         .collect())
 }
@@ -630,6 +639,8 @@ pub struct QosRecord {
     pub max_jobs_per_user: Option<i32>,
     pub max_wall_min: Option<i32>,
     pub max_tres_per_job: Option<String>,
+    pub max_submit_per_user: Option<i32>,
+    pub max_tres_per_user: Option<String>,
 }
 
 #[cfg(test)]
@@ -738,6 +749,54 @@ mod job_history_tests {
         assert_eq!(limited[0].job_id, id2);
 
         delete_jobs(&pool, &ids).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL and PostgreSQL"]
+    async fn list_qos_round_trips_all_limits() -> anyhow::Result<()> {
+        // Regression: usage_factor is REAL (f32) in the schema; decoding it as
+        // f64 panicked the worker and broke ListQos (and the controller's QoS
+        // cache) until widened. Exercise the full upsert -> list path.
+        let pool = test_pool().await?;
+        let name = format!("spur_qos_{}", std::process::id());
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await?;
+
+        upsert_qos(
+            &pool,
+            &name,
+            "d",
+            5,
+            "cluster",
+            1.5,
+            Some(3),
+            Some(60),
+            Some("cpu=2"),
+            Some(4),
+            Some("cpu=16"),
+        )
+        .await?;
+
+        let got = list_qos(&pool)
+            .await?
+            .into_iter()
+            .find(|q| q.name == name)
+            .expect("qos present");
+        assert_eq!(got.usage_factor, 1.5);
+        assert_eq!(got.priority, 5);
+        assert_eq!(got.max_jobs_per_user, Some(3));
+        assert_eq!(got.max_wall_min, Some(60));
+        assert_eq!(got.max_tres_per_job.as_deref(), Some("cpu=2"));
+        assert_eq!(got.max_submit_per_user, Some(4));
+        assert_eq!(got.max_tres_per_user.as_deref(), Some("cpu=16"));
+
+        sqlx::query("DELETE FROM qos WHERE name = $1")
+            .bind(&name)
+            .execute(&pool)
+            .await?;
         Ok(())
     }
 }

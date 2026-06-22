@@ -386,6 +386,16 @@ impl SlurmAccounting for AccountingService {
         } else {
             Some(req.max_tres_per_job.as_str())
         };
+        let max_submit = if req.max_submit_jobs_per_user == 0 {
+            None
+        } else {
+            Some(req.max_submit_jobs_per_user as i32)
+        };
+        let max_tres_user = if req.max_tres_per_user.is_empty() {
+            None
+        } else {
+            Some(req.max_tres_per_user.as_str())
+        };
         db::upsert_qos(
             &self.pool,
             &req.name,
@@ -396,6 +406,8 @@ impl SlurmAccounting for AccountingService {
             max_jobs,
             max_wall,
             max_tres,
+            max_submit,
+            max_tres_user,
         )
         .await
         .map_err(|e| Status::internal(e.to_string()))?;
@@ -429,6 +441,8 @@ impl SlurmAccounting for AccountingService {
                 max_jobs_per_user: r.max_jobs_per_user.unwrap_or(0) as u32,
                 max_wall_minutes: r.max_wall_min.unwrap_or(0) as u32,
                 max_tres_per_job: r.max_tres_per_job.unwrap_or_default(),
+                max_submit_jobs_per_user: r.max_submit_per_user.unwrap_or(0) as u32,
+                max_tres_per_user: r.max_tres_per_user.unwrap_or_default(),
             })
             .collect();
 

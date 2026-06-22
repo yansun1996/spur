@@ -1,11 +1,14 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E tests for sacct accounting: exit:signal and DerivedExitCode.
+"""E2E tests for accounting: sacct exit reporting and QoS pending reasons.
 
 Requires spurdbd + Postgres on node 0 (the accounting_cluster fixture, which
 skips when Docker or the accounting binaries are unavailable).
 """
+
+import re
+import time
 
 from cluster import parse_job_id, wait_job, wait_sacct_row
 
@@ -40,3 +43,38 @@ class TestSacctExitReporting:
         fields = row.split()
         assert fields[1] == "3:0", f"expected ExitCode 3:0, got {fields!r}"
         assert fields[2] == "7:0", f"expected DerivedExitCode 7:0, got {fields!r}"
+
+
+def _reason(cluster, job_id: int) -> str:
+    out = cluster.scontrol("show", "job", str(job_id))
+    m = re.search(r"Reason=(\S+)", out)
+    return m.group(1) if m else ""
+
+
+class TestQosLimitReasons:
+    def test_wall_cap_sets_qos_pending_reason(self, accounting_cluster):
+        c = accounting_cluster
+
+        # Define a QoS that caps wall time at 1 minute.
+        c.sacctmgr(["add", "qos", "name=short", "maxwall=1"])
+        # The controller refreshes its QoS cache every ~2s; wait for it.
+        time.sleep(6)
+
+        # A job in that QoS asking for 1h exceeds the cap, so it stays PENDING
+        # with the specific QoS reason (not generic Resources/PartitionTimeLimit).
+        script = c.write_file("qos-job.sh", "#!/bin/bash\nsleep 30\n")
+        job_id = parse_job_id(
+            c.sbatch(["-J", "qos-wall", "-N", "1", "-q", "short", "-t", "60", script])
+        )
+        assert job_id is not None
+
+        deadline = time.time() + 30
+        reason = ""
+        while time.time() < deadline:
+            reason = _reason(c, job_id)
+            if reason == "QOSMaxWallDurationPerJobLimit":
+                break
+            time.sleep(2)
+        assert reason == "QOSMaxWallDurationPerJobLimit", (
+            f"expected QOSMaxWallDurationPerJobLimit, got {reason!r}"
+        )

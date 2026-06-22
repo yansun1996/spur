@@ -712,8 +712,8 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             ],
         }
         if self.accounting_enabled:
-            # Controller dials spurdbd on node 0. The QoS/limit cache floors
-            # the refresh interval at ~10s, which the tests poll around.
+            # Controller dials spurdbd on node 0; refresh fast so QoS/limit
+            # changes show up within a test's patience window.
             cfg["accounting"] = {
                 "host": f"{self.nodes[0].host}:{ACCOUNTING_PORT}",
                 "database_url": self._db_url,

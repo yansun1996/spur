@@ -4,6 +4,7 @@
 mod accounting;
 mod cluster;
 mod fairshare_cache;
+mod limits_cache;
 mod metrics_proto;
 mod metrics_server;
 mod raft;
@@ -158,6 +159,12 @@ async fn main() -> anyhow::Result<()> {
     cluster.fairshare_cache().spawn_refresh_loop(
         config.accounting.host.clone(),
         config.scheduler.fairshare_halflife_days,
+        config.accounting.fairshare_refresh_secs as u64,
+    );
+
+    // QoS limits refresh loop (shares the accounting host + cadence).
+    cluster.qos_cache().spawn_refresh_loop(
+        config.accounting.host.clone(),
         config.accounting.fairshare_refresh_secs as u64,
     );
 

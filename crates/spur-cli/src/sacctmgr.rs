@@ -233,6 +233,11 @@ async fn add(entity: &str, params: &[String], addr: &str) -> Result<()> {
                     max_jobs_per_user: max_jobs,
                     max_wall_minutes: max_wall,
                     max_tres_per_job: max_tres,
+                    max_submit_jobs_per_user: p
+                        .get("maxsubmitjobsperuser")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
+                    max_tres_per_user: p.get("maxtresperuser").cloned().unwrap_or_default(),
                 })
                 .await
                 .context("CreateQos RPC failed")?;
@@ -381,6 +386,11 @@ async fn modify(entity: &str, params: &[String], addr: &str) -> Result<()> {
                         .and_then(|v| parse_wall_time(v))
                         .unwrap_or(0),
                     max_tres_per_job: p.get("maxtresperjob").cloned().unwrap_or_default(),
+                    max_submit_jobs_per_user: p
+                        .get("maxsubmitjobsperuser")
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0),
+                    max_tres_per_user: p.get("maxtresperuser").cloned().unwrap_or_default(),
                 })
                 .await
                 .context("CreateQos (modify) RPC failed")?;
