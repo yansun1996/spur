@@ -374,12 +374,18 @@ impl SlurmAccounting for AccountingService {
         let max_jobs = if req.max_jobs_per_user == 0 {
             None
         } else {
-            Some(req.max_jobs_per_user as i32)
+            Some(
+                i32::try_from(req.max_jobs_per_user)
+                    .map_err(|_| Status::invalid_argument("max_jobs_per_user exceeds i32::MAX"))?,
+            )
         };
         let max_wall = if req.max_wall_minutes == 0 {
             None
         } else {
-            Some(req.max_wall_minutes as i32)
+            Some(
+                i32::try_from(req.max_wall_minutes)
+                    .map_err(|_| Status::invalid_argument("max_wall_minutes exceeds i32::MAX"))?,
+            )
         };
         let max_tres = if req.max_tres_per_job.is_empty() {
             None
@@ -389,7 +395,11 @@ impl SlurmAccounting for AccountingService {
         let max_submit = if req.max_submit_jobs_per_user == 0 {
             None
         } else {
-            Some(req.max_submit_jobs_per_user as i32)
+            Some(
+                i32::try_from(req.max_submit_jobs_per_user).map_err(|_| {
+                    Status::invalid_argument("max_submit_jobs_per_user exceeds i32::MAX")
+                })?,
+            )
         };
         let max_tres_user = if req.max_tres_per_user.is_empty() {
             None
