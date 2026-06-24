@@ -395,11 +395,9 @@ impl SlurmAccounting for AccountingService {
         let max_submit = if req.max_submit_jobs_per_user == 0 {
             None
         } else {
-            Some(
-                i32::try_from(req.max_submit_jobs_per_user).map_err(|_| {
-                    Status::invalid_argument("max_submit_jobs_per_user exceeds i32::MAX")
-                })?,
-            )
+            Some(i32::try_from(req.max_submit_jobs_per_user).map_err(|_| {
+                Status::invalid_argument("max_submit_jobs_per_user exceeds i32::MAX")
+            })?)
         };
         let max_tres_user = if req.max_tres_per_user.is_empty() {
             None
