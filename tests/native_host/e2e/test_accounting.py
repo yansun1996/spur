@@ -57,9 +57,8 @@ class TestQosLimitReasons:
 
         # Define a QoS that caps wall time at 1 minute.
         c.sacctmgr(["add", "qos", "name=short", "maxwall=1"])
-        # The controller refreshes its QoS cache every ~10s (floor); the poll
-        # loop below waits it out.
-        time.sleep(6)
+        # Wait past the QoS cache refresh floor (10s) before submitting, else the job starts before the cap loads.
+        time.sleep(15)
 
         # A job in that QoS asking for 1h exceeds the cap, so it stays PENDING
         # with the specific QoS reason (not generic Resources/PartitionTimeLimit).
