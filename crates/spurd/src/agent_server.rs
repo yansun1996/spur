@@ -43,6 +43,8 @@ struct TrackedJob {
     cpus: u32,
     memory_mb: u64,
     nodelist: String,
+    /// Temp directory holding the staged job script; removed after job exits.
+    script_dir: std::path::PathBuf,
 }
 
 struct CompletedJob {
@@ -60,6 +62,7 @@ struct CompletedJob {
     cpus: u32,
     memory_mb: u64,
     nodelist: String,
+    script_dir: std::path::PathBuf,
 }
 
 pub struct AgentService {
@@ -184,6 +187,7 @@ impl AgentService {
                                 cpus: tracked.cpus,
                                 memory_mb: tracked.memory_mb,
                                 nodelist: tracked.nodelist.clone(),
+                                script_dir: tracked.script_dir.clone(),
                             });
                         }
                         Ok(None) => {}
@@ -196,6 +200,7 @@ impl AgentService {
                 for c in &completed {
                     jobs.remove(&c.job_id);
                     crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
+                    executor::cleanup_script_dir(&c.script_dir);
                     if let Some(ref cgroup) = c.cgroup {
                         crate::executor::cleanup_cgroup(cgroup);
                     }
@@ -662,8 +667,14 @@ impl SlurmAgent for AgentService {
         // wrapper shell). GPU devices are partitioned across tasks via
         // ROCR_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES overrides in each fork.
         let launch_script = if tasks_per_node > 1 {
-            // Write the user script to disk first so the wrapper can reference it
-            let user_script_path = format!("{}/.spur_user_{}.sh", work_dir, job_id);
+            // Dir may already exist (container path above); create_dir_all is safe — root-owned.
+            let staging_dir = std::env::temp_dir().join(format!(".spur_job_{}", job_id));
+            std::fs::create_dir_all(&staging_dir)
+                .map_err(|e| Status::internal(format!("failed to create staging dir: {}", e)))?;
+            let user_script_path = staging_dir
+                .join(format!(".spur_user_{}.sh", job_id))
+                .to_string_lossy()
+                .into_owned();
             std::fs::write(&user_script_path, &launch_script)
                 .map_err(|e| Status::internal(format!("failed to write user script: {}", e)))?;
             #[cfg(unix)]
@@ -801,6 +812,7 @@ impl SlurmAgent for AgentService {
                         cpus: launch_cfg.cpus,
                         memory_mb: launch_cfg.memory_mb,
                         nodelist: launch_cfg.nodelist,
+                        script_dir: result.script_dir,
                     },
                 );
                 Ok(Response::new(LaunchJobResponse {
@@ -1520,6 +1532,7 @@ impl TrackedJob {
             cpus: 1,
             memory_mb: 0,
             nodelist: String::new(),
+            script_dir: std::path::PathBuf::new(),
         }
     }
 }
@@ -1878,6 +1891,7 @@ mod tests {
             cpus: 1,
             memory_mb: 0,
             nodelist: String::new(),
+            script_dir: std::path::PathBuf::new(),
         };
         svc.insert_test_job(job_id, tracked).await;
 

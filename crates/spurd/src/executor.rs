@@ -78,6 +78,8 @@ pub struct LaunchResult {
     pub job: RunningJob,
     pub stdout_path: String,
     pub stderr_path: String,
+    /// Root-owned temp dir holding staged job scripts; caller removes via [`cleanup_script_dir`].
+    pub script_dir: PathBuf,
 }
 
 /// A running job process — either a tokio-managed child or a raw-forked container.
@@ -289,19 +291,9 @@ async fn spawn_job_process(
     };
     let script = script.as_str();
 
-    // Write script to temp file
-    let script_path = PathBuf::from(work_dir).join(format!(".spur_job_{}.sh", job_id));
-    tokio::fs::write(&script_path, script)
-        .await
-        .context("failed to write job script")?;
-
-    // Make executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&script_path, perms)?;
-    }
+    // Stage to /tmp: work_dir may be /root (700) or NFS root_squash, both unreadable
+    // by the non-root executing user. /tmp sticky bit prevents TOCTOU substitution.
+    let (script_dir, script_path) = stage_script(job_id, script)?;
 
     // Resolve stdout/stderr paths
     let stdout_resolved = resolve_output_path(stdout_path, job_id, work_dir);
@@ -377,6 +369,7 @@ async fn spawn_job_process(
             job,
             stdout_path: stdout_resolved,
             stderr_path: stderr_resolved,
+            script_dir,
         });
     }
 
@@ -385,7 +378,7 @@ async fn spawn_job_process(
     // Issue #99: If root, wrap job with namespace isolation.
     let use_namespaces = nix::unistd::geteuid().is_root();
     let (launch_cmd, launch_args) = if use_namespaces {
-        let wrapper_path = PathBuf::from(work_dir).join(format!(".spur_ns_{}.sh", job_id));
+        let wrapper_path = script_dir.join(format!(".spur_ns_{}.sh", job_id));
         let visible_devices = cfg
             .host_device_plan
             .as_ref()
@@ -535,6 +528,7 @@ async fn spawn_job_process(
         job: RunningJob::Managed { child, cgroup_path },
         stdout_path: stdout_resolved,
         stderr_path: stderr_resolved,
+        script_dir,
     })
 }
 
@@ -1014,9 +1008,57 @@ fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
     wrapper
 }
 
+/// Stage a job script into a root-owned temp dir under `/tmp`.
+/// Returns `(dir_path, script_path)`; caller removes via [`cleanup_script_dir`].
+pub fn stage_script(job_id: JobId, script: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!(".spur_job_{}", job_id));
+    // O_EXCL: fail if an attacker pre-created the path. AlreadyExists is allowed
+    // only when agent_server legitimately pre-created it (container/multi-task).
+    std::fs::create_dir(&dir)
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })
+        .context("failed to create script staging dir")?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))?;
+    let script_path = dir.join("script.sh");
+    std::fs::write(&script_path, script).context("failed to write job script")?;
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+    Ok((dir, script_path))
+}
+
+/// Remove the temp directory created by [`stage_script`]. Best-effort: logs a
+/// warning on failure so cleanup never obscures job exit status.
+pub fn cleanup_script_dir(dir: &Path) {
+    if let Err(e) = std::fs::remove_dir_all(dir) {
+        warn!(path = %dir.display(), error = %e, "failed to clean up script staging dir");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage_script_not_under_restricted_work_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let job_id: JobId = 99991;
+        let (dir, script_path) = stage_script(job_id, "#!/bin/bash\necho hi\n")
+            .expect("stage_script should succeed");
+        let tmp = std::env::temp_dir();
+        assert!(script_path.starts_with(&tmp), "script should be under /tmp, got {}", script_path.display());
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o755);
+        let file_mode = std::fs::metadata(&script_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o755);
+        cleanup_script_dir(&dir);
+        assert!(!dir.exists());
+    }
+
 
     #[test]
     fn decode_wait_status_splits_exit_and_signal() {
