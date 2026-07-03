@@ -1579,6 +1579,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         switch_name: node.switch_name.clone().unwrap_or_default(),
         active_reservation: String::new(),
         labels: node.labels.clone(),
+        features: node.features.clone(),
     }
 }
 
@@ -1749,6 +1750,16 @@ mod tests {
             name: name.into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn node_to_proto_carries_features() {
+        let mut node =
+            spur_core::node::Node::new("gpu-1".into(), spur_core::resource::ResourceSet::default());
+        node.features = vec!["mi350x".into(), "atl".into()];
+
+        let proto = node_to_proto(&node);
+        assert_eq!(proto.features, vec!["mi350x", "atl"]);
     }
 
     fn make_reservation(

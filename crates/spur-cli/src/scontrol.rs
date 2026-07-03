@@ -371,6 +371,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     label_str.sort();
                     println!("   Labels={}", label_str.join(","));
                 }
+                if !node.features.is_empty() {
+                    println!("   AvailableFeatures={}", node.features.join(","));
+                }
                 println!("   CpuLoad={}", node.cpu_load as f64 / 100.0);
                 println!();
             }

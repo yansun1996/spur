@@ -215,6 +215,13 @@ fn resolve_node_field(
         }
         'O' => node.cpu_load.to_string(),
         'e' => node.free_memory_mb.to_string(),
+        'f' => {
+            if node.features.is_empty() {
+                "(null)".into()
+            } else {
+                node.features.join(",")
+            }
+        }
         'l' => "UNLIMITED".into(), // Would need partition context
         _ => "?".into(),
     }
