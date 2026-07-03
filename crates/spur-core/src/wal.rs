@@ -104,6 +104,13 @@ pub enum WalOperation {
         set: HashMap<String, String>,
         remove: Vec<String>,
     },
+    /// Operator-set feature override applied at runtime (scontrol update
+    /// AvailableFeatures=). Persisted so it survives restart and takes
+    /// precedence over NodeConfig-derived features.
+    NodeFeaturesUpdate {
+        name: String,
+        features: Vec<String>,
+    },
 
     // Admission token operations
     TokenCreate {

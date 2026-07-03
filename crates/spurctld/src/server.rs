@@ -491,6 +491,11 @@ impl SlurmController for ControllerService {
                 .update_node_labels(&req.name, req.labels, &req.remove_labels)
                 .map_err(|e| Status::internal(e.to_string()))?;
         }
+        if req.set_features {
+            self.cluster
+                .update_node_features(&req.name, req.features)
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
         Ok(Response::new(()))
     }
 
@@ -1579,6 +1584,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         switch_name: node.switch_name.clone().unwrap_or_default(),
         active_reservation: String::new(),
         labels: node.labels.clone(),
+        features: node.features.clone(),
     }
 }
 

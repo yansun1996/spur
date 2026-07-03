@@ -237,6 +237,12 @@ pub struct Node {
     #[serde(default)]
     pub features: Vec<String>,
 
+    /// Operator-set feature override (via `scontrol update ... AvailableFeatures=`).
+    /// When `Some`, it is authoritative and takes precedence over NodeConfig-derived
+    /// features, so a runtime change survives re-registration and label updates.
+    #[serde(default)]
+    pub feature_override: Option<Vec<String>>,
+
     /// Key-value labels for partition routing and policy application.
     #[serde(default)]
     pub labels: HashMap<String, String>,
@@ -283,6 +289,7 @@ impl Node {
             total_resources: resources,
             alloc_resources: ResourceAllocations::default(),
             features: Vec::new(),
+            feature_override: None,
             labels: HashMap::new(),
             arch: String::new(),
             os: String::new(),

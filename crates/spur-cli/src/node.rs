@@ -89,6 +89,8 @@ async fn cmd_label(controller: &str, node: String, label_args: Vec<String>) -> R
             reason: None,
             labels: set_labels.clone(),
             remove_labels: remove_labels.clone(),
+            features: Vec::new(),
+            set_features: false,
         })
         .await?;
 

@@ -371,6 +371,9 @@ async fn show(controller: &str, entity: &str, name: Option<&str>) -> Result<()> 
                     label_str.sort();
                     println!("   Labels={}", label_str.join(","));
                 }
+                if !node.features.is_empty() {
+                    println!("   AvailableFeatures={}", node.features.join(","));
+                }
                 println!("   CpuLoad={}", node.cpu_load as f64 / 100.0);
                 println!();
             }
@@ -567,6 +570,8 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
     let mut node_name: Option<String> = None;
     let mut node_state: Option<String> = None;
     let mut node_reason: Option<String> = None;
+    // Some(list) when the caller passed AvailableFeatures=/Features= (empty list = clear).
+    let mut node_features: Option<Vec<String>> = None;
 
     for param in params {
         if let Some((key, value)) = param.split_once('=') {
@@ -581,6 +586,16 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
                 "nodename" | "node" => node_name = Some(value.into()),
                 "state" => node_state = Some(value.into()),
                 "reason" => node_reason = Some(value.into()),
+                "availablefeatures" | "features" | "activefeatures" => {
+                    node_features = Some(
+                        value
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                            .collect(),
+                    );
+                }
                 other => eprintln!("scontrol: unknown update key '{}'", other),
             }
         }
@@ -588,7 +603,14 @@ async fn parse_and_update(controller: &str, params: &[String]) -> Result<()> {
 
     // Node update takes priority if NodeName is specified
     if let Some(name) = node_name {
-        return update_node(controller, &name, node_state.as_deref(), node_reason).await;
+        return update_node(
+            controller,
+            &name,
+            node_state.as_deref(),
+            node_reason,
+            node_features,
+        )
+        .await;
     }
 
     let jid =
@@ -623,6 +645,7 @@ async fn update_node(
     name: &str,
     state: Option<&str>,
     reason: Option<String>,
+    features: Option<Vec<String>>,
 ) -> Result<()> {
     let mut client = SlurmControllerClient::connect(controller.to_string())
         .await
@@ -641,6 +664,7 @@ async fn update_node(
         }
     });
 
+    let set_features = features.is_some();
     client
         .update_node(spur_proto::proto::UpdateNodeRequest {
             name: name.to_string(),
@@ -648,6 +672,8 @@ async fn update_node(
             reason,
             labels: HashMap::new(),
             remove_labels: Vec::new(),
+            features: features.unwrap_or_default(),
+            set_features,
         })
         .await
         .context("node update failed")?;

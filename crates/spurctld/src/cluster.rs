@@ -1057,6 +1057,24 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Set an operator feature override on a node at runtime. Persisted via Raft
+    /// and authoritative over NodeConfig-derived features (survives restart and
+    /// agent re-registration). An empty list clears the node's features.
+    pub fn update_node_features(&self, name: &str, features: Vec<String>) -> anyhow::Result<()> {
+        {
+            let nodes = self.nodes.read();
+            if !nodes.contains_key(name) {
+                anyhow::bail!("node {} not found", name);
+            }
+        }
+        self.propose(WalOperation::NodeFeaturesUpdate {
+            name: name.to_string(),
+            features,
+        })?;
+        info!(node = %name, "node features updated");
+        Ok(())
+    }
+
     /// Reconcile node liveness state with heartbeat data.
     /// Marks stale nodes Down and recovers nodes whose heartbeat has resumed.
     pub fn check_node_health(&self, timeout_secs: u64) {
@@ -2176,7 +2194,11 @@ impl ClusterManager {
                 version,
                 labels,
             } => {
+                // Preserve any operator-set feature override across re-registration
+                // (NodeRegister builds a fresh Node, which would otherwise drop it).
+                let prior_override = nodes.get(name).and_then(|n| n.feature_override.clone());
                 let mut node = Node::new(name.clone(), resources.clone());
+                node.feature_override = prior_override;
                 node.address = Some(address.clone());
                 node.port = *port;
                 node.labels = labels.clone();
@@ -2209,13 +2231,19 @@ impl ClusterManager {
                 }
                 drop(partitions);
 
-                // Apply features/weight from matching NodeConfig (by hostname OR selector)
+                // Apply features/weight from matching NodeConfig (by hostname OR selector).
+                // An operator feature_override wins, so it survives re-registration.
                 for nc in &self.config.nodes {
                     if node_config_matches(nc, name, labels) {
-                        node.features = nc.features.clone();
+                        if node.feature_override.is_none() {
+                            node.features = nc.features.clone();
+                        }
                         node.weight = nc.weight;
                         break;
                     }
+                }
+                if let Some(ref ov) = node.feature_override {
+                    node.features = ov.clone();
                 }
 
                 let mut nodes = self.nodes.write();
@@ -2282,14 +2310,25 @@ impl ClusterManager {
                     }
                     node.partitions = matched;
 
-                    // Re-apply NodeConfig features/weight
+                    // Re-apply NodeConfig features/weight; an operator override wins.
                     for nc in &self.config.nodes {
                         if node_config_matches(nc, &node.name, &node.labels) {
-                            node.features = nc.features.clone();
+                            if node.feature_override.is_none() {
+                                node.features = nc.features.clone();
+                            }
                             node.weight = nc.weight;
                             break;
                         }
                     }
+                    if let Some(ref ov) = node.feature_override {
+                        node.features = ov.clone();
+                    }
+                }
+            }
+            WalOperation::NodeFeaturesUpdate { name, features } => {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.feature_override = Some(features.clone());
+                    node.features = features.clone();
                 }
             }
             WalOperation::TokenCreate { token } => {
@@ -2343,10 +2382,15 @@ impl ClusterManager {
 
             for nc in &self.config.nodes {
                 if node_config_matches(nc, &node.name, &node.labels) {
-                    node.features = nc.features.clone();
+                    if node.feature_override.is_none() {
+                        node.features = nc.features.clone();
+                    }
                     node.weight = nc.weight;
                     break;
                 }
+            }
+            if let Some(ref ov) = node.feature_override {
+                node.features = ov.clone();
             }
         }
     }
@@ -5668,6 +5712,74 @@ mod tests {
         let node = cm.get_node("gpu-node").unwrap();
         assert_eq!(node.features, vec!["mi300x", "rocm6"]);
         assert_eq!(node.weight, 10);
+    }
+
+    #[test]
+    fn feature_override_wins_and_survives_reregistration() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.nodes = vec![spur_core::config::NodeConfig {
+            names: String::new(),
+            selector: HashMap::from([("gpu".into(), "mi300x".into())]),
+            cpus: 0,
+            memory_mb: 0,
+            gres: Vec::new(),
+            features: vec!["mi300x".into(), "rocm6".into()],
+            address: None,
+            weight: 10,
+        }];
+        let cm = ClusterManager::new(cfg, dir.path()).unwrap();
+
+        let register = |cm: &ClusterManager| {
+            cm.apply_operation(&WalOperation::NodeRegister {
+                name: "gpu-node".into(),
+                resources: ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                address: "127.0.0.1".into(),
+                port: 6818,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                labels: HashMap::from([("gpu".into(), "mi300x".into())]),
+            });
+        };
+
+        register(&cm);
+        // Config-derived features apply initially.
+        assert_eq!(
+            cm.get_node("gpu-node").unwrap().features,
+            vec!["mi300x", "rocm6"]
+        );
+
+        // Operator override replaces them.
+        cm.apply_operation(&WalOperation::NodeFeaturesUpdate {
+            name: "gpu-node".into(),
+            features: vec!["maintenance".into(), "rackZ".into()],
+        });
+        assert_eq!(
+            cm.get_node("gpu-node").unwrap().features,
+            vec!["maintenance", "rackZ"]
+        );
+
+        // Override wins over a subsequent config-matching label update.
+        cm.apply_operation(&WalOperation::NodeLabelsUpdate {
+            name: "gpu-node".into(),
+            set: HashMap::from([("gpu".into(), "mi300x".into())]),
+            remove: Vec::new(),
+        });
+        assert_eq!(
+            cm.get_node("gpu-node").unwrap().features,
+            vec!["maintenance", "rackZ"]
+        );
+
+        // Override survives agent re-registration.
+        register(&cm);
+        assert_eq!(
+            cm.get_node("gpu-node").unwrap().features,
+            vec!["maintenance", "rackZ"]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
