@@ -387,15 +387,6 @@ impl ClusterManager {
             return Ok(());
         }
 
-        if !self.association_cache.is_loaded() {
-            warn!(
-                user = %spec.user,
-                partition = %partition_name,
-                "association cache unavailable; skipping partition account access checks"
-            );
-            return Ok(());
-        }
-
         let account = match spec.account.as_deref().filter(|a| !a.is_empty()) {
             Some(a) => a,
             None => {
@@ -7106,7 +7097,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn submit_skips_allow_accounts_when_association_cache_unavailable() {
+    async fn submit_enforces_allow_accounts_without_association_cache() {
+        // Partition ACL is pure string matching — it must fire even when the
+        // accounting association cache is empty (no Postgres backend running).
         let dir = TempDir::new().unwrap();
         let mut cfg = test_config();
         cfg.partitions[0].allow_accounts = vec!["research".into()];
@@ -7114,7 +7107,7 @@ mod tests {
 
         let mut spec = basic_spec("nocache");
         spec.account = Some("student".into());
-        assert!(cm.submit_job(spec).is_ok());
+        assert!(cm.submit_job(spec).is_err(), "unlisted account must be rejected");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
