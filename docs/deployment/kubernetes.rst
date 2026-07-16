@@ -77,8 +77,10 @@ The ConfigMap (``examples/k8s/configmap.yaml``) embeds ``spur.conf``:
 Raft peers use StatefulSet DNS names. The node ID is auto-detected from the pod hostname ordinal.
 
 Adjust partition definitions and node resources to match your cluster hardware.
-Once the controller is running, ``scontrol reconfigure`` applies ``[[partitions]]``
-changes without a restart; other config sections require restarting the controller.
+Once the controller is running, ``scontrol reconfigure`` applies most section
+changes (partitions, nodes, licenses, hooks, scheduler tunables) without a
+restart; listen ports, the accounting database, and Raft peers still require
+restarting the controller. See :doc:`partitioning` for the full breakdown.
 
 Submitting Jobs
 ---------------
