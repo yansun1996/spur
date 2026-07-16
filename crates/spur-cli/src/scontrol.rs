@@ -222,6 +222,7 @@ pub enum ScontrolCommand {
         name: String,
     },
     /// Re-read spur.conf and reconcile the live partition table to match it
+    /// (partitions only; other config sections require a controller restart)
     Reconfigure,
     /// Create a reservation
     #[command(name = "create-reservation")]
@@ -1478,7 +1479,9 @@ async fn reconfigure(controller: &str) -> Result<()> {
 
     client.reconfigure(()).await.context("reconfigure failed")?;
 
-    println!("Reconfiguration complete");
+    println!(
+        "Reconfiguration complete (partitions only; other config sections require a controller restart)"
+    );
     Ok(())
 }
 
