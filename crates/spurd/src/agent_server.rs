@@ -315,16 +315,28 @@ impl AgentService {
                     } else {
                         None
                     };
-                    report_completion(
-                        &controller_addr,
-                        c.job_id,
-                        c.exit_code,
-                        c.signal,
-                        c.run_attempt,
-                        &local_hostname,
-                        drain.as_ref(),
-                    )
-                    .await;
+                    // Spawn: report_completion retries a lost completion
+                    // indefinitely, which must not block the monitor loop from
+                    // detecting further job exits. Each completion gets its own
+                    // retry task, mirroring the controller's per-node model.
+                    let controller_addr = controller_addr.clone();
+                    let local_hostname = local_hostname.clone();
+                    let job_id = c.job_id;
+                    let exit_code = c.exit_code;
+                    let signal = c.signal;
+                    let run_attempt = c.run_attempt;
+                    tokio::spawn(async move {
+                        report_completion(
+                            &controller_addr,
+                            job_id,
+                            exit_code,
+                            signal,
+                            run_attempt,
+                            &local_hostname,
+                            drain.as_ref(),
+                        )
+                        .await;
+                    });
                 }
             }
         });
@@ -361,9 +373,23 @@ fn completion_report_retryable(status: &tonic::Status) -> bool {
     )
 }
 
+/// Backoff before the next completion-report attempt: exponential from 1s,
+/// capped at 30s. A lost completion is retried indefinitely (the controller may
+/// be mid-failover or restarting for far longer than a few seconds), so the cap
+/// keeps a persistently-unreachable controller from busy-looping while still
+/// re-delivering promptly once it returns.
+fn next_completion_retry_delay(attempt: u32) -> std::time::Duration {
+    const MAX_BACKOFF_SECS: u64 = 30;
+    let secs = 1u64
+        .checked_shl(attempt.saturating_sub(1))
+        .unwrap_or(MAX_BACKOFF_SECS)
+        .min(MAX_BACKOFF_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 #[cfg(test)]
 mod completion_report_tests {
-    use super::completion_report_retryable;
+    use super::{completion_report_retryable, next_completion_retry_delay};
     use tonic::Status;
 
     #[test]
@@ -376,6 +402,20 @@ mod completion_report_tests {
     fn transient_errors_are_retryable() {
         assert!(completion_report_retryable(&Status::unavailable("x")));
         assert!(completion_report_retryable(&Status::internal("x")));
+    }
+
+    #[test]
+    fn retry_delay_grows_then_caps() {
+        assert_eq!(next_completion_retry_delay(1).as_secs(), 1);
+        assert_eq!(next_completion_retry_delay(2).as_secs(), 2);
+        assert_eq!(next_completion_retry_delay(3).as_secs(), 4);
+        assert_eq!(
+            next_completion_retry_delay(6).as_secs(),
+            30,
+            "capped at 30s"
+        );
+        // Never panics or wraps on a large attempt count (indefinite retry).
+        assert_eq!(next_completion_retry_delay(1000).as_secs(), 30);
     }
 }
 
@@ -485,9 +525,17 @@ async fn report_completion(
     // RaisedSignal outcome from the reported `signal`.
     let state = spur_core::job::JobState::completion_state_for_exit_code(exit_code).to_proto_i32();
 
-    // Retry up to 3 times with 1-second backoff — a single transient failure
-    // must not permanently lose a job completion.
-    for attempt in 1..=3 {
+    // Retry a lost completion indefinitely (capped backoff). A transient failure
+    // must never permanently lose it: if the controller is unreachable — mid-Raft
+    // failover, restarting, or a network blip — for longer than a few attempts,
+    // giving up would strand the job in COMPLETING until the controller's
+    // complete_wait_secs force-finish (minutes later). Only a definitive
+    // controller rejection (non-retryable status, e.g. the job is already
+    // terminal) stops the retry, since re-sending cannot change that outcome.
+    // Callers spawn this so the retry never blocks the monitor loop.
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
         match spur_client::connect_channel(controller_addr).await {
             Ok(channel) => {
                 let mut client = spur_proto::controller_client(channel);
@@ -507,6 +555,7 @@ async fn report_completion(
                         info!(
                             job_id,
                             exit_code,
+                            attempt,
                             controller = %controller_addr,
                             "reported completion to controller"
                         );
@@ -527,7 +576,7 @@ async fn report_completion(
                             job_id,
                             attempt,
                             error = %e,
-                            "ReportJobStatus RPC failed"
+                            "ReportJobStatus RPC failed; will retry"
                         );
                     }
                 }
@@ -537,18 +586,12 @@ async fn report_completion(
                     job_id,
                     attempt,
                     error = %e,
-                    "failed to connect to controller for completion report"
+                    "failed to connect to controller for completion report; will retry"
                 );
             }
         }
-        if attempt < 3 {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
+        tokio::time::sleep(next_completion_retry_delay(attempt)).await;
     }
-    error!(
-        job_id,
-        exit_code, "gave up reporting completion after 3 attempts"
-    );
 }
 
 #[tonic::async_trait]
