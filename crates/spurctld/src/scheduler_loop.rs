@@ -45,6 +45,68 @@ fn node_comm_http_url(node: &Node) -> Option<String> {
     Some(spur_net::format_comm_http_url(host, node.port))
 }
 
+async fn recover_steps_from_prior_terms(cluster: &Arc<ClusterManager>) {
+    let term = cluster.current_term();
+    let mut recovered_attempts = HashSet::new();
+    for step in cluster.steps_from_prior_terms(term) {
+        let Some(job) = cluster
+            .get_job(step.job_id)
+            .filter(|job| job.run_attempt == step.run_attempt)
+        else {
+            continue;
+        };
+        if job.state.is_terminal() {
+            if let Err(error) = cluster.record_step_complete(
+                step.job_id,
+                step.step_id,
+                1,
+                step.run_attempt,
+                step.controller_term,
+            ) {
+                warn!(
+                    job_id = step.job_id,
+                    step_id = step.step_id,
+                    error = %error,
+                    "failed to finalize an orphaned step from a prior controller term"
+                );
+            }
+            continue;
+        }
+        if !recovered_attempts.insert((step.job_id, step.run_attempt)) {
+            continue;
+        }
+        let direct_nodes: Vec<_> = job
+            .allocated_nodes
+            .iter()
+            .filter(|node| !cluster.node_supports_command_polling(node))
+            .cloned()
+            .collect();
+        let finalized = match cluster.evict_job(
+            step.job_id,
+            spur_core::job::PendingReason::NodeDown,
+            step.run_attempt,
+        ) {
+            Ok(finalized) => finalized,
+            Err(error) => {
+                warn!(
+                    job_id = step.job_id,
+                    run_attempt = step.run_attempt,
+                    error = %error,
+                    "failed to evict an allocation with a step from a prior controller term"
+                );
+                continue;
+            }
+        };
+        if finalized.is_empty() {
+            continue;
+        }
+        if !direct_nodes.is_empty() {
+            cancel_job_on_nodes(cluster, step.job_id, &direct_nodes, 9, step.run_attempt).await;
+        }
+        cluster.complete_evicted_steps(&finalized);
+    }
+}
+
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
 pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let enforcer_cluster = cluster.clone();
@@ -122,6 +184,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         if !raft.is_leader() {
             continue;
         }
+
+        recover_steps_from_prior_terms(&cluster).await;
 
         // Finalize never-satisfiable deps before pending_jobs() so they drop
         // out of this cycle instead of sitting PENDING forever.
@@ -649,7 +713,7 @@ pub(crate) async fn try_preempt(
                 mode = ?mode,
                 "preempting lower-priority job"
             );
-            match cluster.preempt_job(candidate.job_id, mode) {
+            match cluster.preempt_job_for_attempt(candidate.job_id, mode, candidate.run_attempt) {
                 Ok(PreemptOutcome::Killed) => {
                     // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
                     send_cancel_to_agents(cluster, candidate, 0).await;
@@ -1360,7 +1424,7 @@ async fn register_allocation_on_nodes(
 
     if dispatch_nodes
         .iter()
-        .all(|node| cluster.node_supports_command_polling(node))
+        .all(|node| cluster.node_has_command_polling_session(node))
     {
         let commands: Vec<_> = dispatch_nodes
             .iter()
@@ -1743,7 +1807,7 @@ async fn confirm_dispatch_on_nodes(
         }
 
         if let Err(detail) =
-            pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, prepare_nodes).await
+            pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, term, prepare_nodes).await
         {
             error!(job_id, error = %detail, "PMIx prepare failed — aborting dispatch");
             return abort_pending_pmix_dispatch(
@@ -1756,6 +1820,8 @@ async fn confirm_dispatch_on_nodes(
         let agent_addrs: Vec<String> = node_agents.iter().map(|(_, addr)| addr.clone()).collect();
         pmix_prepare_guard = Some(pmix_dispatch::PmixPreparedReleaseGuard::new(
             job_id,
+            run_attempt,
+            term,
             agent_addrs,
         ));
     }
@@ -1763,7 +1829,7 @@ async fn confirm_dispatch_on_nodes(
     let durable_delivery = failures == 0
         && dispatch_nodes
             .iter()
-            .all(|node| cluster.node_supports_command_polling(node));
+            .all(|node| cluster.node_has_command_polling_session(node));
     if durable_delivery {
         let commands: Vec<_> = dispatch_nodes
             .iter()
@@ -1933,7 +1999,7 @@ async fn confirm_dispatch_on_nodes(
             guard.disarm();
         }
         let agent_addrs: Vec<String> = node_agents.iter().map(|(_, addr)| addr.clone()).collect();
-        pmix_dispatch::release_pmix_on_agents(&agent_addrs, job_id).await;
+        pmix_dispatch::release_pmix_on_agents(&agent_addrs, job_id, run_attempt, term).await;
     }
 
     let confirmation_detail = if needs_pmix_prepare {
@@ -2070,7 +2136,9 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
 
                 // Record before signalling: if the job exits on the SIGTERM, its
                 // completion must find the run already marked as timed out.
-                if let Err(e) = cluster.signal_time_limit(job.job_id, now) {
+                if let Err(e) =
+                    cluster.signal_time_limit_for_attempt(job.job_id, now, job.run_attempt)
+                {
                     warn!(job_id = job.job_id, error = %e, "failed to record time limit expiry");
                     continue;
                 }
@@ -2088,9 +2156,12 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
                 "grace period expired — force-killing job"
             );
 
-            if let Err(e) =
-                cluster.complete_job_after_cancel(job.job_id, -1, spur_core::job::JobState::Timeout)
-            {
+            if let Err(e) = cluster.complete_job_after_cancel_for_attempt(
+                job.job_id,
+                -1,
+                spur_core::job::JobState::Timeout,
+                job.run_attempt,
+            ) {
                 warn!(job_id = job.job_id, error = %e, "failed to mark job as timed out");
                 continue;
             }
@@ -2179,7 +2250,9 @@ async fn force_finish_completing_job(cluster: &Arc<ClusterManager>, job: &spur_c
         "completing timeout expired — force-finishing job"
     );
 
-    if let Err(e) = cluster.complete_job_after_cancel(job.job_id, exit_code, state) {
+    if let Err(e) =
+        cluster.complete_job_after_cancel_for_attempt(job.job_id, exit_code, state, job.run_attempt)
+    {
         warn!(
             job_id = job.job_id,
             error = %e,
@@ -2335,13 +2408,22 @@ pub async fn cancel_job_on_nodes(
 pub async fn cancel_step_on_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
+    run_attempt: u32,
     step_id: u32,
     node_names: &[String],
     signal: i32,
 ) {
+    let term = cluster.current_term();
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        set.spawn(cancel_one_step_agent(agent_addr, job_id, step_id, signal));
+        set.spawn(cancel_one_step_agent(
+            agent_addr,
+            job_id,
+            run_attempt,
+            step_id,
+            signal,
+            term,
+        ));
     }
     while set.join_next().await.is_some() {}
 }
@@ -2350,8 +2432,10 @@ pub async fn cancel_step_on_nodes(
 async fn cancel_one_step_agent(
     agent_addr: String,
     job_id: spur_core::job::JobId,
+    run_attempt: u32,
     step_id: u32,
     signal: i32,
+    term: u64,
 ) {
     use spur_proto::proto::CancelStepRequest;
 
@@ -2368,6 +2452,8 @@ async fn cancel_one_step_agent(
                         job_id,
                         step_id,
                         signal,
+                        run_attempt,
+                        term,
                     })
                     .await
                 {
@@ -2416,7 +2502,7 @@ fn cancel_agent_addrs(
 ) -> Vec<String> {
     let mut addrs = Vec::with_capacity(node_names.len());
     for node_name in node_names {
-        if cluster.node_supports_command_polling(node_name)
+        if cluster.node_has_command_polling_session(node_name)
             && cluster.has_pending_kill(job_id, node_name)
         {
             continue;
@@ -2454,7 +2540,7 @@ async fn cancel_one_agent(
     signal: i32,
     term: u64,
     run_attempt: u32,
-) {
+) -> bool {
     let attempt = async {
         match SlurmAgentClient::connect(agent_addr.clone())
             .await
@@ -2479,8 +2565,10 @@ async fn cancel_one_agent(
                         error = %e,
                         "CancelJob RPC failed"
                     );
+                    false
                 } else {
                     info!(job_id, signal, agent = %agent_addr, "sent CancelJob");
+                    true
                 }
             }
             Err(e) => {
@@ -2490,19 +2578,31 @@ async fn cancel_one_agent(
                     error = %e,
                     "failed to connect to agent for cancel"
                 );
+                false
             }
         }
     };
-    if tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt)
-        .await
-        .is_err()
-    {
-        warn!(
-            job_id,
-            agent = %agent_addr,
-            "CancelJob RPC timed out"
-        );
+    match tokio::time::timeout(CANCEL_RPC_TIMEOUT, attempt).await {
+        Ok(delivered) => delivered,
+        Err(_) => {
+            warn!(
+                job_id,
+                agent = %agent_addr,
+                "CancelJob RPC timed out"
+            );
+            false
+        }
     }
+}
+
+pub async fn cancel_job_at_agent(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    signal: i32,
+    term: u64,
+    run_attempt: u32,
+) -> bool {
+    cancel_one_agent(agent_addr, job_id, signal, term, run_attempt).await
 }
 
 /// Dispatch suspend (SIGSTOP) or resume (SIGCONT) to every allocated node.
@@ -2530,6 +2630,7 @@ pub async fn send_suspend_to_agents(
             }
         };
         let job_id = job.job_id;
+        let run_attempt = job.run_attempt;
         tokio::spawn(async move {
             match SlurmAgentClient::connect(agent_addr.clone())
                 .await
@@ -2543,6 +2644,7 @@ pub async fn send_suspend_to_agents(
                             job_id,
                             resume,
                             term,
+                            run_attempt,
                         })
                         .await
                     {
@@ -3433,7 +3535,8 @@ mod tests {
                 agent_session_id: String::new(),
                 node_boot_id: String::new(),
                 recovery_complete: true,
-                supports_command_polling: false,
+                supports_command_polling: true,
+                supports_attempt_inventory: false,
             });
             let n = name.to_string();
             wait_for(
@@ -3459,6 +3562,291 @@ mod tests {
             wait_for(&format!("job {job_id} -> {expected:?}"), || {
                 cm.get_job(job_id).is_some_and(|j| j.state == expected)
             });
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn prior_term_step_recovery_evicts_once_and_keeps_release_retryable() {
+            use crate::raft::StateMachineApply;
+            use spur_core::allocation::{AgentCommandKind, AllocationPhase};
+            use spur_core::job::JobState;
+            use spur_core::step::{JobStep, StepState, TaskDistribution};
+            use spur_core::wal::WalOperation;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            register_node_without_comm_addr(&cm, "n1");
+            cm.apply_operation(&WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(JobSpec {
+                    name: "prior-term-step".into(),
+                    user: "testuser".into(),
+                    ..Default::default()
+                }),
+            });
+            cm.apply_operation(&WalOperation::JobDispatchAttempt {
+                job_id: 1,
+                run_attempt: 1,
+            });
+            cm.apply_operation(&WalOperation::job_state_change(
+                1,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            let resources = ResourceAllocations::with_scalar(1, 1000);
+            cm.apply_operation(&WalOperation::JobStart {
+                job_id: 1,
+                nodes: vec!["n1".into()],
+                resources: resources.clone(),
+                per_node_alloc: HashMap::from([("n1".into(), resources)]),
+                srun_step_dispatch: false,
+                run_attempt: 1,
+            });
+            let current_term = cm.current_term();
+            assert!(current_term > 0);
+            let old_term = current_term - 1;
+            for step_id in [0, 1] {
+                cm.apply_operation(&WalOperation::JobStepCreate {
+                    step: Box::new(JobStep {
+                        job_id: 1,
+                        step_id,
+                        name: format!("step-{step_id}"),
+                        state: StepState::Running,
+                        num_tasks: 1,
+                        cpus_per_task: 1,
+                        resources: ResourceAllocations::default(),
+                        nodes: vec!["n1".into()],
+                        distribution: TaskDistribution::Block,
+                        start_time: Some(Utc::now()),
+                        end_time: None,
+                        exit_code: None,
+                        run_attempt: 1,
+                        controller_term: old_term,
+                        pmix_prepared: true,
+                    }),
+                });
+            }
+
+            recover_steps_from_prior_terms(&cm).await;
+
+            assert_eq!(cm.get_job(1).unwrap().state, JobState::NodeFail);
+            assert!(cm
+                .get_steps(1)
+                .iter()
+                .all(|step| step.state == StepState::Failed));
+            let key = AllocationKey::new(1, 1, "n1");
+            let record = cm.allocation_records()[&key].clone();
+            assert_eq!(record.phase, AllocationPhase::Releasing);
+            assert!(!record.release_on_heartbeat_absence);
+            let commands = cm.agent_commands(&[record.last_command_id]);
+            assert_eq!(commands.len(), 1);
+            assert_eq!(commands[0].kind, AgentCommandKind::Release);
+
+            recover_steps_from_prior_terms(&cm).await;
+            assert_eq!(
+                cm.allocation_records()[&key].last_command_id,
+                record.last_command_id
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn prior_term_step_recovery_uses_attempt_fenced_direct_cancel() {
+            use crate::raft::StateMachineApply;
+            use spur_core::allocation::AllocationPhase;
+            use spur_core::job::JobState;
+            use spur_core::step::{JobStep, StepState, TaskDistribution};
+            use spur_core::wal::WalOperation;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, cancel_calls) = spawn_mock_agent().await;
+            cm.register_node_with_session(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                addr.ip().to_string(),
+                addr.port(),
+                String::new(),
+                String::new(),
+                NodeSource::NativeHost,
+                HashMap::new(),
+                String::new(),
+                String::new(),
+                true,
+                false,
+                false,
+            )
+            .unwrap();
+            wait_for("legacy node registered", || cm.get_node("n1").is_some());
+            cm.apply_operation(&WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(JobSpec {
+                    name: "prior-term-direct".into(),
+                    user: "testuser".into(),
+                    ..Default::default()
+                }),
+            });
+            cm.apply_operation(&WalOperation::JobDispatchAttempt {
+                job_id: 1,
+                run_attempt: 1,
+            });
+            cm.apply_operation(&WalOperation::job_state_change(
+                1,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            let resources = ResourceAllocations::with_scalar(1, 1000);
+            cm.apply_operation(&WalOperation::JobStart {
+                job_id: 1,
+                nodes: vec!["n1".into()],
+                resources: resources.clone(),
+                per_node_alloc: HashMap::from([("n1".into(), resources)]),
+                srun_step_dispatch: false,
+                run_attempt: 1,
+            });
+            let current_term = cm.current_term();
+            assert!(current_term > 0);
+            cm.apply_operation(&WalOperation::JobStepCreate {
+                step: Box::new(JobStep {
+                    job_id: 1,
+                    step_id: 0,
+                    name: "step".into(),
+                    state: StepState::Running,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    resources: ResourceAllocations::default(),
+                    nodes: vec!["n1".into()],
+                    distribution: TaskDistribution::Block,
+                    start_time: Some(Utc::now()),
+                    end_time: None,
+                    exit_code: None,
+                    run_attempt: 1,
+                    controller_term: current_term - 1,
+                    pmix_prepared: true,
+                }),
+            });
+
+            recover_steps_from_prior_terms(&cm).await;
+
+            assert_eq!(cancel_calls.load(Ordering::SeqCst), 1);
+            let key = AllocationKey::new(1, 1, "n1");
+            let record = cm.allocation_records()[&key].clone();
+            assert_eq!(record.phase, AllocationPhase::Releasing);
+            assert!(record.release_on_heartbeat_absence);
+            assert!(cm.agent_commands(&[record.last_command_id]).is_empty());
+            assert_eq!(cm.get_steps(1)[0].state, StepState::Failed);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn prior_term_recovery_finalizes_an_orphan_step_on_a_terminal_job() {
+            use crate::raft::StateMachineApply;
+            use spur_core::job::JobState;
+            use spur_core::step::{JobStep, StepState, TaskDistribution};
+            use spur_core::wal::WalOperation;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            cm.apply_operation(&WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(JobSpec {
+                    name: "terminal-orphan-step".into(),
+                    user: "testuser".into(),
+                    ..Default::default()
+                }),
+            });
+            cm.apply_operation(&WalOperation::JobDispatchAttempt {
+                job_id: 1,
+                run_attempt: 1,
+            });
+            cm.apply_operation(&WalOperation::job_state_change(
+                1,
+                JobState::Pending,
+                JobState::Running,
+            ));
+            let current_term = cm.current_term();
+            cm.apply_operation(&WalOperation::JobStepCreate {
+                step: Box::new(JobStep {
+                    job_id: 1,
+                    step_id: 0,
+                    name: "step".into(),
+                    state: StepState::Running,
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    resources: ResourceAllocations::default(),
+                    nodes: Vec::new(),
+                    distribution: TaskDistribution::Block,
+                    start_time: Some(Utc::now()),
+                    end_time: None,
+                    exit_code: None,
+                    run_attempt: 1,
+                    controller_term: current_term.saturating_sub(1),
+                    pmix_prepared: true,
+                }),
+            });
+            cm.apply_operation(&WalOperation::job_state_change(
+                1,
+                JobState::Running,
+                JobState::NodeFail,
+            ));
+
+            recover_steps_from_prior_terms(&cm).await;
+
+            assert_eq!(cm.get_job(1).unwrap().state, JobState::NodeFail);
+            let step = cm.get_steps(1).remove(0);
+            assert_eq!(step.state, StepState::Failed);
+            assert!(!step.pmix_prepared);
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        async fn confirm_prepared_dispatch(
+            cluster: Arc<ClusterManager>,
+            job_id: spur_core::job::JobId,
+            dispatch_nodes: Vec<String>,
+            spec: JobSpec,
+            peer_addrs: Vec<String>,
+            per_node_allocs: HashMap<String, ResourceAllocations>,
+            allocated_nodelist: String,
+            tasks_per_node: u32,
+            run_attempt: u32,
+            task_fanout: bool,
+        ) -> DispatchConfirmOutcome {
+            let already_prepared = cluster.allocation_records().values().any(|record| {
+                record.key.job_id == job_id
+                    && record.key.run_attempt == run_attempt
+                    && record.phase.is_charged()
+            });
+            if !already_prepared {
+                let mut resources = ResourceAllocations::default();
+                for allocation in per_node_allocs.values() {
+                    resources.add(allocation);
+                }
+                let prepared_attempt = cluster
+                    .prepare_dispatch(
+                        job_id,
+                        dispatch_nodes.clone(),
+                        resources,
+                        per_node_allocs.clone(),
+                        false,
+                    )
+                    .unwrap();
+                assert_eq!(prepared_attempt, run_attempt);
+            }
+            confirm_dispatch_on_nodes(
+                cluster,
+                job_id,
+                dispatch_nodes,
+                spec,
+                peer_addrs,
+                per_node_allocs,
+                allocated_nodelist,
+                tasks_per_node,
+                run_attempt,
+                task_fanout,
+            )
+            .await
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3497,7 +3885,7 @@ mod tests {
             // nodes, real JoinSet success/failure counting, and the real
             // branch that aborts admission on a partial failure — n1 (real
             // agent) accepts, n2 (nothing listening) fails.
-            let outcome = confirm_dispatch_on_nodes(
+            let outcome = confirm_prepared_dispatch(
                 cm.clone(),
                 job_id,
                 nodes,
@@ -3674,7 +4062,7 @@ mod tests {
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
 
-            let outcome = confirm_dispatch_on_nodes(
+            let outcome = confirm_prepared_dispatch(
                 cm.clone(),
                 job_id,
                 nodes,
@@ -3733,7 +4121,7 @@ mod tests {
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
 
-            let outcome = confirm_dispatch_on_nodes(
+            let outcome = confirm_prepared_dispatch(
                 cm.clone(),
                 job_id,
                 nodes,
@@ -3788,7 +4176,7 @@ mod tests {
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
 
-            let outcome = confirm_dispatch_on_nodes(
+            let outcome = confirm_prepared_dispatch(
                 cm.clone(),
                 job_id,
                 nodes,
@@ -3847,7 +4235,7 @@ mod tests {
                 .map(|n| (n.clone(), ResourceAllocations::with_scalar(1, 0)))
                 .collect();
 
-            let outcome = confirm_dispatch_on_nodes(
+            let outcome = confirm_prepared_dispatch(
                 cm.clone(),
                 job_id,
                 nodes,
@@ -3899,6 +4287,26 @@ mod tests {
                 .collect();
             let spec = cm.get_job(job_id).unwrap().spec;
             let nodelist = nodes.join(",");
+            let mut resources = ResourceAllocations::default();
+            for allocation in per_node_allocs.values() {
+                resources.add(allocation);
+            }
+            let run_attempt = if cm
+                .allocation_records()
+                .values()
+                .any(|record| record.key.job_id == job_id && record.phase.is_charged())
+            {
+                cm.get_job(job_id).unwrap().run_attempt
+            } else {
+                cm.prepare_dispatch(
+                    job_id,
+                    nodes.clone(),
+                    resources,
+                    per_node_allocs.clone(),
+                    false,
+                )
+                .unwrap()
+            };
             confirm_dispatch_on_nodes(
                 cm.clone(),
                 job_id,
@@ -3908,7 +4316,7 @@ mod tests {
                 per_node_allocs,
                 nodelist,
                 1,
-                1,
+                run_attempt,
                 false,
             )
             .await
@@ -3970,7 +4378,7 @@ mod tests {
             assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
             assert_eq!(cm.get_node("n2").unwrap().alloc_resources.cpus, 1);
 
-            let outcome = confirm_dispatch_on_nodes(
+            let outcome = confirm_prepared_dispatch(
                 cm.clone(),
                 job_id,
                 nodes,
@@ -4291,7 +4699,7 @@ mod tests {
             let nodelist = nodes.join(",");
 
             let start = std::time::Instant::now();
-            let outcome = confirm_dispatch_on_nodes(
+            let outcome = confirm_prepared_dispatch(
                 cm.clone(),
                 job_id,
                 nodes,
@@ -4814,6 +5222,14 @@ mod tests {
             let mut spec = batch_spec("prolog-interactive-double-cancel", 1);
             spec.interactive = true;
             let job_id = submit_and_wait(&cm, spec);
+            cm.prepare_dispatch(
+                job_id,
+                vec!["n1".into()],
+                ResourceAllocations::with_scalar(1, 0),
+                HashMap::from([("n1".into(), ResourceAllocations::with_scalar(1, 0))]),
+                false,
+            )
+            .unwrap();
 
             // Simulate a concurrent scancel landing before the prolog
             // rejection is processed: the job is already terminal by the
@@ -4861,6 +5277,17 @@ mod tests {
             let mut spec = batch_spec("srun-resource-reject", 1);
             spec.srun_job = true;
             let job_id = submit_and_wait(&cm, spec.clone());
+            let per_node_allocs =
+                HashMap::from([("n1".into(), ResourceAllocations::with_scalar(4, 8000))]);
+            let run_attempt = cm
+                .prepare_dispatch(
+                    job_id,
+                    vec!["n1".into()],
+                    ResourceAllocations::with_scalar(4, 8000),
+                    per_node_allocs.clone(),
+                    true,
+                )
+                .unwrap();
 
             assert!(cm.nodes_on_dispatch_cooldown().is_empty());
             let outcome = register_allocation_on_nodes(
@@ -4868,9 +5295,9 @@ mod tests {
                 job_id,
                 vec!["n1".into()],
                 &spec,
-                HashMap::from([("n1".into(), ResourceAllocations::with_scalar(4, 8000))]),
+                per_node_allocs,
                 "n1".into(),
-                0,
+                run_attempt,
             )
             .await;
             assert!(matches!(
@@ -4894,14 +5321,25 @@ mod tests {
             let mut spec = batch_spec("srun-uncertain-registration", 1);
             spec.srun_job = true;
             let job_id = submit_and_wait(&cm, spec.clone());
+            let per_node_allocs =
+                HashMap::from([("n1".into(), ResourceAllocations::with_scalar(4, 8000))]);
+            let run_attempt = cm
+                .prepare_dispatch(
+                    job_id,
+                    vec!["n1".into()],
+                    ResourceAllocations::with_scalar(4, 8000),
+                    per_node_allocs.clone(),
+                    true,
+                )
+                .unwrap();
             let outcome = register_allocation_on_nodes(
                 cm,
                 job_id,
                 vec!["n1".into()],
                 &spec,
-                HashMap::from([("n1".into(), ResourceAllocations::with_scalar(4, 8000))]),
+                per_node_allocs,
                 "n1".into(),
-                0,
+                run_attempt,
             )
             .await;
 
@@ -4955,6 +5393,12 @@ mod tests {
             };
             assert_eq!(cleanup_nodes, vec!["n1".to_string()]);
 
+            cm.update_agent_recovery("n1", "", "", true, true, false)
+                .expect("update test agent capabilities");
+            wait_for("n1 command polling capability", || {
+                cm.get_node("n1")
+                    .is_some_and(|node| node.supports_command_polling)
+            });
             cm.abort_dispatch(job_id, run_attempt, &cleanup_nodes)
                 .unwrap();
             let reserved = cm.pending_kill_reservations();

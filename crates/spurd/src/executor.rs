@@ -1,13 +1,16 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
-use std::ffi::CString;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{CStr, CString};
+use std::io::Write;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use anyhow::{bail, Context};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
@@ -113,16 +116,182 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup/spur";
 /// wrapper). Deliberately off the user's work_dir so these root-side writes
 /// never hit an NFS root_squash mount. Mirrors Slurm's SlurmdSpoolDir.
 const SPOOL_ROOT: &str = "/var/spool/spur";
-const RECOVERY_SCHEMA_VERSION: u32 = 1;
+const RECOVERY_SCHEMA_VERSION: u32 = 2;
+const PROCESS_SETTLE_ATTEMPTS: usize = 100;
+const PROCESS_SETTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-#[derive(Debug, Serialize, Deserialize)]
-struct RecoveryManifest {
-    schema_version: u32,
-    job_id: JobId,
-    run_attempt: u32,
-    pid: i32,
-    start_time: u64,
-    cgroup_path: Option<PathBuf>,
+#[derive(Debug, Clone)]
+pub struct RecoveryStore {
+    root: Arc<PathBuf>,
+    cgroup_root: Arc<PathBuf>,
+    boot_id: Arc<String>,
+    #[cfg(test)]
+    _cleanup: Option<Arc<TestRecoveryRoots>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct TestRecoveryRoots {
+    root: PathBuf,
+    cgroup_root: PathBuf,
+}
+
+#[cfg(test)]
+impl Drop for TestRecoveryRoots {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+        let _ = std::fs::remove_dir_all(&self.cgroup_root);
+    }
+}
+
+impl RecoveryStore {
+    #[cfg(not(test))]
+    pub fn system() -> Self {
+        Self {
+            root: Arc::new(recovery_root()),
+            cgroup_root: Arc::new(PathBuf::from(CGROUP_ROOT)),
+            boot_id: Arc::new(current_boot_id()),
+            #[cfg(test)]
+            _cleanup: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn at(root: PathBuf, cgroup_root: PathBuf) -> Self {
+        Self {
+            root: Arc::new(root),
+            cgroup_root: Arc::new(cgroup_root),
+            boot_id: Arc::new(current_boot_id()),
+            _cleanup: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn isolated() -> Self {
+        let root = tempfile::tempdir()
+            .expect("create isolated recovery root")
+            .keep();
+        let cgroup_root = tempfile::tempdir()
+            .expect("create isolated cgroup root")
+            .keep();
+        let cleanup = Arc::new(TestRecoveryRoots {
+            root: root.clone(),
+            cgroup_root: cgroup_root.clone(),
+        });
+        Self {
+            root: Arc::new(root),
+            cgroup_root: Arc::new(cgroup_root),
+            boot_id: Arc::new(current_boot_id()),
+            _cleanup: Some(cleanup),
+        }
+    }
+
+    fn prepare(&self) -> anyhow::Result<()> {
+        prepare_recovery_root_at(&self.root)
+    }
+
+    fn cgroup_path(&self, job_id: JobId, run_attempt: u32) -> PathBuf {
+        self.cgroup_root.join(format!("job_{job_id}_{run_attempt}"))
+    }
+
+    pub fn load_highest_term(&self) -> anyhow::Result<u64> {
+        self.prepare()?;
+        match std::fs::read_to_string(self.root.join("highest_term")) {
+            Ok(value) => value
+                .trim()
+                .parse()
+                .context("parse persisted controller term"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error).context("read persisted controller term"),
+        }
+    }
+
+    pub fn persist_highest_term(&self, term: u64) -> anyhow::Result<()> {
+        self.prepare()?;
+        let path = self.root.join("highest_term");
+        let temporary = self.root.join(".highest_term.tmp");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)
+            .context("open persisted controller term")?;
+        std::io::Write::write_all(&mut file, term.to_string().as_bytes())
+            .context("write persisted controller term")?;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+        file.sync_all().context("sync persisted controller term")?;
+        drop(file);
+        std::fs::rename(&temporary, &path).context("install persisted controller term")?;
+        std::fs::File::open(&*self.root)?
+            .sync_all()
+            .context("sync recovery spool after controller term update")?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRecoveryMetadata {
+    pub rootfs_mode: crate::container::RootfsMode,
+    pub containerized: bool,
+    pub stdout_path: String,
+    pub stderr_path: String,
+    pub exit_status_path: PathBuf,
+    pub work_dir: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub user: String,
+    pub partition: String,
+    pub gpu_devices: Vec<u32>,
+    pub cpu_ids: Vec<u32>,
+    pub cpus: u32,
+    pub memory_mb: u64,
+    pub nodelist: String,
+    pub mpi: String,
+    pub exact_resources: spur_core::resource::ResourceAllocations,
+    #[serde(default)]
+    pub last_command_id: u64,
+    #[serde(default)]
+    pub restart_safe: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryManifest {
+    pub schema_version: u32,
+    pub job_id: JobId,
+    pub run_attempt: u32,
+    pub pid: i32,
+    pub start_time: u64,
+    #[serde(default)]
+    pub boot_id: String,
+    pub cgroup_path: Option<PathBuf>,
+    #[serde(default)]
+    pub process_id: String,
+    #[serde(default)]
+    pub step_id: Option<u32>,
+    #[serde(default)]
+    pub process_kind: String,
+    #[serde(default)]
+    pub job: Option<JobRecoveryMetadata>,
+    #[serde(default)]
+    pub exit: Option<(i32, i32)>,
+    #[serde(default)]
+    pub epilog_pending: bool,
+    #[serde(default)]
+    pub completion_pending: bool,
+    #[serde(default)]
+    pub drain_pending: bool,
+}
+
+pub struct ProcessRecoveryIntent {
+    pub path: PathBuf,
+    pub manifest: RecoveryManifest,
+}
+
+fn current_boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
 }
 
 pub struct ContainerLaunchConfig {
@@ -147,6 +316,8 @@ pub enum LaunchIo {
 
 pub struct JobLaunchConfig {
     pub job_id: JobId,
+    pub run_attempt: u32,
+    pub exit_status_path: Option<PathBuf>,
     pub script: String,
     pub work_dir: String,
     /// Needed to expand `%x`/`%u`/`%N`/`%a`/`%A` in output paths as the controller does.
@@ -184,6 +355,7 @@ pub struct LaunchResult {
     pub job: RunningJob,
     pub stdout_path: String,
     pub stderr_path: String,
+    pub exit_status_path: PathBuf,
     /// Master fd of the PTY (only set when `io_mode == LaunchIo::Pty`).
     pub pty_master: Option<OwnedFd>,
 }
@@ -321,6 +493,13 @@ pub enum RunningJob {
         cgroup_path: Option<PathBuf>,
         reaped: bool,
     },
+    Resumed {
+        pid: i32,
+        start_time: u64,
+        _pidfd: Option<OwnedFd>,
+        cgroup_path: Option<PathBuf>,
+        exit_status_path: PathBuf,
+    },
     /// Allocation registered without a batch process (standalone srun).
     AllocationOnly,
 }
@@ -372,11 +551,57 @@ fn pidfd_open(pid: i32) -> std::io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+fn pidfd_send_signal(pidfd: &OwnedFd, signal: Signal) -> std::io::Result<()> {
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal as i32,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn signal_process_identity(pid: i32, start_time: u64, signal: Signal) -> anyhow::Result<()> {
+    if !process_identity_is_live(pid, start_time) {
+        return Ok(());
+    }
+    let pidfd = pidfd_open(pid).with_context(|| format!("open pidfd for process {pid}"))?;
+    if !process_identity_is_live(pid, start_time) {
+        return Ok(());
+    }
+    pidfd_send_signal(&pidfd, signal).with_context(|| format!("signal process {pid} through pidfd"))
+}
+
+fn signal_process_identities(
+    leaders: &HashSet<(i32, u64)>,
+    identities: &HashSet<(i32, u64)>,
+    signal: Signal,
+) -> anyhow::Result<()> {
+    for (pid, start_time) in leaders {
+        if process_identity_is_live(*pid, *start_time) {
+            signal_process_identity(*pid, *start_time, signal)?;
+        }
+    }
+    for (pid, start_time) in identities {
+        if !leaders.contains(&(*pid, *start_time)) && process_identity_is_live(*pid, *start_time) {
+            signal_process_identity(*pid, *start_time, signal)?;
+        }
+    }
+    Ok(())
+}
+
 impl RunningJob {
     pub fn pid(&self) -> Option<u32> {
         match self {
             RunningJob::Managed { child, .. } => child.id(),
             RunningJob::Forked { pid, .. } => Some(*pid as u32),
+            RunningJob::Resumed { pid, .. } => Some(*pid as u32),
             RunningJob::AllocationOnly => None,
         }
     }
@@ -417,6 +642,28 @@ impl RunningJob {
                     Err(e) => Err(e.into()),
                 }
             }
+            RunningJob::Resumed {
+                pid,
+                start_time,
+                exit_status_path,
+                ..
+            } => {
+                if process_identity_is_live(*pid, *start_time) {
+                    return Ok(None);
+                }
+                let exit = std::fs::read_to_string(exit_status_path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<i32>().ok())
+                    .map(|code| {
+                        if code > 128 {
+                            (0, code - 128)
+                        } else {
+                            (code, 0)
+                        }
+                    })
+                    .unwrap_or((-1, 0));
+                Ok(Some(exit))
+            }
             RunningJob::AllocationOnly => Ok(None),
         }
     }
@@ -445,6 +692,37 @@ impl RunningJob {
                 kill_process_tree(*pid, sig);
                 Ok(())
             }
+            RunningJob::Resumed {
+                pid,
+                start_time,
+                _pidfd,
+                cgroup_path,
+                ..
+            } => {
+                if !process_identity_is_live(*pid, *start_time) {
+                    return Ok(());
+                }
+                let pidfd = _pidfd.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("recovered process has no stable pidfd identity")
+                })?;
+                let cgroup = cgroup_path
+                    .as_deref()
+                    .filter(|cgroup| sig == Signal::SIGKILL && cgroup.exists());
+                if let Some(cgroup) = cgroup {
+                    signal_residual_cgroup(cgroup)?;
+                } else {
+                    let mut identities = HashSet::new();
+                    collect_process_tree_identities(*pid, &mut identities);
+                    for (child_pid, child_start_time) in identities {
+                        signal_process_identity(child_pid, child_start_time, sig)?;
+                    }
+                }
+                if process_identity_is_live(*pid, *start_time) {
+                    pidfd_send_signal(pidfd, sig)
+                        .context("signal recovered process through pidfd")?;
+                }
+                Ok(())
+            }
             RunningJob::AllocationOnly => Ok(()),
         }
     }
@@ -453,15 +731,16 @@ impl RunningJob {
         match self {
             RunningJob::Managed { cgroup_path, .. } => cgroup_path.take(),
             RunningJob::Forked { cgroup_path, .. } => cgroup_path.take(),
+            RunningJob::Resumed { cgroup_path, .. } => cgroup_path.take(),
             RunningJob::AllocationOnly => None,
         }
     }
 
-    fn cgroup_path(&self) -> Option<&Path> {
+    pub(crate) fn cgroup_path(&self) -> Option<&Path> {
         match self {
-            RunningJob::Managed { cgroup_path, .. } | RunningJob::Forked { cgroup_path, .. } => {
-                cgroup_path.as_deref()
-            }
+            RunningJob::Managed { cgroup_path, .. }
+            | RunningJob::Forked { cgroup_path, .. }
+            | RunningJob::Resumed { cgroup_path, .. } => cgroup_path.as_deref(),
             RunningJob::AllocationOnly => None,
         }
     }
@@ -505,6 +784,7 @@ async fn spawn_job_process(
 ) -> Result<LaunchResult, LaunchError> {
     let JobLaunchConfig {
         job_id,
+        run_attempt,
         ref script,
         ref work_dir,
         ref environment,
@@ -524,7 +804,7 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
+    let cgroup_path = setup_cgroup(job_id, run_attempt, cpus, memory_mb, cpu_ids)?;
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -554,9 +834,21 @@ async fn spawn_job_process(
 
     // Script + wrapper live in the node-local spool dir, not work_dir (see
     // SPOOL_ROOT), so root-side writes survive NFS root_squash work_dirs.
-    let spool_dir = create_job_spool_dir(job_id, uid, gid)?;
+    let spool_dir = create_job_spool_dir(job_id, run_attempt, uid, gid)?;
+    let exit_status_path = cfg
+        .exit_status_path
+        .clone()
+        .unwrap_or_else(|| spool_dir.join("exit_status"));
+    let script = if cfg.exit_status_path.is_some() {
+        script.to_string()
+    } else {
+        write_job_scratch(&exit_status_path, "", uid, gid)
+            .context("failed to create exit status file")
+            .map_err(|error| classify_spool_error(&spool_dir, error))?;
+        wrap_with_exit_sentinel(script, &exit_status_path)
+    };
     let script_path = spool_dir.join("spur_job.sh");
-    write_job_scratch(&script_path, script, uid, gid)
+    write_job_scratch(&script_path, &script, uid, gid)
         .context("failed to write job script")
         .map_err(|e| classify_spool_error(&spool_dir, e))?;
 
@@ -691,6 +983,7 @@ async fn spawn_job_process(
             job,
             stdout_path: stdout_resolved,
             stderr_path: stderr_resolved,
+            exit_status_path,
             pty_master,
         });
     }
@@ -776,6 +1069,14 @@ async fn spawn_job_process(
             apply_memlock(memlock);
             Ok(())
         });
+    }
+
+    if let Some(ref cgroup) = cgroup_path {
+        let procs = CString::new(cgroup.join("cgroup.procs").as_os_str().as_bytes())
+            .context("cgroup path contains NUL")?;
+        unsafe {
+            cmd.pre_exec(move || attach_current_process_to_cgroup(&procs));
+        }
     }
 
     // Issue #99, #107: Run job as the submitting user (not root).
@@ -871,13 +1172,6 @@ async fn spawn_job_process(
     // Drop the slave fd immediately so the master gets EOF when the child exits.
     let pty_master = job_io.into_master();
 
-    // Move process into cgroup
-    if let Some(ref cgroup) = cgroup_path {
-        if let Some(pid) = child.id() {
-            move_to_cgroup(cgroup, pid);
-        }
-    }
-
     debug!(
         job_id,
         pid = child.id(),
@@ -889,6 +1183,7 @@ async fn spawn_job_process(
         job: RunningJob::Managed { child, cgroup_path },
         stdout_path: stdout_resolved,
         stderr_path: stderr_resolved,
+        exit_status_path,
         pty_master,
     })
 }
@@ -896,12 +1191,13 @@ async fn spawn_job_process(
 /// Set up a cgroups v2 hierarchy for a job.
 fn setup_cgroup(
     job_id: JobId,
+    run_attempt: u32,
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
 ) -> anyhow::Result<Option<PathBuf>> {
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
-    let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
+    let cgroup_path = job_cgroup_path(job_id, run_attempt);
 
     // Delegate controllers to children: in cgroup-v2 a child only gets
     // memory.*/cpu.*/pids.* files if the parent lists them in subtree_control;
@@ -985,29 +1281,59 @@ fn setup_cgroup(
 
 pub fn setup_step_cgroup(
     job_id: JobId,
+    run_attempt: u32,
     cpus: u32,
     memory_mb: u64,
 ) -> anyhow::Result<Option<PathBuf>> {
-    setup_cgroup(job_id, cpus, memory_mb, &[])
+    setup_cgroup(job_id, run_attempt, cpus, memory_mb, &[])
 }
 
-/// Move a process into a cgroup. Returns true if successful.
-fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
-    let procs_file = cgroup_path.join("cgroup.procs");
-    if let Err(e) = std::fs::write(&procs_file, pid.to_string()) {
-        warn!(
-            pid,
-            error = %e,
-            "failed to move process to cgroup — job runs without isolation"
-        );
-        false
-    } else {
-        true
+pub fn job_cgroup_path(job_id: JobId, run_attempt: u32) -> PathBuf {
+    Path::new(CGROUP_ROOT).join(format!("job_{job_id}_{run_attempt}"))
+}
+
+pub fn allocation_cgroup_present(job_id: JobId, run_attempt: u32) -> bool {
+    std::fs::read_to_string(job_cgroup_path(job_id, run_attempt).join("cgroup.procs"))
+        .is_ok_and(|processes| !processes.trim().is_empty())
+}
+
+pub(crate) unsafe fn attach_current_process_to_cgroup(procs: &CStr) -> std::io::Result<()> {
+    let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    let mut value = libc::getpid() as u32;
+    let mut digits = [0u8; 10];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let result = libc::write(fd, digits[start..].as_ptr().cast(), digits.len() - start);
+    let error = if result < 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    libc::close(fd);
+    error.map_or(Ok(()), Err)
 }
 
-pub fn attach_process_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
-    move_to_cgroup(cgroup_path, pid)
+pub(crate) fn set_parent_death_signal(expected_parent: i32) -> std::io::Result<()> {
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::getppid() } != expected_parent {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "spurd exited during child launch",
+        ));
+    }
+    Ok(())
 }
 
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).
@@ -1039,13 +1365,6 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
     }
 }
 
-pub fn cleanup_job_cgroup(job_id: JobId) {
-    let path = Path::new(CGROUP_ROOT).join(format!("job_{job_id}"));
-    if path.exists() {
-        cleanup_cgroup(&path);
-    }
-}
-
 fn recovery_manifests_for_allocation(
     root: &Path,
     job_id: JobId,
@@ -1053,7 +1372,11 @@ fn recovery_manifests_for_allocation(
 ) -> anyhow::Result<Vec<(PathBuf, RecoveryManifest)>> {
     let mut manifests = Vec::new();
     for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
         if entry
             .path()
             .extension()
@@ -1062,17 +1385,22 @@ fn recovery_manifests_for_allocation(
         {
             continue;
         }
-        let bytes = std::fs::read(entry.path())?;
+        let bytes = match std::fs::read(entry.path()) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
         let manifest: RecoveryManifest = serde_json::from_slice(&bytes)?;
-        if manifest.schema_version != RECOVERY_SCHEMA_VERSION {
+        if manifest.job_id != job_id || (run_attempt != 0 && manifest.run_attempt != run_attempt) {
+            continue;
+        }
+        if !matches!(manifest.schema_version, 1 | RECOVERY_SCHEMA_VERSION) {
             anyhow::bail!(
                 "unsupported recovery manifest schema {}",
                 manifest.schema_version
             );
         }
-        if manifest.job_id == job_id && (run_attempt == 0 || manifest.run_attempt == run_attempt) {
-            manifests.push((entry.path(), manifest));
-        }
+        manifests.push((entry.path(), manifest));
     }
     Ok(manifests)
 }
@@ -1090,7 +1418,10 @@ fn signal_residual_cgroup(cgroup: &Path) -> anyhow::Result<()> {
     let pids = std::fs::read_to_string(cgroup.join("cgroup.procs"))
         .with_context(|| format!("read residual cgroup {}", cgroup.display()))?;
     for pid in pids.lines().filter_map(|value| value.trim().parse().ok()) {
-        kill_process_tree(pid, Signal::SIGKILL);
+        let Some(start_time) = proc_start_time(pid) else {
+            continue;
+        };
+        signal_process_identity(pid, start_time, Signal::SIGKILL)?;
     }
     Ok(())
 }
@@ -1104,86 +1435,198 @@ fn cgroup_is_empty(cgroup: &Path) -> anyhow::Result<bool> {
     Ok(processes.trim().is_empty())
 }
 
-pub async fn terminate_residual_allocation(job_id: JobId, run_attempt: u32) -> anyhow::Result<()> {
-    let root = prepare_recovery_root()?;
-    let manifests = recovery_manifests_for_allocation(&root, job_id, run_attempt)?;
-    let cgroup = Path::new(CGROUP_ROOT).join(format!("job_{job_id}"));
-
-    for _ in 0..100 {
-        signal_residual_cgroup(&cgroup)?;
-        for (_, manifest) in &manifests {
-            if process_identity_is_live(manifest.pid, manifest.start_time) {
-                kill_process_tree(manifest.pid, Signal::SIGKILL);
-            }
-        }
-
-        let processes_gone = manifests
-            .iter()
-            .all(|(_, manifest)| !process_identity_is_live(manifest.pid, manifest.start_time));
-        if processes_gone && cgroup_is_empty(&cgroup)? {
-            if cgroup.exists() {
-                std::fs::remove_dir(&cgroup)
-                    .with_context(|| format!("remove residual cgroup {}", cgroup.display()))?;
-            }
-            cleanup_job_spool_files(job_id);
-            for (path, _) in manifests {
-                let _ = std::fs::remove_file(path);
-            }
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+fn remove_empty_cgroup(cgroup: &Path) -> std::io::Result<()> {
+    let result = std::fs::remove_dir(cgroup);
+    #[cfg(test)]
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::DirectoryNotEmpty)
+    {
+        return std::fs::remove_dir_all(cgroup);
     }
-
-    anyhow::bail!("residual processes for job {job_id} attempt {run_attempt} are still present")
+    result
 }
 
-pub fn recover_residual_job_cgroups() -> anyhow::Result<usize> {
-    let root = Path::new(CGROUP_ROOT);
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error).context("scan Spur job cgroups"),
-    };
-
-    let mut recovered = 0;
-    for entry in entries {
-        let entry = entry.context("read Spur cgroup entry")?;
-        let name = entry.file_name();
-        if !name.to_string_lossy().starts_with("job_") {
-            continue;
-        }
-        let path = entry.path();
-        if path.join("cgroup.kill").exists() {
-            std::fs::write(path.join("cgroup.kill"), "1")
-                .with_context(|| format!("kill residual cgroup {}", path.display()))?;
+impl RecoveryStore {
+    pub async fn settle_process_manifest(
+        &self,
+        path: &Path,
+        manifest: &RecoveryManifest,
+    ) -> anyhow::Result<()> {
+        let current_boot = self.manifest_is_current_boot(manifest);
+        let leaders = if current_boot {
+            HashSet::from([(manifest.pid, manifest.start_time)])
         } else {
-            cleanup_cgroup(&path);
+            HashSet::new()
+        };
+        let mut identities = leaders.clone();
+
+        for _ in 0..PROCESS_SETTLE_ATTEMPTS {
+            if let Some(cgroup) = manifest.cgroup_path.as_deref() {
+                signal_residual_cgroup(cgroup)?;
+            }
+            if current_boot && process_identity_is_live(manifest.pid, manifest.start_time) {
+                collect_process_tree_identities(manifest.pid, &mut identities);
+            }
+            signal_process_identities(&leaders, &identities, Signal::SIGKILL)?;
+            let cgroup_empty = manifest
+                .cgroup_path
+                .as_deref()
+                .map(cgroup_is_empty)
+                .transpose()?
+                .unwrap_or(true);
+            if cgroup_empty
+                && identities
+                    .iter()
+                    .all(|(pid, start_time)| !process_identity_is_live(*pid, *start_time))
+            {
+                if let Some(cgroup) = manifest.cgroup_path.as_deref().filter(|path| path.exists()) {
+                    remove_empty_cgroup(cgroup).with_context(|| {
+                        format!("remove residual process cgroup {}", cgroup.display())
+                    })?;
+                }
+                remove_recovery_manifest(path)?;
+                return Ok(());
+            }
+            tokio::time::sleep(PROCESS_SETTLE_INTERVAL).await;
         }
-        let remaining = std::fs::read_to_string(path.join("cgroup.procs")).unwrap_or_default();
-        if !remaining.trim().is_empty() {
-            anyhow::bail!("residual cgroup {} still has processes", path.display());
-        }
-        if path.exists() {
-            std::fs::remove_dir(&path)
-                .with_context(|| format!("remove residual cgroup {}", path.display()))?;
-        }
-        recovered += 1;
+
+        anyhow::bail!(
+            "residual process {} for job {} attempt {} is still present",
+            manifest.pid,
+            manifest.job_id,
+            manifest.run_attempt
+        )
     }
-    Ok(recovered)
+
+    pub async fn settle_residual_processes(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+    ) -> anyhow::Result<()> {
+        self.prepare()?;
+        let manifests = recovery_manifests_for_allocation(&self.root, job_id, run_attempt)?;
+        let cgroup = self.cgroup_path(job_id, run_attempt);
+        let leaders: HashSet<_> = manifests
+            .iter()
+            .filter(|(_, manifest)| self.manifest_is_current_boot(manifest))
+            .map(|(_, manifest)| (manifest.pid, manifest.start_time))
+            .collect();
+        let mut identities = leaders.clone();
+
+        for _ in 0..PROCESS_SETTLE_ATTEMPTS {
+            signal_residual_cgroup(&cgroup)?;
+            for (_, manifest) in &manifests {
+                if let Some(process_cgroup) = manifest
+                    .cgroup_path
+                    .as_deref()
+                    .filter(|path| *path != cgroup.as_path())
+                {
+                    signal_residual_cgroup(process_cgroup)?;
+                }
+            }
+            for (_, manifest) in &manifests {
+                if self.manifest_is_current_boot(manifest)
+                    && process_identity_is_live(manifest.pid, manifest.start_time)
+                {
+                    collect_process_tree_identities(manifest.pid, &mut identities);
+                }
+            }
+            signal_process_identities(&leaders, &identities, Signal::SIGKILL)?;
+
+            let processes_gone = identities
+                .iter()
+                .all(|(pid, start_time)| !process_identity_is_live(*pid, *start_time));
+            let mut process_cgroups_empty = true;
+            for (_, manifest) in &manifests {
+                let Some(process_cgroup) = manifest
+                    .cgroup_path
+                    .as_deref()
+                    .filter(|path| *path != cgroup.as_path())
+                else {
+                    continue;
+                };
+                if !cgroup_is_empty(process_cgroup)? {
+                    process_cgroups_empty = false;
+                    break;
+                }
+            }
+            if processes_gone && process_cgroups_empty && cgroup_is_empty(&cgroup)? {
+                for (_, manifest) in &manifests {
+                    if let Some(process_cgroup) = manifest
+                        .cgroup_path
+                        .as_deref()
+                        .filter(|path| *path != cgroup.as_path() && path.exists())
+                    {
+                        remove_empty_cgroup(process_cgroup).with_context(|| {
+                            format!("remove process cgroup {}", process_cgroup.display())
+                        })?;
+                    }
+                }
+                if cgroup.exists() {
+                    remove_empty_cgroup(&cgroup)
+                        .with_context(|| format!("remove residual cgroup {}", cgroup.display()))?;
+                }
+                return Ok(());
+            }
+            tokio::time::sleep(PROCESS_SETTLE_INTERVAL).await;
+        }
+
+        anyhow::bail!("residual processes for job {job_id} attempt {run_attempt} are still present")
+    }
 }
 
+impl RecoveryStore {
+    pub async fn cleanup_unmanifested_job_cgroups(
+        &self,
+        known: &HashSet<PathBuf>,
+    ) -> anyhow::Result<usize> {
+        let entries = match std::fs::read_dir(&*self.cgroup_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error).context("scan Spur job cgroups"),
+        };
+
+        let mut recovered = 0;
+        for entry in entries {
+            let entry = entry.context("read Spur cgroup entry")?;
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with("job_") {
+                continue;
+            }
+            let path = entry.path();
+            if known.contains(&path) {
+                continue;
+            }
+            let mut empty = false;
+            for _ in 0..PROCESS_SETTLE_ATTEMPTS {
+                signal_residual_cgroup(&path)?;
+                if cgroup_is_empty(&path)? {
+                    empty = true;
+                    break;
+                }
+                tokio::time::sleep(PROCESS_SETTLE_INTERVAL).await;
+            }
+            if !empty {
+                anyhow::bail!("residual cgroup {} still has processes", path.display());
+            }
+            if path.exists() {
+                remove_empty_cgroup(&path)
+                    .with_context(|| format!("remove residual cgroup {}", path.display()))?;
+            }
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+}
+
+#[cfg(not(test))]
 fn recovery_root() -> PathBuf {
     if nix::unistd::geteuid().is_root() {
         PathBuf::from(SPOOL_ROOT).join("recovery")
     } else {
         std::env::temp_dir().join(format!("spur-recovery-{}", nix::unistd::geteuid().as_raw()))
     }
-}
-
-fn prepare_recovery_root() -> anyhow::Result<PathBuf> {
-    let root = recovery_root();
-    prepare_recovery_root_at(&root)?;
-    Ok(root)
 }
 
 fn prepare_recovery_root_at(root: &Path) -> anyhow::Result<()> {
@@ -1206,7 +1649,7 @@ fn proc_start_time(pid: i32) -> Option<u64> {
     after_name.split_whitespace().nth(19)?.parse().ok()
 }
 
-fn process_identity_is_live(pid: i32, start_time: u64) -> bool {
+pub(crate) fn process_identity_is_live(pid: i32, start_time: u64) -> bool {
     let Some(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok() else {
         return false;
     };
@@ -1218,38 +1661,291 @@ fn process_identity_is_live(pid: i32, start_time: u64) -> bool {
         && fields.get(19).and_then(|value| value.parse::<u64>().ok()) == Some(start_time)
 }
 
-pub fn write_recovery_manifest(
-    job_id: JobId,
-    run_attempt: u32,
-    job: &RunningJob,
-) -> anyhow::Result<()> {
-    let Some(pid) = job.pid().map(|pid| pid as i32) else {
-        return Ok(());
-    };
-    write_process_recovery_manifest(job_id, run_attempt, pid, job.cgroup_path())
+impl RecoveryStore {
+    pub fn manifest_is_current_boot(&self, manifest: &RecoveryManifest) -> bool {
+        !self.boot_id.is_empty() && manifest.boot_id == *self.boot_id
+    }
+
+    pub fn resumed_job(
+        &self,
+        manifest: &RecoveryManifest,
+        exit_status_path: PathBuf,
+    ) -> anyhow::Result<RunningJob> {
+        if !self.manifest_is_current_boot(manifest)
+            || !process_identity_is_live(manifest.pid, manifest.start_time)
+        {
+            anyhow::bail!("recovery process identity is no longer live on this boot");
+        }
+        let pidfd = pidfd_open(manifest.pid)
+            .with_context(|| format!("open pidfd for recovered process {}", manifest.pid))?;
+        if !process_identity_is_live(manifest.pid, manifest.start_time) {
+            anyhow::bail!("recovery process identity changed while it was being adopted");
+        }
+        Ok(RunningJob::Resumed {
+            pid: manifest.pid,
+            start_time: manifest.start_time,
+            _pidfd: Some(pidfd),
+            cgroup_path: manifest.cgroup_path.clone(),
+            exit_status_path,
+        })
+    }
 }
 
-#[cfg(test)]
-fn write_recovery_manifest_at(
+fn scan_recovery_manifests_at(
     root: &Path,
-    job_id: JobId,
-    run_attempt: u32,
-    job: &RunningJob,
-) -> anyhow::Result<()> {
-    let Some(pid) = job.pid().map(|pid| pid as i32) else {
-        return Ok(());
-    };
-    write_process_recovery_manifest_at(root, job_id, run_attempt, pid, job.cgroup_path())
+    cgroup_root: &Path,
+) -> anyhow::Result<Vec<(PathBuf, RecoveryManifest)>> {
+    prepare_recovery_root_at(root)?;
+    let mut manifests = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path())?;
+        let manifest: RecoveryManifest = serde_json::from_slice(&bytes)?;
+        if !matches!(manifest.schema_version, 1 | RECOVERY_SCHEMA_VERSION) {
+            anyhow::bail!(
+                "unsupported recovery manifest schema {}",
+                manifest.schema_version
+            );
+        }
+        let attempt_name = format!(
+            "job_{}_{}_{}.json",
+            manifest.job_id, manifest.run_attempt, manifest.pid
+        );
+        let legacy_name = format!("job_{}.json", manifest.job_id);
+        let process_name = format!(
+            "job_{}_{}_process_{}.json",
+            manifest.job_id, manifest.run_attempt, manifest.process_id
+        );
+        let entry_path = entry.path();
+        let actual_name = entry_path.file_name().and_then(|name| name.to_str());
+        let filename_matches = actual_name == Some(&attempt_name)
+            || (manifest.schema_version == 1 && actual_name == Some(&legacy_name))
+            || (!manifest.process_id.is_empty() && actual_name == Some(&process_name));
+        if !filename_matches {
+            anyhow::bail!("recovery manifest filename does not match its allocation identity");
+        }
+        let expected_cgroup = if manifest.schema_version == 1 {
+            cgroup_root.join(format!("job_{}", manifest.job_id))
+        } else {
+            cgroup_root.join(format!("job_{}_{}", manifest.job_id, manifest.run_attempt))
+        };
+        let cgroup_matches = manifest.cgroup_path.as_ref().is_none_or(|path| {
+            path == &expected_cgroup
+                || (manifest.job.is_none() && path.parent() == Some(expected_cgroup.as_path()))
+        });
+        if !cgroup_matches {
+            anyhow::bail!("recovery manifest has an invalid cgroup path");
+        }
+        if let Some(metadata) = &manifest.job {
+            validate_recovery_resources(metadata)?;
+        }
+        manifests.push((entry.path(), manifest));
+    }
+    let mut job_allocations = HashSet::new();
+    for (_, manifest) in &manifests {
+        if manifest.job.is_some()
+            && !job_allocations.insert((manifest.job_id, manifest.run_attempt))
+        {
+            anyhow::bail!("duplicate job recovery manifest for one allocation");
+        }
+    }
+    Ok(manifests)
 }
 
-pub fn write_process_recovery_manifest(
-    job_id: JobId,
-    run_attempt: u32,
-    pid: i32,
-    cgroup_path: Option<&Path>,
-) -> anyhow::Result<()> {
-    let root = prepare_recovery_root()?;
-    write_process_recovery_manifest_at(&root, job_id, run_attempt, pid, cgroup_path)
+fn validate_recovery_resources(metadata: &JobRecoveryMetadata) -> anyhow::Result<()> {
+    let mut cpu_ids = metadata.cpu_ids.clone();
+    cpu_ids.sort_unstable();
+    cpu_ids.dedup();
+    if cpu_ids.len() != metadata.cpu_ids.len()
+        || metadata.exact_resources.cpus != metadata.cpu_ids.len() as u32
+        || metadata.exact_resources.memory_mb != metadata.memory_mb
+    {
+        anyhow::bail!("recovery manifest has inconsistent scalar resources");
+    }
+    let mut recovered_gpus = metadata.gpu_devices.clone();
+    recovered_gpus.sort_unstable();
+    let mut exact_gpus = metadata.exact_resources.device_ids("gpu");
+    exact_gpus.sort_unstable();
+    if recovered_gpus != exact_gpus {
+        anyhow::bail!("recovery manifest has inconsistent GPU resources");
+    }
+    Ok(())
+}
+
+impl RecoveryStore {
+    pub fn scan(&self) -> anyhow::Result<Vec<(PathBuf, RecoveryManifest)>> {
+        scan_recovery_manifests_at(&self.root, &self.cgroup_root)
+    }
+}
+
+fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("recovery path has no parent: {}", path.display()))?;
+    std::fs::File::open(parent)
+        .with_context(|| format!("open recovery directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("sync recovery directory {}", parent.display()))
+}
+
+pub fn remove_recovery_manifest(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_parent_directory(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("remove recovery manifest {}", path.display()))
+        }
+    }
+}
+
+impl RecoveryStore {
+    pub fn manifest_for_allocation(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+    ) -> anyhow::Result<Option<(PathBuf, RecoveryManifest)>> {
+        Ok(self.scan()?.into_iter().find(|(_, manifest)| {
+            manifest.job_id == job_id
+                && manifest.run_attempt == run_attempt
+                && manifest.job.is_some()
+        }))
+    }
+}
+
+pub fn resolve_recovered_exit(manifest: &RecoveryManifest) -> (i32, i32) {
+    if let Some(exit) = manifest.exit {
+        return exit;
+    }
+    let mut exit = manifest
+        .job
+        .as_ref()
+        .and_then(|job| std::fs::read_to_string(&job.exit_status_path).ok())
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .map(|code| {
+            if code > 128 {
+                (0, code - 128)
+            } else {
+                (code, 0)
+            }
+        })
+        .unwrap_or((-1, 0));
+    if manifest
+        .cgroup_path
+        .as_ref()
+        .is_some_and(|cgroup| cgroup_oom_killed(cgroup))
+    {
+        exit.1 |= spur_core::job::OOM_SIGNAL_FLAG;
+    }
+    exit
+}
+
+impl RecoveryStore {
+    pub fn write_job_manifest(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        job: &RunningJob,
+        metadata: JobRecoveryMetadata,
+    ) -> anyhow::Result<()> {
+        let Some(pid) = job.pid().map(|pid| pid as i32) else {
+            return Ok(());
+        };
+        write_process_recovery_manifest_at(
+            &self.root,
+            job_id,
+            run_attempt,
+            pid,
+            job.cgroup_path(),
+            Some(metadata),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn write_process_manifest(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        pid: i32,
+        cgroup_path: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        write_process_recovery_manifest_at(&self.root, job_id, run_attempt, pid, cgroup_path, None)
+    }
+
+    pub fn prepare_process_intent(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        step_id: u32,
+        process_kind: &str,
+        allocation_cgroup: Option<&Path>,
+    ) -> anyhow::Result<ProcessRecoveryIntent> {
+        self.prepare()?;
+        let process_id = uuid::Uuid::new_v4().simple().to_string();
+        let cgroup_path = allocation_cgroup
+            .filter(|path| path.exists())
+            .map(|path| path.join(format!("process_{process_id}")));
+        let path = self.root.join(format!(
+            "job_{job_id}_{run_attempt}_process_{process_id}.json"
+        ));
+        let temporary = self.root.join(format!(".process_{process_id}.tmp"));
+        let manifest = RecoveryManifest {
+            schema_version: RECOVERY_SCHEMA_VERSION,
+            job_id,
+            run_attempt,
+            pid: 0,
+            start_time: 0,
+            boot_id: self.boot_id.as_ref().clone(),
+            cgroup_path,
+            process_id,
+            step_id: Some(step_id),
+            process_kind: process_kind.to_string(),
+            job: None,
+            exit: None,
+            epilog_pending: false,
+            completion_pending: false,
+            drain_pending: false,
+        };
+        write_recovery_manifest_file(&path, &temporary, &manifest)?;
+        if let Some(cgroup) = manifest.cgroup_path.as_deref() {
+            if let Err(error) = std::fs::create_dir(cgroup) {
+                let _ = remove_recovery_manifest(&path);
+                return Err(error).with_context(|| {
+                    format!("create process recovery cgroup {}", cgroup.display())
+                });
+            }
+        }
+        Ok(ProcessRecoveryIntent { path, manifest })
+    }
+
+    pub fn activate_process_intent(
+        &self,
+        intent: &mut ProcessRecoveryIntent,
+        pid: i32,
+    ) -> anyhow::Result<()> {
+        let start_time = proc_start_time(pid)
+            .ok_or_else(|| anyhow::anyhow!("step process {pid} disappeared before activation"))?;
+        intent.manifest.pid = pid;
+        intent.manifest.start_time = start_time;
+        update_recovery_manifest(&intent.path, &intent.manifest)
+    }
+
+    pub async fn settle_process_intent(
+        &self,
+        intent: &ProcessRecoveryIntent,
+    ) -> anyhow::Result<()> {
+        self.settle_process_manifest(&intent.path, &intent.manifest)
+            .await
+    }
+
+    pub fn abandon_process_intent(&self, intent: &ProcessRecoveryIntent) {
+        if let Some(cgroup) = intent.manifest.cgroup_path.as_deref() {
+            let _ = remove_empty_cgroup(cgroup);
+        }
+        let _ = remove_recovery_manifest(&intent.path);
+    }
 }
 
 fn recovery_manifest_path(root: &Path, job_id: JobId, run_attempt: u32, pid: i32) -> PathBuf {
@@ -1262,111 +1958,116 @@ fn write_process_recovery_manifest_at(
     run_attempt: u32,
     pid: i32,
     cgroup_path: Option<&Path>,
+    job: Option<JobRecoveryMetadata>,
 ) -> anyhow::Result<()> {
     let start_time = proc_start_time(pid)
         .ok_or_else(|| anyhow::anyhow!("job process {pid} disappeared before it was recorded"))?;
     prepare_recovery_root_at(root)?;
     let path = recovery_manifest_path(root, job_id, run_attempt, pid);
     let temporary = root.join(format!(".job_{job_id}_{run_attempt}_{pid}.tmp"));
+    let is_job = job.is_some();
     let manifest = RecoveryManifest {
         schema_version: RECOVERY_SCHEMA_VERSION,
         job_id,
         run_attempt,
         pid,
         start_time,
+        boot_id: current_boot_id(),
         cgroup_path: cgroup_path.map(Path::to_path_buf),
+        process_id: String::new(),
+        step_id: None,
+        process_kind: String::new(),
+        job,
+        exit: None,
+        epilog_pending: is_job,
+        completion_pending: is_job,
+        drain_pending: false,
     };
-    let bytes = serde_json::to_vec(&manifest)?;
-    std::fs::write(&temporary, bytes)
+    write_recovery_manifest_file(&path, &temporary, &manifest)
+}
+
+fn write_recovery_manifest_file(
+    path: &Path,
+    temporary: &Path,
+    manifest: &RecoveryManifest,
+) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec(manifest)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(temporary)
+        .with_context(|| format!("open recovery manifest {}", temporary.display()))?;
+    file.write_all(&bytes)
         .with_context(|| format!("write recovery manifest {}", temporary.display()))?;
-    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::rename(&temporary, &path)
+    std::fs::set_permissions(temporary, std::fs::Permissions::from_mode(0o600))?;
+    file.sync_all()
+        .with_context(|| format!("sync recovery manifest {}", temporary.display()))?;
+    drop(file);
+    std::fs::rename(temporary, path)
         .with_context(|| format!("install recovery manifest {}", path.display()))?;
-    Ok(())
+    sync_parent_directory(path)
 }
 
-pub fn remove_process_recovery_manifest(job_id: JobId, run_attempt: u32, pid: i32) {
-    let _ = std::fs::remove_file(recovery_manifest_path(
-        &recovery_root(),
-        job_id,
-        run_attempt,
-        pid,
-    ));
+pub fn update_recovery_manifest(path: &Path, manifest: &RecoveryManifest) -> anyhow::Result<()> {
+    let temporary = path.with_extension("tmp");
+    write_recovery_manifest_file(path, &temporary, manifest)
 }
 
-fn remove_recovery_manifests(job_id: JobId) {
-    let root = recovery_root();
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(entry.path()) else {
-            continue;
-        };
-        let Ok(manifest) = serde_json::from_slice::<RecoveryManifest>(&bytes) else {
-            continue;
-        };
-        if manifest.job_id == job_id {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-pub fn recover_residual_allocations() -> anyhow::Result<usize> {
-    let mut recovered = recover_residual_job_cgroups()?;
-    let root = prepare_recovery_root()?;
-    recovered += recover_manifests_at(&root)?;
-    Ok(recovered)
-}
-
-fn recover_manifests_at(root: &Path) -> anyhow::Result<usize> {
-    prepare_recovery_root_at(root)?;
-    let mut recovered = 0;
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        if entry
-            .path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            != Some("json")
-        {
-            continue;
-        }
-        let bytes = std::fs::read(entry.path())?;
-        let manifest: RecoveryManifest = serde_json::from_slice(&bytes)?;
-        if manifest.schema_version != RECOVERY_SCHEMA_VERSION {
-            anyhow::bail!(
-                "unsupported recovery manifest schema {}",
-                manifest.schema_version
-            );
-        }
-        if let Some(cgroup) = &manifest.cgroup_path {
-            let expected = Path::new(CGROUP_ROOT).join(format!("job_{}", manifest.job_id));
-            if cgroup != &expected {
-                anyhow::bail!("recovery manifest has an invalid cgroup path");
+impl RecoveryStore {
+    pub fn mark_epilog_discharged(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        exit: (i32, i32),
+        drain: bool,
+    ) -> anyhow::Result<()> {
+        for (path, mut manifest) in self.scan()? {
+            if manifest.job_id != job_id
+                || manifest.run_attempt != run_attempt
+                || manifest.job.is_none()
+            {
+                continue;
             }
-            if cgroup.exists() {
-                cleanup_cgroup(cgroup);
+            manifest.exit = Some(exit);
+            manifest.epilog_pending = false;
+            manifest.drain_pending = drain;
+            update_recovery_manifest(&path, &manifest)?;
+            return Ok(());
+        }
+        anyhow::bail!("recovery manifest missing for job {job_id} attempt {run_attempt}")
+    }
+
+    fn remove_allocation_manifests(&self, job_id: JobId, run_attempt: u32) -> anyhow::Result<()> {
+        let entries = std::fs::read_dir(&*self.root).context("scan recovery manifests")?;
+        let mut removed = false;
+        for entry in entries {
+            let entry = entry.context("read recovery manifest entry")?;
+            if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = match std::fs::read(entry.path()) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).context("read allocation recovery manifest"),
+            };
+            let manifest = serde_json::from_slice::<RecoveryManifest>(&bytes)?;
+            if manifest.job_id == job_id && manifest.run_attempt == run_attempt {
+                match std::fs::remove_file(entry.path()) {
+                    Ok(()) => removed = true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error).context("remove allocation recovery manifest"),
+                }
             }
         }
-        if process_identity_is_live(manifest.pid, manifest.start_time) {
-            kill_process_tree(manifest.pid, Signal::SIGKILL);
+        if removed {
+            std::fs::File::open(&*self.root)?
+                .sync_all()
+                .context("sync recovery directory after allocation cleanup")?;
         }
-        if process_identity_is_live(manifest.pid, manifest.start_time) {
-            anyhow::bail!(
-                "residual process {} for job {} is still alive",
-                manifest.pid,
-                manifest.job_id
-            );
-        }
-        cleanup_job_spool_files(manifest.job_id);
-        let _ = std::fs::remove_file(entry.path());
-        recovered += 1;
+        Ok(())
     }
-    Ok(recovered)
 }
 
 /// Recursively signal a process and all its descendants (children first).
@@ -1386,6 +2087,17 @@ fn get_child_pids(pid: i32) -> Vec<i32> {
         .split_whitespace()
         .filter_map(|s| s.parse().ok())
         .collect()
+}
+
+fn collect_process_tree_identities(pid: i32, identities: &mut HashSet<(i32, u64)>) {
+    for child in get_child_pids(pid) {
+        let Some(start_time) = proc_start_time(child) else {
+            continue;
+        };
+        if identities.insert((child, start_time)) {
+            collect_process_tree_identities(child, identities);
+        }
+    }
 }
 
 /// Whether output file/dir creation must be performed as the submitting user.
@@ -1645,10 +2357,15 @@ fn create_dir_as_user(dir: &Path, uid: u32, gid: u32) -> bool {
 /// `SPOOL_ROOT`; falls back to a temp dir when it isn't writable (e.g. non-root
 /// dev runs). When spurd is root and the job targets a user, the dir is handed
 /// to that user so the job — which runs as the user — can traverse it.
-fn create_job_spool_dir(job_id: JobId, uid: u32, gid: u32) -> Result<PathBuf, LaunchError> {
+fn create_job_spool_dir(
+    job_id: JobId,
+    run_attempt: u32,
+    uid: u32,
+    gid: u32,
+) -> Result<PathBuf, LaunchError> {
     let mut failures = Vec::new();
     for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
-        let dir = base.join(format!("job{}", job_id));
+        let dir = base.join(format!("job{job_id}_{run_attempt}"));
         match std::fs::create_dir_all(&dir) {
             Ok(()) => {
                 if should_run_as_user(uid) {
@@ -1736,15 +2453,25 @@ pub(crate) fn write_job_scratch(
 /// Remove a job's spool directory (best-effort), mirroring Slurm purging its
 /// batchdir after completion. Tries both candidate roots since the fallback
 /// location isn't recorded.
-pub fn cleanup_job_spool(job_id: JobId) {
-    cleanup_job_spool_files(job_id);
-    remove_recovery_manifests(job_id);
+impl RecoveryStore {
+    pub fn cleanup_job_spool(&self, job_id: JobId, run_attempt: u32) -> anyhow::Result<()> {
+        cleanup_job_spool_files(job_id, run_attempt);
+        self.remove_allocation_manifests(job_id, run_attempt)
+    }
 }
 
-fn cleanup_job_spool_files(job_id: JobId) {
+fn cleanup_job_spool_files(job_id: JobId, run_attempt: u32) {
     for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
-        let _ = std::fs::remove_dir_all(base.join(format!("job{}", job_id)));
+        let _ = std::fs::remove_dir_all(base.join(format!("job{job_id}_{run_attempt}")));
     }
+}
+
+pub(crate) fn wrap_with_exit_sentinel(script: &str, exit_status_path: &Path) -> String {
+    format!(
+        "trap '_spur_rc=$?; echo $_spur_rc > {}; exit $_spur_rc' EXIT\n{}\n",
+        exit_status_path.display(),
+        script,
+    )
 }
 
 /// Resolve output path patterns (%j → job_id, etc.)
@@ -1780,7 +2507,13 @@ async fn launch_container_job(
     job_io: JobIo,
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
-    let cgroup_path = setup_cgroup(job_id, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
+    let cgroup_path = setup_cgroup(
+        job_id,
+        cfg.run_attempt,
+        cfg.cpus,
+        cfg.memory_mb,
+        &cfg.cpu_ids,
+    )?;
 
     // Sync pipe: child writes status, parent reads.
     // Convert OwnedFd to raw fds for manual lifecycle management across fork.
@@ -1808,6 +2541,11 @@ async fn launch_container_job(
     let env_snapshot = env.clone();
     let container_env = config.container_env.clone();
     let entrypoint = config.entrypoint.clone();
+    let cgroup_procs = cgroup_path
+        .as_ref()
+        .map(|path| CString::new(path.join("cgroup.procs").as_os_str().as_bytes()))
+        .transpose()
+        .context("cgroup path contains NUL")?;
 
     match unsafe { nix::unistd::fork().context("fork for container job")? } {
         nix::unistd::ForkResult::Child => {
@@ -1815,6 +2553,16 @@ async fn launch_container_job(
             // CRITICAL: synchronous code only. Tokio runtime is broken after fork.
             unsafe {
                 libc::close(ready_r);
+            }
+
+            if let Some(ref procs) = cgroup_procs {
+                if let Err(error) = unsafe { attach_current_process_to_cgroup(procs) } {
+                    let message = format!("E:cgroup attach failed: {error}");
+                    unsafe {
+                        libc::write(ready_w, message.as_ptr().cast(), message.len());
+                        libc::_exit(1);
+                    }
+                }
             }
 
             // Reset signal handlers
@@ -1905,10 +2653,6 @@ async fn launch_container_job(
             let pty_master = job_io.into_master();
 
             let child_pid = child.as_raw();
-
-            if let Some(ref cgroup) = cgroup_path {
-                let _ = std::fs::write(cgroup.join("cgroup.procs"), child_pid.to_string());
-            }
 
             // pidfd prevents PID recycling; falls back gracefully on kernels < 5.3
             let pidfd = pidfd_open(child_pid).ok();
@@ -2433,24 +3177,28 @@ mod tests {
         let job_id: JobId = 987_654_321;
         // LaunchError has no Debug impl on purpose (it must not be convertible
         // back into an anyhow::Error), so report it through Display.
-        let dir = create_job_spool_dir(job_id, uid, gid)
+        let dir = create_job_spool_dir(job_id, 1, uid, gid)
             .unwrap_or_else(|e| panic!("create spool dir: {e}"));
         assert!(dir.is_dir());
         write_job_scratch(&dir.join("spur_job.sh"), "x", uid, gid).unwrap();
-        cleanup_job_spool(job_id);
+        cleanup_job_spool_files(job_id, 1);
         assert!(!dir.exists());
     }
 
     #[test]
     fn recovery_manifest_records_exact_process_identity() {
         let dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
         let job = RunningJob::Forked {
             pid: std::process::id() as i32,
             _pidfd: None,
             cgroup_path: None,
             reaped: false,
         };
-        write_recovery_manifest_at(dir.path(), 41, 3, &job).unwrap();
+        let store = RecoveryStore::at(dir.path().to_path_buf(), cgroup_dir.path().to_path_buf());
+        store
+            .write_process_manifest(41, 3, std::process::id() as i32, job.cgroup_path())
+            .unwrap();
 
         let path = recovery_manifest_path(dir.path(), 41, 3, std::process::id() as i32);
         let bytes = std::fs::read(path).unwrap();
@@ -2462,104 +3210,325 @@ mod tests {
     }
 
     #[test]
-    fn recovery_manifest_kills_the_recorded_process_before_clearing() {
+    fn resumed_job_never_signals_a_pid_with_a_reused_identity() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static SIGNALED: AtomicBool = AtomicBool::new(false);
+        extern "C" fn record_signal(_: libc::c_int) {
+            SIGNALED.store(true, Ordering::SeqCst);
+        }
+
+        let action = SigAction::new(
+            SigHandler::Handler(record_signal),
+            SaFlags::empty(),
+            SigSet::empty(),
+        );
+        let previous = unsafe { signal::sigaction(Signal::SIGUSR1, &action) }.unwrap();
+        SIGNALED.store(false, Ordering::SeqCst);
+        let pid = std::process::id() as i32;
+        let job = RunningJob::Resumed {
+            pid,
+            start_time: proc_start_time(pid).unwrap().saturating_add(1),
+            _pidfd: Some(pidfd_open(pid).unwrap()),
+            cgroup_path: None,
+            exit_status_path: PathBuf::from("/nonexistent"),
+        };
+
+        job.kill_signal(Signal::SIGUSR1).unwrap();
+
+        unsafe { signal::sigaction(Signal::SIGUSR1, &previous) }.unwrap();
+        assert!(!SIGNALED.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn process_manifest_settlement_kills_the_recorded_process_and_descendants() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
         let dir = tempfile::tempdir().unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("recovery_manifest_child_process")
-            .arg("--ignored")
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::at(dir.path().to_path_buf(), cgroup_dir.path().to_path_buf());
+        let mut process = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 3600 & child=$!; printf '%s\\n' \"$child\"; wait")
+            .process_group(0)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let job = RunningJob::Forked {
-            pid: child.id() as i32,
-            _pidfd: None,
-            cgroup_path: None,
-            reaped: false,
-        };
-        write_recovery_manifest_at(dir.path(), 42, 4, &job).unwrap();
-        let manifest_path = recovery_manifest_path(dir.path(), 42, 4, child.id() as i32);
+        let process_pid = process.id() as i32;
+        let mut child_line = String::new();
+        std::io::BufReader::new(process.stdout.take().unwrap())
+            .read_line(&mut child_line)
+            .unwrap();
+        let child_pid: i32 = child_line.trim().parse().unwrap();
+        let child_start_time = proc_start_time(child_pid).unwrap();
 
-        let first_recovery = recover_manifests_at(dir.path());
-        let status = child.wait().unwrap();
-        let recovered = match first_recovery {
-            Ok(recovered) => recovered,
-            Err(_) => recover_manifests_at(dir.path()).unwrap(),
-        };
+        store
+            .write_process_manifest(42, 7, process_pid, None)
+            .unwrap();
+        let (path, manifest) = store.scan().unwrap().pop().unwrap();
+        store
+            .settle_process_manifest(&path, &manifest)
+            .await
+            .unwrap();
+        let status = process.wait().unwrap();
 
-        assert_eq!(recovered, 1);
         assert!(!status.success());
-        assert!(!manifest_path.exists());
+        assert!(!process_identity_is_live(child_pid, child_start_time));
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn process_intent_precedes_activation_and_settles_its_nested_cgroup() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+
+        let recovery_dir = tempfile::tempdir().unwrap();
+        let cgroup_root = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::at(
+            recovery_dir.path().to_path_buf(),
+            cgroup_root.path().to_path_buf(),
+        );
+        let allocation_cgroup = cgroup_root.path().join("job_53_11");
+        std::fs::create_dir(&allocation_cgroup).unwrap();
+        std::fs::write(allocation_cgroup.join("cgroup.procs"), "").unwrap();
+
+        let mut intent = store
+            .prepare_process_intent(53, 11, 7, "step", Some(&allocation_cgroup))
+            .unwrap();
+        let process_cgroup = intent.manifest.cgroup_path.clone().unwrap();
+        assert!(intent.path.exists());
+        assert_eq!(intent.manifest.pid, 0);
+        assert!(process_cgroup.starts_with(&allocation_cgroup));
+        assert!(process_cgroup.exists());
+        std::fs::write(process_cgroup.join("cgroup.procs"), "").unwrap();
+
+        let mut process = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 3600 & child=$!; printf '%s\\n' \"$child\"; wait")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child_line = String::new();
+        std::io::BufReader::new(process.stdout.take().unwrap())
+            .read_line(&mut child_line)
+            .unwrap();
+        let child_pid: i32 = child_line.trim().parse().unwrap();
+        let child_start_time = proc_start_time(child_pid).unwrap();
+        store
+            .activate_process_intent(&mut intent, process.id() as i32)
+            .unwrap();
+
+        store.settle_process_intent(&intent).await.unwrap();
+        let status = process.wait().unwrap();
+
+        assert!(!status.success());
+        assert!(!process_identity_is_live(child_pid, child_start_time));
+        assert!(!intent.path.exists());
+        assert!(!process_cgroup.exists());
+        assert!(allocation_cgroup.exists());
     }
 
     #[test]
-    fn recovery_processes_every_manifest_for_one_job() {
+    fn frozen_schema_one_manifest_uses_legacy_identity_and_cgroup() {
         let dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::at(dir.path().to_path_buf(), cgroup_dir.path().to_path_buf());
+        let legacy_cgroup = cgroup_dir.path().join("job_42");
+        let payload = format!(
+            r#"{{"schema_version":1,"job_id":42,"run_attempt":0,"pid":2147483647,"start_time":1,"cgroup_path":"{}"}}"#,
+            legacy_cgroup.display()
+        );
+        std::fs::write(dir.path().join("job_42.json"), payload).unwrap();
+
+        let manifests = store.scan().unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].1.schema_version, 1);
+        assert!(manifests[0].1.job.is_none());
+        assert_eq!(manifests[0].1.cgroup_path.as_ref(), Some(&legacy_cgroup));
+    }
+
+    fn recovery_metadata() -> JobRecoveryMetadata {
+        JobRecoveryMetadata {
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            containerized: false,
+            stdout_path: "/tmp/stdout".into(),
+            stderr_path: "/tmp/stderr".into(),
+            exit_status_path: PathBuf::from("/tmp/exit"),
+            work_dir: "/tmp".into(),
+            uid: 1000,
+            gid: 1000,
+            user: "user".into(),
+            partition: "default".into(),
+            gpu_devices: vec![3],
+            cpu_ids: vec![1, 2],
+            cpus: 2,
+            memory_mb: 512,
+            nodelist: "node1".into(),
+            mpi: "none".into(),
+            exact_resources: spur_core::resource::ResourceAllocations {
+                cpus: 2,
+                memory_mb: 512,
+                devices: HashMap::from([(
+                    "gpu".into(),
+                    vec![spur_core::resource::AllocatedDevice::injectable(3)],
+                )]),
+            },
+            last_command_id: 77,
+            restart_safe: true,
+        }
+    }
+
+    fn recovery_manifest_with_job(job_id: JobId, run_attempt: u32, pid: i32) -> RecoveryManifest {
+        RecoveryManifest {
+            schema_version: RECOVERY_SCHEMA_VERSION,
+            job_id,
+            run_attempt,
+            pid,
+            start_time: 1,
+            boot_id: current_boot_id(),
+            cgroup_path: None,
+            process_id: String::new(),
+            step_id: None,
+            process_kind: String::new(),
+            job: Some(recovery_metadata()),
+            exit: None,
+            epilog_pending: true,
+            completion_pending: true,
+            drain_pending: false,
+        }
+    }
+
+    #[test]
+    fn recovery_scan_rejects_duplicate_job_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::at(dir.path().to_path_buf(), cgroup_dir.path().to_path_buf());
         prepare_recovery_root_at(dir.path()).unwrap();
-        let current_pid = std::process::id() as i32;
-        let manifests = [
-            RecoveryManifest {
-                schema_version: RECOVERY_SCHEMA_VERSION,
-                job_id: 44,
-                run_attempt: 6,
-                pid: current_pid,
-                start_time: proc_start_time(current_pid).unwrap() + 1,
-                cgroup_path: None,
-            },
-            RecoveryManifest {
-                schema_version: RECOVERY_SCHEMA_VERSION,
-                job_id: 44,
-                run_attempt: 6,
-                pid: i32::MAX,
-                start_time: 1,
-                cgroup_path: None,
-            },
-        ];
-        for manifest in &manifests {
-            let path = recovery_manifest_path(
-                dir.path(),
-                manifest.job_id,
-                manifest.run_attempt,
-                manifest.pid,
-            );
-            std::fs::write(path, serde_json::to_vec(manifest).unwrap()).unwrap();
+        for pid in [100, 101] {
+            let manifest = recovery_manifest_with_job(43, 2, pid);
+            std::fs::write(
+                recovery_manifest_path(dir.path(), 43, 2, pid),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
         }
 
-        assert_eq!(recover_manifests_at(dir.path()).unwrap(), 2);
-        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+        let error = store.scan().unwrap_err().to_string();
+        assert!(error.contains("duplicate job recovery manifest"));
     }
 
     #[test]
-    fn recovery_manifest_does_not_signal_a_reused_pid() {
+    fn recovery_scan_rejects_inconsistent_resource_ownership() {
         let dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::at(dir.path().to_path_buf(), cgroup_dir.path().to_path_buf());
         prepare_recovery_root_at(dir.path()).unwrap();
-        let pid = std::process::id() as i32;
-        let manifest = RecoveryManifest {
-            schema_version: RECOVERY_SCHEMA_VERSION,
-            job_id: 43,
-            run_attempt: 5,
-            pid,
-            start_time: proc_start_time(pid).unwrap() + 1,
-            cgroup_path: None,
-        };
+        let mut manifest = recovery_manifest_with_job(44, 3, 102);
+        manifest.job.as_mut().unwrap().exact_resources.cpus = 1;
         std::fs::write(
-            dir.path().join("job_43.json"),
+            recovery_manifest_path(dir.path(), 44, 3, 102),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
 
-        assert_eq!(recover_manifests_at(dir.path()).unwrap(), 1);
-        assert!(proc_start_time(pid).is_some());
-        assert!(!dir.path().join("job_43.json").exists());
+        let error = store.scan().unwrap_err().to_string();
+        assert!(error.contains("inconsistent scalar resources"));
     }
 
     #[test]
-    #[ignore]
-    fn recovery_manifest_child_process() {
-        loop {
-            std::thread::park();
-        }
+    fn recovery_stores_are_isolated() {
+        let first = tempfile::tempdir().unwrap();
+        let first_cgroups = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let second_cgroups = tempfile::tempdir().unwrap();
+        let first_store = RecoveryStore::at(
+            first.path().to_path_buf(),
+            first_cgroups.path().to_path_buf(),
+        );
+        let second_store = RecoveryStore::at(
+            second.path().to_path_buf(),
+            second_cgroups.path().to_path_buf(),
+        );
+        let pid = std::process::id() as i32;
+        first_store
+            .write_process_manifest(45, 1, pid, None)
+            .unwrap();
+        second_store
+            .write_process_manifest(46, 1, pid, None)
+            .unwrap();
+
+        let first_jobs: Vec<_> = first_store
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|(_, manifest)| manifest.job_id)
+            .collect();
+        let second_jobs: Vec<_> = second_store
+            .scan()
+            .unwrap()
+            .into_iter()
+            .map(|(_, manifest)| manifest.job_id)
+            .collect();
+        assert_eq!(first_jobs, vec![45]);
+        assert_eq!(second_jobs, vec![46]);
+    }
+
+    #[test]
+    fn first_job_manifest_contains_command_and_exact_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::at(dir.path().to_path_buf(), cgroup_dir.path().to_path_buf());
+        let job = RunningJob::Forked {
+            pid: std::process::id() as i32,
+            _pidfd: None,
+            cgroup_path: None,
+            reaped: false,
+        };
+        store
+            .write_job_manifest(47, 4, &job, recovery_metadata())
+            .unwrap();
+
+        let (_, manifest) = store.scan().unwrap().pop().unwrap();
+        let metadata = manifest.job.unwrap();
+        assert_eq!(metadata.last_command_id, 77);
+        assert_eq!(metadata.cpu_ids, vec![1, 2]);
+        assert_eq!(metadata.gpu_devices, vec![3]);
+        assert_eq!(metadata.exact_resources.cpus, 2);
+        assert_eq!(metadata.exact_resources.memory_mb, 512);
+    }
+
+    #[test]
+    fn recovery_manifest_update_and_removal_leave_one_authoritative_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::at(dir.path().to_path_buf(), cgroup_dir.path().to_path_buf());
+        let job = RunningJob::Forked {
+            pid: std::process::id() as i32,
+            _pidfd: None,
+            cgroup_path: None,
+            reaped: false,
+        };
+        store
+            .write_job_manifest(147, 6, &job, recovery_metadata())
+            .unwrap();
+        let (path, mut manifest) = store.scan().unwrap().pop().unwrap();
+        manifest.exit = Some((17, 0));
+        update_recovery_manifest(&path, &manifest).unwrap();
+
+        let stored: RecoveryManifest =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored.exit, Some((17, 0)));
+        assert!(!path.with_extension("tmp").exists());
+
+        remove_recovery_manifest(&path).unwrap();
+        assert!(!path.exists());
+        assert!(store.scan().unwrap().is_empty());
     }
 
     // send_fds/recv_fds are process-agnostic: they pass fds over any Unix
@@ -2629,6 +3598,8 @@ mod tests {
     fn launch_cfg_for_paths(job_id: JobId, name: &str, user: &str, node: &str) -> JobLaunchConfig {
         JobLaunchConfig {
             job_id,
+            run_attempt: 1,
+            exit_status_path: None,
             script: String::new(),
             work_dir: String::new(),
             name: name.to_string(),

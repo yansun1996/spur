@@ -113,6 +113,76 @@ impl VirtualAgent {
             ))),
         }
     }
+
+    async fn resolve_current_pod(&self, namespace: &str, job_id: u32) -> Result<String, Status> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let listed = pods
+            .list(&ListParams::default().labels(&allocation_selector(job_id, 0)))
+            .await
+            .map_err(|error| Status::internal(format!("pod lookup failed: {error}")))?;
+        current_attempt_pod_name(job_id, &listed.items)
+    }
+
+    async fn delete_allocation_resources(
+        &self,
+        namespace: &str,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> Result<(), Status> {
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let params = ListParams::default().labels(&allocation_selector(job_id, run_attempt));
+        let pod_list = pods.list(&params).await.map_err(|error| {
+            Status::internal(format!("failed to list Pods for cancellation: {error}"))
+        })?;
+        for pod in pod_list {
+            let Some(name) = pod.metadata.name else {
+                continue;
+            };
+            match pods.delete(&name, &DeleteParams::default()).await {
+                Ok(_) => info!(job_id, run_attempt, pod = %name, "deleted Pod"),
+                Err(kube::Error::Api(error)) if error.code == 404 => {
+                    debug!(job_id, run_attempt, pod = %name, "Pod already gone");
+                }
+                Err(error) => {
+                    return Err(Status::internal(format!(
+                        "failed to delete Pod {name}: {error}"
+                    )));
+                }
+            }
+        }
+
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let service_names = if run_attempt == 0 {
+            services
+                .list(&params)
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("failed to list Services for cancellation: {error}"))
+                })?
+                .into_iter()
+                .filter_map(|service| service.metadata.name)
+                .collect()
+        } else {
+            vec![job_resource_name(job_id, run_attempt)]
+        };
+        for service_name in service_names {
+            match services
+                .delete(&service_name, &DeleteParams::default())
+                .await
+            {
+                Ok(_) => {
+                    debug!(job_id, run_attempt, service = %service_name, "deleted headless Service")
+                }
+                Err(kube::Error::Api(error)) if error.code == 404 => {}
+                Err(error) => {
+                    return Err(Status::internal(format!(
+                        "failed to delete headless Service {service_name}: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -139,14 +209,8 @@ impl SlurmAgent for VirtualAgent {
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
 
-        // Pod name includes target_node to avoid conflicts for multi-node jobs
-        let pod_name = if target_node.is_empty() {
-            format!("spur-job-{}", job_id)
-        } else {
-            // Sanitize node name for K8s naming (lowercase, alphanumeric + dashes)
-            let sanitized = sanitize_k8s_name(&target_node);
-            format!("spur-job-{}-{}", job_id, sanitized)
-        };
+        let pod_name = pod_name(job_id, run_attempt, &target_node);
+        let service_name = job_resource_name(job_id, run_attempt);
 
         let image = if spec.container_image.is_empty() {
             "busybox:latest".to_string()
@@ -233,7 +297,7 @@ impl SlurmAgent for VirtualAgent {
         senv.set("NODE_RANK", node_rank);
 
         if num_peers > 1 {
-            let master_addr = format!("spur-job-{}.{}.svc.cluster.local", job_id, ns);
+            let master_addr = format!("{service_name}.{ns}.svc.cluster.local");
             senv.set("MASTER_ADDR", master_addr);
             senv.set("MASTER_PORT", "29500");
             senv.set("WORLD_SIZE", num_peers);
@@ -411,7 +475,10 @@ impl SlurmAgent for VirtualAgent {
 
         // For multi-node jobs, create headless Service for DNS discovery
         if num_peers > 1 {
-            if let Err(e) = self.ensure_headless_service(job_id, &labels, &ns).await {
+            if let Err(e) = self
+                .ensure_headless_service(job_id, run_attempt, &labels, &ns)
+                .await
+            {
                 warn!(job_id, error = %e, "failed to create headless service");
             }
         }
@@ -425,10 +492,7 @@ impl SlurmAgent for VirtualAgent {
 
         // For headless service DNS: set hostname and subdomain
         let (hostname, subdomain) = if num_peers > 1 && !target_node.is_empty() {
-            (
-                Some(sanitize_k8s_name(&target_node)),
-                Some(format!("spur-job-{}", job_id)),
-            )
+            (Some(sanitize_k8s_name(&target_node)), Some(service_name))
         } else {
             (None, None)
         };
@@ -484,14 +548,28 @@ impl SlurmAgent for VirtualAgent {
                     ..Default::default()
                 }))
             }
-            Err(kube::Error::Api(e)) if e.code == 409 => {
-                info!(job_id, pod = %pod_name, namespace = %ns, target = %req.target_node, "K8s Pod already exists, treating as success");
-                Ok(Response::new(LaunchJobResponse {
-                    success: true,
-                    error: String::new(),
+            Err(kube::Error::Api(e)) if e.code == 409 => match pods.get(&pod_name).await {
+                Ok(existing)
+                    if metadata_matches_attempt(&existing.metadata, job_id, run_attempt) =>
+                {
+                    info!(job_id, run_attempt, pod = %pod_name, namespace = %ns, "K8s Pod already exists for this attempt");
+                    Ok(Response::new(LaunchJobResponse {
+                        success: true,
+                        error: String::new(),
+                        ..Default::default()
+                    }))
+                }
+                Ok(_) => Ok(Response::new(LaunchJobResponse {
+                    success: false,
+                    error: "existing Pod belongs to a different run attempt".into(),
                     ..Default::default()
-                }))
-            }
+                })),
+                Err(error) => Ok(Response::new(LaunchJobResponse {
+                    success: false,
+                    error: format!("failed to validate existing Pod: {error}"),
+                    ..Default::default()
+                })),
+            },
             Err(e) => {
                 error!(job_id, error = %e, "failed to create K8s Pod");
                 Ok(Response::new(LaunchJobResponse {
@@ -527,41 +605,8 @@ impl SlurmAgent for VirtualAgent {
         self.term_fence.check(req.term)?;
         let job_id = req.job_id;
         let ns = self.resolve_namespace(job_id).await?;
-
-        // Delete all pods for this job by label selector
-        let pods: Api<Pod> = Api::namespaced(self.client.clone(), &ns);
-        let lp = ListParams::default().labels(&format!("spur.amd.com/job-id={}", job_id));
-
-        match pods.list(&lp).await {
-            Ok(pod_list) => {
-                for pod in pod_list {
-                    let name = pod.metadata.name.unwrap_or_default();
-                    match pods.delete(&name, &DeleteParams::default()).await {
-                        Ok(_) => info!(job_id, pod = %name, "deleted Pod"),
-                        Err(kube::Error::Api(e)) if e.code == 404 => {
-                            debug!(job_id, pod = %name, "Pod already gone");
-                        }
-                        Err(e) => {
-                            error!(job_id, pod = %name, error = %e, "failed to delete Pod");
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                error!(job_id, error = %e, "failed to list Pods for cancellation");
-            }
-        }
-
-        // Also clean up the headless service if it exists
-        let services: Api<Service> = Api::namespaced(self.client.clone(), &ns);
-        let svc_name = format!("spur-job-{}", job_id);
-        match services.delete(&svc_name, &DeleteParams::default()).await {
-            Ok(_) => debug!(job_id, "deleted headless Service"),
-            Err(kube::Error::Api(e)) if e.code == 404 => {}
-            Err(e) => {
-                debug!(job_id, error = %e, "failed to delete headless Service");
-            }
-        }
+        self.delete_allocation_resources(&ns, job_id, req.run_attempt)
+            .await?;
 
         Ok(Response::new(()))
     }
@@ -573,6 +618,7 @@ impl SlurmAgent for VirtualAgent {
         // Pod-level SIGSTOP/SIGCONT is not modeled for the k8s backend; the
         // controller-side state change still applies. Accept as a no-op.
         let req = request.into_inner();
+        self.term_fence.check(req.term)?;
         debug!(
             job_id = req.job_id,
             resume = req.resume,
@@ -598,7 +644,7 @@ impl SlurmAgent for VirtualAgent {
         let req = request.into_inner();
         let job_id = req.job_id;
         let ns = self.resolve_namespace(job_id).await?;
-        let pod_name = format!("spur-job-{}", job_id);
+        let pod_name = self.resolve_current_pod(&ns, job_id).await?;
         let command: Vec<String> = if req.command.is_empty() {
             vec!["bash".into(), "-c".into(), "echo ok".into()]
         } else {
@@ -692,7 +738,7 @@ impl SlurmAgent for VirtualAgent {
         let req = request.into_inner();
         let job_id = req.job_id;
         let ns = self.resolve_namespace(job_id).await?;
-        let pod_name = format!("spur-job-{}", job_id);
+        let pod_name = self.resolve_current_pod(&ns, job_id).await?;
 
         debug!(pod = %pod_name, "streaming logs from K8s pod");
 
@@ -814,13 +860,20 @@ impl VirtualAgent {
     async fn ensure_headless_service(
         &self,
         job_id: u32,
+        run_attempt: u32,
         labels: &BTreeMap<String, String>,
         namespace: &str,
     ) -> Result<(), kube::Error> {
         let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
-        let svc_name = format!("spur-job-{}", job_id);
-
-        let selector = BTreeMap::from([("spur.amd.com/job-id".to_string(), job_id.to_string())]);
+        let svc_name = job_resource_name(job_id, run_attempt);
+        let mut selector =
+            BTreeMap::from([("spur.amd.com/job-id".to_string(), job_id.to_string())]);
+        if run_attempt != 0 {
+            selector.insert(
+                "spur.amd.com/run-attempt".to_string(),
+                run_attempt.to_string(),
+            );
+        }
 
         let svc = Service {
             metadata: ObjectMeta {
@@ -849,8 +902,13 @@ impl VirtualAgent {
                 Ok(())
             }
             Err(kube::Error::Api(e)) if e.code == 409 => {
-                debug!(job_id, "headless Service already exists");
-                Ok(())
+                let existing = services.get(&svc_name).await?;
+                if metadata_matches_attempt(&existing.metadata, job_id, run_attempt) {
+                    debug!(job_id, run_attempt, "headless Service already exists");
+                    Ok(())
+                } else {
+                    Err(kube::Error::Api(e))
+                }
             }
             Err(e) => Err(e),
         }
@@ -911,6 +969,73 @@ fn parse_mounts(mounts: &[String]) -> (Vec<Volume>, Vec<VolumeMount>) {
 }
 
 /// Sanitize a string for use in K8s resource names.
+fn job_resource_name(job_id: u32, run_attempt: u32) -> String {
+    if run_attempt == 0 {
+        format!("spur-job-{job_id}")
+    } else {
+        format!("spur-job-{job_id}-a{run_attempt}")
+    }
+}
+
+fn pod_name(job_id: u32, run_attempt: u32, target_node: &str) -> String {
+    let base = job_resource_name(job_id, run_attempt);
+    if target_node.is_empty() {
+        base
+    } else {
+        format!("{base}-{}", sanitize_k8s_name(target_node))
+    }
+}
+
+fn allocation_selector(job_id: u32, run_attempt: u32) -> String {
+    if run_attempt == 0 {
+        format!("spur.amd.com/job-id={job_id}")
+    } else {
+        format!("spur.amd.com/job-id={job_id},spur.amd.com/run-attempt={run_attempt}")
+    }
+}
+
+fn metadata_matches_attempt(metadata: &ObjectMeta, job_id: u32, run_attempt: u32) -> bool {
+    metadata.labels.as_ref().is_some_and(|labels| {
+        labels.get("spur.amd.com/job-id") == Some(&job_id.to_string())
+            && (run_attempt == 0
+                || labels.get("spur.amd.com/run-attempt") == Some(&run_attempt.to_string()))
+    })
+}
+
+fn current_attempt_pod_name(job_id: u32, pods: &[Pod]) -> Result<String, Status> {
+    let job_label = job_id.to_string();
+    let mut candidates: Vec<(u32, String)> = pods
+        .iter()
+        .filter(|pod| pod.metadata.deletion_timestamp.is_none())
+        .filter_map(|pod| {
+            let labels = pod.metadata.labels.as_ref()?;
+            if labels.get("spur.amd.com/job-id")? != &job_label {
+                return None;
+            }
+            let run_attempt = labels
+                .get("spur.amd.com/run-attempt")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            Some((run_attempt, pod.metadata.name.clone()?))
+        })
+        .collect();
+    let Some(latest_attempt) = candidates.iter().map(|(attempt, _)| *attempt).max() else {
+        return Err(Status::not_found(format!(
+            "no active Pod found for job {job_id}"
+        )));
+    };
+    candidates.retain(|(attempt, _)| *attempt == latest_attempt);
+    if candidates.len() != 1 {
+        return Err(Status::failed_precondition(format!(
+            "job {job_id} attempt {latest_attempt} has multiple Pods; a target node is required"
+        )));
+    }
+    candidates
+        .pop()
+        .map(|(_, name)| name)
+        .ok_or_else(|| Status::internal("current Pod selection lost its candidate"))
+}
+
 fn sanitize_k8s_name(s: &str) -> String {
     s.to_lowercase()
         .chars()
@@ -968,6 +1093,256 @@ pub fn gpu_request_to_gres(count: u32, gpu_type: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{Method, Request, Response, StatusCode};
+    use kube::client::Body;
+    use std::convert::Infallible;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tower::service_fn;
+
+    type SeenRequests = Arc<StdMutex<Vec<(Method, String)>>>;
+
+    fn mock_kube_client<F>(respond: F) -> (Client, SeenRequests)
+    where
+        F: Fn(&Method, &str) -> (StatusCode, serde_json::Value) + Send + Sync + 'static,
+    {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let service_seen = seen.clone();
+        let respond = Arc::new(respond);
+        let service = service_fn(move |request: Request<Body>| {
+            let method = request.method().clone();
+            let uri = request.uri().to_string();
+            service_seen
+                .lock()
+                .expect("request recorder poisoned")
+                .push((method.clone(), uri.clone()));
+            let (status, payload) = respond(&method, &uri);
+            async move {
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&payload).expect("serialize mock response"),
+                        ))
+                        .expect("build mock response"),
+                )
+            }
+        });
+        (Client::new(service, "default"), seen)
+    }
+
+    fn attempt_pod(job_id: u32, run_attempt: u32, name: &str) -> Pod {
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(name.into()),
+                labels: Some(BTreeMap::from([
+                    ("spur.amd.com/job-id".into(), job_id.to_string()),
+                    ("spur.amd.com/run-attempt".into(), run_attempt.to_string()),
+                ])),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn attempt_scoped_resource_names_and_selectors_are_stable() {
+        assert_eq!(job_resource_name(17, 0), "spur-job-17");
+        assert_eq!(job_resource_name(17, 3), "spur-job-17-a3");
+        assert_eq!(pod_name(17, 3, "GPU_Node.1"), "spur-job-17-a3-gpu-node-1");
+        assert_eq!(
+            allocation_selector(17, 3),
+            "spur.amd.com/job-id=17,spur.amd.com/run-attempt=3"
+        );
+    }
+
+    #[test]
+    fn exec_and_logs_select_the_latest_attempt_pod() {
+        let pods = vec![
+            attempt_pod(17, 2, "spur-job-17-a2"),
+            attempt_pod(17, 3, "spur-job-17-a3"),
+        ];
+
+        assert_eq!(
+            current_attempt_pod_name(17, &pods).unwrap(),
+            "spur-job-17-a3"
+        );
+    }
+
+    #[test]
+    fn ambiguous_multinode_attempt_requires_a_target() {
+        let pods = vec![
+            attempt_pod(17, 3, "spur-job-17-a3-node1"),
+            attempt_pod(17, 3, "spur-job-17-a3-node2"),
+        ];
+
+        let error = current_attempt_pod_name(17, &pods).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn current_pod_selection_uses_live_kubernetes_inventory() {
+        let (client, seen) = mock_kube_client(|_, _| {
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "PodList",
+                    "metadata": {},
+                    "items": [
+                        {
+                            "metadata": {
+                                "name": "spur-job-17-a2",
+                                "labels": {
+                                    "spur.amd.com/job-id": "17",
+                                    "spur.amd.com/run-attempt": "2"
+                                }
+                            }
+                        },
+                        {
+                            "metadata": {
+                                "name": "spur-job-17-a3",
+                                "labels": {
+                                    "spur.amd.com/job-id": "17",
+                                    "spur.amd.com/run-attempt": "3"
+                                }
+                            }
+                        }
+                    ]
+                }),
+            )
+        });
+        let agent = VirtualAgent::new(client);
+
+        assert_eq!(
+            agent.resolve_current_pod("jobs", 17).await.unwrap(),
+            "spur-job-17-a3"
+        );
+        let requests = seen.lock().expect("request recorder poisoned");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].0, Method::GET);
+        assert!(requests[0].1.contains("/namespaces/jobs/pods?"));
+        assert!(requests[0].1.contains("spur.amd.com%2Fjob-id%3D17"));
+    }
+
+    #[tokio::test]
+    async fn stale_cancel_deletes_only_its_attempt_resources() {
+        let (client, seen) = mock_kube_client(|method, uri| {
+            if *method == Method::GET && uri.contains("/pods?") {
+                return (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": [{"metadata": {"name": "spur-job-17-a2"}}]
+                    }),
+                );
+            }
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Success"
+                }),
+            )
+        });
+        let agent = VirtualAgent::new(client);
+
+        agent
+            .delete_allocation_resources("jobs", 17, 2)
+            .await
+            .unwrap();
+
+        let requests = seen.lock().expect("request recorder poisoned");
+        let pod_list = requests
+            .iter()
+            .find(|(method, uri)| *method == Method::GET && uri.contains("/pods?"))
+            .expect("pod inventory was not listed");
+        assert!(pod_list.1.contains("spur.amd.com%2Fjob-id%3D17"));
+        assert!(pod_list.1.contains("spur.amd.com%2Frun-attempt%3D2"));
+        assert!(requests.iter().any(|(method, uri)| {
+            *method == Method::DELETE && uri.contains("/pods/spur-job-17-a2")
+        }));
+        assert!(requests.iter().any(|(method, uri)| {
+            *method == Method::DELETE && uri.contains("/services/spur-job-17-a2")
+        }));
+        assert!(!requests
+            .iter()
+            .any(|(method, uri)| *method == Method::DELETE && uri.contains("-a3")));
+    }
+
+    #[tokio::test]
+    async fn cancel_rpc_propagates_kubernetes_delete_failure() {
+        let (client, seen) = mock_kube_client(|method, uri| {
+            if *method == Method::GET && uri.contains("/spurjobs?") {
+                return (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "spur.amd.com/v1alpha1",
+                        "kind": "SpurJobList",
+                        "metadata": {},
+                        "items": [{
+                            "metadata": {"name": "job-17", "namespace": "jobs"},
+                            "spec": {"name": "job-17", "image": "busybox"}
+                        }]
+                    }),
+                );
+            }
+            if *method == Method::GET && uri.contains("/pods?") {
+                return (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": [{"metadata": {"name": "spur-job-17-a2"}}]
+                    }),
+                );
+            }
+            if *method == Method::DELETE && uri.contains("/pods/spur-job-17-a2") {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "Status",
+                        "status": "Failure",
+                        "reason": "InternalError",
+                        "code": 500
+                    }),
+                );
+            }
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Success"
+                }),
+            )
+        });
+        let agent = VirtualAgent::new(client);
+
+        let error = agent
+            .cancel_job(tonic::Request::new(AgentCancelJobRequest {
+                job_id: 17,
+                signal: 0,
+                term: 0,
+                run_attempt: 2,
+            }))
+            .await
+            .expect_err("a failed Pod delete must fail the cancel RPC");
+
+        assert_eq!(error.code(), tonic::Code::Internal);
+        assert!(seen
+            .lock()
+            .expect("request recorder poisoned")
+            .iter()
+            .any(|(method, uri)| {
+                *method == Method::DELETE && uri.contains("/pods/spur-job-17-a2")
+            }));
+    }
 
     // A demoted leader's stale LaunchJob/CancelJob must be rejected here too,
     // not just on the native spurd backend.

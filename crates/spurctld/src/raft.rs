@@ -62,11 +62,15 @@ pub(crate) fn raft_client(
 }
 
 /// Set when a committed WAL entry transitions a job to a terminal state.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobFinalized {
     pub job_id: u32,
     pub state: spur_core::job::JobState,
     pub exit_code: i32,
+    #[serde(default)]
+    pub run_attempt: u32,
+    #[serde(default)]
+    pub cleanup_nodes: Vec<String>,
 }
 
 /// Response returned after a Raft write is committed.
@@ -78,6 +82,14 @@ pub struct ClientResponse {
     pub reservation_created: bool,
     #[serde(default)]
     pub partition_created: bool,
+    #[serde(default)]
+    pub allocation_activated: bool,
+    #[serde(default)]
+    pub allocation_prepared: bool,
+    #[serde(default)]
+    pub step_created: bool,
+    #[serde(default)]
+    pub step_pmix_prepared: bool,
 }
 
 /// Trait for applying committed Raft entries to the cluster state.

@@ -140,6 +140,7 @@ pub async fn run(
                         allocation_inventory: Vec::new(),
                         recovery_complete: true,
                         supports_command_polling: false,
+                        supports_attempt_inventory: true,
                     };
 
                     match ctrl_client.register_agent(req.clone()).await {

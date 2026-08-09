@@ -277,14 +277,12 @@ async fn main() -> anyhow::Result<()> {
             if !health_raft.is_leader() {
                 continue;
             }
-            let evicted = health_cluster.check_node_health(hb_timeout);
-            for fin in &evicted {
-                if let Some(job) = health_cluster.get_job(fin.job_id) {
-                    let c = health_cluster.clone();
-                    tokio::spawn(async move {
-                        crate::scheduler_loop::send_cancel_to_agents(&c, &job, 9).await;
-                    });
-                }
+            let (evicted, cleanup_jobs) = health_cluster.check_node_health(hb_timeout);
+            for job in cleanup_jobs {
+                let c = health_cluster.clone();
+                tokio::spawn(async move {
+                    crate::scheduler_loop::send_cancel_to_agents(&c, &job, 9).await;
+                });
             }
             health_cluster.complete_evicted_steps(&evicted);
         }

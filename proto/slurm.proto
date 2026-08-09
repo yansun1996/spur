@@ -672,6 +672,7 @@ message RegisterAgentRequest {
   repeated AgentAllocationStatus allocation_inventory = 11;
   bool recovery_complete = 12;
   bool supports_command_polling = 13;
+  bool supports_attempt_inventory = 14;
 }
 
 message RegisterAgentResponse {
@@ -695,12 +696,14 @@ message HeartbeatRequest {
   repeated AgentAllocationStatus allocation_inventory = 9;
   bool recovery_complete = 10;
   bool supports_command_polling = 11;
+  bool supports_attempt_inventory = 12;
 }
 
 message RunningJobStatus {
   uint32 job_id = 1;
   JobState state = 2;
   int32 exit_code = 3;
+  uint32 run_attempt = 4;
 }
 
 enum AgentAllocationPhase {
@@ -834,6 +837,7 @@ message PreparePmixRequest {
   uint32 job_id = 1;
   PmixLaunchPlan pmix_plan = 2;
   uint32 run_attempt = 3;
+  uint64 term = 4;
 }
 
 message PreparePmixResponse {
@@ -843,6 +847,8 @@ message PreparePmixResponse {
 
 message ReleasePmixRequest {
   uint32 job_id = 1;
+  uint32 run_attempt = 2;
+  uint64 term = 3;
 }
 
 message ReleasePmixResponse {}
@@ -869,6 +875,7 @@ message AgentSuspendJobRequest {
   bool resume = 2;   // false = SIGSTOP (suspend), true = SIGCONT (resume)
   // See LaunchJobRequest.term.
   uint64 term = 3;
+  uint32 run_attempt = 4;
 }
 
 message NodeResourcesResponse {
@@ -1064,6 +1071,8 @@ message RunCommandRequest {
   string mpi = 13;             // Resolved step MPI type: "none" or "pmix"
   // When true, PMIx was prepared via PreparePmix on the controller before RunCommand.
   bool pmix_prepared = 14;
+  uint32 run_attempt = 15;
+  uint64 term = 16;
 }
 
 // Register a srun-only allocation on an agent without starting a batch process.
@@ -1099,6 +1108,8 @@ message CancelStepRequest {
   uint32 job_id = 1;
   uint32 step_id = 2;
   int32 signal = 3;  // 0 = SIGTERM, 9 = SIGKILL, etc.
+  uint32 run_attempt = 4;
+  uint64 term = 5;
 }
 
 message StreamJobOutputRequest {

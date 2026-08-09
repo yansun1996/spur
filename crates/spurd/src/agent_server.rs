@@ -5,11 +5,13 @@
 //! Receives job launch/cancel requests from spurctld.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use prost::Message;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
@@ -56,10 +58,12 @@ pub(crate) struct TrackedJob {
     memory_mb: u64,
     nodelist: String,
     mpi: String,
+    last_command_id: u64,
     /// Run epoch; echoed on completion and guards the grace-period SIGKILL.
     run_attempt: u32,
 }
 
+#[derive(Clone)]
 struct CompletedJob {
     job_id: u32,
     exit_code: i32,
@@ -78,6 +82,113 @@ struct CompletedJob {
     mpi: String,
 }
 
+struct CompletionWork {
+    completion: CompletedJob,
+    _lifecycle_guard: OwnedMutexGuard<()>,
+}
+
+struct RecoveredCompletion {
+    manifest_path: std::path::PathBuf,
+    manifest: executor::RecoveryManifest,
+}
+
+impl TrackedJob {
+    fn into_completion(
+        mut self,
+        job_id: u32,
+        exit_code: i32,
+        signal: i32,
+    ) -> (executor::RunningJob, CompletedJob) {
+        let cgroup = self.job.take_cgroup();
+        let completion = CompletedJob {
+            job_id,
+            exit_code,
+            signal,
+            run_attempt: self.run_attempt,
+            rootfs_mode: self.rootfs_mode,
+            cgroup,
+            work_dir: self.work_dir,
+            uid: self.uid,
+            gid: self.gid,
+            partition: self.partition,
+            gpu_devices: self.gpu_devices,
+            cpus: self.cpus,
+            memory_mb: self.memory_mb,
+            nodelist: self.nodelist,
+            mpi: self.mpi,
+        };
+        (self.job, completion)
+    }
+}
+
+fn recovered_completion_metadata(
+    manifest: &executor::RecoveryManifest,
+    metadata: &executor::JobRecoveryMetadata,
+) -> CompletedJob {
+    let (exit_code, signal) = executor::resolve_recovered_exit(manifest);
+    CompletedJob {
+        job_id: manifest.job_id,
+        exit_code,
+        signal,
+        run_attempt: manifest.run_attempt,
+        rootfs_mode: metadata.rootfs_mode.clone(),
+        cgroup: manifest.cgroup_path.clone(),
+        work_dir: metadata.work_dir.clone(),
+        uid: metadata.uid,
+        gid: metadata.gid,
+        partition: metadata.partition.clone(),
+        gpu_devices: metadata.gpu_devices.clone(),
+        cpus: metadata.cpus,
+        memory_mb: metadata.memory_mb,
+        nodelist: metadata.nodelist.clone(),
+        mpi: metadata.mpi.clone(),
+    }
+}
+
+async fn run_completion_hooks(
+    completion: &CompletedJob,
+    hooks: &HooksConfig,
+    spank: Option<&SpankHost>,
+) -> bool {
+    let context = spur_core::hooks::HookContext {
+        job_id: completion.job_id,
+        work_dir: completion.work_dir.clone(),
+        uid: completion.uid,
+        gid: completion.gid,
+        partition: completion.partition.clone(),
+        nodelist: completion.nodelist.clone(),
+        script_context: "epilog_slurmd".into(),
+        gpu_devices: completion.gpu_devices.clone(),
+        cpus: completion.cpus,
+        memory_mb: completion.memory_mb,
+    };
+    let mut drain = false;
+    if let Some(epilog) = hooks.epilog.as_ref() {
+        if let Err(error) = spur_core::hooks::run_hook(epilog, &context).await {
+            error!(job_id = completion.job_id, error = %error, "epilog hook failed — requesting node drain");
+            drain = true;
+        }
+    }
+    if let Some(spank) = spank {
+        let mut handle = SpankHandle::new(
+            SpankContext {
+                job_id: completion.job_id,
+                uid: completion.uid,
+                gid: completion.gid,
+                ..Default::default()
+            },
+            HashMap::new(),
+        );
+        for hook in [SpankHook::TaskExit, SpankHook::JobEpilog] {
+            if let Err(error) = spank.invoke_hook(hook, &mut handle) {
+                warn!(job_id = completion.job_id, error = %error, "SPANK completion hook failed");
+                drain = true;
+            }
+        }
+    }
+    drain
+}
+
 async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginHost) {
     if mpi == MPI_PMIX {
         if let Err(e) = mpi_host.release_pmix_server(job_id) {
@@ -86,8 +197,125 @@ async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginH
     }
 }
 
+async fn cleanup_completed_artifacts(
+    completion: &CompletedJob,
+    mpi_host: &MpiPluginHost,
+) -> anyhow::Result<()> {
+    cleanup_completed_artifacts_at(completion, mpi_host, None).await
+}
+
+async fn cleanup_completed_artifacts_at(
+    completion: &CompletedJob,
+    mpi_host: &MpiPluginHost,
+    rootfs_path: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    if let Some(rootfs_path) = rootfs_path {
+        crate::container::cleanup_rootfs_at(rootfs_path, &completion.rootfs_mode)?;
+    } else {
+        crate::container::cleanup_rootfs(
+            completion.job_id,
+            completion.run_attempt,
+            &completion.rootfs_mode,
+        )?;
+    }
+    if let Some(ref cgroup) = completion.cgroup {
+        crate::executor::cleanup_cgroup(cgroup);
+    }
+    cleanup_completed_job_mpi(completion.job_id, &completion.mpi, mpi_host).await;
+    Ok(())
+}
+
 /// Job ids this node holds, shared with the reporter so heartbeats carry them.
 pub(crate) type RunningJobs = Arc<Mutex<HashMap<u32, TrackedJob>>>;
+type LifecycleKey = (u32, u32);
+type LifecycleLocks = Arc<Mutex<HashMap<LifecycleKey, Weak<Mutex<()>>>>>;
+
+async fn acquire_lifecycle_lock(locks: &LifecycleLocks, key: LifecycleKey) -> OwnedMutexGuard<()> {
+    let lock = {
+        let mut locks = locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(Mutex::new(()));
+            locks.insert(key, Arc::downgrade(&lock));
+            lock
+        }
+    };
+    lock.lock_owned().await
+}
+
+async fn launch_ack_pending(
+    command_id: u64,
+    applied: &Mutex<HashMap<u64, AppliedCommandResult>>,
+    in_flight: &Mutex<HashSet<u64>>,
+) -> bool {
+    command_id != 0
+        && (applied.lock().await.contains_key(&command_id)
+            || in_flight.lock().await.contains(&command_id))
+}
+
+async fn collect_completed_jobs(
+    running: &RunningJobs,
+    allocation: &Mutex<NodeAllocation>,
+    lifecycle_locks: &LifecycleLocks,
+    applied: &Mutex<HashMap<u64, AppliedCommandResult>>,
+    in_flight: &Mutex<HashSet<u64>>,
+) -> Vec<CompletionWork> {
+    let candidates: Vec<_> = running
+        .lock()
+        .await
+        .iter()
+        .map(|(&job_id, tracked)| (job_id, tracked.run_attempt, tracked.last_command_id))
+        .collect();
+    let mut completed = Vec::new();
+
+    for (job_id, run_attempt, command_id) in candidates {
+        if launch_ack_pending(command_id, applied, in_flight).await {
+            continue;
+        }
+        let lifecycle_guard = acquire_lifecycle_lock(lifecycle_locks, (job_id, run_attempt)).await;
+        if launch_ack_pending(command_id, applied, in_flight).await {
+            continue;
+        }
+        let removed = {
+            let mut jobs = running.lock().await;
+            let exit = match jobs.get_mut(&job_id) {
+                Some(tracked) if tracked.run_attempt == run_attempt => match tracked.job.try_wait()
+                {
+                    Ok(exit) => exit,
+                    Err(error) => {
+                        warn!(job_id, error = %error, "failed to check job status");
+                        None
+                    }
+                },
+                _ => None,
+            };
+            exit.and_then(|exit| jobs.remove(&job_id).map(|tracked| (tracked, exit)))
+        };
+        let Some((tracked, (exit_code, mut signal))) = removed else {
+            continue;
+        };
+        let (_, mut completion) = tracked.into_completion(job_id, exit_code, signal);
+        if let Some(cgroup) = completion.cgroup.as_deref() {
+            if crate::executor::cgroup_oom_killed(cgroup) {
+                warn!(job_id, "job OOM-killed (cgroup oom_kill > 0)");
+                signal |= spur_core::job::OOM_SIGNAL_FLAG;
+                completion.signal = signal;
+            }
+        }
+        info!(job_id, exit_code, signal, "job finished");
+        allocation.lock().await.begin_release(job_id, run_attempt);
+        completed.push(CompletionWork {
+            completion,
+            _lifecycle_guard: lifecycle_guard,
+        });
+    }
+
+    let jobs = running.lock().await;
+    reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
+    completed
+}
 
 /// Build an empty running-jobs map to share between the reporter and the agent.
 pub(crate) fn new_running_jobs() -> RunningJobs {
@@ -145,9 +373,12 @@ struct ActiveStep {
     pid: Option<u32>,
 }
 
+type ActiveStepKey = (u32, u32, u32);
+type ActiveSteps = Arc<Mutex<HashMap<ActiveStepKey, ActiveStep>>>;
+
 struct ActiveStepGuard {
-    steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
-    key: (u32, u32),
+    steps: ActiveSteps,
+    key: ActiveStepKey,
 }
 
 impl Drop for ActiveStepGuard {
@@ -183,10 +414,7 @@ fn signal_step_process_group(pid: u32, signal: i32) {
     }
 }
 
-async fn step_cancel_requested(
-    steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
-    key: (u32, u32),
-) -> bool {
+async fn step_cancel_requested(steps: &ActiveSteps, key: ActiveStepKey) -> bool {
     steps
         .lock()
         .await
@@ -209,13 +437,19 @@ pub struct AgentService {
     device_registry: Arc<Mutex<DeviceRegistry>>,
     /// RPC-driven owner of this node's k0s systemd unit.
     k0s: Arc<crate::cluster::K0sAgent>,
-    /// In-flight srun steps keyed by `(job_id, step_id)`.
-    active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    /// In-flight srun steps keyed by `(job_id, run_attempt, step_id)`.
+    active_steps: ActiveSteps,
     /// Highest Raft term seen, so a demoted leader's request is rejected.
     highest_term_seen: Arc<std::sync::atomic::AtomicU64>,
+    term_lock: Arc<StdMutex<()>>,
     applied_commands: Arc<Mutex<HashMap<u64, AppliedCommandResult>>>,
+    in_flight_commands: Arc<Mutex<HashSet<u64>>>,
+    command_locks: Arc<Mutex<HashMap<(u32, u32), CommandLockEntry>>>,
+    recovered_completions: Arc<Mutex<Vec<RecoveredCompletion>>>,
+    recovery: executor::RecoveryStore,
     shutting_down: Arc<AtomicBool>,
     step_lifecycle: Arc<StdMutex<HashMap<(u32, u32), usize>>>,
+    lifecycle_locks: LifecycleLocks,
 }
 
 #[derive(Clone)]
@@ -223,6 +457,20 @@ struct AppliedCommandResult {
     success: bool,
     response_payload: Vec<u8>,
     error: String,
+}
+
+struct CommandLockEntry {
+    lock: Arc<Mutex<()>>,
+    users: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PolledCommandId(u64);
+
+struct PtyProcessRecovery {
+    store: executor::RecoveryStore,
+    intent: executor::ProcessRecoveryIntent,
+    _lifecycle_guard: StepLifecycleGuard,
 }
 
 struct StepLifecycleGuard {
@@ -281,20 +529,34 @@ async fn wait_for_active_steps(
     active_steps: &StdMutex<HashMap<(u32, u32), usize>>,
     job_id: u32,
     run_attempt: u32,
-) {
-    while has_active_steps(active_steps, job_id, run_attempt) {
+) -> anyhow::Result<()> {
+    for _ in 0..100 {
+        if !has_active_steps(active_steps, job_id, run_attempt) {
+            return Ok(());
+        }
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
+    anyhow::bail!("step lifecycle for job {job_id} attempt {run_attempt} is still active")
 }
 
 async fn settle_residual_allocation(
+    recovery: &executor::RecoveryStore,
     active_steps: &StdMutex<HashMap<(u32, u32), usize>>,
     job_id: u32,
     run_attempt: u32,
+    preserve_recovery: bool,
 ) -> anyhow::Result<()> {
-    executor::terminate_residual_allocation(job_id, run_attempt).await?;
-    wait_for_active_steps(active_steps, job_id, run_attempt).await;
-    executor::terminate_residual_allocation(job_id, run_attempt).await
+    recovery
+        .settle_residual_processes(job_id, run_attempt)
+        .await?;
+    wait_for_active_steps(active_steps, job_id, run_attempt).await?;
+    recovery
+        .settle_residual_processes(job_id, run_attempt)
+        .await?;
+    if !preserve_recovery {
+        recovery.cleanup_job_spool(job_id, run_attempt)?;
+    }
+    Ok(())
 }
 
 fn allocation_owned_by_different_attempt(
@@ -310,31 +572,42 @@ fn allocation_owned_by_different_attempt(
 }
 
 async fn settle_current_allocation(
+    recovery: &executor::RecoveryStore,
     allocation: &Mutex<NodeAllocation>,
     active_steps: &StdMutex<HashMap<(u32, u32), usize>>,
     job_id: u32,
     run_attempt: u32,
 ) -> anyhow::Result<bool> {
-    let allocation = allocation.lock().await;
-    if allocation_owned_by_different_attempt(&allocation, job_id, run_attempt) {
+    let mut allocation = allocation.lock().await;
+    if !allocation.begin_release(job_id, run_attempt) {
         return Ok(false);
     }
-    settle_residual_allocation(active_steps, job_id, run_attempt).await?;
+    drop(allocation);
+    settle_residual_allocation(recovery, active_steps, job_id, run_attempt, true).await?;
     Ok(true)
 }
 
 async fn release_settled_allocation(
+    recovery: &executor::RecoveryStore,
     allocation: &Mutex<NodeAllocation>,
     job_id: u32,
     run_attempt: u32,
-) -> bool {
-    let mut allocation = allocation.lock().await;
-    if allocation_owned_by_different_attempt(&allocation, job_id, run_attempt) {
-        return false;
+) -> anyhow::Result<bool> {
+    {
+        let allocation = allocation.lock().await;
+        if allocation_owned_by_different_attempt(&allocation, job_id, run_attempt) {
+            return Ok(false);
+        }
     }
-    allocation.release_job_if_attempt(job_id, run_attempt);
-    crate::executor::cleanup_job_spool(job_id);
-    true
+    recovery.cleanup_job_spool(job_id, run_attempt)?;
+    let released = allocation
+        .lock()
+        .await
+        .release_job_if_attempt(job_id, run_attempt);
+    if !released {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn core_allocations(resources: &ResourceAllocations) -> spur_core::resource::ResourceAllocations {
@@ -361,6 +634,47 @@ fn core_allocations(resources: &ResourceAllocations) -> spur_core::resource::Res
     }
 }
 
+fn allocation_result_resources(
+    allocation: &AllocationResult,
+) -> spur_core::resource::ResourceAllocations {
+    let mut resources = spur_core::resource::ResourceAllocations {
+        cpus: allocation.cpu_ids.len() as u32,
+        memory_mb: allocation.memory_mb,
+        ..Default::default()
+    };
+    if !allocation.gpu_ids.is_empty() {
+        resources.devices.insert(
+            "gpu".into(),
+            allocation
+                .gpu_ids
+                .iter()
+                .copied()
+                .map(spur_core::resource::AllocatedDevice::injectable)
+                .collect(),
+        );
+    }
+    resources
+}
+
+fn launch_is_restart_safe(io_mode: executor::LaunchIo, mpi: &str) -> bool {
+    io_mode == executor::LaunchIo::File && mpi != MPI_PMIX
+}
+
+fn recovered_launch_result(metadata: &executor::JobRecoveryMetadata) -> AppliedCommandResult {
+    let response = LaunchJobResponse {
+        success: true,
+        error: String::new(),
+        stdout_path: metadata.stdout_path.clone(),
+        stderr_path: metadata.stderr_path.clone(),
+        failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+    };
+    AppliedCommandResult {
+        success: true,
+        response_payload: response.encode_to_vec(),
+        error: String::new(),
+    }
+}
+
 impl AgentService {
     /// Construct with default k0s settings (pinned version, `/usr/local/bin/k0s`). Test-only; the
     /// binary uses `with_cluster_config` to honor the operator's `[cluster]` settings.
@@ -382,6 +696,20 @@ impl AgentService {
         )
     }
 
+    #[cfg(test)]
+    fn new_with_recovery(reporter: Arc<NodeReporter>, recovery: executor::RecoveryStore) -> Self {
+        Self::with_cluster_config_and_recovery(
+            reporter,
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::MemlockLimit::Unlimited,
+            MpiConfig::default(),
+            new_running_jobs(),
+            recovery,
+        )
+    }
+
     /// Construct with the `[cluster]` config so this node's K0sAgent honors the operator's k0s
     /// version + install path.
     #[allow(clippy::too_many_arguments)]
@@ -393,6 +721,33 @@ impl AgentService {
         memlock: spur_core::config::MemlockLimit,
         mpi: MpiConfig,
         running: RunningJobs,
+    ) -> Self {
+        #[cfg(test)]
+        let recovery = executor::RecoveryStore::isolated();
+        #[cfg(not(test))]
+        let recovery = executor::RecoveryStore::system();
+        Self::with_cluster_config_and_recovery(
+            reporter,
+            hooks,
+            device_registry,
+            cluster,
+            memlock,
+            mpi,
+            running,
+            recovery,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_cluster_config_and_recovery(
+        reporter: Arc<NodeReporter>,
+        hooks: HooksConfig,
+        device_registry: Arc<Mutex<DeviceRegistry>>,
+        cluster: &spur_core::config::ClusterConfig,
+        memlock: spur_core::config::MemlockLimit,
+        mpi: MpiConfig,
+        running: RunningJobs,
+        recovery: executor::RecoveryStore,
     ) -> Self {
         let allocation = Arc::new(Mutex::new(NodeAllocation::new(
             reporter.hostname.clone(),
@@ -443,6 +798,10 @@ impl AgentService {
         } else {
             None
         };
+        let highest_term_seen = recovery.load_highest_term().unwrap_or_else(|error| {
+            warn!(error = %error, "persisted controller term is unreadable; fencing all controller RPCs");
+            u64::MAX
+        });
 
         Self {
             reporter,
@@ -455,16 +814,26 @@ impl AgentService {
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
-            highest_term_seen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            highest_term_seen: Arc::new(std::sync::atomic::AtomicU64::new(highest_term_seen)),
+            term_lock: Arc::new(StdMutex::new(())),
             applied_commands: Arc::new(Mutex::new(HashMap::new())),
+            in_flight_commands: Arc::new(Mutex::new(HashSet::new())),
+            command_locks: Arc::new(Mutex::new(HashMap::new())),
+            recovered_completions: Arc::new(Mutex::new(Vec::new())),
+            recovery,
             shutting_down: Arc::new(AtomicBool::new(false)),
             step_lifecycle: Arc::new(StdMutex::new(HashMap::new())),
+            lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Reject a term older than the highest seen. 0 (legacy/unset) passes only
     /// before any real term has been observed — once fencing starts, it can't stop.
     fn check_term(&self, term: u64) -> Result<(), Status> {
+        let _term_guard = self
+            .term_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if term == 0 {
             return if self.highest_term_seen.load(Ordering::Acquire) == 0 {
                 Ok(())
@@ -474,11 +843,17 @@ impl AgentService {
                 ))
             };
         }
-        let prev = self.highest_term_seen.fetch_max(term, Ordering::AcqRel);
+        let prev = self.highest_term_seen.load(Ordering::Acquire);
         if term < prev {
             return Err(Status::failed_precondition(format!(
                 "stale controller term {term} (highest seen {prev}); a newer leader has taken over"
             )));
+        }
+        if term > prev {
+            self.recovery.persist_highest_term(term).map_err(|error| {
+                Status::internal(format!("failed to persist controller term: {error:#}"))
+            })?;
+            self.highest_term_seen.store(term, Ordering::Release);
         }
         Ok(())
     }
@@ -504,84 +879,322 @@ impl AgentService {
             .any(|allocation| allocation.job_id == job_id && allocation.run_attempt != run_attempt)
     }
 
+    async fn accepts_new_step(&self, job_id: u32, run_attempt: u32) -> bool {
+        let tracked = self
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .is_some_and(|job| job.run_attempt == run_attempt);
+        if !tracked {
+            return false;
+        }
+        self.allocation
+            .lock()
+            .await
+            .owned_allocations()
+            .into_iter()
+            .any(|allocation| {
+                allocation.job_id == job_id
+                    && allocation.run_attempt == run_attempt
+                    && !allocation.releasing
+            })
+    }
+
     /// Handle to the RPC-driven k0s component owner. spurd `main()` spawns its supervise loop.
     pub fn k0s(&self) -> Arc<crate::cluster::K0sAgent> {
         self.k0s.clone()
     }
 
-    pub async fn shutdown_jobs(&self) -> anyhow::Result<()> {
-        if self.shutting_down.swap(true, Ordering::AcqRel) {
-            return Ok(());
+    async fn restore_recovered_job(
+        &self,
+        manifest: &executor::RecoveryManifest,
+        metadata: executor::JobRecoveryMetadata,
+    ) -> anyhow::Result<()> {
+        let allocation = AllocationResult {
+            cpu_ids: metadata.cpu_ids.clone(),
+            gpu_ids: metadata.gpu_devices.clone(),
+            memory_mb: metadata.memory_mb,
+        };
+        {
+            let mut local = self.allocation.lock().await;
+            local
+                .restore_committed(
+                    manifest.job_id,
+                    manifest.run_attempt,
+                    allocation,
+                    metadata.exact_resources.clone(),
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot restore job {} attempt {} allocation: {error:?}",
+                        manifest.job_id,
+                        manifest.run_attempt
+                    )
+                })?;
+            local.set_last_command_id(
+                manifest.job_id,
+                manifest.run_attempt,
+                metadata.last_command_id,
+            );
         }
 
-        let mut cleanup_failures = HashMap::new();
-        let tracked: Vec<_> = self.running.lock().await.drain().collect();
-        for (job_id, mut tracked) in tracked {
-            let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
-            let cgroup = tracked.job.take_cgroup();
-            let rootfs_mode = tracked.rootfs_mode.clone();
-            let mpi = tracked.mpi.clone();
-            let run_attempt = tracked.run_attempt;
-            reap_killed_job(tracked.job).await;
-            crate::container::cleanup_rootfs(job_id, &rootfs_mode);
-            if let Some(ref cgroup) = cgroup {
-                crate::executor::cleanup_cgroup(cgroup);
-            }
-            crate::executor::cleanup_job_cgroup(job_id);
-            cleanup_completed_job_mpi(job_id, &mpi, &self.mpi_host).await;
-            if let Err(error) =
-                settle_residual_allocation(&self.step_lifecycle, job_id, run_attempt).await
-            {
-                warn!(job_id, run_attempt, error = %error, "job cleanup incomplete during shutdown");
-                cleanup_failures.insert((job_id, run_attempt), error.to_string());
-                continue;
-            }
-            self.allocation
-                .lock()
-                .await
-                .release_job_if_attempt(job_id, run_attempt);
-            crate::executor::cleanup_job_spool(job_id);
-        }
+        let is_root = nix::unistd::geteuid().is_root();
+        let resumed = self
+            .recovery
+            .resumed_job(manifest, metadata.exit_status_path.clone())?;
+        self.running.lock().await.insert(
+            manifest.job_id,
+            TrackedJob {
+                job: resumed,
+                rootfs_mode: metadata.rootfs_mode,
+                stdout_path: metadata.stdout_path,
+                stderr_path: metadata.stderr_path,
+                has_pid_namespace: is_root || metadata.containerized,
+                has_user_namespace: metadata.containerized && !is_root,
+                has_mount_namespace: is_root || metadata.containerized,
+                _pty_master: None,
+                work_dir: metadata.work_dir,
+                uid: metadata.uid,
+                gid: metadata.gid,
+                user: metadata.user,
+                partition: metadata.partition,
+                gpu_devices: metadata.gpu_devices,
+                cpus: metadata.cpus,
+                memory_mb: metadata.memory_mb,
+                nodelist: metadata.nodelist,
+                mpi: metadata.mpi,
+                last_command_id: metadata.last_command_id,
+                run_attempt: manifest.run_attempt,
+            },
+        );
+        Ok(())
+    }
 
-        let remaining = self.allocation.lock().await.owned_allocations();
-        for owner in remaining {
-            if let Err(error) = self.mpi_host.stop_pmix_server(owner.job_id) {
-                warn!(job_id = owner.job_id, error = %error, "PMIx stop failed during shutdown");
-            }
-            crate::executor::cleanup_job_cgroup(owner.job_id);
-            if let Err(error) =
-                settle_residual_allocation(&self.step_lifecycle, owner.job_id, owner.run_attempt)
-                    .await
-            {
-                warn!(
-                    job_id = owner.job_id,
-                    run_attempt = owner.run_attempt,
-                    error = %error,
-                    "allocation cleanup incomplete during shutdown"
-                );
-                cleanup_failures.insert((owner.job_id, owner.run_attempt), error.to_string());
-                continue;
-            }
-            cleanup_failures.remove(&(owner.job_id, owner.run_attempt));
-            self.allocation
-                .lock()
-                .await
-                .release_job_if_attempt(owner.job_id, owner.run_attempt);
-            crate::executor::cleanup_job_spool(owner.job_id);
-        }
+    async fn queue_recovered_completion(
+        &self,
+        manifest_path: std::path::PathBuf,
+        mut manifest: executor::RecoveryManifest,
+        exit: (i32, i32),
+    ) -> anyhow::Result<()> {
+        manifest.exit = Some(exit);
+        executor::update_recovery_manifest(&manifest_path, &manifest)?;
+        self.recovered_completions
+            .lock()
+            .await
+            .push(RecoveredCompletion {
+                manifest_path,
+                manifest,
+            });
+        Ok(())
+    }
 
-        if cleanup_failures.is_empty() {
-            Ok(())
-        } else {
-            let failures = cleanup_failures
-                .into_iter()
-                .map(|((job_id, run_attempt), error)| {
-                    format!("job {job_id} attempt {run_attempt}: {error}")
+    pub async fn recover_jobs(&self) -> anyhow::Result<()> {
+        let manifests = self.recovery.scan()?;
+        let mut allocations: Vec<_> = manifests
+            .iter()
+            .map(|(_, manifest)| (manifest.job_id, manifest.run_attempt))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        allocations.sort_unstable();
+        let mut restored_cgroups = HashSet::new();
+
+        for (job_id, run_attempt) in allocations {
+            let allocation_manifests: Vec<_> = manifests
+                .iter()
+                .filter(|(_, manifest)| {
+                    manifest.job_id == job_id && manifest.run_attempt == run_attempt
                 })
-                .collect::<Vec<_>>()
-                .join("; ");
-            anyhow::bail!("local cleanup is incomplete: {}", failures)
+                .collect();
+            let has_process_manifest = allocation_manifests
+                .iter()
+                .any(|(_, manifest)| manifest.job.is_none());
+            let restartable = (!has_process_manifest)
+                .then(|| {
+                    allocation_manifests.iter().find(|(_, manifest)| {
+                        self.recovery.manifest_is_current_boot(manifest)
+                            && executor::process_identity_is_live(manifest.pid, manifest.start_time)
+                            && manifest
+                                .job
+                                .as_ref()
+                                .is_some_and(|metadata| metadata.restart_safe)
+                    })
+                })
+                .flatten();
+
+            if let Some((_, job_manifest)) = restartable {
+                let metadata = job_manifest
+                    .job
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("restartable manifest lost job metadata"))?;
+                let replay = (metadata.last_command_id != 0)
+                    .then(|| (metadata.last_command_id, recovered_launch_result(&metadata)));
+                match self.restore_recovered_job(job_manifest, metadata).await {
+                    Ok(()) => {
+                        if let Some((command_id, result)) = replay {
+                            self.applied_commands
+                                .lock()
+                                .await
+                                .insert(command_id, result);
+                        }
+                        if let Some(cgroup) = &job_manifest.cgroup_path {
+                            restored_cgroups.insert(cgroup.clone());
+                        }
+                        info!(job_id, run_attempt, "re-adopted job after agent restart");
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(job_id, run_attempt, error = %error, "recovered allocation is not restorable");
+                    }
+                }
+            }
+
+            let recovered_exit = allocation_manifests
+                .iter()
+                .find_map(|(_, manifest)| manifest.job.as_ref().map(|_| manifest))
+                .map(executor::resolve_recovered_exit);
+            self.recovery
+                .settle_residual_processes(job_id, run_attempt)
+                .await?;
+
+            let mut retained_job_manifest = false;
+            for (path, manifest) in allocation_manifests {
+                if manifest.job.is_some() {
+                    retained_job_manifest = true;
+                    if let Some(metadata) = manifest
+                        .job
+                        .as_ref()
+                        .filter(|metadata| metadata.last_command_id != 0)
+                    {
+                        self.applied_commands
+                            .lock()
+                            .await
+                            .insert(metadata.last_command_id, recovered_launch_result(metadata));
+                    }
+                    self.queue_recovered_completion(
+                        path.clone(),
+                        manifest.clone(),
+                        recovered_exit.unwrap_or((-1, 0)),
+                    )
+                    .await?;
+                } else {
+                    executor::remove_recovery_manifest(path)?;
+                }
+            }
+            if !retained_job_manifest {
+                self.recovery.cleanup_job_spool(job_id, run_attempt)?;
+            }
         }
+
+        self.recovery
+            .cleanup_unmanifested_job_cgroups(&restored_cgroups)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn report_recovered_completions(&self) {
+        let pending = std::mem::take(&mut *self.recovered_completions.lock().await);
+        let mut retry = Vec::new();
+        for mut recovered in pending {
+            let Some(metadata) = recovered.manifest.job.clone() else {
+                continue;
+            };
+            let job_id = recovered.manifest.job_id;
+            let run_attempt = recovered.manifest.run_attempt;
+            let _lifecycle_guard =
+                acquire_lifecycle_lock(&self.lifecycle_locks, (job_id, run_attempt)).await;
+            if metadata.last_command_id != 0
+                && self
+                    .applied_commands
+                    .lock()
+                    .await
+                    .contains_key(&metadata.last_command_id)
+            {
+                retry.push(recovered);
+                continue;
+            }
+            if let Err(error) = settle_residual_allocation(
+                &self.recovery,
+                &self.step_lifecycle,
+                job_id,
+                run_attempt,
+                true,
+            )
+            .await
+            {
+                warn!(job_id, run_attempt, error = %error, "recovered cleanup is still incomplete");
+                retry.push(recovered);
+                continue;
+            }
+            let (exit_code, signal) = recovered
+                .manifest
+                .exit
+                .unwrap_or_else(|| executor::resolve_recovered_exit(&recovered.manifest));
+            let mut completion = recovered_completion_metadata(&recovered.manifest, &metadata);
+            completion.exit_code = exit_code;
+            completion.signal = signal;
+
+            if recovered.manifest.epilog_pending {
+                let drain =
+                    run_completion_hooks(&completion, &self.hooks, self.spank.as_ref().as_ref())
+                        .await;
+                recovered.manifest.epilog_pending = false;
+                recovered.manifest.drain_pending = drain;
+                if let Err(error) = executor::update_recovery_manifest(
+                    &recovered.manifest_path,
+                    &recovered.manifest,
+                ) {
+                    warn!(job_id, error = %error, "failed to persist recovered epilog result");
+                    retry.push(recovered);
+                    continue;
+                }
+            }
+
+            let drain = recovered.manifest.drain_pending.then(|| DrainRequest {
+                reason: "epilog script failed".into(),
+            });
+            if let Err(error) = cleanup_completed_artifacts(&completion, &self.mpi_host).await {
+                warn!(job_id, run_attempt, error = %error, "recovered artifact cleanup is incomplete");
+                retry.push(recovered);
+                continue;
+            }
+            if recovered.manifest.completion_pending
+                && !report_completion(
+                    &self.reporter.controller_addr,
+                    CompletionReport {
+                        job_id,
+                        exit_code,
+                        signal,
+                        run_attempt,
+                        reporting_node: &self.reporter.hostname,
+                        drain: drain.as_ref(),
+                        agent_session_id: self.reporter.agent_session_id(),
+                        node_boot_id: self.reporter.node_boot_id(),
+                        node_token: &self.reporter.node_token(),
+                    },
+                )
+                .await
+            {
+                retry.push(recovered);
+                continue;
+            }
+            recovered.manifest.completion_pending = false;
+            if let Err(error) = self.recovery.cleanup_job_spool(job_id, run_attempt) {
+                warn!(job_id, run_attempt, error = %error, "recovered manifest cleanup is incomplete");
+                retry.push(recovered);
+            }
+        }
+        self.recovered_completions.lock().await.extend(retry);
+    }
+
+    pub async fn has_active_jobs(&self) -> bool {
+        !self.running.lock().await.is_empty()
+            || !self.allocation.lock().await.owned_allocations().is_empty()
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
     }
 
     /// Spawn a background task to monitor running jobs and report completions.
@@ -593,128 +1206,54 @@ impl AgentService {
         let hooks = self.hooks.clone();
         let step_lifecycle = self.step_lifecycle.clone();
         let reporter = self.reporter.clone();
+        let recovered_completions = self.recovered_completions.clone();
+        let recovery = self.recovery.clone();
+        let lifecycle_locks = self.lifecycle_locks.clone();
+        let applied_commands = self.applied_commands.clone();
+        let in_flight_commands = self.in_flight_commands.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                let mut jobs = running.lock().await;
-                let mut completed: Vec<CompletedJob> = Vec::new();
-
-                for (job_id, tracked) in jobs.iter_mut() {
-                    match tracked.job.try_wait() {
-                        Ok(Some((exit_code, mut signal))) => {
-                            // Disambiguate an OOM kill (cgroup memory.events) from
-                            // a plain SIGKILL by OR'ing a sentinel into the reported
-                            // signal; read before cleanup_cgroup removes the dir.
-                            let cgroup = tracked.job.take_cgroup();
-                            if let Some(ref cg) = cgroup {
-                                if crate::executor::cgroup_oom_killed(cg) {
-                                    warn!(job_id, "job OOM-killed (cgroup oom_kill > 0)");
-                                    signal |= spur_core::job::OOM_SIGNAL_FLAG;
-                                }
-                            }
-                            info!(job_id, exit_code, signal, "job finished");
-                            completed.push(CompletedJob {
-                                job_id: *job_id,
-                                exit_code,
-                                signal,
-                                run_attempt: tracked.run_attempt,
-                                rootfs_mode: tracked.rootfs_mode.clone(),
-                                cgroup,
-                                work_dir: tracked.work_dir.clone(),
-                                uid: tracked.uid,
-                                gid: tracked.gid,
-                                partition: tracked.partition.clone(),
-                                gpu_devices: tracked.gpu_devices.clone(),
-                                cpus: tracked.cpus,
-                                memory_mb: tracked.memory_mb,
-                                nodelist: tracked.nodelist.clone(),
-                                mpi: tracked.mpi.clone(),
-                            });
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            warn!(job_id, error = %e, "failed to check job status");
-                        }
-                    }
-                }
-
-                for c in &completed {
-                    jobs.remove(&c.job_id);
-                    allocation
-                        .lock()
-                        .await
-                        .begin_release(c.job_id, c.run_attempt);
-                    crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
-                    if let Some(ref cgroup) = c.cgroup {
-                        crate::executor::cleanup_cgroup(cgroup);
-                    }
-                    cleanup_completed_job_mpi(c.job_id, &c.mpi, &mpi_host).await;
-                }
-
-                // Self-heal backstop: reclaim allocations with no tracked,
-                // non-launching job. `jobs` is held so the live set is a
-                // consistent snapshot that can't race a committing launch
-                // (commit_job takes the running lock first).
-                reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
-
-                // Release lock BEFORE network I/O — holding the lock during
-                // report_completion blocks new job launches and can lose
-                // completions if the RPC times out.
-                drop(jobs);
-
+                let completed = collect_completed_jobs(
+                    &running,
+                    &allocation,
+                    &lifecycle_locks,
+                    &applied_commands,
+                    &in_flight_commands,
+                )
+                .await;
                 let local_hostname = reporter.hostname.clone();
-
-                let mut drain_jobs: std::collections::HashSet<u32> =
-                    std::collections::HashSet::new();
-
-                // Run epilog hook for completed jobs
-                if let Some(ref epilog_script) = hooks.epilog {
-                    for c in &completed {
-                        let ctx = spur_core::hooks::HookContext {
-                            job_id: c.job_id,
-                            work_dir: c.work_dir.clone(),
-                            uid: c.uid,
-                            gid: c.gid,
-                            partition: c.partition.clone(),
-                            nodelist: c.nodelist.clone(),
-                            script_context: "epilog_slurmd".into(),
-                            gpu_devices: c.gpu_devices.clone(),
-                            cpus: c.cpus,
-                            memory_mb: c.memory_mb,
-                        };
-                        if let Err(e) = spur_core::hooks::run_hook(epilog_script, &ctx).await {
-                            error!(
-                                job_id = c.job_id,
-                                error = %e,
-                                "epilog hook failed — requesting node drain"
-                            );
-                            drain_jobs.insert(c.job_id);
+                for work in completed {
+                    let c = &work.completion;
+                    let drain_requested =
+                        run_completion_hooks(c, &hooks, spank.as_ref().as_ref()).await;
+                    if let Err(error) = recovery.mark_epilog_discharged(
+                        c.job_id,
+                        c.run_attempt,
+                        (c.exit_code, c.signal),
+                        drain_requested,
+                    ) {
+                        warn!(
+                            job_id = c.job_id,
+                            run_attempt = c.run_attempt,
+                            error = %error,
+                            "failed to persist completion obligations"
+                        );
+                        if let Ok(Some((manifest_path, manifest))) =
+                            recovery.manifest_for_allocation(c.job_id, c.run_attempt)
+                        {
+                            recovered_completions
+                                .lock()
+                                .await
+                                .push(RecoveredCompletion {
+                                    manifest_path,
+                                    manifest,
+                                });
                         }
+                        continue;
                     }
-                }
-
-                // Invoke SPANK TaskExit and JobEpilog hooks for completed jobs
-                if let Some(ref spank_host) = *spank {
-                    for c in &completed {
-                        let context = SpankContext {
-                            job_id: c.job_id,
-                            uid: c.uid,
-                            gid: c.gid,
-                            ..Default::default()
-                        };
-                        let mut handle = SpankHandle::new(context, HashMap::new());
-                        if let Err(e) = spank_host.invoke_hook(SpankHook::TaskExit, &mut handle) {
-                            warn!(c.job_id, error = %e, "SPANK TaskExit hook failed");
-                        }
-                        if let Err(e) = spank_host.invoke_hook(SpankHook::JobEpilog, &mut handle) {
-                            warn!(c.job_id, error = %e, "SPANK JobEpilog hook failed");
-                        }
-                    }
-                }
-
-                for c in &completed {
-                    let drain = if drain_jobs.contains(&c.job_id) {
+                    let drain = if drain_requested {
                         Some(DrainRequest {
                             reason: "epilog script failed".into(),
                         })
@@ -722,6 +1261,7 @@ impl AgentService {
                         None
                     };
                     let physically_released = settle_current_allocation(
+                        &recovery,
                         &allocation,
                         &step_lifecycle,
                         c.job_id,
@@ -737,7 +1277,23 @@ impl AgentService {
                         );
                     })
                     .unwrap_or(false);
-                    let reported = physically_released
+                    let artifacts_clean = if physically_released {
+                        match cleanup_completed_artifacts(c, &mpi_host).await {
+                            Ok(()) => true,
+                            Err(error) => {
+                                warn!(
+                                    job_id = c.job_id,
+                                    run_attempt = c.run_attempt,
+                                    error = %error,
+                                    "job artifact cleanup is incomplete"
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    let reported = artifacts_clean
                         && report_completion(
                             &controller_addr,
                             CompletionReport {
@@ -754,8 +1310,27 @@ impl AgentService {
                         )
                         .await;
                     if reported {
-                        release_settled_allocation(&allocation, c.job_id, c.run_attempt).await;
-                        continue;
+                        match release_settled_allocation(
+                            &recovery,
+                            &allocation,
+                            c.job_id,
+                            c.run_attempt,
+                        )
+                        .await
+                        {
+                            Ok(true) => continue,
+                            Ok(false) => {
+                                info!(
+                                    job_id = c.job_id,
+                                    run_attempt = c.run_attempt,
+                                    "completion was superseded locally"
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                warn!(job_id = c.job_id, run_attempt = c.run_attempt, error = %error, "completion manifest cleanup is incomplete")
+                            }
+                        }
                     }
 
                     let retry_controller = controller_addr.clone();
@@ -764,6 +1339,10 @@ impl AgentService {
                     let retry_drain = drain.clone();
                     let retry_step_lifecycle = step_lifecycle.clone();
                     let retry_reporter = reporter.clone();
+                    let retry_completion = c.clone();
+                    let retry_mpi_host = mpi_host.clone();
+                    let retry_recovery = recovery.clone();
+                    let retry_lifecycle_locks = lifecycle_locks.clone();
                     let job_id = c.job_id;
                     let exit_code = c.exit_code;
                     let signal = c.signal;
@@ -772,7 +1351,13 @@ impl AgentService {
                         let mut retry = tokio::time::interval(tokio::time::Duration::from_secs(2));
                         loop {
                             retry.tick().await;
+                            let _lifecycle_guard = acquire_lifecycle_lock(
+                                &retry_lifecycle_locks,
+                                (job_id, run_attempt),
+                            )
+                            .await;
                             match settle_current_allocation(
+                                &retry_recovery,
                                 &retry_allocation,
                                 &retry_step_lifecycle,
                                 job_id,
@@ -799,6 +1384,13 @@ impl AgentService {
                                     continue;
                                 }
                             }
+                            if let Err(error) =
+                                cleanup_completed_artifacts(&retry_completion, &retry_mpi_host)
+                                    .await
+                            {
+                                warn!(job_id, run_attempt, error = %error, "job artifact cleanup is still incomplete");
+                                continue;
+                            }
                             if !report_completion(
                                 &retry_controller,
                                 CompletionReport {
@@ -817,9 +1409,19 @@ impl AgentService {
                             {
                                 continue;
                             }
-                            release_settled_allocation(&retry_allocation, job_id, run_attempt)
-                                .await;
-                            break;
+                            match release_settled_allocation(
+                                &retry_recovery,
+                                &retry_allocation,
+                                job_id,
+                                run_attempt,
+                            )
+                            .await
+                            {
+                                Ok(true) | Ok(false) => break,
+                                Err(error) => {
+                                    warn!(job_id, run_attempt, error = %error, "completion manifest cleanup is still incomplete");
+                                }
+                            }
                         }
                     });
                 }
@@ -854,43 +1456,109 @@ impl AgentService {
             };
             let pending_ids: HashSet<_> =
                 commands.iter().map(|command| command.command_id).collect();
+            self.reconcile_applied_commands(&pending_ids).await;
+
+            for command in commands {
+                if !self
+                    .in_flight_commands
+                    .lock()
+                    .await
+                    .insert(command.command_id)
+                {
+                    continue;
+                }
+                let service = self.clone();
+                tokio::spawn(async move {
+                    service.execute_and_acknowledge_command(command).await;
+                });
+            }
+        }
+    }
+
+    async fn reconcile_applied_commands(&self, pending_ids: &HashSet<u64>) {
+        self.applied_commands
+            .lock()
+            .await
+            .retain(|command_id, _| pending_ids.contains(command_id));
+    }
+
+    async fn acquire_command_lock(&self, key: (u32, u32)) -> Arc<Mutex<()>> {
+        let mut locks = self.command_locks.lock().await;
+        let entry = locks.entry(key).or_insert_with(|| CommandLockEntry {
+            lock: Arc::new(Mutex::new(())),
+            users: 0,
+        });
+        entry.users += 1;
+        entry.lock.clone()
+    }
+
+    async fn retire_command_lock(&self, key: (u32, u32), command_lock: &Arc<Mutex<()>>) {
+        let mut locks = self.command_locks.lock().await;
+        let remove = locks.get_mut(&key).is_some_and(|entry| {
+            if !Arc::ptr_eq(&entry.lock, command_lock) {
+                return false;
+            }
+            entry.users = entry.users.saturating_sub(1);
+            entry.users == 0
+        });
+        if remove {
+            locks.remove(&key);
+        }
+    }
+
+    async fn execute_and_acknowledge_command(&self, command: AgentCommand) {
+        let key = (command.job_id, command.run_attempt);
+        let command_lock = self.acquire_command_lock(key).await;
+        let guard = command_lock.lock().await;
+        let result = self.apply_or_replay_command(&command).await;
+        drop(guard);
+
+        let acknowledgement = AcknowledgeAgentCommandRequest {
+            hostname: self.reporter.hostname.clone(),
+            node_token: self.reporter.node_token(),
+            agent_session_id: self.reporter.agent_session_id().to_string(),
+            node_boot_id: self.reporter.node_boot_id().to_string(),
+            command_id: command.command_id,
+            job_id: command.job_id,
+            run_attempt: command.run_attempt,
+            success: result.success,
+            response_payload: result.response_payload,
+            error: result.error,
+        };
+        let acknowledged = match spur_client::connect_channel(&self.reporter.controller_addr).await
+        {
+            Ok(channel) => spur_proto::controller_client(channel)
+                .acknowledge_agent_command(acknowledgement)
+                .await
+                .map(|_| true)
+                .unwrap_or_else(|error| {
+                    warn!(
+                        command_id = command.command_id,
+                        error = %error,
+                        "agent command acknowledgement failed"
+                    );
+                    false
+                }),
+            Err(error) => {
+                warn!(
+                    command_id = command.command_id,
+                    error = %error,
+                    "agent command acknowledgement connection failed"
+                );
+                false
+            }
+        };
+        if acknowledged {
             self.applied_commands
                 .lock()
                 .await
-                .retain(|command_id, _| pending_ids.contains(command_id));
-
-            for command in commands {
-                let result = self.apply_or_replay_command(&command).await;
-
-                let acknowledgement = AcknowledgeAgentCommandRequest {
-                    hostname: self.reporter.hostname.clone(),
-                    node_token: self.reporter.node_token(),
-                    agent_session_id: self.reporter.agent_session_id().to_string(),
-                    node_boot_id: self.reporter.node_boot_id().to_string(),
-                    command_id: command.command_id,
-                    job_id: command.job_id,
-                    run_attempt: command.run_attempt,
-                    success: result.success,
-                    response_payload: result.response_payload,
-                    error: result.error,
-                };
-                match client.acknowledge_agent_command(acknowledgement).await {
-                    Ok(_) => {
-                        self.applied_commands
-                            .lock()
-                            .await
-                            .remove(&command.command_id);
-                    }
-                    Err(error) => {
-                        warn!(
-                            command_id = command.command_id,
-                            error = %error,
-                            "agent command acknowledgement failed"
-                        );
-                    }
-                }
-            }
+                .remove(&command.command_id);
         }
+        self.in_flight_commands
+            .lock()
+            .await
+            .remove(&command.command_id);
+        self.retire_command_lock(key, &command_lock).await;
     }
 
     async fn apply_or_replay_command(&self, command: &AgentCommand) -> AppliedCommandResult {
@@ -902,12 +1570,17 @@ impl AgentService {
             return result;
         }
 
+        if let Some(result) = self.durable_launch_replay(command).await {
+            self.applied_commands
+                .lock()
+                .await
+                .insert(command.command_id, result.clone());
+            return result;
+        }
+
         let result = self.apply_polled_command(command).await;
         if result.success
-            && matches!(
-                AgentCommandKind::try_from(command.kind),
-                Ok(AgentCommandKind::Launch | AgentCommandKind::Register)
-            )
+            && AgentCommandKind::try_from(command.kind) == Ok(AgentCommandKind::Register)
         {
             let _ = self.allocation.lock().await.set_last_command_id(
                 command.job_id,
@@ -920,6 +1593,50 @@ impl AgentService {
             .await
             .insert(command.command_id, result.clone());
         result
+    }
+
+    async fn durable_launch_replay(&self, command: &AgentCommand) -> Option<AppliedCommandResult> {
+        if command.node != self.reporter.hostname
+            || AgentCommandKind::try_from(command.kind) != Ok(AgentCommandKind::Launch)
+        {
+            return None;
+        }
+        let request = LaunchJobRequest::decode(command.payload.as_slice()).ok()?;
+        if request.job_id != command.job_id || request.run_attempt != command.run_attempt {
+            return None;
+        }
+        let already_applied = self
+            .allocation
+            .lock()
+            .await
+            .owned_allocations()
+            .into_iter()
+            .any(|allocation| {
+                allocation.job_id == command.job_id
+                    && allocation.run_attempt == command.run_attempt
+                    && allocation.last_command_id == command.command_id
+                    && !allocation.releasing
+            });
+        if !already_applied {
+            return None;
+        }
+        let jobs = self.running.lock().await;
+        let tracked = jobs.get(&command.job_id)?;
+        if tracked.run_attempt != command.run_attempt {
+            return None;
+        }
+        let response = LaunchJobResponse {
+            success: true,
+            error: String::new(),
+            stdout_path: tracked.stdout_path.clone(),
+            stderr_path: tracked.stderr_path.clone(),
+            failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+        };
+        Some(AppliedCommandResult {
+            success: true,
+            response_payload: response.encode_to_vec(),
+            error: String::new(),
+        })
     }
 
     async fn apply_polled_command(&self, command: &AgentCommand) -> AppliedCommandResult {
@@ -945,17 +1662,21 @@ impl AgentService {
                             success: false,
                             response_payload: Vec::new(),
                             error: "launch payload identity does not match command".into(),
-                        }
+                        };
                     }
                     Err(error) => {
                         return AppliedCommandResult {
                             success: false,
                             response_payload: Vec::new(),
                             error: format!("invalid launch payload: {error}"),
-                        }
+                        };
                     }
                 };
-                match <Self as SlurmAgent>::launch_job(self, Request::new(request)).await {
+                let mut request = Request::new(request);
+                request
+                    .extensions_mut()
+                    .insert(PolledCommandId(command.command_id));
+                match <Self as SlurmAgent>::launch_job(self, request).await {
                     Ok(response) => {
                         let response = response.into_inner();
                         AppliedCommandResult {
@@ -985,14 +1706,14 @@ impl AgentService {
                             success: false,
                             response_payload: Vec::new(),
                             error: "registration payload identity does not match command".into(),
-                        }
+                        };
                     }
                     Err(error) => {
                         return AppliedCommandResult {
                             success: false,
                             response_payload: Vec::new(),
                             error: format!("invalid registration payload: {error}"),
-                        }
+                        };
                     }
                 };
                 match <Self as SlurmAgent>::register_job_allocation(self, Request::new(request))
@@ -1041,7 +1762,17 @@ impl AgentService {
         run_attempt: u32,
         signal: i32,
     ) -> anyhow::Result<()> {
-        if self.has_different_local_attempt(job_id, run_attempt).await {
+        let _lifecycle_guard =
+            acquire_lifecycle_lock(&self.lifecycle_locks, (job_id, run_attempt)).await;
+        self.mpi_host
+            .release_prepared_pmix(job_id, run_attempt)
+            .map_err(anyhow::Error::msg)?;
+        if !self
+            .allocation
+            .lock()
+            .await
+            .begin_release(job_id, run_attempt)
+        {
             anyhow::bail!(
                 "job {job_id} attempt {run_attempt} was superseded by a local allocation"
             );
@@ -1049,26 +1780,136 @@ impl AgentService {
         if signal > 0 {
             self.send_explicit_signal(job_id, signal, run_attempt).await;
         } else {
-            self.graceful_cancel(job_id, run_attempt).await;
+            self.send_explicit_signal(
+                job_id,
+                nix::sys::signal::Signal::SIGTERM as i32,
+                run_attempt,
+            )
+            .await;
         }
 
-        loop {
-            let running = self
-                .running
-                .lock()
-                .await
-                .get(&job_id)
-                .is_some_and(|job| run_attempt == 0 || job.run_attempt == run_attempt);
-            if !running {
-                settle_residual_allocation(&self.step_lifecycle, job_id, run_attempt).await?;
-                self.allocation
-                    .lock()
-                    .await
-                    .release_job_if_attempt(job_id, run_attempt);
-                return Ok(());
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let initial_checks = if signal > 0 { 60 } else { 100 };
+        let mut reaped = self
+            .wait_for_released_job_exit(job_id, run_attempt, initial_checks)
+            .await;
+        if !reaped {
+            self.send_explicit_signal(
+                job_id,
+                nix::sys::signal::Signal::SIGKILL as i32,
+                run_attempt,
+            )
+            .await;
+            reaped = self
+                .wait_for_released_job_exit(job_id, run_attempt, 60)
+                .await;
         }
+
+        let orphan = {
+            let mut jobs = self.running.lock().await;
+            match jobs.entry(job_id) {
+                std::collections::hash_map::Entry::Occupied(entry)
+                    if run_attempt == 0 || entry.get().run_attempt == run_attempt =>
+                {
+                    Some(entry.remove())
+                }
+                _ => None,
+            }
+        };
+        let completion = if let Some(tracked) = orphan {
+            let (job, completion) =
+                tracked.into_completion(job_id, 0, nix::sys::signal::Signal::SIGKILL as i32);
+            if !reaped {
+                let _ = job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+                tokio::time::timeout(std::time::Duration::from_secs(5), reap_killed_job(job))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("job {job_id} did not reap after SIGKILL"))?;
+            }
+            Some(completion)
+        } else {
+            None
+        };
+
+        settle_residual_allocation(
+            &self.recovery,
+            &self.step_lifecycle,
+            job_id,
+            run_attempt,
+            true,
+        )
+        .await?;
+        self.cleanup_release_artifacts(job_id, run_attempt, completion)
+            .await?;
+        release_settled_allocation(&self.recovery, &self.allocation, job_id, run_attempt).await?;
+        Ok(())
+    }
+
+    async fn wait_for_released_job_exit(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        checks: usize,
+    ) -> bool {
+        for _ in 0..checks {
+            let exited = {
+                let mut jobs = self.running.lock().await;
+                match jobs.get_mut(&job_id) {
+                    Some(tracked) if run_attempt == 0 || tracked.run_attempt == run_attempt => {
+                        match tracked.job.try_wait() {
+                            Ok(Some(_)) => true,
+                            Ok(None) => false,
+                            Err(error) => {
+                                warn!(job_id, run_attempt, error = %error, "failed to reap released job");
+                                false
+                            }
+                        }
+                    }
+                    _ => true,
+                }
+            };
+            if exited {
+                return true;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    async fn cleanup_release_artifacts(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        completion: Option<CompletedJob>,
+    ) -> anyhow::Result<()> {
+        let recovered = self.recovery.manifest_for_allocation(job_id, run_attempt)?;
+        let mut completion = match (completion, recovered.as_ref()) {
+            (Some(completion), _) => completion,
+            (None, Some((_, manifest))) => {
+                let metadata = manifest
+                    .job
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("released allocation has no job metadata"))?;
+                recovered_completion_metadata(manifest, metadata)
+            }
+            (None, None) => return Ok(()),
+        };
+        if let Some((_, manifest)) = recovered.as_ref() {
+            if manifest.epilog_pending {
+                let drain =
+                    run_completion_hooks(&completion, &self.hooks, self.spank.as_ref().as_ref())
+                        .await;
+                self.recovery.mark_epilog_discharged(
+                    job_id,
+                    run_attempt,
+                    (completion.exit_code, completion.signal),
+                    drain,
+                )?;
+            }
+            completion.cgroup = manifest.cgroup_path.clone();
+        } else {
+            let _ =
+                run_completion_hooks(&completion, &self.hooks, self.spank.as_ref().as_ref()).await;
+        }
+        cleanup_completed_artifacts(&completion, &self.mpi_host).await
     }
 }
 
@@ -1093,7 +1934,8 @@ struct CompletionReport<'a> {
 /// Reclaim a launch reservation that never commits within this bound. Sized
 /// above a typical image pull + fork so a normal launch is spared; one stalled
 /// past this bound is reclaimed.
-const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const LAUNCHING_TTL: std::time::Duration =
+    std::time::Duration::from_secs(spur_core::allocation::LAUNCH_RESERVATION_TTL_SECS);
 
 /// Reclaim allocations whose job is no longer tracked and is not mid-launch,
 /// using the running set as ground truth. Callers hold the `running` lock
@@ -1326,6 +2168,9 @@ mod controller_rpc_tests {
 /// monitor loop no longer polls it, so without this a killed `Forked` run would
 /// linger as a zombie until spurd exits.
 async fn reap_killed_job(mut job: executor::RunningJob) {
+    if job.is_allocation_only() {
+        return;
+    }
     loop {
         match job.try_wait() {
             Ok(Some(_)) | Err(_) => break,
@@ -1586,6 +2431,11 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<LaunchJobRequest>,
     ) -> Result<Response<LaunchJobResponse>, Status> {
+        let initial_command_id = request
+            .extensions()
+            .get::<PolledCommandId>()
+            .map(|command| command.0)
+            .unwrap_or(0);
         let req = request.into_inner();
         self.check_term(req.term)?;
         if self.shutting_down.load(Ordering::Acquire) {
@@ -1741,7 +2591,7 @@ impl SlurmAgent for AgentService {
         let mut container_config: Option<crate::container::ContainerConfig> = None;
         let mut rootfs_path: Option<std::path::PathBuf> = None;
 
-        let (launch_script, rootfs_mode) = if !spec.container_image.is_empty() {
+        let (launch_script, rootfs_mode, exit_status_path) = if !spec.container_image.is_empty() {
             info!(job_id, image = %spec.container_image, "launching containerized job");
 
             let mounts: Vec<crate::container::BindMount> = spec
@@ -1797,13 +2647,21 @@ impl SlurmAgent for AgentService {
             )
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
-            let (rootfs, rootfs_mode) =
-                crate::container::setup_rootfs(&image_path, job_id, cfg.name.as_deref())
-                    .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
+            let (rootfs, rootfs_mode) = crate::container::setup_rootfs(
+                &image_path,
+                job_id,
+                run_attempt,
+                cfg.name.as_deref(),
+            )
+            .map_err(|e| Status::internal(format!("container setup failed: {}", e)))?;
 
             // Copy user script into rootfs/tmp/ so it's accessible after pivot_root
             let container_script = format!("{}/tmp/spur_job_{}.sh", rootfs.display(), job_id);
-            std::fs::write(&container_script, &script).map_err(|e| {
+            let container_exit = format!("/tmp/spur_exit_{job_id}_{run_attempt}");
+            let host_exit = rootfs.join(container_exit.trim_start_matches('/'));
+            let wrapped =
+                executor::wrap_with_exit_sentinel(&script, std::path::Path::new(&container_exit));
+            std::fs::write(&container_script, wrapped).map_err(|e| {
                 Status::internal(format!("failed to write container script: {}", e))
             })?;
             #[cfg(unix)]
@@ -1821,9 +2679,9 @@ impl SlurmAgent for AgentService {
             // The launch_script passed to executor is the user's script
             // (used as fallback for non-container path; for container path,
             // the executor reads from rootfs/tmp/ directly).
-            (script, rootfs_mode)
+            (script, rootfs_mode, Some(host_exit))
         } else {
-            (script, crate::container::RootfsMode::Extracted)
+            (script, crate::container::RootfsMode::Extracted, None)
         };
 
         let mut pmix_guard = None;
@@ -1890,6 +2748,11 @@ impl SlurmAgent for AgentService {
                 run_attempt,
             )
             .await?;
+        let exact_resources = req
+            .allocated
+            .as_ref()
+            .map(core_allocations)
+            .unwrap_or_else(|| allocation_result_resources(&alloc_result));
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
@@ -1978,6 +2841,8 @@ impl SlurmAgent for AgentService {
 
         let launch_cfg = executor::JobLaunchConfig {
             job_id,
+            run_attempt,
+            exit_status_path,
             script: launch_script,
             work_dir: work_dir.clone(),
             name: spec.name.clone(),
@@ -2016,8 +2881,30 @@ impl SlurmAgent for AgentService {
 
         match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
             Ok(mut result) => {
+                let recovery = executor::JobRecoveryMetadata {
+                    rootfs_mode: rootfs_mode.clone(),
+                    containerized: launch_cfg.container.is_some(),
+                    stdout_path: result.stdout_path.clone(),
+                    stderr_path: result.stderr_path.clone(),
+                    exit_status_path: result.exit_status_path.clone(),
+                    work_dir: launch_cfg.work_dir.clone(),
+                    uid: launch_cfg.uid,
+                    gid: launch_cfg.gid,
+                    user: launch_cfg.user.clone(),
+                    partition: launch_cfg.partition.clone(),
+                    gpu_devices: launch_cfg.gpu_devices.clone(),
+                    cpu_ids: alloc_result.cpu_ids.clone(),
+                    cpus: launch_cfg.cpus,
+                    memory_mb: launch_cfg.memory_mb,
+                    nodelist: launch_cfg.nodelist.clone(),
+                    mpi: spec.mpi.clone(),
+                    exact_resources,
+                    last_command_id: initial_command_id,
+                    restart_safe: launch_is_restart_safe(launch_cfg.io_mode, &spec.mpi),
+                };
                 if let Err(error) =
-                    executor::write_recovery_manifest(job_id, run_attempt, &result.job)
+                    self.recovery
+                        .write_job_manifest(job_id, run_attempt, &result.job, recovery)
                 {
                     let error = format!("failed to record launched process: {error:#}");
                     let controller = self.reporter.controller_addr.clone();
@@ -2029,10 +2916,12 @@ impl SlurmAgent for AgentService {
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                     let cgroup = result.job.take_cgroup();
                     let cleanup_rootfs = rootfs_mode.clone();
+                    let recovery = self.recovery.clone();
                     tokio::spawn(async move {
                         reap_killed_job(result.job).await;
-                        crate::container::cleanup_rootfs(job_id, &cleanup_rootfs);
-                        crate::executor::cleanup_job_spool(job_id);
+                        let _ =
+                            crate::container::cleanup_rootfs(job_id, run_attempt, &cleanup_rootfs);
+                        let _ = recovery.cleanup_job_spool(job_id, run_attempt);
                         if let Some(ref cgroup) = cgroup {
                             crate::executor::cleanup_cgroup(cgroup);
                         }
@@ -2044,6 +2933,13 @@ impl SlurmAgent for AgentService {
                         stderr_path: String::new(),
                         failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
                     }));
+                }
+                if initial_command_id != 0 {
+                    let _ = self.allocation.lock().await.set_last_command_id(
+                        job_id,
+                        run_attempt,
+                        initial_command_id,
+                    );
                 }
                 pmix_guard.as_mut().map(PmixLaunchGuard::disarm);
                 let mut jobs = self.running.lock().await;
@@ -2080,19 +2976,11 @@ impl SlurmAgent for AgentService {
                     }
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                     let cgroup = result.job.take_cgroup();
-                    let running = self.running.clone();
+                    let recovery = self.recovery.clone();
                     tokio::spawn(async move {
                         reap_killed_job(result.job).await;
-                        // rootfs/spool paths are derived from job_id, so the
-                        // controller re-dispatching the same id to this node
-                        // would reuse them. Skip that cleanup if a live run for
-                        // job_id reappeared, or this reap would delete its files.
-                        // The cgroup handle is this launch's own, so it is always
-                        // safe to release.
-                        if !running.lock().await.contains_key(&job_id) {
-                            crate::container::cleanup_rootfs(job_id, &rootfs_mode);
-                            crate::executor::cleanup_job_spool(job_id);
-                        }
+                        let _ = crate::container::cleanup_rootfs(job_id, run_attempt, &rootfs_mode);
+                        let _ = recovery.cleanup_job_spool(job_id, run_attempt);
                         if let Some(ref cg) = cgroup {
                             crate::executor::cleanup_cgroup(cg);
                         }
@@ -2141,6 +3029,7 @@ impl SlurmAgent for AgentService {
                         memory_mb: launch_cfg.memory_mb,
                         nodelist: launch_cfg.nodelist,
                         mpi: spec.mpi.clone(),
+                        last_command_id: initial_command_id,
                         run_attempt,
                     },
                 );
@@ -2199,6 +3088,15 @@ impl SlurmAgent for AgentService {
         request: Request<PreparePmixRequest>,
     ) -> Result<Response<PreparePmixResponse>, Status> {
         let req = request.into_inner();
+        self.check_term(req.term)?;
+        if self
+            .has_different_local_attempt(req.job_id, req.run_attempt)
+            .await
+        {
+            return Err(Status::failed_precondition(
+                "PMIx prepare targets a superseded run attempt",
+            ));
+        }
         let plan = req
             .pmix_plan
             .as_ref()
@@ -2222,8 +3120,10 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<ReleasePmixRequest>,
     ) -> Result<Response<ReleasePmixResponse>, Status> {
-        let job_id = request.into_inner().job_id;
-        if let Err(err) = self.mpi_host.release_prepared_pmix(job_id) {
+        let req = request.into_inner();
+        self.check_term(req.term)?;
+        let job_id = req.job_id;
+        if let Err(err) = self.mpi_host.release_prepared_pmix(job_id, req.run_attempt) {
             warn!(job_id, error = %err, "PMIx prepare release failed");
         }
         Ok(Response::new(ReleasePmixResponse {}))
@@ -2243,12 +3143,13 @@ impl SlurmAgent for AgentService {
         {
             return Ok(Response::new(()));
         }
-        let requires_synchronous_cleanup = self
-            .running
-            .lock()
-            .await
-            .get(&job_id)
-            .is_none_or(|tracked| tracked.job.is_allocation_only());
+        let requires_synchronous_cleanup = req.signal == nix::sys::signal::Signal::SIGKILL as i32
+            || self
+                .running
+                .lock()
+                .await
+                .get(&job_id)
+                .is_none_or(|tracked| tracked.job.is_allocation_only());
         if requires_synchronous_cleanup {
             self.apply_release_command(job_id, req.run_attempt, req.signal)
                 .await
@@ -2260,7 +3161,7 @@ impl SlurmAgent for AgentService {
             self.graceful_cancel(job_id, req.run_attempt).await;
         }
 
-        if let Err(err) = self.mpi_host.release_prepared_pmix(job_id) {
+        if let Err(err) = self.mpi_host.release_prepared_pmix(job_id, req.run_attempt) {
             warn!(job_id, error = %err, "PMIx prepare release on cancel failed");
         }
 
@@ -2272,23 +3173,33 @@ impl SlurmAgent for AgentService {
         request: Request<CancelStepRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        let step_key = (req.job_id, req.step_id);
+        self.check_term(req.term)?;
+        if self
+            .has_different_local_attempt(req.job_id, req.run_attempt)
+            .await
+        {
+            return Ok(Response::new(()));
+        }
         let signal = if req.signal > 0 {
             req.signal
         } else {
             nix::sys::signal::Signal::SIGTERM as i32
         };
-        let pid = {
+        let pids = {
             let mut steps = self.active_steps.lock().await;
-            match steps.get_mut(&step_key) {
-                Some(step) => {
+            let mut pids = Vec::new();
+            for ((job_id, run_attempt, step_id), step) in steps.iter_mut() {
+                if *job_id == req.job_id
+                    && *step_id == req.step_id
+                    && (req.run_attempt == 0 || *run_attempt == req.run_attempt)
+                {
                     step.cancel_requested = true;
-                    step.pid
+                    pids.extend(step.pid);
                 }
-                None => return Ok(Response::new(())),
             }
+            pids
         };
-        if let Some(pid) = pid {
+        for pid in pids {
             signal_step_process_group(pid, signal);
         }
         Ok(Response::new(()))
@@ -2300,6 +3211,12 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         self.check_term(req.term)?;
+        if self
+            .has_different_local_attempt(req.job_id, req.run_attempt)
+            .await
+        {
+            return Ok(Response::new(()));
+        }
         self.suspend_signal(req.job_id, req.resume).await;
         Ok(Response::new(()))
     }
@@ -2490,6 +3407,7 @@ impl SlurmAgent for AgentService {
                 memory_mb,
                 nodelist: req.nodelist,
                 mpi: req.mpi,
+                last_command_id: 0,
                 run_attempt: req.run_attempt,
             },
         );
@@ -2506,6 +3424,7 @@ impl SlurmAgent for AgentService {
         request: Request<RunCommandRequest>,
     ) -> Result<Response<RunCommandResponse>, Status> {
         let req = request.into_inner();
+        self.check_term(req.term)?;
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
         }
@@ -2528,36 +3447,22 @@ impl SlurmAgent for AgentService {
             num_tasks
         };
         let step_id = req.step_id;
-        let step_key = (job_id, step_id);
-        {
-            self.active_steps
-                .lock()
-                .await
-                .insert(step_key, ActiveStep::default());
-        }
-        let _active_step_guard = ActiveStepGuard {
-            steps: self.active_steps.clone(),
-            key: step_key,
-        };
 
         // No retry on a miss: a step only reaches a Running job, i.e. one every
         // node already confirmed via LaunchJob (confirm_dispatch_on_nodes) — so a
         // miss is a wrong job/node pairing, not a launch race. The one uncovered
         // case is a spurd restart mid-job, which starts `running` empty.
-        let (
-            gpu_devices,
-            partition,
-            cpus,
-            memory_mb,
-            nodelist,
-            job_mpi,
-            run_attempt,
-            _active_step_guard,
-        ) = {
+        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, run_attempt) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
             })?;
+            if req.run_attempt != 0 && tracked.run_attempt != req.run_attempt {
+                return Err(Status::failed_precondition(format!(
+                    "job {job_id} run attempt {} superseded step attempt {}",
+                    tracked.run_attempt, req.run_attempt
+                )));
+            }
             let nodelist = if tracked.nodelist.is_empty() {
                 self.reporter.hostname.clone()
             } else {
@@ -2571,8 +3476,16 @@ impl SlurmAgent for AgentService {
                 nodelist,
                 tracked.mpi.clone(),
                 tracked.run_attempt,
-                StepLifecycleGuard::new(self.step_lifecycle.clone(), job_id, tracked.run_attempt),
             )
+        };
+        let step_key = (job_id, run_attempt, step_id);
+        self.active_steps
+            .lock()
+            .await
+            .insert(step_key, ActiveStep::default());
+        let _active_step_guard = ActiveStepGuard {
+            steps: self.active_steps.clone(),
+            key: step_key,
         };
 
         let agent_hostname = self.reporter.hostname.clone();
@@ -2759,6 +3672,19 @@ impl SlurmAgent for AgentService {
             }
         }
 
+        if !self.accepts_new_step(job_id, run_attempt).await {
+            return Err(Status::failed_precondition(
+                "job allocation began releasing during step setup",
+            ));
+        }
+        let step_lifecycle_guard =
+            StepLifecycleGuard::new(self.step_lifecycle.clone(), job_id, run_attempt);
+        if !self.accepts_new_step(job_id, run_attempt).await {
+            return Err(Status::failed_precondition(
+                "job allocation is no longer accepting steps",
+            ));
+        }
+
         let mut env = senv.into_map();
         if num_tasks > 1 && step_mpi {
             mpi_plugin::strip_launcher_mpi_env(&mut env);
@@ -2785,14 +3711,9 @@ impl SlurmAgent for AgentService {
         }
 
         let memlock = self.memlock;
-        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
         unsafe {
             cmd.pre_exec(move || {
                 crate::executor::apply_memlock(memlock);
-                if let Some(ref pd) = priv_drop {
-                    pd.apply()
-                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                }
                 Ok(())
             });
         }
@@ -2822,34 +3743,59 @@ impl SlurmAgent for AgentService {
                     "job {job_id} run attempt changed before step launch"
                 ))
             })?;
-        let cgroup = executor::setup_step_cgroup(job_id, tracked.cpus, tracked.memory_mb)
-            .map_err(|error| Status::internal(format!("step cgroup setup failed: {error}")))?;
-        let mut child = cmd
-            .spawn()
-            .map_err(|error| Status::internal(format!("command failed: {error}")))?;
+        let cgroup =
+            executor::setup_step_cgroup(job_id, run_attempt, tracked.cpus, tracked.memory_mb)
+                .map_err(|error| Status::internal(format!("step cgroup setup failed: {error}")))?;
+        let mut process_intent = self
+            .recovery
+            .prepare_process_intent(job_id, run_attempt, step_id, "step", cgroup.as_deref())
+            .map_err(|error| {
+                Status::internal(format!("failed to record step launch intent: {error:#}"))
+            })?;
+        let process_cgroup = process_intent
+            .manifest
+            .cgroup_path
+            .as_ref()
+            .or(cgroup.as_ref());
+        if let Some(cgroup) = process_cgroup {
+            let procs = CString::new(cgroup.join("cgroup.procs").as_os_str().as_bytes())
+                .map_err(|_| Status::internal("step cgroup path contains NUL"))?;
+            unsafe {
+                cmd.pre_exec(move || executor::attach_current_process_to_cgroup(&procs));
+            }
+        }
+        let spurd_pid = std::process::id() as i32;
+        unsafe {
+            cmd.pre_exec(move || executor::set_parent_death_signal(spurd_pid));
+        }
+        if let Some(priv_drop) = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid) {
+            unsafe {
+                cmd.pre_exec(move || {
+                    priv_drop
+                        .apply()
+                        .map_err(|error| std::io::Error::from_raw_os_error(error as i32))
+                });
+            }
+        }
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.recovery.abandon_process_intent(&process_intent);
+                return Err(Status::internal(format!("command failed: {error}")));
+            }
+        };
         let pid = child
             .id()
             .ok_or_else(|| Status::internal("step process exited before its pid was recorded"))?;
 
-        if cgroup
-            .as_deref()
-            .is_some_and(|path| !executor::attach_process_to_cgroup(path, pid))
+        if let Err(error) = self
+            .recovery
+            .activate_process_intent(&mut process_intent, pid as i32)
         {
             drop(jobs);
             let _ = child.kill().await;
             let _ = child.wait().await;
-            return Err(Status::internal("failed to attach step process to cgroup"));
-        }
-
-        if let Err(error) = executor::write_process_recovery_manifest(
-            job_id,
-            run_attempt,
-            pid as i32,
-            cgroup.as_deref(),
-        ) {
-            drop(jobs);
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = self.recovery.settle_process_intent(&process_intent).await;
             return Err(Status::internal(format!(
                 "failed to record step process for recovery: {error}"
             )));
@@ -2870,12 +3816,19 @@ impl SlurmAgent for AgentService {
             signal_step_process_group(pid, nix::sys::signal::Signal::SIGTERM as i32);
             let _ = child.kill().await;
             let _ = child.wait().await;
-            executor::remove_process_recovery_manifest(job_id, run_attempt, pid as i32);
+            self.recovery
+                .settle_process_intent(&process_intent)
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?;
             return Ok(Response::new(cancelled_step_response()));
         }
 
         let output = child.wait_with_output().await;
-        executor::remove_process_recovery_manifest(job_id, run_attempt, pid as i32);
+        self.recovery
+            .settle_process_intent(&process_intent)
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?;
+        drop(step_lifecycle_guard);
         let output =
             output.map_err(|error| Status::internal(format!("command failed: {error}")))?;
 
@@ -3026,6 +3979,13 @@ impl SlurmAgent for AgentService {
             .await?;
 
         let entry = self.job_entry(init.job_id).await?;
+        let lifecycle_guard =
+            StepLifecycleGuard::new(self.step_lifecycle.clone(), init.job_id, entry.run_attempt);
+        if !self.accepts_new_step(init.job_id, entry.run_attempt).await {
+            return Err(Status::failed_precondition(
+                "job allocation is no longer accepting steps",
+            ));
+        }
 
         let winsize = init.winsize.as_ref().map(|ws| PtyWinSize {
             rows: ws.rows as u16,
@@ -3035,9 +3995,60 @@ impl SlurmAgent for AgentService {
         });
 
         let argv: Vec<String> = init.argv.clone();
+        let mut process_intent = self
+            .recovery
+            .prepare_process_intent(
+                init.job_id,
+                entry.run_attempt,
+                init.step_id,
+                "pty",
+                entry.cgroup_path.as_deref(),
+            )
+            .map_err(|error| {
+                Status::internal(format!(
+                    "failed to record interactive launch intent: {error:#}"
+                ))
+            })?;
+        let process_cgroup = process_intent
+            .manifest
+            .cgroup_path
+            .as_deref()
+            .or(entry.cgroup_path.as_deref());
 
-        let (master_fd, child, child_pid) =
-            Self::spawn_pty_in_job(&entry, &argv, init.job_id, winsize.as_ref())?;
+        let (master_fd, mut child, child_pid) = match Self::spawn_pty_in_job(
+            &entry,
+            &argv,
+            init.job_id,
+            winsize.as_ref(),
+            process_cgroup,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                self.recovery.abandon_process_intent(&process_intent);
+                return Err(error);
+            }
+        };
+
+        if !self.accepts_new_step(init.job_id, entry.run_attempt).await {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            self.recovery.abandon_process_intent(&process_intent);
+            return Err(Status::failed_precondition(
+                "job allocation began releasing during interactive launch",
+            ));
+        }
+
+        if let Err(error) = self
+            .recovery
+            .activate_process_intent(&mut process_intent, child_pid)
+        {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = self.recovery.settle_process_intent(&process_intent).await;
+            return Err(Status::internal(format!(
+                "failed to record interactive process: {error}"
+            )));
+        }
 
         info!(
             job_id = init.job_id,
@@ -3049,7 +4060,16 @@ impl SlurmAgent for AgentService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
 
         tokio::spawn(Self::run_pty_bridge(
-            master_fd, child, child_pid, inbound, tx,
+            master_fd,
+            child,
+            child_pid,
+            inbound,
+            tx,
+            Some(PtyProcessRecovery {
+                store: self.recovery.clone(),
+                intent: process_intent,
+                _lifecycle_guard: lifecycle_guard,
+            }),
         ));
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -3320,9 +4340,10 @@ impl AgentService {
             }
         };
 
-        if let Some(resources) = allocated {
-            let _ = alloc.set_exact_resources(job_id, run_attempt, core_allocations(resources));
-        }
+        let exact_resources = allocated
+            .map(core_allocations)
+            .unwrap_or_else(|| allocation_result_resources(&result));
+        let _ = alloc.set_exact_resources(job_id, run_attempt, exact_resources);
 
         let gpu_ids = controller_gpu_ids;
         Ok((result, gpu_ids))
@@ -3470,6 +4491,8 @@ impl AgentService {
 
         Ok(crate::job_entry::JobEntry {
             pid: pid as i32,
+            run_attempt: tracked.run_attempt,
+            cgroup_path: tracked.job.cgroup_path().map(std::path::Path::to_path_buf),
             has_pid_namespace: tracked.has_pid_namespace,
             has_user_namespace: tracked.has_user_namespace,
             has_mount_namespace: tracked.has_mount_namespace,
@@ -3487,6 +4510,7 @@ impl AgentService {
         child_pid: i32,
         mut inbound: S,
         tx: tokio::sync::mpsc::Sender<Result<InteractiveOutput, Status>>,
+        recovery: Option<PtyProcessRecovery>,
     ) where
         S: tokio_stream::Stream<Item = Result<InteractiveInput, Status>> + Unpin + Send,
     {
@@ -3499,6 +4523,11 @@ impl AgentService {
         let async_fd = match AsyncFd::new(master) {
             Ok(fd) => fd,
             Err(e) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                if let Some(recovery) = &recovery {
+                    let _ = recovery.store.settle_process_intent(&recovery.intent).await;
+                }
                 let _ = tx
                     .send(Err(Status::internal(format!("AsyncFd setup: {e}"))))
                     .await;
@@ -3592,6 +4621,10 @@ impl AgentService {
             };
         }
 
+        if let Some(recovery) = &recovery {
+            let _ = recovery.store.settle_process_intent(&recovery.intent).await;
+        }
+
         let _ = tx
             .send(Ok(InteractiveOutput {
                 msg: Some(interactive_output::Msg::ExitStatus(exit_code)),
@@ -3659,6 +4692,7 @@ impl AgentService {
         argv: &[String],
         job_id: u32,
         winsize: Option<&crate::pty::WindowSize>,
+        process_cgroup: Option<&std::path::Path>,
     ) -> Result<(std::os::fd::OwnedFd, tokio::process::Child, i32), Status> {
         use std::os::fd::AsRawFd;
         use std::process::Stdio;
@@ -3706,7 +4740,8 @@ impl AgentService {
             .current_dir(work_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
 
         if entry.pid > 0 {
             for (k, v) in Self::read_proc_environ(entry.pid as u32) {
@@ -3732,10 +4767,19 @@ impl AgentService {
             master: master.as_raw_fd(),
             slave: slave.as_raw_fd(),
         };
+        let cgroup_procs = process_cgroup
+            .map(|path| CString::new(path.join("cgroup.procs").as_os_str().as_bytes()))
+            .transpose()
+            .map_err(|_| Status::internal("job cgroup path contains NUL"))?;
         let priv_drop_for_child = if apply_priv_in_child { priv_drop } else { None };
+        let spurd_pid = std::process::id() as i32;
         unsafe {
             cmd.pre_exec(move || {
+                executor::set_parent_death_signal(spurd_pid)?;
                 raw.wire()?;
+                if let Some(ref procs) = cgroup_procs {
+                    executor::attach_current_process_to_cgroup(procs)?;
+                }
                 if let Some(ref pd) = priv_drop_for_child {
                     pd.apply()
                         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
@@ -3821,8 +4865,15 @@ impl TrackedJob {
             memory_mb: 0,
             nodelist: String::new(),
             mpi: String::new(),
+            last_command_id: 0,
             run_attempt: 0,
         }
+    }
+
+    fn dummy_for_attempt(run_attempt: u32) -> Self {
+        let mut job = Self::dummy(0);
+        job.run_attempt = run_attempt;
+        job
     }
 }
 
@@ -3836,9 +4887,15 @@ impl AgentService {
         self.allocation.lock().await.free_gpus(None)
     }
 
-    async fn register_test_step(&self, job_id: u32, step_id: u32, pid: Option<u32>) {
+    async fn register_test_step(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: u32,
+        pid: Option<u32>,
+    ) {
         self.active_steps.lock().await.insert(
-            (job_id, step_id),
+            (job_id, run_attempt, step_id),
             ActiveStep {
                 cancel_requested: false,
                 pid,
@@ -3846,21 +4903,21 @@ impl AgentService {
         );
     }
 
-    async fn step_cancel_requested(&self, job_id: u32, step_id: u32) -> bool {
+    async fn step_cancel_requested(&self, job_id: u32, run_attempt: u32, step_id: u32) -> bool {
         self.active_steps
             .lock()
             .await
-            .get(&(job_id, step_id))
+            .get(&(job_id, run_attempt, step_id))
             .is_some_and(|step| step.cancel_requested)
     }
 
-    async fn wait_for_active_step(&self, job_id: u32, step_id: u32) {
+    async fn wait_for_active_step(&self, job_id: u32, run_attempt: u32, step_id: u32) {
         for _ in 0..100 {
             if self
                 .active_steps
                 .lock()
                 .await
-                .contains_key(&(job_id, step_id))
+                .contains_key(&(job_id, run_attempt, step_id))
             {
                 return;
             }
@@ -3955,6 +5012,13 @@ mod tests {
         );
         let job_id = 100;
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+        {
+            let mut allocation = svc.allocation.lock().await;
+            allocation
+                .allocate_for_job_with_attempt(job_id, 1, 0, &[], 0)
+                .unwrap();
+            allocation.commit_job(job_id);
+        }
         (svc, job_id)
     }
 
@@ -3996,6 +5060,33 @@ mod tests {
             String::new(),
             new_running_jobs(),
         ))
+    }
+
+    fn restart_safe_recovery_metadata(
+        exit_status_path: std::path::PathBuf,
+        last_command_id: u64,
+    ) -> executor::JobRecoveryMetadata {
+        executor::JobRecoveryMetadata {
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            containerized: false,
+            stdout_path: "/tmp/out".into(),
+            stderr_path: "/tmp/err".into(),
+            exit_status_path,
+            work_dir: "/tmp".into(),
+            uid: 1000,
+            gid: 1000,
+            user: "user".into(),
+            partition: "default".into(),
+            gpu_devices: Vec::new(),
+            cpu_ids: vec![0],
+            cpus: 1,
+            memory_mb: 256,
+            nodelist: "test-node".into(),
+            mpi: "none".into(),
+            exact_resources: spur_core::resource::ResourceAllocations::with_scalar(1, 256),
+            last_command_id,
+            restart_safe: true,
+        }
     }
 
     #[tokio::test]
@@ -4042,6 +5133,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_lock_retires_only_after_every_registered_user() {
+        let service = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let key = (9, 2);
+        let first = service.acquire_command_lock(key).await;
+        let second = service.acquire_command_lock(key).await;
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(service.command_locks.lock().await[&key].users, 2);
+        service.retire_command_lock(key, &first).await;
+        assert_eq!(service.command_locks.lock().await[&key].users, 1);
+        service.retire_command_lock(key, &second).await;
+        assert!(!service.command_locks.lock().await.contains_key(&key));
+
+        let replacement = service.acquire_command_lock(key).await;
+        assert!(!Arc::ptr_eq(&first, &replacement));
+        service.retire_command_lock(key, &replacement).await;
+    }
+
+    #[tokio::test]
     async fn stale_completion_cleanup_refuses_a_newer_local_attempt() {
         let resources = ResourceSet {
             cpus: 4,
@@ -4055,11 +5170,564 @@ mod tests {
         local.commit_job(9);
         let allocation = Mutex::new(local);
         let steps = StdMutex::new(HashMap::new());
+        let recovery_dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        let recovery = executor::RecoveryStore::at(
+            recovery_dir.path().to_path_buf(),
+            cgroup_dir.path().to_path_buf(),
+        );
 
-        assert!(!settle_current_allocation(&allocation, &steps, 9, 1)
-            .await
-            .unwrap());
+        assert!(
+            !settle_current_allocation(&recovery, &allocation, &steps, 9, 1)
+                .await
+                .unwrap()
+        );
         assert!(allocation.lock().await.owns_attempt(9, 2));
+    }
+
+    #[tokio::test]
+    async fn recovery_restores_resources_and_replays_the_durable_launch() {
+        let mut service = AgentService::new(
+            test_reporter_with_gpus(&[3]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let recovery_dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        service.recovery = executor::RecoveryStore::at(
+            recovery_dir.path().to_path_buf(),
+            cgroup_dir.path().to_path_buf(),
+        );
+        let job_id = 48;
+        let run_attempt = 5;
+        let command_id = 77;
+        let running = executor::RunningJob::Forked {
+            pid: std::process::id() as i32,
+            _pidfd: None,
+            cgroup_path: None,
+            reaped: false,
+        };
+        let exact_resources = spur_core::resource::ResourceAllocations {
+            cpus: 2,
+            memory_mb: 512,
+            devices: HashMap::from([(
+                "gpu".into(),
+                vec![spur_core::resource::AllocatedDevice::injectable(3)],
+            )]),
+        };
+        service
+            .recovery
+            .write_job_manifest(
+                job_id,
+                run_attempt,
+                &running,
+                executor::JobRecoveryMetadata {
+                    rootfs_mode: crate::container::RootfsMode::Extracted,
+                    containerized: false,
+                    stdout_path: "/tmp/out".into(),
+                    stderr_path: "/tmp/err".into(),
+                    exit_status_path: recovery_dir.path().join("exit"),
+                    work_dir: "/tmp".into(),
+                    uid: 1000,
+                    gid: 1000,
+                    user: "user".into(),
+                    partition: "default".into(),
+                    gpu_devices: vec![3],
+                    cpu_ids: vec![0, 1],
+                    cpus: 2,
+                    memory_mb: 512,
+                    nodelist: "test-node".into(),
+                    mpi: "none".into(),
+                    exact_resources: exact_resources.clone(),
+                    last_command_id: command_id,
+                    restart_safe: true,
+                },
+            )
+            .unwrap();
+
+        service.recover_jobs().await.unwrap();
+
+        let owned = service.allocation.lock().await.owned_allocations();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].job_id, job_id);
+        assert_eq!(owned[0].run_attempt, run_attempt);
+        assert_eq!(owned[0].resources.cpu_ids, vec![0, 1]);
+        assert_eq!(owned[0].resources.gpu_ids, vec![3]);
+        assert_eq!(owned[0].exact_resources, exact_resources);
+        assert_eq!(owned[0].last_command_id, command_id);
+
+        let request = LaunchJobRequest {
+            job_id,
+            run_attempt,
+            ..Default::default()
+        };
+        let replay = service
+            .apply_or_replay_command(&AgentCommand {
+                command_id,
+                job_id,
+                run_attempt,
+                node: "test-node".into(),
+                kind: AgentCommandKind::Launch as i32,
+                payload: request.encode_to_vec(),
+                ..Default::default()
+            })
+            .await;
+        assert!(replay.success);
+        assert_eq!(service.running.lock().await.len(), 1);
+    }
+
+    async fn recovered_live_job(command_id: u64) -> (AgentService, std::process::Child, u32, u32) {
+        let recovery = executor::RecoveryStore::isolated();
+        let service = AgentService::new_with_recovery(test_reporter(), recovery);
+        let job_id = 148;
+        let run_attempt = 5;
+        let child = std::process::Command::new("sleep")
+            .arg("3600")
+            .spawn()
+            .unwrap();
+        let running = executor::RunningJob::Forked {
+            pid: child.id() as i32,
+            _pidfd: None,
+            cgroup_path: None,
+            reaped: false,
+        };
+        service
+            .recovery
+            .write_job_manifest(
+                job_id,
+                run_attempt,
+                &running,
+                restart_safe_recovery_metadata(
+                    std::path::PathBuf::from("/tmp/spur-test-recovered-exit"),
+                    command_id,
+                ),
+            )
+            .unwrap();
+        service.recover_jobs().await.unwrap();
+        (service, child, job_id, run_attempt)
+    }
+
+    #[tokio::test]
+    async fn live_recovery_waits_for_pending_launch_replay_before_completion() {
+        let command_id = 177;
+        let (service, mut child, job_id, run_attempt) = recovered_live_job(command_id).await;
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let completed = collect_completed_jobs(
+            &service.running,
+            &service.allocation,
+            &service.lifecycle_locks,
+            &service.applied_commands,
+            &service.in_flight_commands,
+        )
+        .await;
+        assert!(completed.is_empty());
+        assert!(service.running.lock().await.contains_key(&job_id));
+
+        let replay = service
+            .apply_or_replay_command(&AgentCommand {
+                command_id,
+                job_id,
+                run_attempt,
+                node: "test-node".into(),
+                kind: AgentCommandKind::Launch as i32,
+                payload: LaunchJobRequest {
+                    job_id,
+                    run_attempt,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                ..Default::default()
+            })
+            .await;
+        assert!(replay.success);
+        assert!(service.running.lock().await.contains_key(&job_id));
+
+        service.applied_commands.lock().await.remove(&command_id);
+        let completed = collect_completed_jobs(
+            &service.running,
+            &service.allocation,
+            &service.lifecycle_locks,
+            &service.applied_commands,
+            &service.in_flight_commands,
+        )
+        .await;
+        assert_eq!(completed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn live_recovery_completion_unblocks_when_successful_poll_omits_launch() {
+        let command_id = 178;
+        let (service, mut child, job_id, _) = recovered_live_job(command_id).await;
+        service.reconcile_applied_commands(&HashSet::new()).await;
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let completed = collect_completed_jobs(
+            &service.running,
+            &service.allocation,
+            &service.lifecycle_locks,
+            &service.applied_commands,
+            &service.in_flight_commands,
+        )
+        .await;
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].completion.job_id, job_id);
+    }
+
+    #[tokio::test]
+    async fn cross_boot_manifest_is_not_adopted_or_signaled_by_pid() {
+        use std::os::unix::process::CommandExt;
+
+        let mut service = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let recovery_dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        service.recovery = executor::RecoveryStore::at(
+            recovery_dir.path().to_path_buf(),
+            cgroup_dir.path().to_path_buf(),
+        );
+        let job_id = 49;
+        let run_attempt = 6;
+        let mut child = std::process::Command::new("sleep")
+            .arg("3600")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let running = executor::RunningJob::Forked {
+            pid: child.id() as i32,
+            _pidfd: None,
+            cgroup_path: None,
+            reaped: false,
+        };
+        service
+            .recovery
+            .write_job_manifest(
+                job_id,
+                run_attempt,
+                &running,
+                restart_safe_recovery_metadata(recovery_dir.path().join("exit"), 90),
+            )
+            .unwrap();
+        let (manifest_path, mut manifest) = service.recovery.scan().unwrap().pop().unwrap();
+        manifest.boot_id = "a-different-kernel-boot".into();
+        executor::update_recovery_manifest(&manifest_path, &manifest).unwrap();
+
+        service.recover_jobs().await.unwrap();
+
+        assert!(child.try_wait().unwrap().is_none());
+        assert!(service.running.lock().await.is_empty());
+        assert_eq!(service.recovered_completions.lock().await.len(), 1);
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dead_recovered_launch_replays_success_before_completion_advances() {
+        use std::os::unix::process::CommandExt;
+
+        let mut reporter = test_reporter();
+        Arc::get_mut(&mut reporter).unwrap().controller_addr = "http://127.0.0.1:0".into();
+        let mut service = AgentService::new(
+            reporter,
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let recovery_dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        service.recovery = executor::RecoveryStore::at(
+            recovery_dir.path().to_path_buf(),
+            cgroup_dir.path().to_path_buf(),
+        );
+        let job_id = 52;
+        let run_attempt = 10;
+        let command_id = 93;
+        let mut child = std::process::Command::new("sleep")
+            .arg("3600")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let running = executor::RunningJob::Forked {
+            pid: child.id() as i32,
+            _pidfd: None,
+            cgroup_path: None,
+            reaped: false,
+        };
+        service
+            .recovery
+            .write_job_manifest(
+                job_id,
+                run_attempt,
+                &running,
+                restart_safe_recovery_metadata(recovery_dir.path().join("exit"), command_id),
+            )
+            .unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        service.recover_jobs().await.unwrap();
+        service.report_recovered_completions().await;
+        assert!(
+            service.recovered_completions.lock().await[0]
+                .manifest
+                .epilog_pending
+        );
+
+        let request = LaunchJobRequest {
+            job_id,
+            run_attempt,
+            ..Default::default()
+        };
+        let replay = service
+            .apply_or_replay_command(&AgentCommand {
+                command_id,
+                job_id,
+                run_attempt,
+                node: "test-node".into(),
+                kind: AgentCommandKind::Launch as i32,
+                payload: request.encode_to_vec(),
+                ..Default::default()
+            })
+            .await;
+        assert!(replay.success);
+        assert!(service.running.lock().await.is_empty());
+
+        service.applied_commands.lock().await.remove(&command_id);
+        service.report_recovered_completions().await;
+        assert!(
+            !service.recovered_completions.lock().await[0]
+                .manifest
+                .epilog_pending
+        );
+    }
+
+    #[tokio::test]
+    async fn process_only_recovery_evidence_fails_the_whole_allocation_closed() {
+        use std::os::unix::process::CommandExt;
+
+        let mut service = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let recovery_dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        service.recovery = executor::RecoveryStore::at(
+            recovery_dir.path().to_path_buf(),
+            cgroup_dir.path().to_path_buf(),
+        );
+        let job_id = 50;
+        let run_attempt = 8;
+        let mut batch_child = std::process::Command::new("sleep")
+            .arg("3600")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let batch = executor::RunningJob::Forked {
+            pid: batch_child.id() as i32,
+            _pidfd: None,
+            cgroup_path: None,
+            reaped: false,
+        };
+        service
+            .recovery
+            .write_job_manifest(
+                job_id,
+                run_attempt,
+                &batch,
+                executor::JobRecoveryMetadata {
+                    rootfs_mode: crate::container::RootfsMode::Extracted,
+                    containerized: false,
+                    stdout_path: "/tmp/out".into(),
+                    stderr_path: "/tmp/err".into(),
+                    exit_status_path: recovery_dir.path().join("exit"),
+                    work_dir: "/tmp".into(),
+                    uid: 1000,
+                    gid: 1000,
+                    user: "user".into(),
+                    partition: "default".into(),
+                    gpu_devices: Vec::new(),
+                    cpu_ids: vec![0],
+                    cpus: 1,
+                    memory_mb: 256,
+                    nodelist: "test-node".into(),
+                    mpi: "none".into(),
+                    exact_resources: spur_core::resource::ResourceAllocations::with_scalar(1, 256),
+                    last_command_id: 91,
+                    restart_safe: true,
+                },
+            )
+            .unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("3600")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        service
+            .recovery
+            .write_process_manifest(job_id, run_attempt, child.id() as i32, None)
+            .unwrap();
+
+        service.recover_jobs().await.unwrap();
+        let batch_status = batch_child.wait().unwrap();
+        let child_status = child.wait().unwrap();
+        let remaining = service.recovery.scan().unwrap();
+
+        assert!(!batch_status.success());
+        assert!(!child_status.success());
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining[0].1.job.is_some());
+        assert!(service.running.lock().await.is_empty());
+        assert!(!service
+            .allocation
+            .lock()
+            .await
+            .owns_attempt(job_id, run_attempt));
+        assert_eq!(service.recovered_completions.lock().await.len(), 1);
+        assert!(service.applied_commands.lock().await.contains_key(&91));
+    }
+
+    #[tokio::test]
+    async fn recovery_does_not_preserve_a_cgroup_for_an_unrestorable_record() {
+        use std::os::unix::process::CommandExt;
+
+        let mut service = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let recovery_dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        service.recovery = executor::RecoveryStore::at(
+            recovery_dir.path().to_path_buf(),
+            cgroup_dir.path().to_path_buf(),
+        );
+        let job_id = 51;
+        let run_attempt = 9;
+        let cgroup = cgroup_dir
+            .path()
+            .join(format!("job_{job_id}_{run_attempt}"));
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), "").unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("3600")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let running = executor::RunningJob::Forked {
+            pid: child.id() as i32,
+            _pidfd: None,
+            cgroup_path: Some(cgroup.clone()),
+            reaped: false,
+        };
+        let exact_resources = spur_core::resource::ResourceAllocations {
+            cpus: 1,
+            memory_mb: 256,
+            devices: HashMap::from([(
+                "gpu".into(),
+                vec![spur_core::resource::AllocatedDevice::injectable(99)],
+            )]),
+        };
+        service
+            .recovery
+            .write_job_manifest(
+                job_id,
+                run_attempt,
+                &running,
+                executor::JobRecoveryMetadata {
+                    rootfs_mode: crate::container::RootfsMode::Extracted,
+                    containerized: false,
+                    stdout_path: "/tmp/out".into(),
+                    stderr_path: "/tmp/err".into(),
+                    exit_status_path: recovery_dir.path().join("exit"),
+                    work_dir: "/tmp".into(),
+                    uid: 1000,
+                    gid: 1000,
+                    user: "user".into(),
+                    partition: "default".into(),
+                    gpu_devices: vec![99],
+                    cpu_ids: vec![0],
+                    cpus: 1,
+                    memory_mb: 256,
+                    nodelist: "test-node".into(),
+                    mpi: "none".into(),
+                    exact_resources,
+                    last_command_id: 92,
+                    restart_safe: true,
+                },
+            )
+            .unwrap();
+
+        service.recover_jobs().await.unwrap();
+        let child_status = child.wait().unwrap();
+
+        assert!(!child_status.success());
+        assert!(!cgroup.exists());
+        assert!(service.running.lock().await.is_empty());
+        assert!(service
+            .allocation
+            .lock()
+            .await
+            .owned_allocations()
+            .is_empty());
+        assert_eq!(service.recovered_completions.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn only_file_io_non_pmix_launches_are_restart_safe() {
+        assert!(launch_is_restart_safe(executor::LaunchIo::File, "none"));
+        assert!(!launch_is_restart_safe(executor::LaunchIo::Pty, "none"));
+        assert!(!launch_is_restart_safe(executor::LaunchIo::File, MPI_PMIX));
+    }
+
+    #[tokio::test]
+    async fn recovery_settles_a_live_unowned_step_before_registration() {
+        let mut service = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let recovery_dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        service.recovery = executor::RecoveryStore::at(
+            recovery_dir.path().to_path_buf(),
+            cgroup_dir.path().to_path_buf(),
+        );
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("release_command_residual_child_process")
+            .arg("--ignored")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        service
+            .recovery
+            .write_process_manifest(49, 6, child.id() as i32, None)
+            .unwrap();
+
+        service.recover_jobs().await.unwrap();
+        let status = child.wait().unwrap();
+
+        assert!(!status.success());
+        assert!(service.recovery.scan().unwrap().is_empty());
+        assert!(service.running.lock().await.is_empty());
+        assert!(service
+            .allocation
+            .lock()
+            .await
+            .owned_allocations()
+            .is_empty());
     }
 
     /// An executable script at a temp path that sleeps `millis` then exits 0,
@@ -4092,7 +5760,7 @@ mod tests {
         // only string-match. The agent itself neither drains nor reports a
         // completion: pairing the drain with the hold is the controller's job.
         let prolog = failing_hook_script(1);
-        let svc = AgentService::new(
+        let mut svc = AgentService::new(
             test_reporter(),
             HooksConfig {
                 prolog: Some(prolog.to_str().unwrap().to_string()),
@@ -4100,6 +5768,12 @@ mod tests {
             },
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
+        );
+        let recovery_dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        svc.recovery = executor::RecoveryStore::at(
+            recovery_dir.path().to_path_buf(),
+            cgroup_dir.path().to_path_buf(),
         );
 
         let resp = svc
@@ -4545,6 +6219,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_command_rejects_stale_terms_and_attempts() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 101;
+        let run_attempt = 2;
+        svc.insert_test_job(job_id, TrackedJob::dummy_for_attempt(run_attempt))
+            .await;
+        {
+            let mut allocation = svc.allocation.lock().await;
+            allocation
+                .allocate_for_job_with_attempt(job_id, 1, 0, &[], run_attempt)
+                .unwrap();
+            allocation.commit_job(job_id);
+        }
+        svc.check_term(7).unwrap();
+
+        let stale_term = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["true".into()],
+                job_id,
+                run_attempt,
+                term: 6,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a demoted controller must not launch a step");
+        assert_eq!(stale_term.code(), tonic::Code::FailedPrecondition);
+
+        let stale_attempt = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["true".into()],
+                job_id,
+                run_attempt: run_attempt - 1,
+                term: 7,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("a superseded run must not launch a step");
+        assert_eq!(stale_attempt.code(), tonic::Code::FailedPrecondition);
+        assert!(svc.active_steps.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn cancel_step_sets_flag_when_step_has_no_pid() {
         let svc = AgentService::new(
             test_reporter(),
@@ -4552,15 +6273,55 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        svc.register_test_step(10, 1, None).await;
+        svc.register_test_step(10, 0, 1, None).await;
         svc.cancel_step(Request::new(CancelStepRequest {
             job_id: 10,
             step_id: 1,
             signal: 0,
+            ..Default::default()
         }))
         .await
         .unwrap();
-        assert!(svc.step_cancel_requested(10, 1).await);
+        assert!(svc.step_cancel_requested(10, 0, 1).await);
+    }
+
+    #[tokio::test]
+    async fn stale_cancel_step_does_not_cancel_a_replacement_attempt() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 11;
+        let step_id = 4;
+        let replacement_attempt = 2;
+        svc.insert_test_job(job_id, TrackedJob::dummy_for_attempt(replacement_attempt))
+            .await;
+        {
+            let mut allocation = svc.allocation.lock().await;
+            allocation
+                .allocate_for_job_with_attempt(job_id, 1, 0, &[], replacement_attempt)
+                .unwrap();
+            allocation.commit_job(job_id);
+        }
+        svc.register_test_step(job_id, replacement_attempt, step_id, None)
+            .await;
+
+        svc.cancel_step(Request::new(CancelStepRequest {
+            job_id,
+            step_id,
+            signal: 9,
+            run_attempt: replacement_attempt - 1,
+            term: 0,
+        }))
+        .await
+        .unwrap();
+
+        assert!(
+            !svc.step_cancel_requested(job_id, replacement_attempt, step_id)
+                .await
+        );
     }
 
     #[tokio::test]
@@ -4587,11 +6348,12 @@ mod tests {
                 .await
         });
 
-        svc.wait_for_active_step(job_id, step_id).await;
+        svc.wait_for_active_step(job_id, 0, step_id).await;
         svc.cancel_step(Request::new(CancelStepRequest {
             job_id,
             step_id,
             signal: 0,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -4630,12 +6392,13 @@ mod tests {
             .spawn()
             .expect("failed to spawn process group");
         let pid = child.id().expect("spawned child should have pid");
-        svc.register_test_step(job_id, step_id, Some(pid)).await;
+        svc.register_test_step(job_id, 0, step_id, Some(pid)).await;
 
         svc.cancel_step(Request::new(CancelStepRequest {
             job_id,
             step_id,
             signal: 0,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -4645,7 +6408,7 @@ mod tests {
             .expect("process group did not exit after CancelStep")
             .expect("wait failed");
         assert!(!status.success());
-        assert!(svc.step_cancel_requested(job_id, step_id).await);
+        assert!(svc.step_cancel_requested(job_id, 0, step_id).await);
     }
 
     #[tokio::test]
@@ -5440,6 +7203,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn highest_controller_term_survives_agent_service_reconstruction() {
+        let recovery_dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        let recovery = executor::RecoveryStore::at(
+            recovery_dir.path().to_path_buf(),
+            cgroup_dir.path().to_path_buf(),
+        );
+        let first = AgentService::new_with_recovery(test_reporter(), recovery.clone());
+        first.check_term(11).expect("persist first controller term");
+        drop(first);
+
+        let restarted = AgentService::new_with_recovery(test_reporter(), recovery);
+        let stale = restarted
+            .check_term(10)
+            .expect_err("restarted service must restore the high-water mark");
+        assert_eq!(stale.code(), tonic::Code::FailedPrecondition);
+        restarted
+            .check_term(12)
+            .expect("newer term remains acceptable after restart");
+    }
+
     // The heartbeat's held-job source must report an allocation-only (srun/salloc)
     // job so the controller can reconcile it — the strand this fix addresses.
     #[tokio::test]
@@ -5540,42 +7325,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_kills_tracked_process_and_releases_local_allocation() {
-        let svc = AgentService::new(
+    async fn release_command_kills_a_manifested_process_after_agent_restart() {
+        let mut svc = AgentService::new(
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        let job_id = 907;
-        let run_attempt = 3;
-        let mut tracked = TrackedJob::dummy(0);
-        tracked.run_attempt = run_attempt;
-        let pid = tracked.job.pid().unwrap() as i32;
-        {
-            let mut allocation = svc.allocation.lock().await;
-            allocation
-                .allocate_for_job_with_attempt(job_id, 1, 0, &[], run_attempt)
-                .unwrap();
-            assert!(allocation.commit_job(job_id));
-        }
-        svc.insert_test_job(job_id, tracked).await;
-
-        svc.shutdown_jobs().await.unwrap();
-
-        assert!(svc.running.lock().await.is_empty());
-        assert!(svc.allocation.lock().await.owned_allocations().is_empty());
-        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
-        assert!(svc.shutting_down.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn release_command_kills_a_manifested_process_after_agent_restart() {
-        let svc = AgentService::new(
-            test_reporter(),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
-            spur_core::config::MemlockLimit::Unlimited,
+        let recovery_dir = tempfile::tempdir().unwrap();
+        let cgroup_dir = tempfile::tempdir().unwrap();
+        svc.recovery = executor::RecoveryStore::at(
+            recovery_dir.path().to_path_buf(),
+            cgroup_dir.path().to_path_buf(),
         );
         let job_id = 908;
         let run_attempt = 4;
@@ -5587,7 +7348,8 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        executor::write_process_recovery_manifest(job_id, run_attempt, child.id() as i32, None)
+        svc.recovery
+            .write_process_manifest(job_id, run_attempt, child.id() as i32, None)
             .unwrap();
 
         svc.apply_release_command(job_id, run_attempt, 9)
@@ -5596,6 +7358,94 @@ mod tests {
         let status = child.wait().unwrap();
 
         assert!(!status.success());
+        assert!(svc.running.lock().await.is_empty());
+        assert!(svc.allocation.lock().await.owned_allocations().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_reaps_an_exited_job_without_waiting_for_the_monitor() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 912;
+        let run_attempt = 8;
+        let mut child = tokio::process::Command::new("true").spawn().unwrap();
+        child.wait().await.unwrap();
+        let mut tracked = TrackedJob::dummy_for_attempt(run_attempt);
+        tracked.job = executor::RunningJob::Managed {
+            child,
+            cgroup_path: None,
+        };
+        svc.insert_test_job(job_id, tracked).await;
+        {
+            let mut allocation = svc.allocation.lock().await;
+            allocation
+                .allocate_for_job_with_attempt(job_id, 1, 0, &[], run_attempt)
+                .unwrap();
+            allocation.commit_job(job_id);
+        }
+
+        let started = tokio::time::Instant::now();
+        svc.apply_release_command(job_id, run_attempt, 9)
+            .await
+            .unwrap();
+
+        assert_eq!(tokio::time::Instant::now(), started);
+        assert!(svc.running.lock().await.is_empty());
+        assert!(svc.allocation.lock().await.owned_allocations().is_empty());
+    }
+
+    #[tokio::test]
+    async fn graceful_release_returns_only_after_a_term_ignoring_job_is_absent() {
+        use tokio::io::AsyncBufReadExt;
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 911;
+        let run_attempt = 7;
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("trap '' TERM; printf 'ready\\n'; while :; do sleep 3600; done")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+        let mut ready = String::new();
+        tokio::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .await
+            .unwrap();
+        assert_eq!(ready, "ready\n");
+
+        let mut tracked = TrackedJob::dummy_for_attempt(run_attempt);
+        tracked.job = executor::RunningJob::Managed {
+            child,
+            cgroup_path: None,
+        };
+        svc.insert_test_job(job_id, tracked).await;
+        {
+            let mut allocation = svc.allocation.lock().await;
+            allocation
+                .allocate_for_job_with_attempt(job_id, 1, 0, &[], run_attempt)
+                .unwrap();
+            allocation.commit_job(job_id);
+        }
+
+        svc.apply_release_command(job_id, run_attempt, 0)
+            .await
+            .unwrap();
+
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
         assert!(svc.running.lock().await.is_empty());
         assert!(svc.allocation.lock().await.owned_allocations().is_empty());
     }
@@ -5623,6 +7473,35 @@ mod tests {
         drop(guard);
 
         release.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_command_returns_when_a_step_lifecycle_never_drains() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 910;
+        let run_attempt = 6;
+        let guard = StepLifecycleGuard::new(svc.step_lifecycle.clone(), job_id, run_attempt);
+
+        let error = svc
+            .apply_release_command(job_id, run_attempt, 9)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("step lifecycle"));
+        assert!(!svc
+            .allocation
+            .lock()
+            .await
+            .begin_release(job_id, run_attempt + 1));
+        drop(guard);
+        svc.apply_release_command(job_id, run_attempt, 9)
+            .await
+            .unwrap();
     }
 
     #[test]
@@ -5724,6 +7603,7 @@ mod tests {
                 memory_mb: 0,
                 nodelist: String::new(),
                 mpi: String::new(),
+                last_command_id: 0,
                 run_attempt,
             };
             (t, pid)
@@ -5813,6 +7693,7 @@ mod tests {
             job_id: 1,
             resume: false,
             term: 5,
+            run_attempt: 1,
         }))
         .await
         .expect("first real term is accepted");
@@ -5822,6 +7703,7 @@ mod tests {
                 job_id: 1,
                 resume: false,
                 term: 3,
+                run_attempt: 1,
             }))
             .await
             .expect_err("a stale term must be rejected");
@@ -5855,6 +7737,190 @@ mod tests {
             svc.mpi_host.has_active_pmix(99),
             "batch completion must release one ref, not force-stop an active step namespace"
         );
+    }
+
+    #[tokio::test]
+    async fn completion_artifact_boundary_cleans_rootfs_and_pmix_together() {
+        use crate::mpi_plugin::ActiveNamespace;
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let root = tempfile::tempdir().unwrap();
+        let rootfs = root.path().join("job_199_7");
+        std::fs::create_dir_all(rootfs.join("nested")).unwrap();
+        std::fs::write(rootfs.join("nested/artifact"), b"owned").unwrap();
+        svc.mpi_host.active_namespaces.lock().unwrap().insert(
+            199,
+            ActiveNamespace {
+                namespace: "spur.199".into(),
+                refs: 2,
+            },
+        );
+        let completion = CompletedJob {
+            job_id: 199,
+            exit_code: 0,
+            signal: 9,
+            run_attempt: 7,
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            cgroup: None,
+            work_dir: "/tmp".into(),
+            uid: 0,
+            gid: 0,
+            partition: String::new(),
+            gpu_devices: Vec::new(),
+            cpus: 1,
+            memory_mb: 0,
+            nodelist: String::new(),
+            mpi: MPI_PMIX.into(),
+        };
+
+        cleanup_completed_artifacts_at(&completion, &svc.mpi_host, Some(&rootfs))
+            .await
+            .unwrap();
+
+        assert!(!rootfs.exists());
+        assert_eq!(svc.mpi_host.active_namespaces.lock().unwrap()[&199].refs, 1);
+    }
+
+    #[tokio::test]
+    async fn release_removes_manifest_only_after_artifact_cleanup() {
+        use crate::mpi_plugin::ActiveNamespace;
+
+        let recovery = executor::RecoveryStore::isolated();
+        let svc = AgentService::new_with_recovery(test_reporter(), recovery);
+        let job_id = 298;
+        let run_attempt = 9;
+        let running = executor::RunningJob::Forked {
+            pid: std::process::id() as i32,
+            _pidfd: None,
+            cgroup_path: None,
+            reaped: false,
+        };
+        let mut metadata = restart_safe_recovery_metadata(
+            std::path::PathBuf::from("/tmp/spur-release-boundary-exit"),
+            0,
+        );
+        metadata.mpi = MPI_PMIX.into();
+        svc.recovery
+            .write_job_manifest(job_id, run_attempt, &running, metadata.clone())
+            .unwrap();
+        {
+            let mut allocation = svc.allocation.lock().await;
+            allocation
+                .restore_committed(
+                    job_id,
+                    run_attempt,
+                    AllocationResult {
+                        cpu_ids: metadata.cpu_ids.clone(),
+                        gpu_ids: metadata.gpu_devices.clone(),
+                        memory_mb: metadata.memory_mb,
+                    },
+                    metadata.exact_resources.clone(),
+                )
+                .unwrap();
+            allocation.begin_release(job_id, run_attempt);
+        }
+        svc.mpi_host.active_namespaces.lock().unwrap().insert(
+            job_id,
+            ActiveNamespace {
+                namespace: format!("spur.{job_id}"),
+                refs: 2,
+            },
+        );
+        let (_, manifest) = svc.recovery.scan().unwrap().pop().unwrap();
+        let completion = recovered_completion_metadata(&manifest, &metadata);
+
+        svc.cleanup_release_artifacts(job_id, run_attempt, Some(completion))
+            .await
+            .unwrap();
+
+        let manifest = svc.recovery.scan().unwrap().pop().unwrap().1;
+        assert!(!manifest.epilog_pending);
+        assert_eq!(
+            svc.mpi_host.active_namespaces.lock().unwrap()[&job_id].refs,
+            1
+        );
+        assert!(
+            release_settled_allocation(&svc.recovery, &svc.allocation, job_id, run_attempt)
+                .await
+                .unwrap()
+        );
+        assert!(svc.recovery.scan().unwrap().is_empty());
+        assert!(svc.allocation.lock().await.owned_allocations().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forced_release_waits_for_cleanup_owner_and_releases_pmix() {
+        use crate::mpi_plugin::ActiveNamespace;
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 299;
+        let run_attempt = 10;
+        {
+            let mut allocation = svc.allocation.lock().await;
+            allocation
+                .allocate_for_job_with_attempt(job_id, 1, 0, &[], run_attempt)
+                .unwrap();
+            allocation.commit_job(job_id);
+        }
+        svc.running.lock().await.insert(
+            job_id,
+            TrackedJob {
+                job: executor::RunningJob::AllocationOnly,
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
+                _pty_master: None,
+                work_dir: "/tmp".into(),
+                uid: 0,
+                gid: 0,
+                user: "testuser".into(),
+                partition: String::new(),
+                gpu_devices: Vec::new(),
+                cpus: 1,
+                memory_mb: 0,
+                nodelist: String::new(),
+                mpi: MPI_PMIX.into(),
+                last_command_id: 0,
+                run_attempt,
+            },
+        );
+        svc.mpi_host.active_namespaces.lock().unwrap().insert(
+            job_id,
+            ActiveNamespace {
+                namespace: format!("spur.{job_id}"),
+                refs: 1,
+            },
+        );
+        let owner = acquire_lifecycle_lock(&svc.lifecycle_locks, (job_id, run_attempt)).await;
+        let release_service = svc.clone();
+        let release = tokio::spawn(async move {
+            release_service
+                .apply_release_command(job_id, run_attempt, 9)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!release.is_finished());
+        assert!(svc.running.lock().await.contains_key(&job_id));
+
+        drop(owner);
+        release.await.unwrap().unwrap();
+
+        assert!(!svc.mpi_host.has_active_pmix(job_id));
+        assert!(svc.running.lock().await.is_empty());
+        assert!(svc.allocation.lock().await.owned_allocations().is_empty());
     }
 
     // The guard must release the reservation when dropped before commit
@@ -5919,6 +7985,13 @@ mod tests {
         tracked.cpus = 8;
         tracked.memory_mb = 16384;
         svc.insert_test_job(job_id, tracked).await;
+        {
+            let mut allocation = svc.allocation.lock().await;
+            allocation
+                .allocate_for_job_with_attempt(job_id, 1, 0, &[], 0)
+                .unwrap();
+            allocation.commit_job(job_id);
+        }
 
         let req = Request::new(RunCommandRequest {
             command: vec![
@@ -6023,6 +8096,7 @@ mod tests {
             memory_mb: 0,
             nodelist: String::new(),
             mpi: String::new(),
+            last_command_id: 0,
             run_attempt: 0,
         };
         svc.insert_test_job(job_id, tracked).await;
@@ -6083,6 +8157,7 @@ mod tests {
                 memory_mb: 0,
                 nodelist: String::new(),
                 mpi: String::new(),
+                last_command_id: 0,
                 run_attempt,
             };
             (t, pid)
@@ -6289,7 +8364,7 @@ mod tests {
 
         let inbound = tokio_stream::wrappers::ReceiverStream::new(in_rx);
         tokio::spawn(AgentService::run_pty_bridge(
-            master, child, child_pid, inbound, out_tx,
+            master, child, child_pid, inbound, out_tx, None,
         ));
 
         in_tx
@@ -6334,5 +8409,35 @@ mod tests {
             }
         }
         panic!("did not receive exit status from bridge");
+    }
+
+    #[tokio::test]
+    async fn pty_child_is_attached_to_the_allocation_cgroup_before_exec() {
+        let cgroup = tempfile::tempdir().unwrap();
+        let procs = cgroup.path().join("cgroup.procs");
+        std::fs::write(&procs, "").unwrap();
+        let entry = crate::job_entry::JobEntry {
+            pid: 0,
+            run_attempt: 4,
+            cgroup_path: Some(cgroup.path().to_path_buf()),
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            uid: nix::unistd::getuid().as_raw(),
+            gid: nix::unistd::getgid().as_raw(),
+            work_dir: "/tmp".into(),
+        };
+        let argv = vec!["/bin/sh".into(), "-c".into(), "exit 0".into()];
+
+        let (master, mut child, child_pid) =
+            AgentService::spawn_pty_in_job(&entry, &argv, 61, None, Some(cgroup.path())).unwrap();
+        let status = child.wait().await.unwrap();
+        drop(master);
+
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(procs).unwrap(),
+            child_pid.to_string()
+        );
     }
 }

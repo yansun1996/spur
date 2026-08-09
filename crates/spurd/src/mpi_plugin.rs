@@ -451,7 +451,7 @@ impl MpiPluginHost {
             return Ok(());
         }
         if existing_attempt.is_some() {
-            self.release_prepared_pmix(plan.job_id)?;
+            self.release_prepared_pmix(plan.job_id, 0)?;
         }
 
         let mut plan = plan.clone();
@@ -552,12 +552,21 @@ impl MpiPluginHost {
     }
 
     /// Tear down a prepared-but-not-launched PMIx server.
-    pub fn release_prepared_pmix(&self, job_id: u32) -> Result<(), String> {
-        let was_prepared = self
-            .prepared
-            .lock()
-            .map_err(|_| "prepared lock poisoned".to_string())?
-            .remove(&job_id);
+    pub fn release_prepared_pmix(&self, job_id: u32, run_attempt: u32) -> Result<(), String> {
+        let was_prepared = {
+            let mut prepared = self
+                .prepared
+                .lock()
+                .map_err(|_| "prepared lock poisoned".to_string())?;
+            if run_attempt != 0
+                && prepared
+                    .get(&job_id)
+                    .is_some_and(|entry| entry.run_attempt != run_attempt)
+            {
+                return Ok(());
+            }
+            prepared.remove(&job_id)
+        };
         let has_unrefd_namespace = self
             .active_namespaces
             .lock()
@@ -1232,7 +1241,7 @@ mod tests {
     #[test]
     fn release_prepared_is_noop_when_not_prepared() {
         let host = MpiPluginHost::new(MpiConfig::default());
-        host.release_prepared_pmix(99).unwrap();
+        host.release_prepared_pmix(99, 0).unwrap();
     }
 
     #[test]
@@ -1245,7 +1254,7 @@ mod tests {
                 refs: 0,
             },
         );
-        host.release_prepared_pmix(55).unwrap();
+        host.release_prepared_pmix(55, 0).unwrap();
         assert!(!host.active_namespaces.lock().unwrap().contains_key(&55));
     }
 
@@ -1259,7 +1268,7 @@ mod tests {
                 refs: 1,
             },
         );
-        host.release_prepared_pmix(42).unwrap();
+        host.release_prepared_pmix(42, 0).unwrap();
         assert!(host.active_namespaces.lock().unwrap().contains_key(&42));
     }
 
@@ -1273,7 +1282,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert(77, PreparedPmix { run_attempt: 1 });
-        host.release_prepared_pmix(77).unwrap();
+        host.release_prepared_pmix(77, 1).unwrap();
         assert!(host.prepared.lock().unwrap().get(&77).is_none());
     }
 

@@ -29,9 +29,7 @@ use spur_core::qos::{check_qos_limits, qos_adjusted_priority, QosCheckResult};
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
 use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
-#[cfg(test)]
-use spur_core::wal::PendingKillRelease;
-use spur_core::wal::{PendingKillReservation, WalOperation};
+use spur_core::wal::{PendingKillRelease, PendingKillReservation, WalOperation};
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
 use spur_metrics::partition::PartitionMetricsSnapshot;
@@ -49,7 +47,8 @@ use crate::sched_stats::SchedStatsCollector;
 /// the next node. Byte-exact with the `state_desc` Slurm sets in the same case,
 /// so operator runbooks and log greps written against Slurm keep working.
 pub const LAUNCH_FAILURE_HELD_DESC: &str = "launch failed requeued held";
-pub(crate) const AGENT_COMMAND_ACK_TIMEOUT_SECS: u64 = 30;
+pub(crate) const AGENT_COMMAND_ACK_TIMEOUT_SECS: u64 =
+    spur_core::allocation::LAUNCH_RESERVATION_TTL_SECS + 60;
 
 /// Seconds to defer a job by after its `requeue_count`-th launch failure,
 /// doubling per attempt from the same base the preemption requeue uses.
@@ -378,6 +377,8 @@ pub struct ClusterManager {
     agent_commands: RwLock<HashMap<u64, AgentCommandRecord>>,
     agent_command_notify: Notify,
     next_agent_command_id: AtomicU64,
+    #[cfg(test)]
+    allocation_transition_apply_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct PendingJobClassification {
@@ -442,6 +443,8 @@ impl ClusterManager {
             agent_commands: RwLock::new(HashMap::new()),
             agent_command_notify: Notify::new(),
             next_agent_command_id: AtomicU64::new(1),
+            #[cfg(test)]
+            allocation_transition_apply_hook: RwLock::new(None),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -501,7 +504,20 @@ impl ClusterManager {
         if reservations.is_empty() {
             return Ok(());
         }
-        self.propose(WalOperation::PendingKillReserve { reservations })?;
+        let mut nodes = self.nodes.write();
+        let mut allocations = self.allocations.write();
+        let mut commands = self.agent_commands.write();
+        self.apply_pending_kill_reservations_locked(
+            &nodes,
+            &mut allocations,
+            &mut commands,
+            &reservations,
+        );
+        Self::rebuild_node_resource_projection(&mut nodes, &allocations);
+        drop(commands);
+        drop(allocations);
+        drop(nodes);
+        self.agent_command_notify.notify_waiters();
         Ok(())
     }
 
@@ -519,6 +535,7 @@ impl ClusterManager {
             resources,
             attempt,
             run_attempt: 0,
+            supports_command_polling: true,
         }])
         .expect("test pending-kill reservation must commit");
     }
@@ -544,6 +561,7 @@ impl ClusterManager {
                 }),
                 attempt: self.new_pending_kill_attempt(),
                 run_attempt: job.run_attempt,
+                supports_command_polling: self.node_supports_command_polling(node),
             })
             .collect()
     }
@@ -554,7 +572,12 @@ impl ClusterManager {
         run_attempt: u32,
         cleanup_nodes: &[String],
     ) -> anyhow::Result<()> {
-        let commands: Vec<_> = cleanup_nodes
+        let command_nodes: Vec<_> = cleanup_nodes
+            .iter()
+            .filter(|node| self.node_supports_command_polling(node))
+            .cloned()
+            .collect();
+        let commands: Vec<_> = command_nodes
             .iter()
             .map(|node| {
                 AgentCommandRecord::new(
@@ -597,6 +620,40 @@ impl ClusterManager {
         }
         self.propose(WalOperation::PendingKillTransition {
             reservations,
+            allocation_targets: Vec::new(),
+            operation: Box::new(operation),
+        })
+    }
+
+    fn allocation_targets_for_jobs(&self, jobs: &[Job]) -> Vec<AllocationKey> {
+        let attempts: HashSet<_> = jobs
+            .iter()
+            .map(|job| (job.job_id, job.run_attempt))
+            .collect();
+        self.allocations
+            .read()
+            .values()
+            .filter(|record| {
+                record.phase.is_charged()
+                    && attempts.contains(&(record.key.job_id, record.key.run_attempt))
+            })
+            .map(|record| record.key.clone())
+            .collect()
+    }
+
+    fn propose_node_lifecycle_transition(
+        &self,
+        affected_jobs: &[Job],
+        operation: WalOperation,
+    ) -> anyhow::Result<ClientResponse> {
+        let reservations = self.pending_kills_for_jobs(affected_jobs);
+        let allocation_targets = self.allocation_targets_for_jobs(affected_jobs);
+        if reservations.is_empty() && allocation_targets.is_empty() {
+            return self.propose(operation);
+        }
+        self.propose(WalOperation::PendingKillTransition {
+            reservations,
+            allocation_targets,
             operation: Box::new(operation),
         })
     }
@@ -636,6 +693,60 @@ impl ClusterManager {
             })
             .map(|record| record.key.run_attempt)
             .max()
+    }
+
+    pub(crate) fn confirm_legacy_releases(
+        &self,
+        node: &str,
+        reported_jobs: &HashSet<JobId>,
+    ) -> anyhow::Result<()> {
+        let releases: Vec<_> = self
+            .allocations
+            .read()
+            .values()
+            .filter(|record| {
+                record.phase == AllocationPhase::Releasing
+                    && record.key.node == node
+                    && record.release_on_heartbeat_absence
+                    && !reported_jobs.contains(&record.key.job_id)
+            })
+            .map(|record| PendingKillRelease {
+                job_id: record.key.job_id,
+                node: node.into(),
+                attempt: record.last_command_id,
+            })
+            .collect();
+        if !releases.is_empty() {
+            self.propose(WalOperation::PendingKillRelease { releases })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn confirm_attempt_releases(
+        &self,
+        node: &str,
+        reported_attempts: &HashSet<(JobId, u32)>,
+    ) -> anyhow::Result<()> {
+        let releases: Vec<_> = self
+            .allocations
+            .read()
+            .values()
+            .filter(|record| {
+                record.phase == AllocationPhase::Releasing
+                    && record.key.node == node
+                    && record.release_on_heartbeat_absence
+                    && !reported_attempts.contains(&(record.key.job_id, record.key.run_attempt))
+            })
+            .map(|record| PendingKillRelease {
+                job_id: record.key.job_id,
+                node: node.into(),
+                attempt: record.last_command_id,
+            })
+            .collect();
+        if !releases.is_empty() {
+            self.propose(WalOperation::PendingKillRelease { releases })?;
+        }
+        Ok(())
     }
 
     /// Submit a new job. If it has an array spec, expand into individual tasks.
@@ -1037,10 +1148,10 @@ impl ClusterManager {
     /// Only valid from `Pending`: returns `Err` if the job is unknown, already
     /// terminal, or has started running. Callers treat the error as non-fatal.
     pub fn deadline_job(&self, job_id: JobId) -> anyhow::Result<()> {
-        {
-            let mut jobs = self.jobs.write();
+        let run_attempt = {
+            let jobs = self.jobs.read();
             let job = jobs
-                .get_mut(&job_id)
+                .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
             if job.state.is_terminal() {
                 anyhow::bail!("job {} is already {:?}", job_id, job.state);
@@ -1052,18 +1163,10 @@ impl ClusterManager {
                     job.state
                 );
             }
-            // Record the reason before the terminal transition so any
-            // observer (history, audit log, late `squeue` poll) sees DeadLine
-            // instead of whatever update_pending_reasons last wrote.
-            job.set_pending_reason(PendingReason::DeadLine);
-        }
+            job.run_attempt
+        };
 
-        let resp = self.propose(WalOperation::JobComplete {
-            job_id,
-            exit_code: -1,
-            state: JobState::Deadline,
-        })?;
-        self.run_all_finalized_side_effects(&resp);
+        self.complete_job_inner(job_id, -1, JobState::Deadline, true, run_attempt)?;
 
         info!(job_id, "job deadline passed — transitioned to DEADLINE");
         Ok(())
@@ -1091,9 +1194,34 @@ impl ClusterManager {
     /// Cancel a job. The requesting `user` must be the job owner, root, or
     /// empty (trusted internal/daemon calls).
     pub fn cancel_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
-        self.check_cancel_allowed(job_id, user)?;
+        self.cancel_job_for_attempt(job_id, user, 0)
+    }
 
-        self.complete_job_after_cancel(job_id, -1, JobState::Cancelled)?;
+    pub fn cancel_job_for_attempt(
+        &self,
+        job_id: JobId,
+        user: &str,
+        expected_run_attempt: u32,
+    ) -> anyhow::Result<()> {
+        self.check_cancel_allowed(job_id, user)?;
+        let actual_run_attempt = self
+            .jobs
+            .read()
+            .get(&job_id)
+            .map(|job| job.run_attempt)
+            .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
+        if expected_run_attempt != 0 && expected_run_attempt != actual_run_attempt {
+            anyhow::bail!(
+                "job {job_id} run attempt {expected_run_attempt} was superseded by attempt {actual_run_attempt}"
+            );
+        }
+
+        self.complete_job_after_cancel_for_attempt(
+            job_id,
+            -1,
+            JobState::Cancelled,
+            actual_run_attempt,
+        )?;
 
         info!(job_id, "job cancelled");
         Ok(())
@@ -1124,7 +1252,7 @@ impl ClusterManager {
                     state: job.state,
                 });
             }
-            if run_attempt != 0 && run_attempt != job.run_attempt {
+            if run_attempt != job.run_attempt {
                 return Err(SrunCompleteError::StaleRun {
                     job_id,
                     expected: run_attempt,
@@ -1145,7 +1273,7 @@ impl ClusterManager {
         } else {
             JobState::Failed
         };
-        self.complete_job_after_cancel(job_id, exit_code, state)
+        self.complete_job_after_cancel_for_attempt(job_id, exit_code, state, job.run_attempt)
             .map_err(|e| {
                 warn!(job_id, error = %e, "finish_srun_job: complete_job failed");
                 SrunCompleteError::Internal {
@@ -1159,7 +1287,16 @@ impl ClusterManager {
     /// Suspend a running job: validate state, record through Raft. Allocation is retained.
     /// The requesting `user` must be the job owner, root, or empty (trusted internal calls).
     pub fn suspend_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
-        {
+        self.suspend_job_for_attempt(job_id, user, 0)
+    }
+
+    fn suspend_job_for_attempt(
+        &self,
+        job_id: JobId,
+        user: &str,
+        expected_run_attempt: u32,
+    ) -> anyhow::Result<()> {
+        let run_attempt = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -1168,10 +1305,15 @@ impl ClusterManager {
                 anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
             }
             Self::check_job_owner(user, &job.spec.user, "suspend")?;
-        }
+            if expected_run_attempt != 0 && expected_run_attempt != job.run_attempt {
+                anyhow::bail!("job {job_id} run attempt was superseded");
+            }
+            job.run_attempt
+        };
         self.propose(WalOperation::JobSuspend {
             job_id,
             at: chrono::Utc::now(),
+            expected_run_attempt: Some(run_attempt),
         })?;
         info!(job_id, "job suspended");
         Ok(())
@@ -1180,7 +1322,7 @@ impl ClusterManager {
     /// Resume a suspended job: validate state, record through Raft, fold suspended time.
     /// The requesting `user` must be the job owner, root, or empty (trusted internal calls).
     pub fn resume_job(&self, job_id: JobId, user: &str) -> anyhow::Result<()> {
-        {
+        let run_attempt = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
@@ -1189,10 +1331,12 @@ impl ClusterManager {
                 anyhow::bail!("job {} is not suspended (state {:?})", job_id, job.state);
             }
             Self::check_job_owner(user, &job.spec.user, "resume")?;
-        }
+            job.run_attempt
+        };
         self.propose(WalOperation::JobResume {
             job_id,
             at: chrono::Utc::now(),
+            expected_run_attempt: Some(run_attempt),
         })?;
         info!(job_id, "job resumed");
         Ok(())
@@ -1258,7 +1402,7 @@ impl ClusterManager {
             anyhow::bail!("job {job_id} still has an in-flight dispatch");
         }
 
-        self.propose(WalOperation::AllocationPrepare {
+        let prepared = self.propose(WalOperation::AllocationPrepare {
             job_id,
             run_attempt,
             nodes: node_names,
@@ -1266,6 +1410,9 @@ impl ClusterManager {
             per_node_alloc,
             srun_step_dispatch,
         })?;
+        if !prepared.allocation_prepared {
+            anyhow::bail!("job {job_id} attempt {run_attempt} allocation was not prepared");
+        }
         Ok(run_attempt)
     }
 
@@ -1282,6 +1429,20 @@ impl ClusterManager {
             created_at: Some(Utc::now()),
             commands: Vec::new(),
         })?;
+        let records: Vec<_> = self
+            .allocations
+            .read()
+            .values()
+            .filter(|record| record.key.job_id == job_id && record.key.run_attempt == run_attempt)
+            .map(|record| record.phase)
+            .collect();
+        if records.is_empty()
+            || records
+                .iter()
+                .any(|phase| !matches!(phase, AllocationPhase::Launching | AllocationPhase::Active))
+        {
+            anyhow::bail!("job {job_id} attempt {run_attempt} launch intent was not applied");
+        }
         Ok(command_id)
     }
 
@@ -1313,7 +1474,12 @@ impl ClusterManager {
                 .iter()
                 .all(|record| record.phase == AllocationPhase::Prepared)
             {
-                if let Err(error) = self.abort_dispatch(job.job_id, job.run_attempt, &[]) {
+                let cleanup_nodes: Vec<_> = records
+                    .iter()
+                    .map(|record| record.key.node.clone())
+                    .collect();
+                if let Err(error) = self.abort_dispatch(job.job_id, job.run_attempt, &cleanup_nodes)
+                {
                     warn!(job_id = job.job_id, error = %error, "failed to roll back prepared dispatch");
                 }
                 continue;
@@ -1402,6 +1568,13 @@ impl ClusterManager {
             created_at: Some(created_at),
             commands: commands.clone(),
         })?;
+        let committed = self.agent_commands.read();
+        if commands
+            .iter()
+            .any(|command| !committed.contains_key(&command.command_id))
+        {
+            anyhow::bail!("job {job_id} attempt {run_attempt} launch commands were not applied");
+        }
         Ok(commands)
     }
 
@@ -1410,6 +1583,14 @@ impl ClusterManager {
             .read()
             .get(name)
             .is_some_and(|node| node.supports_command_polling)
+    }
+
+    pub(crate) fn node_has_command_polling_session(&self, name: &str) -> bool {
+        self.nodes.read().get(name).is_some_and(|node| {
+            node.supports_command_polling
+                && !node.agent_session_id.is_empty()
+                && !node.node_boot_id.is_empty()
+        })
     }
 
     pub(crate) fn agent_session_matches(
@@ -1513,6 +1694,7 @@ impl ClusterManager {
             .collect();
         let commands: Vec<_> = keys
             .into_iter()
+            .filter(|key| self.node_supports_command_polling(&key.node))
             .filter(|key| !existing.contains(key))
             .map(|key| {
                 AgentCommandRecord::new(
@@ -1571,23 +1753,33 @@ impl ClusterManager {
             .values()
             .find(|record| record.key.job_id == job_id && record.key.run_attempt == run_attempt)
             .map(|record| record.phase);
-        if phase.is_none() {
-            run_attempt = self.prepare_dispatch(
-                job_id,
-                node_names.clone(),
-                resources.clone(),
-                per_node_alloc.clone(),
-                srun_step_dispatch,
-            )?;
-            self.begin_allocation_launch(job_id, run_attempt)?;
-        } else if phase == Some(AllocationPhase::Prepared) {
-            self.begin_allocation_launch(job_id, run_attempt)?;
+        match phase {
+            None | Some(AllocationPhase::Released) => {
+                run_attempt = self.prepare_dispatch(
+                    job_id,
+                    node_names.clone(),
+                    resources.clone(),
+                    per_node_alloc.clone(),
+                    srun_step_dispatch,
+                )?;
+                self.begin_allocation_launch(job_id, run_attempt)?;
+            }
+            Some(AllocationPhase::Prepared) => {
+                self.begin_allocation_launch(job_id, run_attempt)?;
+            }
+            Some(AllocationPhase::Launching | AllocationPhase::Active) => {}
+            Some(AllocationPhase::Releasing) => {
+                anyhow::bail!("job {job_id} attempt {run_attempt} is still releasing");
+            }
         }
 
-        self.propose(WalOperation::AllocationActivate {
+        let activation = self.propose(WalOperation::AllocationActivate {
             job_id,
             run_attempt,
         })?;
+        if !activation.allocation_activated {
+            anyhow::bail!("job {job_id} attempt {run_attempt} was not activated");
+        }
 
         let node_count = node_names.len().max(1) as u32;
         let per_node = node_names
@@ -1613,6 +1805,9 @@ impl ClusterManager {
                 start_time: Some(Utc::now()),
                 end_time: None,
                 exit_code: None,
+                run_attempt,
+                controller_term: self.current_term(),
+                pmix_prepared: false,
             };
             if let Err(e) = self.create_step(batch_step) {
                 warn!(job_id, error = %e, "failed to record batch step");
@@ -1665,9 +1860,9 @@ impl ClusterManager {
             if job.state.is_terminal() {
                 return Ok(NodeCompleteResult::AlreadyTerminal);
             }
-            // Epoch 0 predates fencing (legacy job or agent) and is trusted.
-            // Every fenced report must identify the allocation exactly.
-            if run_attempt != 0 && run_attempt != job.run_attempt {
+            // A legacy report is exact for a legacy attempt. Once the job has
+            // advanced, accepting zero would let a delayed report end its replacement.
+            if run_attempt != job.run_attempt {
                 return Ok(NodeCompleteResult::StaleReport);
             }
             if !job.allocated_nodes.iter().any(|n| n == node_name) {
@@ -1712,7 +1907,7 @@ impl ClusterManager {
         exit_code: i32,
         state: JobState,
     ) -> anyhow::Result<()> {
-        self.complete_job_inner(job_id, exit_code, state, false)
+        self.complete_job_inner(job_id, exit_code, state, false, 0)
     }
 
     pub fn complete_job_after_cancel(
@@ -1721,7 +1916,17 @@ impl ClusterManager {
         exit_code: i32,
         state: JobState,
     ) -> anyhow::Result<()> {
-        self.complete_job_inner(job_id, exit_code, state, true)
+        self.complete_job_inner(job_id, exit_code, state, true, 0)
+    }
+
+    pub(crate) fn complete_job_after_cancel_for_attempt(
+        &self,
+        job_id: JobId,
+        exit_code: i32,
+        state: JobState,
+        expected_run_attempt: u32,
+    ) -> anyhow::Result<()> {
+        self.complete_job_inner(job_id, exit_code, state, true, expected_run_attempt)
     }
 
     fn complete_job_inner(
@@ -1730,6 +1935,7 @@ impl ClusterManager {
         exit_code: i32,
         state: JobState,
         hold_until_heartbeat: bool,
+        expected_run_attempt: u32,
     ) -> anyhow::Result<()> {
         // A time-limit expiry has to win over the caller's outcome here, not
         // just in the per-node completion path. The marker is only ever set on
@@ -1739,13 +1945,19 @@ impl ClusterManager {
         // expiry that would otherwise be reported as an ordinary failure and
         // skip the Timeout requeue. Cancelled (user cancel, preemption) and an
         // already-correct Timeout pass through untouched.
-        let (state, holds) = {
+        let (state, holds, completion_attempt) = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
             if job.state.is_terminal() {
                 anyhow::bail!("invalid transition from {:?} to {:?}", job.state, state);
+            }
+            if expected_run_attempt != 0 && expected_run_attempt != job.run_attempt {
+                anyhow::bail!(
+                    "job {job_id} run attempt {expected_run_attempt} was superseded by attempt {}",
+                    job.run_attempt
+                );
             }
             let state = if job.time_limit_signaled_at.is_some()
                 && matches!(state, JobState::Failed | JobState::Completed)
@@ -1759,19 +1971,27 @@ impl ClusterManager {
             } else {
                 Vec::new()
             };
-            (state, holds)
+            (state, holds, job.run_attempt)
         };
 
         // propose() handles: state transition, exit_code, end_time,
         // resource deallocation, step completion, license return
         let resp = self.propose_with_pending_kills(
             holds,
-            WalOperation::JobComplete {
+            WalOperation::JobCompleteForAttempt {
                 job_id,
                 exit_code,
                 state,
+                expected_run_attempt: completion_attempt,
             },
         )?;
+        if !resp
+            .jobs_finalized
+            .iter()
+            .any(|job| job.job_id == job_id && job.run_attempt == completion_attempt)
+        {
+            anyhow::bail!("job {job_id} attempt {completion_attempt} was not completed");
+        }
         self.run_all_finalized_side_effects(&resp);
 
         debug!(job_id, exit_code, "job completed");
@@ -1783,15 +2003,45 @@ impl ClusterManager {
     /// completion path report `Timeout` instead of reading the terminating
     /// signal as an ordinary failure — a job that exits promptly on SIGTERM
     /// reports back long before the grace period is up.
+    #[cfg(test)]
     pub fn signal_time_limit(&self, job_id: JobId, at: DateTime<Utc>) -> anyhow::Result<()> {
-        self.propose(WalOperation::JobTimeLimitSignaled { job_id, at })?;
+        let run_attempt = self
+            .jobs
+            .read()
+            .get(&job_id)
+            .map(|job| job.run_attempt)
+            .ok_or_else(|| anyhow::anyhow!("job {job_id} not found"))?;
+        self.signal_time_limit_for_attempt(job_id, at, run_attempt)
+    }
+
+    pub(crate) fn signal_time_limit_for_attempt(
+        &self,
+        job_id: JobId,
+        at: DateTime<Utc>,
+        expected_run_attempt: u32,
+    ) -> anyhow::Result<()> {
+        self.propose(WalOperation::JobTimeLimitSignaled {
+            job_id,
+            at,
+            expected_run_attempt: Some(expected_run_attempt),
+        })?;
         Ok(())
     }
 
     /// Preempt a running job per its partition's PreemptMode. Does the
     /// controller-side state change; the caller dispatches the signal named by
     /// the returned `PreemptOutcome`. `Off` is rejected.
+    #[cfg(test)]
     pub fn preempt_job(&self, job_id: JobId, mode: PreemptMode) -> anyhow::Result<PreemptOutcome> {
+        self.preempt_job_for_attempt(job_id, mode, 0)
+    }
+
+    pub(crate) fn preempt_job_for_attempt(
+        &self,
+        job_id: JobId,
+        mode: PreemptMode,
+        expected_run_attempt: u32,
+    ) -> anyhow::Result<PreemptOutcome> {
         let job = {
             let jobs = self.jobs.read();
             let job = jobs
@@ -1800,18 +2050,26 @@ impl ClusterManager {
             if job.state != JobState::Running {
                 anyhow::bail!("job {} is not running (state {:?})", job_id, job.state);
             }
+            if expected_run_attempt != 0 && expected_run_attempt != job.run_attempt {
+                anyhow::bail!("job {job_id} run attempt was superseded");
+            }
             job.clone()
         };
 
         match mode {
             PreemptMode::Off => anyhow::bail!("preemption disabled for job {}", job_id),
             PreemptMode::Suspend => {
-                self.suspend_job(job_id, "")?;
+                self.suspend_job_for_attempt(job_id, "", job.run_attempt)?;
                 info!(job_id, "job preempted (suspend)");
                 Ok(PreemptOutcome::Suspended)
             }
             PreemptMode::Cancel => {
-                self.complete_job_after_cancel(job_id, -1, JobState::Cancelled)?;
+                self.complete_job_after_cancel_for_attempt(
+                    job_id,
+                    -1,
+                    JobState::Cancelled,
+                    job.run_attempt,
+                )?;
                 info!(job_id, "job preempted (cancel)");
                 Ok(PreemptOutcome::Killed)
             }
@@ -1838,8 +2096,17 @@ impl ClusterManager {
                     .map_or(hold, |user_begin| user_begin.max(hold));
                 let resp = self.propose_with_pending_kills(
                     self.pending_kills_for_job(&job),
-                    WalOperation::JobPreemptRequeue { job_id, begin_time },
+                    WalOperation::JobPreemptRequeue {
+                        job_id,
+                        begin_time,
+                        expected_run_attempt: Some(job.run_attempt),
+                    },
                 )?;
+                if !resp.jobs_finalized.iter().any(|finalized| {
+                    finalized.job_id == job_id && finalized.run_attempt == job.run_attempt
+                }) {
+                    anyhow::bail!("job {job_id} attempt {} was not preempted", job.run_attempt);
+                }
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, hold_secs, "job preempted (requeue)");
                 Ok(PreemptOutcome::Killed)
@@ -1847,7 +2114,7 @@ impl ClusterManager {
         }
     }
 
-    fn run_job_finalized_side_effects(&self, finalized: JobFinalized) {
+    fn run_job_finalized_side_effects(&self, finalized: &JobFinalized) {
         if let Some(stats) = self.sched_stats.get() {
             stats.record_finalized();
         }
@@ -1857,7 +2124,7 @@ impl ClusterManager {
 
     fn run_all_finalized_side_effects(&self, resp: &ClientResponse) {
         for f in &resp.jobs_finalized {
-            self.run_job_finalized_side_effects(*f);
+            self.run_job_finalized_side_effects(f);
         }
     }
 
@@ -2140,7 +2407,7 @@ impl ClusterManager {
                 job_id,
                 reason,
                 detail,
-                run_attempt,
+                run_attempt: Some(run_attempt),
             },
         )?;
         self.run_all_finalized_side_effects(&resp);
@@ -2175,6 +2442,7 @@ impl ClusterManager {
             String::new(),
             String::new(),
             true,
+            true,
             false,
         )
     }
@@ -2195,6 +2463,7 @@ impl ClusterManager {
         node_boot_id: String,
         recovery_complete: bool,
         supports_command_polling: bool,
+        supports_attempt_inventory: bool,
     ) -> anyhow::Result<()> {
         let hostname = if hostname.is_empty() {
             name.clone()
@@ -2206,13 +2475,14 @@ impl ClusterManager {
             evaluate_registration(nodes.get(&name), &resources)
         };
 
-        if !agent_session_id.is_empty() && !matches!(&action, RegistrationAction::Register) {
+        if !matches!(&action, RegistrationAction::Register) {
             self.propose(WalOperation::NodeAgentState {
                 name: name.clone(),
                 agent_session_id: agent_session_id.clone(),
                 node_boot_id: node_boot_id.clone(),
                 recovery_complete,
                 supports_command_polling,
+                supports_attempt_inventory,
             })?;
         }
 
@@ -2280,6 +2550,7 @@ impl ClusterManager {
                     node_boot_id,
                     recovery_complete,
                     supports_command_polling,
+                    supports_attempt_inventory,
                 })?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
                     node.source = source;
@@ -2298,21 +2569,24 @@ impl ClusterManager {
         node_boot_id: &str,
         recovery_complete: bool,
         supports_command_polling: bool,
+        supports_attempt_inventory: bool,
     ) -> anyhow::Result<()> {
         if self.nodes.read().get(name).is_some_and(|node| {
             node.agent_session_id == agent_session_id
                 && node.node_boot_id == node_boot_id
                 && node.recovery_complete == recovery_complete
                 && node.supports_command_polling == supports_command_polling
+                && node.supports_attempt_inventory == supports_attempt_inventory
         }) {
             return Ok(());
         }
-        self.propose(WalOperation::NodeAgentState {
+        self.propose(WalOperation::NodeAgentRecovery {
             name: name.into(),
             agent_session_id: agent_session_id.into(),
             node_boot_id: node_boot_id.into(),
             recovery_complete,
             supports_command_polling,
+            supports_attempt_inventory,
         })?;
         Ok(())
     }
@@ -2416,14 +2690,14 @@ impl ClusterManager {
         self.nodes.read().values().cloned().collect()
     }
 
-    /// Nodes eligible for new placement this tick: all nodes minus those within
-    /// a dispatch cooldown after a resources-unavailable reject.
+    /// Nodes eligible for new placement this tick. Legacy agents remain
+    /// unschedulable because they cannot prove attempt-fenced cleanup.
     pub fn schedulable_nodes(&self) -> Vec<Node> {
         let cooling = self.nodes_on_dispatch_cooldown();
         self.nodes
             .read()
             .values()
-            .filter(|n| n.recovery_complete && !cooling.contains(&n.name))
+            .filter(|n| n.supports_safe_allocation_lifecycle() && !cooling.contains(&n.name))
             .cloned()
             .collect()
     }
@@ -2739,14 +3013,14 @@ impl ClusterManager {
         // locked so auto-recovery won't override the operator's intent.
         // Resuming to Idle clears the lock.
         let admin_locked = effective_state.is_admin_hold();
-        let holds = if effective_state == NodeState::Down {
-            self.pending_kills_for_jobs(&self.active_jobs_on_node(name))
+        let affected_jobs = if effective_state == NodeState::Down {
+            self.active_jobs_on_node(name)
         } else {
             Vec::new()
         };
 
-        self.propose_with_pending_kills(
-            holds,
+        let response = self.propose_node_lifecycle_transition(
+            &affected_jobs,
             WalOperation::NodeStateChange {
                 name: name.to_string(),
                 old_state,
@@ -2755,6 +3029,8 @@ impl ClusterManager {
                 admin_locked,
             },
         )?;
+        self.run_all_finalized_side_effects(&response);
+        self.complete_evicted_steps(&response.jobs_finalized);
         info!(node = %name, old = ?old_state, new = ?effective_state, "node state updated");
         Ok(())
     }
@@ -2848,7 +3124,7 @@ impl ClusterManager {
     /// Reconcile node liveness state with heartbeat data.
     /// Marks stale nodes Down and recovers nodes whose heartbeat has resumed.
     /// Returns finalized jobs from eviction so callers can send cancel RPCs.
-    pub fn check_node_health(&self, timeout_secs: u64) -> Vec<JobFinalized> {
+    pub fn check_node_health(&self, timeout_secs: u64) -> (Vec<JobFinalized>, Vec<Job>) {
         let actions = {
             let nodes = self.nodes.read();
             let refs: Vec<&Node> = nodes.values().collect();
@@ -2857,8 +3133,9 @@ impl ClusterManager {
         self.apply_health_actions(actions)
     }
 
-    fn apply_health_actions(&self, actions: Vec<HealthAction>) -> Vec<JobFinalized> {
+    fn apply_health_actions(&self, actions: Vec<HealthAction>) -> (Vec<JobFinalized>, Vec<Job>) {
         let mut evicted = Vec::new();
+        let mut cleanup_jobs = Vec::new();
         for action in actions {
             match action {
                 HealthAction::MarkDown {
@@ -2867,8 +3144,9 @@ impl ClusterManager {
                     admin_locked,
                 } => {
                     warn!(node = %name, "node marked DOWN (heartbeat timeout)");
-                    match self.propose_with_pending_kills(
-                        self.pending_kills_for_jobs(&self.active_jobs_on_node(&name)),
+                    let affected_jobs = self.active_jobs_on_node(&name);
+                    match self.propose_node_lifecycle_transition(
+                        &affected_jobs,
                         WalOperation::NodeStateChange {
                             name: name.clone(),
                             old_state,
@@ -2880,6 +3158,7 @@ impl ClusterManager {
                         Ok(resp) => {
                             self.run_all_finalized_side_effects(&resp);
                             evicted.extend(resp.jobs_finalized);
+                            cleanup_jobs.extend(affected_jobs);
                         }
                         Err(e) => {
                             warn!(error = %e, "failed to propose node DOWN");
@@ -2901,7 +3180,7 @@ impl ClusterManager {
                 }
             }
         }
-        evicted
+        (evicted, cleanup_jobs)
     }
 
     /// Drain a node: stop scheduling new jobs on it. Running jobs finish naturally.
@@ -2964,24 +3243,16 @@ impl ClusterManager {
                 anyhow::bail!("node '{}' not found", name);
             }
         }
-        if !force {
-            let jobs = self.jobs.read();
-            let has_running = jobs.values().any(|j| {
-                matches!(
-                    j.state,
-                    JobState::Running | JobState::Completing | JobState::Suspended
-                ) && j.allocated_nodes.iter().any(|n| n == name)
-            });
-            if has_running {
-                anyhow::bail!(
-                    "node '{}' has running jobs; use --force to evict them",
-                    name
-                );
-            }
+        if !force && !self.active_jobs_on_node(name).is_empty() {
+            anyhow::bail!(
+                "node '{}' has active allocations; use --force to evict them",
+                name
+            );
         }
 
-        let resp = self.propose_with_pending_kills(
-            self.pending_kills_for_jobs(&self.active_jobs_on_node(name)),
+        let affected_jobs = self.active_jobs_on_node(name);
+        let resp = self.propose_node_lifecycle_transition(
+            &affected_jobs,
             WalOperation::NodeRemove {
                 name: name.to_string(),
                 reason,
@@ -2995,11 +3266,48 @@ impl ClusterManager {
     pub fn create_step(&self, step: JobStep) -> anyhow::Result<()> {
         let job_id = step.job_id;
         let step_id = step.step_id;
-        self.propose(WalOperation::JobStepCreate {
+        let response = self.propose(WalOperation::JobStepCreate {
             step: Box::new(step),
         })?;
+        if !response.step_created {
+            anyhow::bail!("job {job_id} step {step_id} was not created");
+        }
         debug!(job_id, step_id, "step created");
         Ok(())
+    }
+
+    pub fn mark_step_pmix_prepared(
+        &self,
+        job_id: JobId,
+        step_id: u32,
+        run_attempt: u32,
+        controller_term: u64,
+    ) -> anyhow::Result<()> {
+        let response = self.propose(WalOperation::JobStepPmixPrepare {
+            job_id,
+            step_id,
+            run_attempt,
+            controller_term,
+        })?;
+        if !response.step_pmix_prepared {
+            anyhow::bail!(
+                "job {job_id} step {step_id} is not running in controller term {controller_term}"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn steps_from_prior_terms(&self, controller_term: u64) -> Vec<JobStep> {
+        self.steps
+            .read()
+            .values()
+            .filter(|step| {
+                step.step_id < STEP_RESERVED_MIN
+                    && step.state == StepState::Running
+                    && step.controller_term < controller_term
+            })
+            .cloned()
+            .collect()
     }
 
     /// Record an srun step's completion via Raft so the step exit code and the
@@ -3010,13 +3318,38 @@ impl ClusterManager {
         job_id: JobId,
         step_id: u32,
         exit_code: i32,
+        run_attempt: u32,
+        controller_term: u64,
     ) -> anyhow::Result<()> {
         self.propose(WalOperation::JobStepComplete {
             job_id,
             step_id,
             exit_code,
+            expected_run_attempt: Some(run_attempt),
+            expected_controller_term: Some(controller_term),
         })?;
         Ok(())
+    }
+
+    pub(crate) fn step_dispatch_still_valid(
+        &self,
+        job_id: JobId,
+        step_id: u32,
+        run_attempt: u32,
+        controller_term: u64,
+    ) -> bool {
+        if self.current_term() != controller_term {
+            return false;
+        }
+        let jobs = self.jobs.read();
+        let steps = self.steps.read();
+        jobs.get(&job_id)
+            .is_some_and(|job| job.state == JobState::Running && job.run_attempt == run_attempt)
+            && steps.get(&(job_id, step_id)).is_some_and(|step| {
+                step.state == StepState::Running
+                    && step.run_attempt == run_attempt
+                    && step.controller_term == controller_term
+            })
     }
 
     /// Get all steps for a job.
@@ -3443,7 +3776,7 @@ impl ClusterManager {
         use spur_core::job::PendingReason;
 
         // Snapshot under a read lock to evaluate dependencies.
-        let (to_cancel, to_wait): (Vec<JobId>, Vec<JobId>) = {
+        let (to_cancel, to_wait): (Vec<(JobId, u32)>, Vec<JobId>) = {
             let jobs = self.jobs.read();
             let get_job = |id: JobId| -> Option<Job> { jobs.get(&id).cloned() };
             let get_array_tasks = |id: JobId| -> Vec<Job> {
@@ -3469,7 +3802,7 @@ impl ClusterManager {
                     continue;
                 }
                 match check_dependencies(job, &get_job, &get_array_tasks, &get_jobs_by_name_user) {
-                    DependencyResult::Failed => cancel.push(job.job_id),
+                    DependencyResult::Failed => cancel.push((job.job_id, job.run_attempt)),
                     DependencyResult::Waiting => wait.push(job.job_id),
                     DependencyResult::Satisfied => {}
                 }
@@ -3497,20 +3830,15 @@ impl ClusterManager {
 
         // Finalize unsatisfiable jobs via the WAL so resources/accounting fire.
         let mut cancelled = Vec::new();
-        for id in to_cancel {
+        for (id, run_attempt) in to_cancel {
             // Re-check Pending: the snapshot's read lock was released, so the
             // job may have started concurrently. Running -> Cancelled is a valid
             // WAL transition that would otherwise destroy live work.
             if self.jobs.read().get(&id).map(|j| j.state) != Some(JobState::Pending) {
                 continue;
             }
-            match self.propose(WalOperation::JobComplete {
-                job_id: id,
-                exit_code: -1,
-                state: JobState::Cancelled,
-            }) {
-                Ok(resp) => {
-                    self.run_all_finalized_side_effects(&resp);
+            match self.complete_job_inner(id, -1, JobState::Cancelled, true, run_attempt) {
+                Ok(()) => {
                     info!(job_id = id, "job cancelled: dependency never satisfied");
                     cancelled.push(id);
                 }
@@ -4526,10 +4854,17 @@ impl ClusterManager {
 
     /// Persist a mutation via Raft consensus. The apply callback
     /// (`StateMachineApply`) handles in-memory state on all nodes.
-    fn complete_job_steps(&self, job_id: &JobId, exit_code: i32, timestamp: DateTime<Utc>) {
+    fn complete_job_steps(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        exit_code: i32,
+        timestamp: DateTime<Utc>,
+    ) {
         let mut steps = self.steps.write();
         for step in steps.values_mut() {
-            if step.job_id == *job_id && !step.state.is_terminal() {
+            if step.job_id == job_id && step.run_attempt == run_attempt && !step.state.is_terminal()
+            {
                 step.state = if exit_code == 0 {
                     StepState::Completed
                 } else {
@@ -4537,9 +4872,9 @@ impl ClusterManager {
                 };
                 step.exit_code = Some(exit_code);
                 step.end_time = Some(timestamp);
+                step.pmix_prepared = false;
             }
         }
-        drop(steps);
         // Licenses are not returned here: usage is derived from running jobs, so a
         // job leaving the running set frees its licenses automatically.
     }
@@ -4548,7 +4883,7 @@ impl ClusterManager {
     pub fn complete_evicted_steps(&self, evicted: &[JobFinalized]) {
         let now = Utc::now();
         for fin in evicted {
-            self.complete_job_steps(&fin.job_id, fin.exit_code, now);
+            self.complete_job_steps(fin.job_id, fin.run_attempt, fin.exit_code, now);
         }
     }
 
@@ -4612,12 +4947,14 @@ impl ClusterManager {
         jobs: &mut HashMap<JobId, Job>,
         timestamp: chrono::DateTime<Utc>,
         reason: PendingReason,
-        run_attempt: u32,
+        run_attempt: Option<u32>,
     ) -> Option<JobFinalized> {
         let job = jobs.get_mut(&job_id)?;
-        if run_attempt != 0 && run_attempt != job.run_attempt {
+        if run_attempt.is_some_and(|attempt| attempt != job.run_attempt) {
             return None;
         }
+        let finalized_attempt = job.run_attempt;
+        let cleanup_nodes = job.allocated_nodes.clone();
 
         if let Some(since) = job.suspended_at.take() {
             job.suspended_secs += (timestamp - since).num_seconds().max(0);
@@ -4635,6 +4972,8 @@ impl ClusterManager {
             job_id,
             state: JobState::NodeFail,
             exit_code: -1,
+            run_attempt: finalized_attempt,
+            cleanup_nodes,
         })
     }
 
@@ -4659,7 +4998,7 @@ impl ClusterManager {
 
         for jid in affected {
             if let Some(fin) =
-                Self::evict_job_locked(jid, jobs, timestamp, PendingReason::NodeDown, 0)
+                Self::evict_job_locked(jid, jobs, timestamp, PendingReason::NodeDown, None)
             {
                 response.jobs_finalized.push(fin);
             }
@@ -4671,20 +5010,28 @@ impl ClusterManager {
         job_id: JobId,
         exit_code: i32,
         state: JobState,
+        expected_run_attempt: Option<u32>,
         reservations: &[PendingKillReservation],
     ) -> ClientResponse {
         let timestamp = Utc::now();
         let mut response = ClientResponse::default();
         let mut jobs = self.jobs.write();
         let mut nodes = self.nodes.write();
+        let mut allocations = self.allocations.write();
+        let mut commands = self.agent_commands.write();
         let completion_attempt;
 
         if let Some(job) = jobs.get_mut(&job_id) {
+            if expected_run_attempt.is_some_and(|attempt| attempt != job.run_attempt) {
+                return ClientResponse::default();
+            }
             if job.state.is_finalized()
                 && !(job.state == JobState::Preempted && state == JobState::Cancelled)
             {
                 return ClientResponse::default();
             }
+            completion_attempt = job.run_attempt;
+            let cleanup_nodes = job.allocated_nodes.clone();
             if let Err(e) = job.transition(state) {
                 warn!(
                     job_id,
@@ -4698,17 +5045,20 @@ impl ClusterManager {
                     job_id,
                     state,
                     exit_code,
+                    run_attempt: completion_attempt,
+                    cleanup_nodes,
                 });
             }
             job.exit_code = Some(exit_code);
             job.end_time = Some(timestamp);
             if state == JobState::Timeout {
                 job.set_pending_reason(PendingReason::TimeLimit);
+            } else if state == JobState::Deadline {
+                job.set_pending_reason(PendingReason::DeadLine);
             }
             if let Some(since) = job.suspended_at.take() {
                 job.suspended_secs += (timestamp - since).num_seconds().max(0);
             }
-            completion_attempt = job.run_attempt;
             job.node_completions.clear();
         } else {
             return ClientResponse::default();
@@ -4721,51 +5071,52 @@ impl ClusterManager {
             })
             .cloned()
             .collect();
-        let held_keys: HashSet<_> = reservations
-            .iter()
-            .map(|reservation| {
-                AllocationKey::new(
-                    reservation.job_id,
-                    reservation.run_attempt,
-                    reservation.node.clone(),
-                )
-            })
-            .collect();
-        {
-            let mut allocations = self.allocations.write();
-            for record in allocations.values_mut().filter(|record| {
-                record.key.job_id == job_id && record.key.run_attempt == completion_attempt
-            }) {
-                if !held_keys.contains(&record.key) {
-                    record.phase = AllocationPhase::Released;
-                }
-            }
-        }
-        self.apply_pending_kill_reservations(&reservations);
-        {
-            let allocations = self.allocations.read();
-            Self::rebuild_node_resource_projection(&mut nodes, &allocations);
-        }
+        let commands_changed = self.release_allocation_attempt_locked(
+            &nodes,
+            &mut allocations,
+            &mut commands,
+            job_id,
+            completion_attempt,
+            &reservations,
+        );
+        Self::rebuild_node_resource_projection(&mut nodes, &allocations);
+        self.run_allocation_transition_apply_hook();
 
-        drop(jobs);
+        drop(commands);
+        drop(allocations);
         drop(nodes);
-        self.complete_job_steps(&job_id, exit_code, timestamp);
+        drop(jobs);
+        if commands_changed {
+            self.agent_command_notify.notify_waiters();
+        }
+        self.complete_job_steps(job_id, completion_attempt, exit_code, timestamp);
         response
     }
 
-    fn apply_pending_kill_reservations(&self, reservations: &[PendingKillReservation]) {
-        let mut allocations = self.allocations.write();
-        let mut commands = self.agent_commands.write();
+    fn apply_pending_kill_reservations_locked(
+        &self,
+        nodes: &HashMap<String, Node>,
+        allocations: &mut HashMap<AllocationKey, AllocationRecord>,
+        commands: &mut HashMap<u64, AgentCommandRecord>,
+        reservations: &[PendingKillReservation],
+    ) {
         for hold in reservations {
             let key = AllocationKey::new(hold.job_id, hold.run_attempt, hold.node.clone());
+            let supports_command_polling = nodes
+                .get(&hold.node)
+                .is_some_and(|node| node.supports_command_polling);
+            commands.retain(|_, command| {
+                command.key != key || command.kind == AgentCommandKind::Release
+            });
             let mut record = AllocationRecord::new(
                 key.clone(),
                 hold.resources.clone(),
                 AllocationPhase::Releasing,
             );
             record.last_command_id = hold.attempt;
-            allocations.insert(key, record);
-            if hold.attempt > 0 {
+            record.release_on_heartbeat_absence = !supports_command_polling;
+            allocations.insert(key.clone(), record);
+            if hold.attempt > 0 && supports_command_polling {
                 commands.entry(hold.attempt).or_insert_with(|| {
                     AgentCommandRecord::new(
                         hold.attempt,
@@ -4779,9 +5130,380 @@ impl ClusterManager {
             self.next_agent_command_id
                 .fetch_max(hold.attempt.saturating_add(1), Ordering::Relaxed);
         }
-        if !reservations.is_empty() {
+    }
+
+    fn release_allocation_attempt_locked(
+        &self,
+        nodes: &HashMap<String, Node>,
+        allocations: &mut HashMap<AllocationKey, AllocationRecord>,
+        commands: &mut HashMap<u64, AgentCommandRecord>,
+        job_id: JobId,
+        run_attempt: u32,
+        reservations: &[PendingKillReservation],
+    ) -> bool {
+        let held_keys: HashSet<_> = reservations
+            .iter()
+            .map(|reservation| {
+                AllocationKey::new(
+                    reservation.job_id,
+                    reservation.run_attempt,
+                    reservation.node.clone(),
+                )
+            })
+            .collect();
+        for record in allocations
+            .values_mut()
+            .filter(|record| record.key.job_id == job_id && record.key.run_attempt == run_attempt)
+        {
+            if !held_keys.contains(&record.key) {
+                record.phase = AllocationPhase::Released;
+            }
+        }
+        self.apply_pending_kill_reservations_locked(nodes, allocations, commands, reservations);
+        !reservations.is_empty()
+    }
+
+    fn adapt_releasing_allocations_without_command_polling(
+        node: &str,
+        allocations: &mut HashMap<AllocationKey, AllocationRecord>,
+        commands: &mut HashMap<u64, AgentCommandRecord>,
+    ) -> bool {
+        let keys: HashSet<_> = allocations
+            .values_mut()
+            .filter(|record| record.key.node == node && record.phase == AllocationPhase::Releasing)
+            .map(|record| {
+                record.release_on_heartbeat_absence = true;
+                record.key.clone()
+            })
+            .collect();
+        let before = commands.len();
+        commands.retain(|_, command| {
+            command.kind != AgentCommandKind::Release || !keys.contains(&command.key)
+        });
+        commands.len() != before
+    }
+
+    #[cfg(test)]
+    fn run_allocation_transition_apply_hook(&self) {
+        let hook = self.allocation_transition_apply_hook.read().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn run_allocation_transition_apply_hook(&self) {}
+
+    fn apply_job_evict_operation(
+        &self,
+        job_id: JobId,
+        reason: PendingReason,
+        detail: &Option<String>,
+        run_attempt: Option<u32>,
+        reservations: &[PendingKillReservation],
+    ) -> ClientResponse {
+        let timestamp = Utc::now();
+        let mut jobs = self.jobs.write();
+        let mut nodes = self.nodes.write();
+        let mut allocations = self.allocations.write();
+        let mut commands = self.agent_commands.write();
+        let Some(finalized) =
+            Self::evict_job_locked(job_id, &mut jobs, timestamp, reason, run_attempt)
+        else {
+            return ClientResponse::default();
+        };
+        if let Some(job) = jobs.get_mut(&job_id) {
+            job.launch_failure_detail = detail.clone();
+        }
+
+        let reservations: Vec<_> = reservations
+            .iter()
+            .filter(|reservation| {
+                reservation.job_id == job_id && reservation.run_attempt == finalized.run_attempt
+            })
+            .cloned()
+            .collect();
+        let commands_changed = self.release_allocation_attempt_locked(
+            &nodes,
+            &mut allocations,
+            &mut commands,
+            job_id,
+            finalized.run_attempt,
+            &reservations,
+        );
+        Self::rebuild_node_resource_projection(&mut nodes, &allocations);
+        self.run_allocation_transition_apply_hook();
+        self.complete_job_steps(
+            job_id,
+            finalized.run_attempt,
+            finalized.exit_code,
+            timestamp,
+        );
+
+        drop(commands);
+        drop(allocations);
+        drop(nodes);
+        drop(jobs);
+        if commands_changed {
             self.agent_command_notify.notify_waiters();
         }
+        ClientResponse {
+            jobs_finalized: vec![finalized],
+            ..Default::default()
+        }
+    }
+
+    fn apply_job_preempt_requeue_operation(
+        &self,
+        job_id: JobId,
+        begin_time: DateTime<Utc>,
+        expected_run_attempt: Option<u32>,
+        reservations: &[PendingKillReservation],
+    ) -> ClientResponse {
+        let timestamp = Utc::now();
+        let mut jobs = self.jobs.write();
+        let mut nodes = self.nodes.write();
+        let mut allocations = self.allocations.write();
+        let mut commands = self.agent_commands.write();
+        let Some(job) = jobs.get_mut(&job_id) else {
+            return ClientResponse::default();
+        };
+        if job.state != JobState::Running
+            || expected_run_attempt.is_some_and(|attempt| attempt != job.run_attempt)
+        {
+            return ClientResponse::default();
+        }
+        if let Err(error) = job.transition(JobState::Preempted) {
+            warn!(job_id, error = %error, "invalid preempt transition in WAL apply");
+            return ClientResponse::default();
+        }
+        job.exit_code = Some(-1);
+        job.end_time = Some(timestamp);
+        if let Some(since) = job.suspended_at.take() {
+            job.suspended_secs += (timestamp - since).num_seconds().max(0);
+        }
+        let run_attempt = job.run_attempt;
+        let cleanup_nodes = job.allocated_nodes.clone();
+        job.node_completions.clear();
+        if let Err(error) = job.transition(JobState::Pending) {
+            warn!(job_id, error = %error, "invalid requeue transition in WAL apply");
+            return ClientResponse::default();
+        }
+        Self::reset_job_for_preempt_requeue(job);
+        job.spec.begin_time = Some(begin_time);
+        job.set_pending_reason(PendingReason::BeginTime);
+
+        let reservations: Vec<_> = reservations
+            .iter()
+            .filter(|reservation| {
+                reservation.job_id == job_id && reservation.run_attempt == run_attempt
+            })
+            .cloned()
+            .collect();
+        let commands_changed = self.release_allocation_attempt_locked(
+            &nodes,
+            &mut allocations,
+            &mut commands,
+            job_id,
+            run_attempt,
+            &reservations,
+        );
+        Self::rebuild_node_resource_projection(&mut nodes, &allocations);
+        self.run_allocation_transition_apply_hook();
+
+        drop(commands);
+        drop(allocations);
+        drop(nodes);
+        drop(jobs);
+        if commands_changed {
+            self.agent_command_notify.notify_waiters();
+        }
+        self.complete_job_steps(job_id, run_attempt, -1, timestamp);
+        ClientResponse {
+            jobs_finalized: vec![JobFinalized {
+                job_id,
+                state: JobState::Preempted,
+                exit_code: -1,
+                run_attempt,
+                cleanup_nodes,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn apply_node_lifecycle_operation(
+        &self,
+        operation: &WalOperation,
+        allocation_targets: &[AllocationKey],
+        reservations: &[PendingKillReservation],
+    ) -> ClientResponse {
+        let (name, state_change, remove_reason) = match operation {
+            WalOperation::NodeStateChange {
+                name,
+                new_state,
+                reason,
+                admin_locked,
+                ..
+            } => (
+                name.as_str(),
+                Some((*new_state, reason.clone(), *admin_locked)),
+                None,
+            ),
+            WalOperation::NodeRemove { name, reason } => {
+                (name.as_str(), None, Some(reason.clone()))
+            }
+            _ => return ClientResponse::default(),
+        };
+
+        let removing = remove_reason.is_some();
+        let mut response = ClientResponse::default();
+        let timestamp = Utc::now();
+        let mut jobs = self.jobs.write();
+        let mut nodes = self.nodes.write();
+        let mut allocations = self.allocations.write();
+        let mut commands = self.agent_commands.write();
+
+        let mut affected_attempts: HashSet<_> = allocation_targets
+            .iter()
+            .filter(|key| {
+                allocations
+                    .get(*key)
+                    .is_some_and(|record| record.phase.is_charged())
+            })
+            .map(|key| (key.job_id, key.run_attempt))
+            .collect();
+        affected_attempts.extend(
+            allocations
+                .values()
+                .filter(|record| record.key.node == name && record.phase.is_charged())
+                .map(|record| (record.key.job_id, record.key.run_attempt)),
+        );
+        let target_keys: HashSet<_> = allocations
+            .values()
+            .filter(|record| {
+                record.phase.is_charged()
+                    && affected_attempts.contains(&(record.key.job_id, record.key.run_attempt))
+            })
+            .map(|record| record.key.clone())
+            .collect();
+
+        for (job_id, run_attempt) in &affected_attempts {
+            let state = jobs
+                .get(job_id)
+                .filter(|job| job.run_attempt == *run_attempt)
+                .map(|job| job.state);
+            if matches!(
+                state,
+                Some(JobState::Running | JobState::Completing | JobState::Suspended)
+            ) {
+                if let Some(finalized) = Self::evict_job_locked(
+                    *job_id,
+                    &mut jobs,
+                    timestamp,
+                    PendingReason::NodeDown,
+                    Some(*run_attempt),
+                ) {
+                    response.jobs_finalized.push(finalized);
+                }
+            } else if state == Some(JobState::Pending) {
+                if let Some(job) = jobs.get_mut(job_id) {
+                    job.allocated_nodes.clear();
+                    job.allocated_resources = None;
+                    job.per_node_alloc.clear();
+                    job.set_pending_reason(PendingReason::NodeDown);
+                }
+            }
+        }
+
+        let reservation_keys: HashSet<_> = reservations
+            .iter()
+            .map(|reservation| {
+                AllocationKey::new(
+                    reservation.job_id,
+                    reservation.run_attempt,
+                    reservation.node.clone(),
+                )
+            })
+            .collect();
+        let reservations: Vec<_> = reservations
+            .iter()
+            .filter(|reservation| {
+                affected_attempts.contains(&(reservation.job_id, reservation.run_attempt))
+                    && target_keys.contains(&AllocationKey::new(
+                        reservation.job_id,
+                        reservation.run_attempt,
+                        reservation.node.clone(),
+                    ))
+                    && (!removing || reservation.node != name)
+            })
+            .cloned()
+            .collect();
+        for record in allocations.values_mut().filter(|record| {
+            target_keys.contains(&record.key)
+                && affected_attempts.contains(&(record.key.job_id, record.key.run_attempt))
+        }) {
+            if reservation_keys.contains(&record.key) || record.phase == AllocationPhase::Prepared {
+                record.phase = AllocationPhase::Released;
+                continue;
+            }
+            record.phase = AllocationPhase::Releasing;
+            record.release_on_heartbeat_absence = nodes
+                .get(&record.key.node)
+                .is_none_or(|node| !node.supports_command_polling);
+        }
+
+        let mut command_state_changed = false;
+        for command in commands.values_mut().filter(|command| {
+            target_keys.contains(&command.key)
+                && command.kind != AgentCommandKind::Release
+                && command.state == AgentCommandState::Pending
+        }) {
+            command.state = AgentCommandState::Failed;
+            command.error = "allocation node became unavailable".into();
+            command_state_changed = true;
+        }
+
+        if let Some((new_state, reason, admin_locked)) = state_change {
+            if let Some(node) = nodes.get_mut(name) {
+                node.state = new_state;
+                node.state_reason = reason;
+                node.admin_locked = admin_locked;
+            }
+        } else {
+            let reason = remove_reason.as_ref().and_then(Clone::clone);
+            allocations.retain(|key, _| key.node != name);
+            nodes.remove(name);
+            commands.retain(|_, command| command.key.node != name);
+            info!(
+                node = %name,
+                reason = reason.as_deref().unwrap_or(""),
+                "node removed from cluster"
+            );
+        }
+        self.apply_pending_kill_reservations_locked(
+            &nodes,
+            &mut allocations,
+            &mut commands,
+            &reservations,
+        );
+        Self::rebuild_node_resource_projection(&mut nodes, &allocations);
+        self.run_allocation_transition_apply_hook();
+        for finalized in &response.jobs_finalized {
+            self.complete_job_steps(
+                finalized.job_id,
+                finalized.run_attempt,
+                finalized.exit_code,
+                timestamp,
+            );
+        }
+        drop(commands);
+        drop(allocations);
+        drop(nodes);
+        drop(jobs);
+        if command_state_changed || !reservations.is_empty() {
+            self.agent_command_notify.notify_waiters();
+        }
+        response
     }
 
     /// Apply a WalOperation to in-memory state.
@@ -4789,54 +5511,117 @@ impl ClusterManager {
     fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
         if let WalOperation::PendingKillTransition {
             reservations,
+            allocation_targets,
             operation,
         } = op
         {
-            if let WalOperation::JobComplete {
+            if matches!(
+                operation.as_ref(),
+                WalOperation::NodeStateChange {
+                    new_state: NodeState::Down,
+                    ..
+                } | WalOperation::NodeRemove { .. }
+            ) {
+                return self.apply_node_lifecycle_operation(
+                    operation,
+                    allocation_targets,
+                    reservations,
+                );
+            }
+            match operation.as_ref() {
+                WalOperation::JobComplete {
+                    job_id,
+                    exit_code,
+                    state,
+                } => {
+                    return self.apply_job_complete_operation(
+                        *job_id,
+                        *exit_code,
+                        *state,
+                        None,
+                        reservations,
+                    );
+                }
+                WalOperation::JobCompleteForAttempt {
+                    job_id,
+                    exit_code,
+                    state,
+                    expected_run_attempt,
+                } => {
+                    return self.apply_job_complete_operation(
+                        *job_id,
+                        *exit_code,
+                        *state,
+                        Some(*expected_run_attempt),
+                        reservations,
+                    );
+                }
+                WalOperation::JobEvict {
+                    job_id,
+                    reason,
+                    detail,
+                    run_attempt,
+                } => {
+                    return self.apply_job_evict_operation(
+                        *job_id,
+                        reason.clone(),
+                        detail,
+                        *run_attempt,
+                        reservations,
+                    );
+                }
+                WalOperation::JobPreemptRequeue {
+                    job_id,
+                    begin_time,
+                    expected_run_attempt,
+                } => {
+                    return self.apply_job_preempt_requeue_operation(
+                        *job_id,
+                        *begin_time,
+                        *expected_run_attempt,
+                        reservations,
+                    );
+                }
+                _ => {
+                    warn!("ignoring unsupported operation inside PendingKillTransition");
+                    return ClientResponse::default();
+                }
+            }
+        }
+
+        if matches!(
+            op,
+            WalOperation::NodeStateChange {
+                new_state: NodeState::Down,
+                ..
+            } | WalOperation::NodeRemove { .. }
+        ) {
+            return self.apply_node_lifecycle_operation(op, &[], &[]);
+        }
+
+        match op {
+            WalOperation::JobComplete {
                 job_id,
                 exit_code,
                 state,
-            } = operation.as_ref()
-            {
+            } => {
+                return self.apply_job_complete_operation(*job_id, *exit_code, *state, None, &[]);
+            }
+            WalOperation::JobCompleteForAttempt {
+                job_id,
+                exit_code,
+                state,
+                expected_run_attempt,
+            } => {
                 return self.apply_job_complete_operation(
                     *job_id,
                     *exit_code,
                     *state,
-                    reservations,
+                    Some(*expected_run_attempt),
+                    &[],
                 );
             }
-            let response = self.apply_operation(operation);
-            let finalized: HashSet<_> = response
-                .jobs_finalized
-                .iter()
-                .map(|job| job.job_id)
-                .collect();
-            let removed_node = match operation.as_ref() {
-                WalOperation::NodeRemove { name, .. } => Some(name.as_str()),
-                _ => None,
-            };
-            let reservations: Vec<_> = reservations
-                .iter()
-                .filter(|reservation| {
-                    finalized.contains(&reservation.job_id)
-                        && removed_node != Some(reservation.node.as_str())
-                })
-                .cloned()
-                .collect();
-            self.apply_pending_kill_reservations(&reservations);
-            let mut nodes = self.nodes.write();
-            let allocations = self.allocations.read();
-            Self::rebuild_node_resource_projection(&mut nodes, &allocations);
-            return response;
-        }
-
-        if let WalOperation::JobComplete {
-            job_id,
-            exit_code,
-            state,
-        } = op
-        {
-            return self.apply_job_complete_operation(*job_id, *exit_code, *state, &[]);
+            _ => {}
         }
 
         let mut response = ClientResponse::default();
@@ -4854,33 +5639,66 @@ impl ClusterManager {
                 per_node_alloc,
                 srun_step_dispatch,
             } => {
-                let Some(job) = jobs.get_mut(job_id) else {
+                let Some(job) = jobs.get(job_id) else {
                     return ClientResponse::default();
                 };
                 if job.state != JobState::Pending || *run_attempt < job.run_attempt {
                     return ClientResponse::default();
                 }
+                let unique_nodes: HashSet<_> = node_names.iter().collect();
+                if unique_nodes.len() != node_names.len() {
+                    return ClientResponse::default();
+                }
+
+                let mut allocations = self.allocations.write();
+                if node_names.iter().any(|name| {
+                    let Some(node) = nodes.get(name) else {
+                        return true;
+                    };
+                    let Some(slice) = per_node_alloc.get(name) else {
+                        return true;
+                    };
+                    let key = AllocationKey::new(*job_id, *run_attempt, name.clone());
+                    let existing = allocations
+                        .get(&key)
+                        .filter(|record| record.phase.is_charged());
+                    if !node.supports_safe_allocation_lifecycle()
+                        || !(node.is_schedulable() || existing.is_some() && node.state.is_up())
+                        || existing.is_some_and(|record| record.resources != *slice)
+                    {
+                        return true;
+                    }
+
+                    let mut projected = node.alloc_resources.clone();
+                    if let Some(existing) = existing {
+                        projected.subtract(&existing.resources);
+                    }
+                    !node.total_resources.can_fit_allocation(&projected, slice)
+                }) {
+                    return ClientResponse::default();
+                }
+
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
                 job.run_attempt = *run_attempt;
                 job.allocated_nodes = node_names.clone();
                 job.allocated_resources = Some(resources.clone());
                 job.per_node_alloc = per_node_alloc.clone();
                 job.srun_step_dispatch = *srun_step_dispatch;
 
-                let mut allocations = self.allocations.write();
                 allocations.retain(|_, record| {
                     record.key.job_id != *job_id || record.phase != AllocationPhase::Released
                 });
                 for node in node_names {
-                    let Some(slice) = per_node_alloc.get(node) else {
-                        warn!(job_id = *job_id, node = %node, "prepared allocation has no resource slice");
-                        continue;
-                    };
+                    let slice = &per_node_alloc[node];
                     let key = AllocationKey::new(*job_id, *run_attempt, node.clone());
                     allocations.entry(key.clone()).or_insert_with(|| {
                         AllocationRecord::new(key, slice.clone(), AllocationPhase::Prepared)
                     });
                 }
                 Self::rebuild_node_resource_projection(&mut nodes, &allocations);
+                response.allocation_prepared = true;
             }
             WalOperation::AllocationBeginLaunch {
                 job_id,
@@ -4889,7 +5707,33 @@ impl ClusterManager {
                 created_at,
                 commands,
             } => {
+                let Some(job) = jobs.get(job_id) else {
+                    return ClientResponse::default();
+                };
+                if job.state != JobState::Pending
+                    || job.run_attempt != *run_attempt
+                    || job.allocated_nodes.is_empty()
+                    || job.allocated_nodes.iter().any(|name| {
+                        nodes.get(name).is_none_or(|node| {
+                            !node.supports_safe_allocation_lifecycle() || !node.state.is_up()
+                        })
+                    })
+                {
+                    return ClientResponse::default();
+                }
                 let mut allocations = self.allocations.write();
+                if job.allocated_nodes.iter().any(|node| {
+                    allocations
+                        .get(&AllocationKey::new(*job_id, *run_attempt, node.clone()))
+                        .is_none_or(|record| {
+                            !matches!(
+                                record.phase,
+                                AllocationPhase::Prepared | AllocationPhase::Launching
+                            )
+                        })
+                }) {
+                    return ClientResponse::default();
+                }
                 for record in allocations.values_mut().filter(|record| {
                     record.key.job_id == *job_id && record.key.run_attempt == *run_attempt
                 }) {
@@ -4933,6 +5777,15 @@ impl ClusterManager {
                 if job.run_attempt != *run_attempt || job.state != JobState::Pending {
                     return ClientResponse::default();
                 }
+                if job.allocated_nodes.is_empty()
+                    || job.allocated_nodes.iter().any(|name| {
+                        nodes.get(name).is_none_or(|node| {
+                            !node.supports_safe_allocation_lifecycle() || !node.state.is_up()
+                        })
+                    })
+                {
+                    return ClientResponse::default();
+                }
                 let mut allocations = self.allocations.write();
                 let all_launching = job.allocated_nodes.iter().all(|node| {
                     allocations
@@ -4967,6 +5820,7 @@ impl ClusterManager {
                         || command.kind == AgentCommandKind::Release
                 });
                 Self::rebuild_node_resource_projection(&mut nodes, &allocations);
+                response.allocation_activated = true;
             }
             WalOperation::AllocationAbort {
                 job_id,
@@ -4982,6 +5836,9 @@ impl ClusterManager {
                 }) {
                     if releasing.contains(record.key.node.as_str()) {
                         record.phase = AllocationPhase::Releasing;
+                        record.release_on_heartbeat_absence = nodes
+                            .get(&record.key.node)
+                            .is_none_or(|node| !node.supports_command_polling);
                         record.last_command_id = commands
                             .iter()
                             .find(|command| command.key == record.key)
@@ -5014,55 +5871,6 @@ impl ClusterManager {
                 }
                 self.next_agent_command_id
                     .fetch_max(command_id.saturating_add(1), Ordering::Relaxed);
-                Self::rebuild_node_resource_projection(&mut nodes, &allocations);
-            }
-            WalOperation::AllocationBeginRelease {
-                keys,
-                command_id,
-                commands,
-            } => {
-                let mut allocations = self.allocations.write();
-                for key in keys {
-                    if let Some(record) = allocations.get_mut(key) {
-                        if record.phase != AllocationPhase::Released {
-                            record.phase = AllocationPhase::Releasing;
-                            record.last_command_id = commands
-                                .iter()
-                                .find(|command| command.key == *key)
-                                .map(|command| command.command_id)
-                                .unwrap_or(*command_id);
-                        }
-                    }
-                }
-                self.agent_commands.write().extend(
-                    commands
-                        .iter()
-                        .cloned()
-                        .map(|command| (command.command_id, command)),
-                );
-                if !commands.is_empty() {
-                    self.agent_command_notify.notify_waiters();
-                }
-                self.next_agent_command_id
-                    .fetch_max(command_id.saturating_add(1), Ordering::Relaxed);
-                Self::rebuild_node_resource_projection(&mut nodes, &allocations);
-            }
-            WalOperation::AllocationConfirmRelease {
-                key,
-                command_id,
-                agent_session_id,
-                node_boot_id,
-            } => {
-                let mut allocations = self.allocations.write();
-                if let Some(record) = allocations.get_mut(key) {
-                    if record.phase == AllocationPhase::Releasing
-                        && record.last_command_id == *command_id
-                    {
-                        record.phase = AllocationPhase::Released;
-                        record.agent_session_id = Some(agent_session_id.clone());
-                        record.node_boot_id = Some(node_boot_id.clone());
-                    }
-                }
                 Self::rebuild_node_resource_projection(&mut nodes, &allocations);
             }
             WalOperation::AgentCommandAcknowledge {
@@ -5108,6 +5916,7 @@ impl ClusterManager {
 
                 if *success {
                     let mut allocations = self.allocations.write();
+                    let mut remove_released = false;
                     if let Some(record) = allocations.get_mut(key) {
                         if record.last_command_id == *command_id {
                             match kind {
@@ -5124,10 +5933,14 @@ impl ClusterManager {
                                     record.phase = AllocationPhase::Released;
                                     record.agent_session_id = Some(agent_session_id.clone());
                                     record.node_boot_id = Some(node_boot_id.clone());
+                                    remove_released = !jobs.contains_key(&key.job_id);
                                 }
                                 _ => {}
                             }
                         }
+                    }
+                    if remove_released {
+                        allocations.remove(key);
                     }
                     Self::rebuild_node_resource_projection(&mut nodes, &allocations);
                 }
@@ -5168,11 +5981,6 @@ impl ClusterManager {
                 }
                 Self::rebuild_node_resource_projection(&mut nodes, &allocations);
             }
-            WalOperation::PendingKillReserve { reservations } => {
-                self.apply_pending_kill_reservations(reservations);
-                let allocations = self.allocations.read();
-                Self::rebuild_node_resource_projection(&mut nodes, &allocations);
-            }
             WalOperation::PendingKillTransition { .. } => unreachable!("handled before locking"),
             WalOperation::PendingKillRelease { releases } => {
                 let mut allocations = self.allocations.write();
@@ -5186,6 +5994,10 @@ impl ClusterManager {
                         }
                     }
                 }
+                allocations.retain(|_, record| {
+                    record.phase != AllocationPhase::Released
+                        || jobs.contains_key(&record.key.job_id)
+                });
                 Self::rebuild_node_resource_projection(&mut nodes, &allocations);
             }
             WalOperation::JobSubmit { job_id, spec } => {
@@ -5270,15 +6082,23 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobPreemptRequeue { job_id, begin_time } => {
+            WalOperation::JobPreemptRequeue {
+                job_id,
+                begin_time,
+                expected_run_attempt,
+            } => {
                 // Only a running job is preempted; on replay the job is already
                 // Pending, so this is a NoOp (no re-dealloc, no double requeue).
                 let preempt_attempt;
+                let cleanup_nodes;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
                     };
                     if job.state != JobState::Running {
+                        return ClientResponse::default();
+                    }
+                    if expected_run_attempt.is_some_and(|attempt| attempt != job.run_attempt) {
                         return ClientResponse::default();
                     }
                     // Route through Preempted so the state machine and accounting
@@ -5294,6 +6114,7 @@ impl ClusterManager {
                         job.suspended_secs += (timestamp - since).num_seconds().max(0);
                     }
                     preempt_attempt = job.run_attempt;
+                    cleanup_nodes = job.allocated_nodes.clone();
                     job.node_completions.clear();
 
                     if let Err(e) = job.transition(JobState::Pending) {
@@ -5311,7 +6132,7 @@ impl ClusterManager {
                             && record.key.run_attempt == preempt_attempt
                             && record.phase != AllocationPhase::Released
                     }) {
-                        record.phase = AllocationPhase::Releasing;
+                        record.phase = AllocationPhase::Released;
                     }
                     Self::rebuild_node_resource_projection(&mut nodes, &allocations);
                 }
@@ -5319,19 +6140,28 @@ impl ClusterManager {
                 drop(nodes);
                 // Complete steps and fire accounting for the terminated run as
                 // PREEMPTED, even though the job itself is now Pending-with-hold.
-                self.complete_job_steps(job_id, -1, timestamp);
+                self.complete_job_steps(*job_id, preempt_attempt, -1, timestamp);
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse {
                     jobs_finalized: vec![JobFinalized {
                         job_id: *job_id,
                         state: JobState::Preempted,
                         exit_code: -1,
+                        run_attempt: preempt_attempt,
+                        cleanup_nodes,
                     }],
                     ..Default::default()
                 };
             }
-            WalOperation::JobSuspend { job_id, at } => {
+            WalOperation::JobSuspend {
+                job_id,
+                at,
+                expected_run_attempt,
+            } => {
                 if let Some(job) = jobs.get_mut(job_id) {
+                    if expected_run_attempt.is_some_and(|attempt| attempt != job.run_attempt) {
+                        return ClientResponse::default();
+                    }
                     match job.apply_transition(JobState::Suspended) {
                         Ok(TransitionOutcome::Applied) => job.suspended_at = Some(*at),
                         Ok(TransitionOutcome::NoOp) => {}
@@ -5341,8 +6171,15 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobResume { job_id, at } => {
+            WalOperation::JobResume {
+                job_id,
+                at,
+                expected_run_attempt,
+            } => {
                 if let Some(job) = jobs.get_mut(job_id) {
+                    if expected_run_attempt.is_some_and(|attempt| attempt != job.run_attempt) {
+                        return ClientResponse::default();
+                    }
                     match job.apply_transition(JobState::Running) {
                         Ok(TransitionOutcome::Applied) => {
                             if let Some(since) = job.suspended_at.take() {
@@ -5373,6 +6210,7 @@ impl ClusterManager {
                     if let Some(job) = jobs.get_mut(job_id) {
                         job.launch_failure_detail = detail.clone();
                     }
+                    self.complete_job_steps(*job_id, fin.run_attempt, fin.exit_code, timestamp);
                     response.jobs_finalized.push(fin);
                     if let Some(current_attempt) = current_attempt {
                         let mut allocations = self.allocations.write();
@@ -5381,7 +6219,7 @@ impl ClusterManager {
                                 && record.key.run_attempt == current_attempt
                                 && record.phase != AllocationPhase::Released
                         }) {
-                            record.phase = AllocationPhase::Releasing;
+                            record.phase = AllocationPhase::Released;
                         }
                         Self::rebuild_node_resource_projection(&mut nodes, &allocations);
                     }
@@ -5444,6 +6282,7 @@ impl ClusterManager {
                 run_attempt,
             } => {
                 let completion_attempt;
+                let cleanup_nodes;
                 let finalized = {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
@@ -5453,10 +6292,11 @@ impl ClusterManager {
                     if !job.state.is_active() {
                         return ClientResponse::default();
                     }
-                    if *run_attempt != 0 && *run_attempt != job.run_attempt {
+                    if *run_attempt != job.run_attempt {
                         return ClientResponse::default();
                     }
                     completion_attempt = job.run_attempt;
+                    cleanup_nodes = job.allocated_nodes.clone();
 
                     job.node_completions.insert(
                         node_name.clone(),
@@ -5531,54 +6371,75 @@ impl ClusterManager {
                 if let Some((final_state, final_exit)) = finalized {
                     drop(jobs);
                     drop(nodes);
-                    self.complete_job_steps(job_id, final_exit, timestamp);
+                    self.complete_job_steps(*job_id, completion_attempt, final_exit, timestamp);
                     self.next_job_id.store(next_id, Ordering::Relaxed);
                     return ClientResponse {
                         jobs_finalized: vec![JobFinalized {
                             job_id: *job_id,
                             state: final_state,
                             exit_code: final_exit,
+                            run_attempt: completion_attempt,
+                            cleanup_nodes,
                         }],
                         ..Default::default()
                     };
                 }
             }
-            WalOperation::JobTimeLimitSignaled { job_id, at } => {
+            WalOperation::JobTimeLimitSignaled {
+                job_id,
+                at,
+                expected_run_attempt,
+            } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     // A run that already ended keeps the verdict it finalized
                     // with: the watchdog raced the job's own exit and lost.
-                    if job.state.is_active() && job.time_limit_signaled_at.is_none() {
+                    if expected_run_attempt.is_none_or(|attempt| attempt == job.run_attempt)
+                        && job.state.is_active()
+                        && job.time_limit_signaled_at.is_none()
+                    {
                         job.time_limit_signaled_at = Some(*at);
                     }
                 }
             }
-            WalOperation::JobComplete { .. } => unreachable!("handled before locking"),
+            WalOperation::JobComplete { .. } | WalOperation::JobCompleteForAttempt { .. } => {
+                unreachable!("handled before locking")
+            }
             WalOperation::JobStepComplete {
                 job_id,
                 step_id,
                 exit_code,
+                expected_run_attempt,
+                expected_controller_term,
             } => {
-                // Record the step's own exit code/state.
+                let Some(job) = jobs.get_mut(job_id) else {
+                    return ClientResponse::default();
+                };
+                let mut steps = self.steps.write();
+                let Some(step) = steps.get_mut(&(*job_id, *step_id)) else {
+                    return ClientResponse::default();
+                };
+                let terminal_recovery = job.state.is_terminal()
+                    && *expected_run_attempt == Some(step.run_attempt)
+                    && *expected_controller_term == Some(step.controller_term);
+                if step.state != StepState::Running
+                    || expected_run_attempt.is_some_and(|attempt| attempt != step.run_attempt)
+                    || expected_controller_term.is_some_and(|term| term != step.controller_term)
+                    || (job.state != JobState::Running && !terminal_recovery)
+                    || job.run_attempt != step.run_attempt
                 {
-                    let mut steps = self.steps.write();
-                    if let Some(step) = steps.get_mut(&(*job_id, *step_id)) {
-                        step.state = if *exit_code == 0 {
-                            StepState::Completed
-                        } else {
-                            StepState::Failed
-                        };
-                        step.exit_code = Some(*exit_code);
-                        step.end_time = Some(timestamp);
-                    }
+                    return ClientResponse::default();
                 }
-                // DerivedExitCode is the running max over srun steps (the batch
-                // step is excluded — it carries the job's own exit, not a step
-                // result). Maintained live so `scontrol show job` reflects it
-                // mid-run, matching Slurm.
-                if *step_id < STEP_RESERVED_MIN {
-                    if let Some(job) = jobs.get_mut(job_id) {
-                        job.derived_exit_code = job.derived_exit_code.max(*exit_code);
-                    }
+
+                step.state = if *exit_code == 0 {
+                    StepState::Completed
+                } else {
+                    StepState::Failed
+                };
+                step.exit_code = Some(*exit_code);
+                step.end_time = Some(timestamp);
+                step.pmix_prepared = false;
+                if job.state == JobState::Running && *step_id < STEP_RESERVED_MIN {
+                    job.derived_exit_code = job.derived_exit_code.max(*exit_code);
                 }
             }
             WalOperation::JobStepCreate { step } => match jobs.get(&step.job_id) {
@@ -5589,21 +6450,44 @@ impl ClusterManager {
                         "JobStepCreate: skipping step for unknown job"
                     );
                 }
-                Some(job) if job.state.is_terminal() => {
+                Some(job)
+                    if job.state != JobState::Running || job.run_attempt != step.run_attempt =>
+                {
                     warn!(
                         job_id = step.job_id,
                         step_id = step.step_id,
                         state = ?job.state,
-                        "JobStepCreate: skipping step for terminal job"
+                        job_run_attempt = job.run_attempt,
+                        step_run_attempt = step.run_attempt,
+                        "JobStepCreate: skipping step outside its running allocation"
                     );
                 }
                 Some(_) => {
                     let mut steps = self.steps.write();
-                    steps
-                        .entry((step.job_id, step.step_id))
-                        .or_insert_with(|| (**step).clone());
+                    if let std::collections::hash_map::Entry::Vacant(entry) =
+                        steps.entry((step.job_id, step.step_id))
+                    {
+                        entry.insert((**step).clone());
+                        response.step_created = true;
+                    }
                 }
             },
+            WalOperation::JobStepPmixPrepare {
+                job_id,
+                step_id,
+                run_attempt,
+                controller_term,
+            } => {
+                if let Some(step) = self.steps.write().get_mut(&(*job_id, *step_id)) {
+                    if step.state == StepState::Running
+                        && step.run_attempt == *run_attempt
+                        && step.controller_term == *controller_term
+                    {
+                        step.pmix_prepared = true;
+                        response.step_pmix_prepared = true;
+                    }
+                }
+            }
             WalOperation::JobPriorityChange {
                 job_id,
                 new_priority,
@@ -5643,6 +6527,7 @@ impl ClusterManager {
                 node_boot_id,
                 recovery_complete,
                 supports_command_polling,
+                supports_attempt_inventory,
             } => {
                 let mut node = Node::new(name.clone(), resources.clone());
                 node.hostname = if hostname.is_empty() {
@@ -5667,6 +6552,7 @@ impl ClusterManager {
                 node.node_boot_id = node_boot_id.clone();
                 node.recovery_complete = *recovery_complete;
                 node.supports_command_polling = *supports_command_polling;
+                node.supports_attempt_inventory = *supports_attempt_inventory;
                 node.last_heartbeat = Some(Utc::now());
                 if *recovery_complete {
                     node.state = node
@@ -5706,21 +6592,25 @@ impl ClusterManager {
                 node_boot_id,
                 recovery_complete,
                 supports_command_polling,
+                supports_attempt_inventory,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
                     node.agent_session_id = agent_session_id.clone();
                     node.node_boot_id = node_boot_id.clone();
                     node.recovery_complete = *recovery_complete;
                     node.supports_command_polling = *supports_command_polling;
+                    node.supports_attempt_inventory = *supports_attempt_inventory;
                     if *recovery_complete {
                         if node.admin_locked {
-                            node.state = if node.alloc_resources.cpus > 0
-                                || node.alloc_resources.has_devices()
-                            {
-                                NodeState::Draining
-                            } else {
-                                NodeState::Drain
-                            };
+                            if node.state != NodeState::Down {
+                                node.state = if node.alloc_resources.cpus > 0
+                                    || node.alloc_resources.has_devices()
+                                {
+                                    NodeState::Draining
+                                } else {
+                                    NodeState::Drain
+                                };
+                            }
                         } else {
                             node.state_reason = None;
                             node.update_state_from_alloc();
@@ -5730,6 +6620,68 @@ impl ClusterManager {
                         if !node.admin_locked {
                             node.state_reason = Some("agent recovery in progress".into());
                         }
+                    }
+                }
+                if !supports_command_polling {
+                    let mut allocations = self.allocations.write();
+                    let removed = Self::adapt_releasing_allocations_without_command_polling(
+                        name,
+                        &mut allocations,
+                        &mut self.agent_commands.write(),
+                    );
+                    if removed {
+                        self.agent_command_notify.notify_waiters();
+                    }
+                }
+            }
+            WalOperation::NodeAgentRecovery {
+                name,
+                agent_session_id,
+                node_boot_id,
+                recovery_complete,
+                supports_command_polling,
+                supports_attempt_inventory,
+            } => {
+                let Some(node) = nodes.get_mut(name) else {
+                    return ClientResponse::default();
+                };
+                if node.agent_session_id != *agent_session_id || node.node_boot_id != *node_boot_id
+                {
+                    return ClientResponse::default();
+                }
+                node.recovery_complete = *recovery_complete;
+                node.supports_command_polling = *supports_command_polling;
+                node.supports_attempt_inventory = *supports_attempt_inventory;
+                if *recovery_complete {
+                    if node.admin_locked {
+                        if node.state != NodeState::Down {
+                            node.state = if node.alloc_resources.cpus > 0
+                                || node.alloc_resources.has_devices()
+                            {
+                                NodeState::Draining
+                            } else {
+                                NodeState::Drain
+                            };
+                        }
+                    } else {
+                        node.state_reason = None;
+                        node.update_state_from_alloc();
+                    }
+                } else {
+                    node.state = NodeState::Unknown;
+                    if !node.admin_locked {
+                        node.state_reason = Some("agent recovery in progress".into());
+                    }
+                }
+                if !supports_command_polling {
+                    let mut allocations = self.allocations.write();
+                    let removed = Self::adapt_releasing_allocations_without_command_polling(
+                        name,
+                        &mut allocations,
+                        &mut self.agent_commands.write(),
+                    );
+                    if removed {
+                        self.agent_command_notify.notify_waiters();
                     }
                 }
             }
@@ -5787,7 +6739,7 @@ impl ClusterManager {
                         evicted.contains(&record.key.job_id)
                             && record.phase != AllocationPhase::Released
                     }) {
-                        record.phase = AllocationPhase::Releasing;
+                        record.phase = AllocationPhase::Released;
                     }
                     Self::rebuild_node_resource_projection(&mut nodes, &allocations);
                 }
@@ -6244,6 +7196,7 @@ impl ClusterManager {
 
     fn legacy_allocation_records(
         jobs: &HashMap<JobId, Job>,
+        nodes: &HashMap<String, Node>,
         pending_kills: &[PendingKillReservation],
     ) -> HashMap<AllocationKey, AllocationRecord> {
         let mut allocations = HashMap::new();
@@ -6284,6 +7237,9 @@ impl ClusterManager {
                 AllocationPhase::Releasing,
             );
             record.last_command_id = hold.attempt;
+            record.release_on_heartbeat_absence = nodes
+                .get(&hold.node)
+                .is_none_or(|node| !node.supports_command_polling);
             allocations.insert(key, record);
         }
         allocations
@@ -6355,6 +7311,11 @@ impl StateMachineApply for ClusterManager {
                     resources: record.resources.clone(),
                     attempt: record.last_command_id,
                     run_attempt: record.key.run_attempt,
+                    supports_command_polling: self
+                        .nodes
+                        .read()
+                        .get(&record.key.node)
+                        .is_some_and(|node| node.supports_command_polling),
                 })
                 .collect(),
             next_pending_kill_attempt: self.next_agent_command_id.load(Ordering::Relaxed),
@@ -6395,7 +7356,7 @@ impl StateMachineApply for ClusterManager {
                 .into_iter()
                 .map(|record| (record.key.clone(), record))
                 .collect(),
-            None => Self::legacy_allocation_records(&jobs, &snap.pending_kills),
+            None => Self::legacy_allocation_records(&jobs, &nodes, &snap.pending_kills),
         };
         let agent_commands: HashMap<_, _> = snap
             .agent_commands
@@ -7246,7 +8207,7 @@ fn expand_job_specs(spec: JobSpec, parent_job_id: JobId) -> anyhow::Result<Vec<J
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
 
     use super::*;
     use spur_core::job::JobSpec;
@@ -7533,6 +8494,7 @@ mod tests {
             resources: scalar_alloc(2, 4000),
             attempt: 102,
             run_attempt: 0,
+            supports_command_polling: true,
         }])
         .unwrap();
 
@@ -7552,6 +8514,124 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_hold_uses_the_apply_time_agent_capability() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_operation(&WalOperation::NodeAgentState {
+            name: "n1".into(),
+            agent_session_id: String::new(),
+            node_boot_id: String::new(),
+            recovery_complete: true,
+            supports_command_polling: false,
+            supports_attempt_inventory: true,
+        });
+        let key = AllocationKey::new(7, 3, "n1");
+
+        cm.reserve_pending_kills(vec![PendingKillReservation {
+            job_id: 7,
+            node: "n1".into(),
+            resources: scalar_alloc(1, 1000),
+            attempt: 77,
+            run_attempt: 3,
+            supports_command_polling: true,
+        }])
+        .unwrap();
+
+        let record = cm.allocation_records()[&key].clone();
+        assert!(record.release_on_heartbeat_absence);
+        assert!(cm.agent_commands(&[77]).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn command_polling_downgrade_converts_outstanding_release_holds() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let key = AllocationKey::new(7, 3, "n1");
+        cm.reserve_pending_kills(vec![PendingKillReservation {
+            job_id: 7,
+            node: "n1".into(),
+            resources: scalar_alloc(1, 1000),
+            attempt: 78,
+            run_attempt: 3,
+            supports_command_polling: true,
+        }])
+        .unwrap();
+        assert!(!cm.allocation_records()[&key].release_on_heartbeat_absence);
+        assert_eq!(cm.agent_commands(&[78]).len(), 1);
+
+        cm.apply_operation(&WalOperation::NodeAgentState {
+            name: "n1".into(),
+            agent_session_id: String::new(),
+            node_boot_id: String::new(),
+            recovery_complete: true,
+            supports_command_polling: false,
+            supports_attempt_inventory: true,
+        });
+
+        assert!(cm.allocation_records()[&key].release_on_heartbeat_absence);
+        assert!(cm.agent_commands(&[78]).is_empty());
+        cm.confirm_attempt_releases("n1", &HashSet::new()).unwrap();
+        assert!(!cm.allocation_records().contains_key(&key));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_release_ack_removes_a_purged_jobs_ledger_record() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.register_node_with_session(
+            "n1".into(),
+            "n1".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            NodeSource::NativeHost,
+            HashMap::new(),
+            "session-1".into(),
+            "boot-1".into(),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 77,
+            spec: Box::new(basic_spec("purged-release")),
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 77,
+            exit_code: -1,
+            state: JobState::Cancelled,
+        });
+        cm.note_pending_kill(77, "n1", scalar_alloc(2, 4000), 101);
+        let key = AllocationKey::new(77, 0, "n1");
+        cm.apply_operation(&WalOperation::EvictTerminalJobs { job_ids: vec![77] });
+        assert!(cm.get_job(77).is_none());
+        assert!(cm.allocation_records().contains_key(&key));
+
+        cm.acknowledge_agent_command(
+            101,
+            key.clone(),
+            "session-1".into(),
+            "boot-1".into(),
+            true,
+            Vec::new(),
+            String::new(),
+        )
+        .unwrap();
+
+        assert!(!cm.allocation_records().contains_key(&key));
+        assert!(cm.agent_commands(&[101]).is_empty());
+    }
+
     // Different run attempts are independent owners even when job and node match.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pending_kill_reserve_keeps_distinct_run_attempts() {
@@ -7563,6 +8643,7 @@ mod tests {
             resources: scalar_alloc(2, 4000),
             attempt: 101,
             run_attempt: 5,
+            supports_command_polling: true,
         }])
         .unwrap();
 
@@ -7572,6 +8653,7 @@ mod tests {
             resources: scalar_alloc(4, 8000),
             attempt: 205,
             run_attempt: 6,
+            supports_command_polling: true,
         }])
         .unwrap();
 
@@ -7597,6 +8679,7 @@ mod tests {
             resources: scalar_alloc(2, 4000),
             attempt: 101,
             run_attempt: 0,
+            supports_command_polling: true,
         }])
         .unwrap();
 
@@ -7613,20 +8696,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn old_snapshot_without_pending_kills_restores() {
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir).await;
-        let mut snapshot: serde_json::Value =
-            serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
-        let object = snapshot.as_object_mut().unwrap();
-        object.remove("pending_kills");
-        object.remove("next_pending_kill_attempt");
-
+    async fn frozen_snapshot_before_pending_kills_restores() {
+        let frozen = br#"{"jobs":[],"nodes":[],"reservations":[],"steps":[],"license_pool":{}}"#;
         let restored_dir = TempDir::new().unwrap();
         let restored = test_cluster(&restored_dir).await;
-        restored
-            .restore_from_snapshot(&serde_json::to_vec(&snapshot).unwrap())
-            .unwrap();
+        restored.restore_from_snapshot(frozen).unwrap();
 
         assert!(restored.pending_kill_reservations().is_empty());
     }
@@ -7681,6 +8755,88 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allocation_prepare_rejects_capacity_consumed_after_scheduling() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 2, 2000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("capacity-owner")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let existing = scalar_alloc(1, 1000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: existing.clone(),
+            per_node_alloc: per_node_for(&["n1"], existing),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+        });
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 2,
+            spec: Box::new(basic_spec("stale-placement")),
+        });
+
+        let requested = scalar_alloc(2, 2000);
+        let response = cm.apply_operation(&WalOperation::AllocationPrepare {
+            job_id: 2,
+            run_attempt: 1,
+            nodes: vec!["n1".into()],
+            resources: requested.clone(),
+            per_node_alloc: per_node_for(&["n1"], requested),
+            srun_step_dispatch: false,
+        });
+
+        assert!(!response.allocation_prepared);
+        let job = cm.get_job(2).unwrap();
+        assert_eq!(job.run_attempt, 0);
+        assert!(job.allocated_nodes.is_empty());
+        assert!(job.allocated_resources.is_none());
+        assert!(job.per_node_alloc.is_empty());
+        assert!(!cm
+            .allocation_records()
+            .contains_key(&AllocationKey::new(2, 1, "n1")));
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allocation_prepare_replay_does_not_count_itself_twice() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 2, 2000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("prepare-replay")),
+        });
+        let resources = scalar_alloc(2, 2000);
+        let operation = WalOperation::AllocationPrepare {
+            job_id: 1,
+            run_attempt: 1,
+            nodes: vec!["n1".into()],
+            resources: resources.clone(),
+            per_node_alloc: per_node_for(&["n1"], resources),
+            srun_step_dispatch: false,
+        };
+
+        assert!(cm.apply_operation(&operation).allocation_prepared);
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Allocated);
+        assert!(cm.apply_operation(&operation).allocation_prepared);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 2);
+        assert_eq!(
+            cm.allocation_records()
+                .values()
+                .filter(|record| record.key.job_id == 1)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn polled_commands_require_the_registered_session_and_explicit_release_ack() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -7702,6 +8858,7 @@ mod tests {
             "boot-1".into(),
             true,
             true,
+            false,
         )
         .unwrap();
         wait_for("session-aware node registration", || {
@@ -7903,51 +9060,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn snapshot_without_allocation_records_migrates_job_and_release_holds() {
-        let dir = TempDir::new().unwrap();
-        let cm = test_cluster(&dir).await;
-        register_node(&cm, "n1", 8, 16000);
-        cm.apply_operation(&WalOperation::JobSubmit {
-            job_id: 1,
-            spec: Box::new(basic_spec("legacy-snapshot")),
-        });
-        cm.apply_operation(&WalOperation::job_state_change(
-            1,
-            JobState::Pending,
-            JobState::Running,
-        ));
-        cm.apply_operation(&WalOperation::JobStart {
-            job_id: 1,
-            nodes: vec!["n1".into()],
-            resources: scalar_alloc(2, 4000),
-            per_node_alloc: per_node_for(&["n1"], scalar_alloc(2, 4000)),
-            srun_step_dispatch: false,
-            run_attempt: 3,
-        });
-        cm.note_pending_kill(9, "n1", scalar_alloc(1, 1000), 77);
-
-        let mut snapshot: serde_json::Value =
-            serde_json::from_slice(&cm.snapshot_state().unwrap()).unwrap();
-        let object = snapshot.as_object_mut().unwrap();
-        object.remove("allocations");
-        object.remove("next_agent_command_id");
-
+    async fn frozen_pre_allocation_snapshot_migrates_phases_and_projection() {
+        let frozen = include_bytes!("pre_allocation_ledger_snapshot.json");
+        let value: serde_json::Value = serde_json::from_slice(frozen).unwrap();
+        assert!(value.get("allocations").is_none());
         let restored_dir = TempDir::new().unwrap();
         let restored = test_cluster(&restored_dir).await;
-        restored
-            .restore_from_snapshot(&serde_json::to_vec(&snapshot).unwrap())
-            .unwrap();
+        restored.restore_from_snapshot(frozen).unwrap();
 
         let records = restored.allocation_records();
         assert_eq!(
-            records[&AllocationKey::new(1, 3, "n1")].phase,
+            records[&AllocationKey::new(11, 3, "legacy-a")].phase,
             AllocationPhase::Active
         );
         assert_eq!(
-            records[&AllocationKey::new(9, 0, "n1")].phase,
+            records[&AllocationKey::new(12, 4, "legacy-a")].phase,
+            AllocationPhase::Released
+        );
+        assert_eq!(
+            records[&AllocationKey::new(12, 4, "legacy-b")].phase,
             AllocationPhase::Releasing
         );
-        assert_eq!(restored.get_node("n1").unwrap().alloc_resources.cpus, 3);
+        assert!(!records.values().any(|record| record.key.job_id == 13));
+
+        let legacy_a = restored.get_node("legacy-a").unwrap();
+        assert_eq!(legacy_a.alloc_resources, scalar_alloc(2, 2000));
+        assert!(legacy_a.agent_session_id.is_empty());
+        assert!(legacy_a.node_boot_id.is_empty());
+        assert!(!legacy_a.supports_command_polling);
+        assert!(!legacy_a.supports_attempt_inventory);
+        assert!(legacy_a.recovery_complete);
+
+        let legacy_b = restored.get_node("legacy-b").unwrap();
+        assert_eq!(legacy_b.alloc_resources, scalar_alloc(1, 1000));
+        assert!(legacy_b.agent_session_id.is_empty());
+        assert!(legacy_b.node_boot_id.is_empty());
+        assert!(!legacy_b.supports_command_polling);
+        assert!(!legacy_b.supports_attempt_inventory);
+        assert!(legacy_b.recovery_complete);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7956,6 +9106,8 @@ mod tests {
         // the reservation must still protect its real allocation, not zero.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        register_node(&cm, "n2", 4, 8000);
         let mut job = make_running_job(1, &["n1", "n2"], 2);
         job.per_node_alloc.clear();
 
@@ -8101,6 +9253,31 @@ mod tests {
             .collect()
     }
 
+    fn running_step(
+        job_id: JobId,
+        step_id: u32,
+        run_attempt: u32,
+        controller_term: u64,
+    ) -> JobStep {
+        JobStep {
+            job_id,
+            step_id,
+            name: format!("step-{step_id}"),
+            state: StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            resources: ResourceAllocations::default(),
+            nodes: vec!["n1".into()],
+            distribution: spur_core::step::TaskDistribution::Block,
+            start_time: Some(Utc::now()),
+            end_time: None,
+            exit_code: None,
+            run_attempt,
+            controller_term,
+            pmix_prepared: false,
+        }
+    }
+
     /// Spin until a Raft-proposed mutation is visible in memory.
     /// In tests, `propose()` can be called before the single-node Raft
     /// has finished its initial self-election, causing `client_write` to
@@ -8137,6 +9314,11 @@ mod tests {
         wait_for(&format!("node '{n}' registered"), || {
             cm.get_node(&n).is_some()
         });
+        cm.nodes
+            .write()
+            .get_mut(&n)
+            .expect("registered test node")
+            .supports_command_polling = true;
     }
 
     fn submit_and_wait(cm: &ClusterManager, spec: JobSpec) -> JobId {
@@ -8370,6 +9552,9 @@ mod tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            run_attempt: 0,
+            controller_term: 0,
+            pmix_prepared: false,
         };
         cm.steps.write().insert((1, 0), step(1));
         cm.steps.write().insert((2, 0), step(2));
@@ -8687,11 +9872,16 @@ mod tests {
             JobState::Running,
         ));
         let t0 = chrono::Utc::now();
-        cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t0 });
+        cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: 1,
+            at: t0,
+            expected_run_attempt: Some(0),
+        });
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Suspended);
         cm.apply_operation(&WalOperation::JobResume {
             job_id: 1,
             at: t0 + chrono::Duration::seconds(25),
+            expected_run_attempt: Some(0),
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Running);
@@ -8852,17 +10042,27 @@ mod tests {
         ));
         let t0 = chrono::Utc::now();
         // Cycle 1: 10s suspended.
-        cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t0 });
+        cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: 1,
+            at: t0,
+            expected_run_attempt: Some(0),
+        });
         cm.apply_operation(&WalOperation::JobResume {
             job_id: 1,
             at: t0 + chrono::Duration::seconds(10),
+            expected_run_attempt: Some(0),
         });
         // Cycle 2: 15s suspended.
         let t1 = t0 + chrono::Duration::seconds(40);
-        cm.apply_operation(&WalOperation::JobSuspend { job_id: 1, at: t1 });
+        cm.apply_operation(&WalOperation::JobSuspend {
+            job_id: 1,
+            at: t1,
+            expected_run_attempt: Some(0),
+        });
         cm.apply_operation(&WalOperation::JobResume {
             job_id: 1,
             at: t1 + chrono::Duration::seconds(15),
+            expected_run_attempt: Some(0),
         });
         let job = cm.get_job(1).unwrap();
         assert_eq!(job.state, JobState::Running);
@@ -8892,6 +10092,7 @@ mod tests {
         cm.apply_operation(&WalOperation::JobSuspend {
             job_id: 1,
             at: since,
+            expected_run_attempt: Some(0),
         });
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
@@ -8969,6 +10170,7 @@ mod tests {
             node_boot_id: String::new(),
             recovery_complete: true,
             supports_command_polling: false,
+            supports_attempt_inventory: false,
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -9316,7 +10518,7 @@ mod tests {
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
-            per_node_alloc: per_node_for(&["worker1"], alloc),
+            per_node_alloc: per_node_for(&["worker1"], alloc.clone()),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
@@ -9358,7 +10560,7 @@ mod tests {
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
-            per_node_alloc: per_node_for(&["worker1"], alloc),
+            per_node_alloc: per_node_for(&["worker1"], alloc.clone()),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
@@ -9474,25 +10676,33 @@ mod tests {
             run_attempt: 0,
         });
 
-        // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
-        // the running max live; ExitCode is unaffected (it is the batch exit).
+        for step_id in 0..3 {
+            cm.apply_operation(&WalOperation::JobStepCreate {
+                step: Box::new(running_step(1, step_id, 0, 7)),
+            });
+        }
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
             step_id: 0,
             exit_code: 7,
+            expected_run_attempt: Some(0),
+            expected_controller_term: Some(7),
         });
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
             step_id: 1,
             exit_code: 3,
+            expected_run_attempt: Some(0),
+            expected_controller_term: Some(7),
         });
-        // 3 < 7, running max stays 7.
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
             step_id: 2,
             exit_code: 2,
+            expected_run_attempt: Some(0),
+            expected_controller_term: Some(7),
         });
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
 
@@ -9527,14 +10737,172 @@ mod tests {
             JobState::Pending,
             JobState::Running,
         ));
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(running_step(1, STEP_BATCH, 0, 7)),
+        });
 
         cm.apply_operation(&WalOperation::JobStepComplete {
             job_id: 1,
             step_id: STEP_BATCH,
             exit_code: 9,
+            expected_run_attempt: Some(0),
+            expected_controller_term: Some(7),
         });
         // Reserved step id -> derived untouched.
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_step_completion_cannot_mutate_a_replacement_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("step-replacement")),
+        });
+        cm.apply_operation(&WalOperation::JobDispatchAttempt {
+            job_id: 1,
+            run_attempt: 2,
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(1, 1000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(1, 1000)),
+            srun_step_dispatch: false,
+            run_attempt: 2,
+        });
+
+        cm.steps.write().insert((1, 0), running_step(1, 0, 1, 7));
+        let delayed = WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 0,
+            exit_code: 9,
+            expected_run_attempt: Some(1),
+            expected_controller_term: Some(7),
+        };
+        cm.apply_operation(&delayed);
+        assert_eq!(cm.steps.read()[&(1, 0)].state, StepState::Running);
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 0);
+
+        cm.steps.write().insert((1, 0), running_step(1, 0, 2, 8));
+        cm.apply_operation(&delayed);
+        let replacement = cm.steps.read()[&(1, 0)].clone();
+        assert_eq!(replacement.state, StepState::Running);
+        assert_eq!(replacement.exit_code, None);
+        assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn step_dispatch_revalidation_requires_current_job_step_epoch() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("step-revalidate")),
+        });
+        cm.apply_operation(&WalOperation::JobDispatchAttempt {
+            job_id: 1,
+            run_attempt: 2,
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let term = cm.current_term();
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(running_step(1, 0, 2, term)),
+        });
+
+        assert!(cm.step_dispatch_still_valid(1, 0, 2, term));
+        assert!(!cm.step_dispatch_still_valid(1, 0, 1, term));
+        assert!(!cm.step_dispatch_still_valid(1, 0, 2, term.saturating_sub(1)));
+        cm.jobs.write().get_mut(&1).unwrap().state = JobState::Completing;
+        assert!(!cm.step_dispatch_still_valid(1, 0, 2, term));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pmix_prepare_cannot_adopt_a_step_from_a_prior_term() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("pmix-term-fence")),
+        });
+        cm.apply_operation(&WalOperation::JobDispatchAttempt {
+            job_id: 1,
+            run_attempt: 2,
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let term = cm.current_term();
+        let prior_term = term.saturating_sub(1);
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(running_step(1, 0, 2, prior_term)),
+        });
+
+        let response = cm.apply_operation(&WalOperation::JobStepPmixPrepare {
+            job_id: 1,
+            step_id: 0,
+            run_attempt: 2,
+            controller_term: term,
+        });
+
+        assert!(!response.step_pmix_prepared);
+        let step = cm.steps.read()[&(1, 0)].clone();
+        assert_eq!(step.controller_term, prior_term);
+        assert!(!step.pmix_prepared);
+        assert!(!cm.step_dispatch_still_valid(1, 0, 2, prior_term));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn step_create_apply_requires_the_current_running_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("step-create-fence")),
+        });
+        cm.apply_operation(&WalOperation::JobDispatchAttempt {
+            job_id: 1,
+            run_attempt: 2,
+        });
+        let term = cm.current_term();
+
+        let pending = cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(running_step(1, 0, 2, term)),
+        });
+        assert!(!pending.step_created);
+        assert!(cm.get_steps(1).is_empty());
+
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let stale = cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(running_step(1, 0, 1, term)),
+        });
+        assert!(!stale.step_created);
+
+        let current = cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(running_step(1, 0, 2, term)),
+        });
+        assert!(current.step_created);
+        let duplicate = cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(running_step(1, 0, 2, term)),
+        });
+        assert!(!duplicate.step_created);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9769,6 +11137,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "time-limit-job", "worker1");
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
         cm.signal_time_limit(job_id, Utc::now()).unwrap();
         wait_for("time limit expiry recorded", || {
             cm.get_job(job_id)
@@ -9776,7 +11145,8 @@ mod tests {
         });
 
         // What spurd reports for a script that dies on SIGTERM.
-        cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+        cm.node_complete(job_id, "worker1", 0, 15, run_attempt)
+            .unwrap();
 
         let job = cm.get_job(job_id).unwrap();
         assert_eq!(job.state, JobState::Timeout);
@@ -9795,7 +11165,9 @@ mod tests {
         // The watchdog can lose the race: the job finished on its own just as
         // the deadline passed, so its verdict is already final.
         let job_id = run_job_on(&cm, "raced-job", "worker1");
-        cm.node_complete(job_id, "worker1", 0, 0, 0).unwrap();
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.node_complete(job_id, "worker1", 0, 0, run_attempt)
+            .unwrap();
         settle(&cm, job_id, JobState::Completed);
 
         cm.signal_time_limit(job_id, Utc::now()).unwrap();
@@ -9890,8 +11262,10 @@ mod tests {
         .unwrap();
         settle(&cm, job_id, JobState::Running);
 
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
         cm.signal_time_limit(job_id, Utc::now()).unwrap();
-        cm.node_complete(job_id, "worker1", 0, 15, 0).unwrap();
+        cm.node_complete(job_id, "worker1", 0, 15, run_attempt)
+            .unwrap();
 
         // Attributing the kill to the time limit is what routes a well-behaved
         // job into the requeue path at all.
@@ -10037,9 +11411,8 @@ mod tests {
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Failed);
     }
 
-    // Reported epoch 0 (legacy sentinel) must be trusted, not dropped as stale.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn node_complete_trusts_legacy_zero_epoch_report() {
+    async fn node_complete_accepts_zero_for_the_legacy_attempt() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
@@ -10059,7 +11432,7 @@ mod tests {
             resources: scalar_alloc(6, 12000),
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
-            run_attempt: 2,
+            run_attempt: 0,
         });
 
         let res = cm.node_complete(1, "n1", 0, 0, 0).unwrap();
@@ -10441,6 +11814,7 @@ mod tests {
         let job_id = run_job_on(&cm, "hold-expiry", "worker1");
         cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
         settle(&cm, job_id, JobState::Pending);
+        acknowledge_all_releases(&cm);
 
         // Simulate the hold having elapsed by moving begin_time into the past,
         // exactly as the wall clock would after the hold window.
@@ -10602,7 +11976,9 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "stranded", "worker1");
-        cm.node_complete(job_id, "worker1", -1, 0, 0).unwrap();
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.node_complete(job_id, "worker1", -1, 0, run_attempt)
+            .unwrap();
         wait_for("job reaches a terminal state", || {
             cm.get_job(job_id).is_some_and(|j| j.state.is_terminal())
         });
@@ -10669,6 +12045,7 @@ mod tests {
 
             cm.requeue_job(job_id).unwrap();
             settle(&cm, job_id, JobState::Pending);
+            acknowledge_all_releases(&cm);
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.requeue_count, attempt + 1);
@@ -10828,6 +12205,7 @@ mod tests {
         let job_id = run_job_on(&cm, "hold-lapses", "worker1");
         cm.requeue_job(job_id).unwrap();
         settle(&cm, job_id, JobState::Pending);
+        acknowledge_all_releases(&cm);
         lapse_hold(&cm, job_id);
 
         assert!(
@@ -11069,17 +12447,31 @@ mod tests {
             job_id: 1,
             nodes: vec!["worker1".into()],
             resources: alloc.clone(),
-            per_node_alloc: per_node_for(&["worker1"], alloc),
+            per_node_alloc: per_node_for(&["worker1"], alloc.clone()),
             srun_step_dispatch: false,
             run_attempt: 0,
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
         let begin_time = Utc::now() + chrono::Duration::seconds(5);
-        let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+        let hold = PendingKillReservation {
             job_id: 1,
-            begin_time,
-        });
+            node: "worker1".into(),
+            resources: alloc.clone(),
+            attempt: cm.new_pending_kill_attempt(),
+            run_attempt: 0,
+            supports_command_polling: true,
+        };
+        let transition = WalOperation::PendingKillTransition {
+            reservations: vec![hold],
+            allocation_targets: Vec::new(),
+            operation: Box::new(WalOperation::JobPreemptRequeue {
+                job_id: 1,
+                begin_time,
+                expected_run_attempt: Some(0),
+            }),
+        };
+        let resp = cm.apply_operation(&transition);
         // One op finalizes the prior run as PREEMPTED (drives accounting) ...
         assert_eq!(resp.jobs_finalized.len(), 1);
         assert_eq!(resp.jobs_finalized[0].state, JobState::Preempted);
@@ -11094,10 +12486,7 @@ mod tests {
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
         // Replay the identical entry: job is already Pending -> NoOp.
-        let replay = cm.apply_operation(&WalOperation::JobPreemptRequeue {
-            job_id: 1,
-            begin_time,
-        });
+        let replay = cm.apply_operation(&transition);
         assert!(
             replay.jobs_finalized.is_empty(),
             "replayed preempt-requeue must not re-finalize"
@@ -11113,6 +12502,125 @@ mod tests {
             "replayed preempt-requeue must not double-count"
         );
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_kill_transition_hides_the_release_hold_installation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("atomic-eviction")),
+        });
+        start_job_on(&cm, 1, "n1");
+        let run_attempt = cm.get_job(1).unwrap().run_attempt;
+        let resources = scalar_alloc(1, 1000);
+        let transition = WalOperation::PendingKillTransition {
+            reservations: vec![PendingKillReservation {
+                job_id: 1,
+                node: "n1".into(),
+                resources,
+                attempt: 77,
+                run_attempt,
+                supports_command_polling: true,
+            }],
+            allocation_targets: Vec::new(),
+            operation: Box::new(WalOperation::JobEvict {
+                job_id: 1,
+                reason: PendingReason::NodeDown,
+                detail: None,
+                run_attempt: Some(run_attempt),
+            }),
+        };
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let hook_entered = entered.clone();
+        let hook_release = release.clone();
+        *cm.allocation_transition_apply_hook.write() = Some(Arc::new(move || {
+            hook_entered.wait();
+            hook_release.wait();
+        }));
+
+        let applying = cm.clone();
+        let worker = std::thread::spawn(move || applying.apply_operation(&transition));
+        entered.wait();
+        assert!(cm.jobs.try_read().is_none());
+        assert!(cm.nodes.try_read().is_none());
+        assert!(cm.allocations.try_read().is_none());
+        release.wait();
+        let response = worker.join().unwrap();
+        cm.allocation_transition_apply_hook.write().take();
+
+        assert_eq!(response.jobs_finalized.len(), 1);
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::NodeFail);
+        let key = AllocationKey::new(1, run_attempt, "n1");
+        assert_eq!(
+            cm.allocation_records()[&key].phase,
+            AllocationPhase::Releasing
+        );
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_lifecycle_transition_hides_the_release_hold_installation() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("atomic-node-down")),
+        });
+        start_job_on(&cm, 1, "n1");
+        let run_attempt = cm.get_job(1).unwrap().run_attempt;
+        let key = AllocationKey::new(1, run_attempt, "n1");
+        let transition = WalOperation::PendingKillTransition {
+            reservations: vec![PendingKillReservation {
+                job_id: 1,
+                node: "n1".into(),
+                resources: scalar_alloc(1, 1000),
+                attempt: 78,
+                run_attempt,
+                supports_command_polling: true,
+            }],
+            allocation_targets: vec![key.clone()],
+            operation: Box::new(WalOperation::NodeStateChange {
+                name: "n1".into(),
+                old_state: NodeState::Allocated,
+                new_state: NodeState::Down,
+                reason: Some("lost".into()),
+                admin_locked: false,
+            }),
+        };
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let hook_entered = entered.clone();
+        let hook_release = release.clone();
+        *cm.allocation_transition_apply_hook.write() = Some(Arc::new(move || {
+            hook_entered.wait();
+            hook_release.wait();
+        }));
+
+        let applying = cm.clone();
+        let worker = std::thread::spawn(move || applying.apply_operation(&transition));
+        entered.wait();
+        assert!(cm.jobs.try_read().is_none());
+        assert!(cm.nodes.try_read().is_none());
+        assert!(cm.allocations.try_read().is_none());
+        release.wait();
+        let response = worker.join().unwrap();
+        cm.allocation_transition_apply_hook.write().take();
+
+        assert_eq!(response.jobs_finalized.len(), 1);
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::NodeFail);
+        assert_eq!(cm.get_node("n1").unwrap().state, NodeState::Down);
+        assert_eq!(
+            cm.allocation_records()[&key].phase,
+            AllocationPhase::Releasing
+        );
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
     }
 
     /// Drive a job to RUNNING on `node` then finalize it as PREEMPTED via the
@@ -13057,6 +14565,7 @@ mod tests {
         for _ in 0..(max + 3) {
             cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
             settle(&cm, job_id, JobState::Pending);
+            acknowledge_all_releases(&cm);
             {
                 let mut jobs = cm.jobs.write();
                 jobs.get_mut(&job_id).unwrap().spec.begin_time =
@@ -13116,6 +14625,7 @@ mod tests {
             settle(&cm, job_id, JobState::Running);
             cm.preempt_job(job_id, PreemptMode::Requeue).unwrap();
             settle(&cm, job_id, JobState::Pending);
+            acknowledge_all_releases(&cm);
             {
                 let mut jobs = cm.jobs.write();
                 jobs.get_mut(&job_id).unwrap().spec.begin_time =
@@ -13173,7 +14683,8 @@ mod tests {
         .unwrap();
         settle(&cm, job_id, JobState::Running);
 
-        cm.evict_job(job_id, PendingReason::JobLaunchFailure, 0)
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.evict_job(job_id, PendingReason::JobLaunchFailure, run_attempt)
             .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
@@ -13244,6 +14755,7 @@ mod tests {
             settle(&cm, job_id, JobState::Running);
             cm.complete_job(job_id, -1, JobState::Timeout).unwrap();
             settle(&cm, job_id, JobState::Pending);
+            acknowledge_all_releases(&cm);
         }
         assert_eq!(cm.get_job(job_id).unwrap().requeue_count, 5);
 
@@ -15757,7 +17269,8 @@ mod tests {
         settle(&cm, id, JobState::Running);
 
         // n1's dispatch succeeded, n2's never reached the agent.
-        cm.evict_job(id, PendingReason::JobLaunchFailure, 0)
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
+        cm.evict_job(id, PendingReason::JobLaunchFailure, run_attempt)
             .unwrap();
         settle(&cm, id, JobState::NodeFail);
 
@@ -15847,12 +17360,13 @@ mod tests {
             "n1 should hold both A's (2) and B's (3) allocations"
         );
 
+        let run_attempt = cm.get_job(job_a).unwrap().run_attempt;
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: job_a,
             node_name: "n1".into(),
             exit_code: 0,
             signal: 0,
-            run_attempt: 0,
+            run_attempt,
         });
         settle(&cm, job_a, JobState::Completing);
         assert_eq!(
@@ -15862,7 +17376,8 @@ mod tests {
              leaving only B's 3 cpus"
         );
 
-        cm.evict_job(job_a, PendingReason::NodeDown, 0).unwrap();
+        cm.evict_job(job_a, PendingReason::NodeDown, run_attempt)
+            .unwrap();
         settle(&cm, job_a, JobState::NodeFail);
 
         assert_eq!(
@@ -17392,6 +18907,7 @@ mod tests {
             node_boot_id: String::new(),
             recovery_complete: true,
             supports_command_polling: false,
+            supports_attempt_inventory: false,
         });
 
         assert_eq!(
@@ -17435,6 +18951,7 @@ mod tests {
             node_boot_id: String::new(),
             recovery_complete: true,
             supports_command_polling: false,
+            supports_attempt_inventory: false,
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -17486,6 +19003,7 @@ mod tests {
             node_boot_id: String::new(),
             recovery_complete: true,
             supports_command_polling: false,
+            supports_attempt_inventory: false,
         });
 
         let node = cm.get_node("gpu-node").unwrap();
@@ -17537,6 +19055,7 @@ mod tests {
             node_boot_id: String::new(),
             recovery_complete: true,
             supports_command_polling: false,
+            supports_attempt_inventory: false,
         });
 
         let node = cm.get_node("cpu-node").unwrap();
@@ -17701,12 +19220,24 @@ mod tests {
         start_job_on(&cm, id, "n1");
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
 
-        let resp = cm.apply_operation(&WalOperation::NodeStateChange {
-            name: "n1".into(),
-            old_state: NodeState::Allocated,
-            new_state: NodeState::Down,
-            reason: Some("heartbeat timeout".into()),
-            admin_locked: false,
+        let key = AllocationKey::new(id, 0, "n1");
+        let resp = cm.apply_operation(&WalOperation::PendingKillTransition {
+            reservations: vec![PendingKillReservation {
+                job_id: id,
+                node: "n1".into(),
+                resources: scalar_alloc(1, 1000),
+                attempt: cm.new_pending_kill_attempt(),
+                run_attempt: 0,
+                supports_command_polling: true,
+            }],
+            allocation_targets: vec![key],
+            operation: Box::new(WalOperation::NodeStateChange {
+                name: "n1".into(),
+                old_state: NodeState::Allocated,
+                new_state: NodeState::Down,
+                reason: Some("heartbeat timeout".into()),
+                admin_locked: false,
+            }),
         });
         assert_eq!(resp.jobs_finalized.len(), 1);
         assert_eq!(resp.jobs_finalized[0].job_id, id);
@@ -17791,6 +19322,7 @@ mod tests {
             resources: scalar_alloc(2, 4000),
             attempt: 101,
             run_attempt: 1,
+            supports_command_polling: true,
         }])
         .unwrap();
         cm.reserve_pending_kills(vec![PendingKillReservation {
@@ -17799,6 +19331,7 @@ mod tests {
             resources: scalar_alloc(1, 1000),
             attempt: 102,
             run_attempt: 1,
+            supports_command_polling: true,
         }])
         .unwrap();
 
@@ -17980,23 +19513,6 @@ mod tests {
         job
     }
 
-    fn make_test_node(name: &str, total_cpus: u32, alloc_cpus: u32) -> Node {
-        let mut node = Node::new(
-            name.into(),
-            ResourceSet {
-                cpus: total_cpus,
-                ..Default::default()
-            },
-        );
-        node.state = if alloc_cpus > 0 {
-            NodeState::Allocated
-        } else {
-            NodeState::Idle
-        };
-        node.alloc_resources = ResourceAllocations::with_scalar(alloc_cpus, 0);
-        node
-    }
-
     #[test]
     fn evict_job_locked_rejects_stale_run_attempt() {
         let mut jobs = HashMap::new();
@@ -18004,16 +19520,26 @@ mod tests {
         job.run_attempt = 5;
         jobs.insert(1, job);
 
-        let result =
-            ClusterManager::evict_job_locked(1, &mut jobs, Utc::now(), PendingReason::NodeDown, 3);
+        let result = ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            Utc::now(),
+            PendingReason::NodeDown,
+            Some(3),
+        );
         assert!(
             result.is_none(),
             "eviction targeting a superseded run must no-op"
         );
         assert_eq!(jobs[&1].state, JobState::Running, "job must be untouched");
 
-        let result =
-            ClusterManager::evict_job_locked(1, &mut jobs, Utc::now(), PendingReason::NodeDown, 5);
+        let result = ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            Utc::now(),
+            PendingReason::NodeDown,
+            Some(5),
+        );
         assert!(result.is_some(), "a matching run_attempt must still evict");
     }
 
@@ -18039,15 +19565,17 @@ mod tests {
             resources,
             attempt: cm.new_pending_kill_attempt(),
             run_attempt: attempt,
+            supports_command_polling: true,
         };
 
         let response = cm.apply_operation(&WalOperation::PendingKillTransition {
             reservations: vec![hold],
+            allocation_targets: Vec::new(),
             operation: Box::new(WalOperation::JobEvict {
                 job_id,
                 reason: PendingReason::NodeDown,
                 detail: None,
-                run_attempt: attempt + 1,
+                run_attempt: Some(attempt + 1),
             }),
         });
 
@@ -18065,7 +19593,7 @@ mod tests {
             &mut jobs,
             Utc::now(),
             PendingReason::NodeDown,
-            0,
+            None,
         );
         assert!(result.is_none());
     }
@@ -18075,9 +19603,14 @@ mod tests {
         let mut jobs = HashMap::new();
         jobs.insert(1, make_running_job(1, &["n1"], 2));
 
-        let fin =
-            ClusterManager::evict_job_locked(1, &mut jobs, Utc::now(), PendingReason::NodeDown, 0)
-                .unwrap();
+        let fin = ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            Utc::now(),
+            PendingReason::NodeDown,
+            None,
+        )
+        .unwrap();
         assert_eq!(fin.job_id, 1);
         assert_eq!(fin.state, JobState::NodeFail);
         assert_eq!(fin.exit_code, -1);
@@ -18090,28 +19623,19 @@ mod tests {
     }
 
     #[test]
-    fn evict_job_locked_does_not_mutate_resource_projection() {
-        let mut jobs = HashMap::new();
-        let mut nodes: HashMap<String, Node> = HashMap::new();
-        jobs.insert(1, make_running_job(1, &["n1", "n2"], 2));
-        nodes.insert("n1".into(), make_test_node("n1", 4, 2));
-        nodes.insert("n2".into(), make_test_node("n2", 4, 2));
-
-        ClusterManager::evict_job_locked(1, &mut jobs, Utc::now(), PendingReason::NodeDown, 0);
-
-        assert_eq!(nodes["n1"].alloc_resources.cpus, 2);
-        assert_eq!(nodes["n2"].alloc_resources.cpus, 2);
-    }
-
-    #[test]
     fn evict_job_returns_none_for_terminal_job() {
         let mut jobs = HashMap::new();
         let mut job = make_running_job(1, &["n1"], 2);
         job.state = JobState::Completed;
         jobs.insert(1, job);
 
-        let result =
-            ClusterManager::evict_job_locked(1, &mut jobs, Utc::now(), PendingReason::NodeDown, 0);
+        let result = ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            Utc::now(),
+            PendingReason::NodeDown,
+            None,
+        );
         assert!(result.is_none());
     }
 
@@ -18125,7 +19649,7 @@ mod tests {
         job.suspended_secs = 10;
         jobs.insert(1, job);
 
-        ClusterManager::evict_job_locked(1, &mut jobs, Utc::now(), PendingReason::NodeDown, 0);
+        ClusterManager::evict_job_locked(1, &mut jobs, Utc::now(), PendingReason::NodeDown, None);
 
         let job = &jobs[&1];
         assert!(job.suspended_at.is_none());
@@ -18135,32 +19659,485 @@ mod tests {
     #[test]
     fn evict_job_transitions_completing_to_nodefail() {
         let mut jobs = HashMap::new();
-        let mut nodes: HashMap<String, Node> = HashMap::new();
         let mut job = make_running_job(1, &["n1"], 2);
         job.state = JobState::Completing;
         jobs.insert(1, job);
-        nodes.insert("n1".into(), make_test_node("n1", 4, 2));
 
-        let fin =
-            ClusterManager::evict_job_locked(1, &mut jobs, Utc::now(), PendingReason::NodeDown, 0)
-                .unwrap();
+        let fin = ClusterManager::evict_job_locked(
+            1,
+            &mut jobs,
+            Utc::now(),
+            PendingReason::NodeDown,
+            None,
+        )
+        .unwrap();
         assert_eq!(fin.state, JobState::NodeFail);
         assert_eq!(jobs[&1].state, JobState::NodeFail);
-        assert_eq!(nodes["n1"].alloc_resources.cpus, 2);
     }
 
-    #[test]
-    fn evict_job_locked_does_not_change_draining_node_state() {
-        let mut jobs = HashMap::new();
-        let mut nodes: HashMap<String, Node> = HashMap::new();
-        jobs.insert(1, make_running_job(1, &["n1"], 2));
-        let mut node = make_test_node("n1", 4, 2);
-        node.state = NodeState::Draining;
-        nodes.insert("n1".into(), node);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_legacy_completion_cannot_finalize_a_replacement() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let job_id = submit_and_wait(&cm, basic_spec("legacy-completion"));
+        let resources = scalar_alloc(1, 1000);
+        let attempt = cm
+            .start_job(
+                job_id,
+                vec!["n1".into()],
+                resources.clone(),
+                per_node_for(&["n1"], resources),
+            )
+            .unwrap();
+        assert!(attempt > 0);
 
-        ClusterManager::evict_job_locked(1, &mut jobs, Utc::now(), PendingReason::NodeDown, 0);
+        assert_eq!(
+            cm.node_complete(job_id, "n1", 0, 0, 0).unwrap(),
+            NodeCompleteResult::StaleReport
+        );
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+    }
 
-        assert_eq!(nodes["n1"].state, NodeState::Draining);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn committed_stale_completion_cannot_finalize_a_replacement() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("stale-completion")),
+        });
+        cm.apply_operation(&WalOperation::JobDispatchAttempt {
+            job_id: 1,
+            run_attempt: 2,
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let resources = scalar_alloc(1, 1000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: resources.clone(),
+            per_node_alloc: per_node_for(&["n1"], resources),
+            srun_step_dispatch: false,
+            run_attempt: 2,
+        });
+
+        let response = cm.apply_operation(&WalOperation::JobCompleteForAttempt {
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::Cancelled,
+            expected_run_attempt: 1,
+        });
+
+        assert!(response.jobs_finalized.is_empty());
+        assert_eq!(cm.get_job(1).unwrap().state, JobState::Running);
+        assert_eq!(cm.get_job(1).unwrap().run_attempt, 2);
+        assert_eq!(
+            cm.allocation_records()[&AllocationKey::new(1, 2, "n1")].phase,
+            AllocationPhase::Active
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_release_hold_clears_only_after_heartbeat_absence() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let job_id = submit_and_wait(&cm, basic_spec("legacy-release"));
+        start_job_on(&cm, job_id, "n1");
+        cm.nodes
+            .write()
+            .get_mut("n1")
+            .unwrap()
+            .supports_command_polling = false;
+
+        cm.cancel_job(job_id, "testuser").unwrap();
+        settle(&cm, job_id, JobState::Cancelled);
+        assert!(cm.has_pending_kill(job_id, "n1"));
+        assert!(cm.agent_commands.read().values().all(|command| {
+            command.key.job_id != job_id || command.kind != AgentCommandKind::Release
+        }));
+
+        cm.confirm_legacy_releases("n1", &HashSet::from([job_id]))
+            .unwrap();
+        assert!(cm.has_pending_kill(job_id, "n1"));
+        cm.confirm_legacy_releases("n1", &HashSet::new()).unwrap();
+        wait_for("legacy release confirmation", || {
+            !cm.has_pending_kill(job_id, "n1")
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_requeue_keeps_capacity_held_until_heartbeat_absence() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let mut spec = basic_spec("legacy-requeue");
+        spec.requeue = true;
+        let job_id = submit_and_wait(&cm, spec);
+        start_job_on(&cm, job_id, "n1");
+        let attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.nodes
+            .write()
+            .get_mut("n1")
+            .unwrap()
+            .supports_command_polling = false;
+
+        cm.evict_job(job_id, PendingReason::NodeDown, attempt)
+            .unwrap();
+
+        let job = cm.get_job(job_id).unwrap();
+        assert_eq!(job.state, JobState::Pending);
+        assert!(cm.has_pending_kill(job_id, "n1"));
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+        assert!(cm.schedulable_nodes().is_empty());
+        cm.confirm_legacy_releases("n1", &HashSet::from([job_id]))
+            .unwrap();
+        assert!(cm.has_pending_kill(job_id, "n1"));
+        cm.confirm_legacy_releases("n1", &HashSet::new()).unwrap();
+        assert!(!cm.has_pending_kill(job_id, "n1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_agents_are_not_eligible_for_new_placement() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.nodes
+            .write()
+            .get_mut("n1")
+            .unwrap()
+            .supports_command_polling = false;
+
+        assert!(cm.schedulable_nodes().is_empty());
+        let job_id = submit_and_wait(&cm, basic_spec("legacy-prepare"));
+        let resources = scalar_alloc(1, 1000);
+        assert!(cm
+            .prepare_dispatch(
+                job_id,
+                vec!["n1".into()],
+                resources.clone(),
+                per_node_for(&["n1"], resources),
+                false,
+            )
+            .is_err());
+        assert!(cm.allocation_records().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attempt_inventory_agent_can_prepare_and_activate_without_command_polling() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.register_node_with_session(
+            "n1".into(),
+            "n1".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            "spur-k8s-operator".into(),
+            NodeSource::Kubernetes {
+                namespace: "default".into(),
+            },
+            HashMap::new(),
+            String::new(),
+            String::new(),
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+        wait_for("attempt-inventory node registration", || {
+            cm.get_node("n1")
+                .is_some_and(|node| node.supports_attempt_inventory)
+        });
+
+        assert_eq!(cm.schedulable_nodes().len(), 1);
+        let job_id = submit_and_wait(&cm, basic_spec("attempt-inventory"));
+        let resources = scalar_alloc(1, 1000);
+        let per_node = per_node_for(&["n1"], resources.clone());
+        let attempt = cm
+            .prepare_dispatch(
+                job_id,
+                vec!["n1".into()],
+                resources.clone(),
+                per_node.clone(),
+                false,
+            )
+            .unwrap();
+        cm.start_job(job_id, vec!["n1".into()], resources, per_node)
+            .unwrap();
+
+        assert_eq!(cm.get_job(job_id).unwrap().run_attempt, attempt);
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
+        assert!(cm.agent_commands.read().is_empty());
+
+        cm.abort_dispatch(job_id, attempt, &["n1".into()]).unwrap();
+        let key = AllocationKey::new(job_id, attempt, "n1");
+        assert!(cm.allocation_records()[&key].release_on_heartbeat_absence);
+        assert!(cm.agent_commands.read().is_empty());
+        cm.confirm_attempt_releases("n1", &HashSet::new()).unwrap();
+        wait_for("attempt-inventory abort release", || {
+            cm.allocation_records()[&key].phase == AllocationPhase::Released
+        });
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attempt_inventory_absence_releases_only_the_missing_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_operation(&WalOperation::NodeAgentState {
+            name: "n1".into(),
+            agent_session_id: String::new(),
+            node_boot_id: String::new(),
+            recovery_complete: true,
+            supports_command_polling: false,
+            supports_attempt_inventory: true,
+        });
+        cm.reserve_pending_kills(vec![
+            PendingKillReservation {
+                job_id: 7,
+                node: "n1".into(),
+                resources: scalar_alloc(1, 1000),
+                attempt: 101,
+                run_attempt: 1,
+                supports_command_polling: false,
+            },
+            PendingKillReservation {
+                job_id: 7,
+                node: "n1".into(),
+                resources: scalar_alloc(1, 1000),
+                attempt: 102,
+                run_attempt: 2,
+                supports_command_polling: false,
+            },
+        ])
+        .unwrap();
+
+        cm.confirm_attempt_releases("n1", &HashSet::from([(7, 2)]))
+            .unwrap();
+        wait_for("attempt-specific release confirmation", || {
+            !cm.allocation_records()
+                .contains_key(&AllocationKey::new(7, 1, "n1"))
+        });
+
+        let records = cm.allocation_records();
+        assert_eq!(
+            records[&AllocationKey::new(7, 2, "n1")].phase,
+            AllocationPhase::Releasing
+        );
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_recovery_update_cannot_replace_a_new_agent_session() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.register_node_with_session(
+            "n1".into(),
+            "n1".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8000,
+                ..Default::default()
+            },
+            "127.0.0.1".into(),
+            6818,
+            String::new(),
+            String::new(),
+            NodeSource::NativeHost,
+            HashMap::new(),
+            "new-session".into(),
+            "new-boot".into(),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+
+        cm.apply_operation(&WalOperation::NodeAgentRecovery {
+            name: "n1".into(),
+            agent_session_id: "old-session".into(),
+            node_boot_id: "old-boot".into(),
+            recovery_complete: false,
+            supports_command_polling: false,
+            supports_attempt_inventory: false,
+        });
+
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.agent_session_id, "new-session");
+        assert_eq!(node.node_boot_id, "new-boot");
+        assert!(node.recovery_complete);
+        assert!(node.supports_command_polling);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_rejects_a_node_that_went_down_after_prepare() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let job_id = submit_and_wait(&cm, basic_spec("down-race"));
+        let resources = scalar_alloc(1, 1000);
+        let attempt = cm
+            .prepare_dispatch(
+                job_id,
+                vec!["n1".into()],
+                resources.clone(),
+                per_node_for(&["n1"], resources),
+                false,
+            )
+            .unwrap();
+        let key = AllocationKey::new(job_id, attempt, "n1");
+        cm.apply_operation(&WalOperation::PendingKillTransition {
+            reservations: Vec::new(),
+            allocation_targets: Vec::new(),
+            operation: Box::new(WalOperation::NodeStateChange {
+                name: "n1".into(),
+                old_state: NodeState::Allocated,
+                new_state: NodeState::Down,
+                reason: Some("lost".into()),
+                admin_locked: false,
+            }),
+        });
+        let command =
+            AgentCommandRecord::new(991, key.clone(), AgentCommandKind::Launch, Vec::new(), 0);
+        cm.apply_operation(&WalOperation::AllocationBeginLaunch {
+            job_id,
+            run_attempt: attempt,
+            command_id: command.command_id,
+            created_at: Some(Utc::now()),
+            commands: vec![command],
+        });
+
+        let response = cm.apply_operation(&WalOperation::AllocationActivate {
+            job_id,
+            run_attempt: attempt,
+        });
+        assert!(!response.allocation_activated);
+        assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+        assert!(cm.get_job(job_id).unwrap().allocated_nodes.is_empty());
+        assert_eq!(
+            cm.allocation_records()[&key].phase,
+            AllocationPhase::Released
+        );
+        assert!(cm.agent_commands(&[991]).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prior_term_step_keeps_durable_pmix_cleanup_intent() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("step-recovery")),
+        });
+        cm.apply_operation(&WalOperation::JobDispatchAttempt {
+            job_id: 1,
+            run_attempt: 4,
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let step = JobStep {
+            job_id: 1,
+            step_id: 3,
+            name: "step".into(),
+            state: StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            resources: ResourceAllocations::default(),
+            nodes: vec!["n1".into()],
+            distribution: spur_core::step::TaskDistribution::Block,
+            start_time: Some(Utc::now()),
+            end_time: None,
+            exit_code: None,
+            run_attempt: 4,
+            controller_term: 7,
+            pmix_prepared: true,
+        };
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(step),
+        });
+
+        let pending = cm.steps_from_prior_terms(8);
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].pmix_prepared);
+        assert_eq!(pending[0].run_attempt, 4);
+        cm.apply_operation(&WalOperation::JobStepComplete {
+            job_id: 1,
+            step_id: 3,
+            exit_code: 1,
+            expected_run_attempt: Some(4),
+            expected_controller_term: Some(7),
+        });
+        assert!(cm.steps_from_prior_terms(8).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn eviction_apply_finalizes_only_steps_from_the_evicted_attempt() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("evicted-step")),
+        });
+        cm.apply_operation(&WalOperation::JobDispatchAttempt {
+            job_id: 1,
+            run_attempt: 2,
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.steps.write().insert((1, 0), running_step(1, 0, 2, 7));
+        cm.steps.write().insert((1, 1), running_step(1, 1, 1, 6));
+
+        cm.apply_operation(&WalOperation::JobEvict {
+            job_id: 1,
+            reason: PendingReason::NodeDown,
+            detail: None,
+            run_attempt: Some(2),
+        });
+
+        assert_eq!(cm.steps.read()[&(1, 0)].state, StepState::Failed);
+        assert_eq!(cm.steps.read()[&(1, 1)].state, StepState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn node_lifecycle_apply_finalizes_affected_attempt_steps() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let job_id = submit_and_wait(&cm, basic_spec("node-down-step"));
+        start_job_on(&cm, job_id, "n1");
+        let run_attempt = cm.get_job(job_id).unwrap().run_attempt;
+        cm.steps
+            .write()
+            .insert((job_id, 0), running_step(job_id, 0, run_attempt, 7));
+
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            name: "n1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("lost".into()),
+            admin_locked: false,
+        });
+
+        assert_eq!(cm.steps.read()[&(job_id, 0)].state, StepState::Failed);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -18170,8 +20147,9 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_spec("srun-alloc"));
         start_srun_job_on(&cm, id, "n1");
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
 
-        let returned = cm.finish_srun_job(id, 0, "testuser", 0).unwrap();
+        let returned = cm.finish_srun_job(id, 0, "testuser", run_attempt).unwrap();
         assert_eq!(returned.job_id, id);
         settle(&cm, id, JobState::Completed);
         assert_eq!(cm.get_job(id).unwrap().exit_code, Some(0));
@@ -18200,6 +20178,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_attempt_zero_after_dispatch() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, srun_spec("srun-zero-stale"));
+        cm.apply_operation(&WalOperation::JobDispatchAttempt {
+            job_id: id,
+            run_attempt: 1,
+        });
+        start_srun_job_on(&cm, id, "n1");
+        let current_attempt = cm.get_job(id).unwrap().run_attempt;
+        assert_ne!(current_attempt, 0);
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser", 0),
+            Err(SrunCompleteError::StaleRun {
+                job_id,
+                expected: 0,
+                actual,
+            }) if job_id == id && actual == current_attempt
+        ));
+        assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_accepts_a_true_attempt_zero_job() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(srun_spec("srun-legacy-zero")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let resources = scalar_alloc(1, 1000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: resources.clone(),
+            per_node_alloc: per_node_for(&["n1"], resources),
+            srun_step_dispatch: true,
+            run_attempt: 0,
+        });
+        assert_eq!(cm.get_job(1).unwrap().run_attempt, 0);
+
+        cm.finish_srun_job(1, 0, "testuser", 0).unwrap();
+        settle(&cm, 1, JobState::Completed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finish_srun_job_rejects_non_srun_job() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
@@ -18220,7 +20252,8 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_spec("srun-done"));
         start_srun_job_on(&cm, id, "n1");
-        cm.finish_srun_job(id, 0, "testuser", 0).unwrap();
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
+        cm.finish_srun_job(id, 0, "testuser", run_attempt).unwrap();
         settle(&cm, id, JobState::Completed);
 
         assert!(matches!(
@@ -18239,9 +20272,10 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
         let id = submit_and_wait(&cm, srun_spec("srun-owner"));
         start_srun_job_on(&cm, id, "n1");
+        let run_attempt = cm.get_job(id).unwrap().run_attempt;
 
         assert!(matches!(
-            cm.finish_srun_job(id, 0, "otheruser", 0),
+            cm.finish_srun_job(id, 0, "otheruser", run_attempt),
             Err(SrunCompleteError::NotOwner { job_id, user }) if job_id == id && user == "otheruser"
         ));
     }

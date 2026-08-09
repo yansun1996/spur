@@ -216,7 +216,7 @@ pub fn resolve_image(
 }
 
 /// How the rootfs was set up — determines cleanup strategy.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum RootfsMode {
     /// Extracted via unsquashfs — cleanup by removing the directory.
     Extracted,
@@ -233,13 +233,14 @@ pub enum RootfsMode {
 pub fn setup_rootfs(
     image_path: &Path,
     job_id: u32,
+    run_attempt: u32,
     name: Option<&str>,
 ) -> anyhow::Result<(PathBuf, RootfsMode)> {
     let cdir = container_dir();
     let base_dir = if let Some(name) = name {
         cdir.join(sanitize_name(name))
     } else {
-        cdir.join(format!("job_{}", job_id))
+        cdir.join(format!("job_{job_id}_{run_attempt}"))
     };
 
     // If named container already exists, reuse it
@@ -400,10 +401,14 @@ pub fn parse_mount(spec: &str) -> anyhow::Result<BindMount> {
 /// Clean up an unnamed container rootfs.
 ///
 /// Handles both overlay (unmount) and extracted (rm -rf) modes.
-pub fn cleanup_rootfs(job_id: u32, mode: &RootfsMode) {
-    let base_dir = container_dir().join(format!("job_{}", job_id));
+pub fn cleanup_rootfs(job_id: u32, run_attempt: u32, mode: &RootfsMode) -> anyhow::Result<()> {
+    let base_dir = container_dir().join(format!("job_{job_id}_{run_attempt}"));
+    cleanup_rootfs_at(&base_dir, mode)
+}
+
+pub(crate) fn cleanup_rootfs_at(base_dir: &Path, mode: &RootfsMode) -> anyhow::Result<()> {
     if !base_dir.exists() {
-        return;
+        return Ok(());
     }
 
     if *mode == RootfsMode::Overlay {
@@ -418,15 +423,10 @@ pub fn cleanup_rootfs(job_id: u32, mode: &RootfsMode) {
         }
     }
 
-    if let Err(e) = std::fs::remove_dir_all(&base_dir) {
-        warn!(
-            path = %base_dir.display(),
-            error = %e,
-            "failed to clean up container rootfs"
-        );
-    } else {
-        debug!(path = %base_dir.display(), "container rootfs cleaned up");
-    }
+    std::fs::remove_dir_all(base_dir)
+        .with_context(|| format!("clean up container rootfs {}", base_dir.display()))?;
+    debug!(path = %base_dir.display(), "container rootfs cleaned up");
+    Ok(())
 }
 
 /// Creates a file or directory at the mount-point destination to match the
@@ -1748,8 +1748,8 @@ mod tests {
     #[test]
     fn test_cleanup_rootfs_nonexistent() {
         // Should not panic when cleaning up a rootfs that doesn't exist
-        cleanup_rootfs(999999, &RootfsMode::Extracted);
-        cleanup_rootfs(999998, &RootfsMode::Overlay);
+        cleanup_rootfs(999999, 1, &RootfsMode::Extracted).unwrap();
+        cleanup_rootfs(999998, 1, &RootfsMode::Overlay).unwrap();
     }
 
     // --- run_hooks ---

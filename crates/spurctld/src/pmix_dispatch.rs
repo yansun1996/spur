@@ -56,6 +56,7 @@ pub async fn prepare_pmix_on_agent(
     agent_addr: &str,
     job_id: u32,
     run_attempt: u32,
+    term: u64,
     pmix_plan: spur_proto::proto::PmixLaunchPlan,
 ) -> Result<(), String> {
     let mut client = SlurmAgentClient::connect(agent_addr.to_string())
@@ -68,6 +69,7 @@ pub async fn prepare_pmix_on_agent(
             job_id,
             pmix_plan: Some(pmix_plan),
             run_attempt,
+            term,
         })
         .await
         .map_err(|e| format!("PreparePmix RPC failed: {e}"))?
@@ -81,14 +83,20 @@ pub async fn prepare_pmix_on_agent(
     }
 }
 
-pub async fn release_pmix_on_agent(agent_addr: &str, job_id: u32) {
+pub async fn release_pmix_on_agent(agent_addr: &str, job_id: u32, run_attempt: u32, term: u64) {
     let result = async {
         let mut client = SlurmAgentClient::connect(agent_addr.to_string())
             .await
             .map_err(|e| tonic::Status::unavailable(e.to_string()))?
             .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
             .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
-        client.release_pmix(ReleasePmixRequest { job_id }).await?;
+        client
+            .release_pmix(ReleasePmixRequest {
+                job_id,
+                run_attempt,
+                term,
+            })
+            .await?;
         Ok::<(), tonic::Status>(())
     }
     .await;
@@ -97,12 +105,17 @@ pub async fn release_pmix_on_agent(agent_addr: &str, job_id: u32) {
     }
 }
 
-pub async fn release_pmix_on_agents(agent_addrs: &[String], job_id: u32) {
+pub async fn release_pmix_on_agents(
+    agent_addrs: &[String],
+    job_id: u32,
+    run_attempt: u32,
+    term: u64,
+) {
     let mut release_set = tokio::task::JoinSet::new();
     for agent_addr in agent_addrs {
         let agent_addr = agent_addr.clone();
         release_set.spawn(async move {
-            release_pmix_on_agent(&agent_addr, job_id).await;
+            release_pmix_on_agent(&agent_addr, job_id, run_attempt, term).await;
         });
     }
     while release_set.join_next().await.is_some() {}
@@ -112,6 +125,7 @@ pub async fn release_pmix_on_agents(agent_addrs: &[String], job_id: u32) {
 pub async fn prepare_pmix_on_nodes(
     job_id: u32,
     run_attempt: u32,
+    term: u64,
     nodes: Vec<PmixPrepareNode>,
 ) -> Result<(), String> {
     if nodes.is_empty() {
@@ -126,7 +140,7 @@ pub async fn prepare_pmix_on_nodes(
         let node_name = node.node_name.clone();
         let pmix_plan = node.pmix_plan;
         prepare_set.spawn(async move {
-            prepare_pmix_on_agent(&agent_addr, job_id, run_attempt, pmix_plan)
+            prepare_pmix_on_agent(&agent_addr, job_id, run_attempt, term, pmix_plan)
                 .await
                 .map(|()| agent_addr)
                 .map_err(|e| format!("{node_name}: {e}"))
@@ -148,7 +162,7 @@ pub async fn prepare_pmix_on_nodes(
 
     let detail = errors.join("; ");
     error!(job_id, error = %detail, "PMIx prepare failed — rolling back prepared agents");
-    release_pmix_on_agents(&all_agent_addrs, job_id).await;
+    release_pmix_on_agents(&all_agent_addrs, job_id, run_attempt, term).await;
     Err(detail)
 }
 
@@ -156,14 +170,18 @@ pub async fn prepare_pmix_on_nodes(
 /// before the normal release path runs.
 pub struct PmixPreparedReleaseGuard {
     job_id: u32,
+    run_attempt: u32,
+    term: u64,
     agent_addrs: Vec<String>,
     release: bool,
 }
 
 impl PmixPreparedReleaseGuard {
-    pub fn new(job_id: u32, agent_addrs: Vec<String>) -> Self {
+    pub fn new(job_id: u32, run_attempt: u32, term: u64, agent_addrs: Vec<String>) -> Self {
         Self {
             job_id,
+            run_attempt,
+            term,
             agent_addrs,
             release: true,
         }
@@ -180,9 +198,11 @@ impl Drop for PmixPreparedReleaseGuard {
             return;
         }
         let job_id = self.job_id;
+        let run_attempt = self.run_attempt;
+        let term = self.term;
         let addrs = self.agent_addrs.clone();
         tokio::spawn(async move {
-            release_pmix_on_agents(&addrs, job_id).await;
+            release_pmix_on_agents(&addrs, job_id, run_attempt, term).await;
         });
     }
 }

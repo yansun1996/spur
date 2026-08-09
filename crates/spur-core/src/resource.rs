@@ -232,6 +232,63 @@ impl ResourceSet {
         true
     }
 
+    pub fn can_fit_allocation(
+        &self,
+        allocated: &ResourceAllocations,
+        request: &ResourceAllocations,
+    ) -> bool {
+        if request.cpus > self.cpus.saturating_sub(allocated.cpus)
+            || request.memory_mb > self.memory_mb.saturating_sub(allocated.memory_mb)
+        {
+            return false;
+        }
+
+        for (name, requested_devices) in &request.devices {
+            if name == "gpu" {
+                for requested in requested_devices {
+                    let requested_count = requested_devices
+                        .iter()
+                        .filter(|device| device.device_id == requested.device_id)
+                        .map(|device| device.count)
+                        .sum::<u64>();
+                    let capacity = u64::from(
+                        self.gpus
+                            .iter()
+                            .any(|gpu| gpu.device_id == requested.device_id),
+                    );
+                    let used = allocated
+                        .devices
+                        .get(name)
+                        .into_iter()
+                        .flatten()
+                        .filter(|device| device.device_id == requested.device_id)
+                        .map(|device| device.count)
+                        .sum::<u64>();
+                    if requested_count > capacity.saturating_sub(used) {
+                        return false;
+                    }
+                }
+                continue;
+            }
+
+            let requested_count = requested_devices
+                .iter()
+                .map(|device| device.count)
+                .sum::<u64>();
+            let available = self
+                .generic
+                .get(name)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(allocated.generic_count(name));
+            if requested_count > available {
+                return false;
+            }
+        }
+
+        true
+    }
+
     /// Return unallocated device IDs for an injectable gres type.
     pub fn available_device_ids(
         &self,
@@ -489,6 +546,66 @@ mod tests {
             ..Default::default()
         };
         assert!(!inventory.can_satisfy_with_allocated(&allocated, &req_two));
+    }
+
+    #[test]
+    fn exact_allocation_rejects_allocated_or_unknown_devices() {
+        let inventory = ResourceSet {
+            cpus: 8,
+            memory_mb: 16_000,
+            gpus: vec![
+                GpuResource {
+                    device_id: 3,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 192_000,
+                    peer_gpus: Vec::new(),
+                    link_type: GpuLinkType::XGMI,
+                },
+                GpuResource {
+                    device_id: 7,
+                    gpu_type: "mi300x".into(),
+                    memory_mb: 192_000,
+                    peer_gpus: Vec::new(),
+                    link_type: GpuLinkType::XGMI,
+                },
+            ],
+            generic: HashMap::from([("bandwidth".into(), 100)]),
+        };
+        let mut allocated = ResourceAllocations::with_scalar(4, 8_000);
+        allocated
+            .devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(3)]);
+        allocated.devices.insert(
+            "bandwidth".into(),
+            vec![AllocatedDevice {
+                device_id: 0,
+                count: 75,
+            }],
+        );
+
+        let mut fits = ResourceAllocations::with_scalar(4, 8_000);
+        fits.devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(7)]);
+        fits.devices.insert(
+            "bandwidth".into(),
+            vec![AllocatedDevice {
+                device_id: 0,
+                count: 25,
+            }],
+        );
+        assert!(inventory.can_fit_allocation(&allocated, &fits));
+
+        let mut allocated_gpu = fits.clone();
+        allocated_gpu
+            .devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(3)]);
+        assert!(!inventory.can_fit_allocation(&allocated, &allocated_gpu));
+
+        let mut unknown_gpu = fits;
+        unknown_gpu
+            .devices
+            .insert("gpu".into(), vec![AllocatedDevice::injectable(9)]);
+        assert!(!inventory.can_fit_allocation(&allocated, &unknown_gpu));
     }
 
     #[test]

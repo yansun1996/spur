@@ -310,6 +310,8 @@ pub struct Node {
     pub recovery_complete: bool,
     #[serde(default)]
     pub supports_command_polling: bool,
+    #[serde(default)]
+    pub supports_attempt_inventory: bool,
 
     /// Routable comm address for agent gRPC and inter-node TCP (NodeAddr).
     pub address: Option<String>,
@@ -373,6 +375,7 @@ impl Node {
             node_boot_id: String::new(),
             recovery_complete: true,
             supports_command_polling: false,
+            supports_attempt_inventory: false,
             address: None,
             port: 6818,
             wg_pubkey: None,
@@ -433,6 +436,10 @@ impl Node {
         } else {
             self.state = NodeState::Mixed;
         }
+    }
+
+    pub fn supports_safe_allocation_lifecycle(&self) -> bool {
+        self.recovery_complete && (self.supports_command_polling || self.supports_attempt_inventory)
     }
 }
 

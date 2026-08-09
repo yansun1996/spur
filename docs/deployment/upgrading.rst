@@ -138,6 +138,13 @@ unable to parse a log written by a differently-versioned peer:
 
    cargo build --release -p spur-cli -p spurctld -p spurd
 
+.. warning::
+
+   A release that adds Raft WAL operation variants requires a coordinated upgrade of every
+   controller. Drain work first, stop controller writes, replace the complete controller set,
+   and restart it together. An upgraded leader must not commit a new operation while an older
+   peer that cannot decode it remains in the quorum.
+
 Binaries roll out by content, not version string: Ansible compares checksums, so an
 unchanged re-run is a near no-op.
 
@@ -164,8 +171,9 @@ or when a short blip is acceptable:
 Rolling upgrade (``rolling_upgrade.yml``)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``rolling_upgrade.yml`` is the seamless, no-full-outage path: it upgrades one host at a
-time so the cluster keeps scheduling and running jobs throughout.
+``rolling_upgrade.yml`` is the no-full-outage path for releases whose notes confirm that their
+Raft WAL is readable by the previous controller version. It upgrades one host at a time so the
+cluster keeps scheduling and running jobs throughout.
 
 .. code-block:: bash
 
@@ -186,6 +194,9 @@ The playbook proceeds in order:
    binary, restart ``spurd``, wait for the node to re-register, then resume it
    (``scontrol update NodeName=<node> State=RESUME``).
 4. **Verify.** Submit a real test job to confirm the upgraded cluster schedules work.
+
+Do not use the serial controller phase across a WAL-variant boundary. Use a maintenance window
+and coordinated controller restart instead, then continue with the drained agent rollout.
 
 The rolling upgrade is controlled with these ``-e`` flags:
 
@@ -223,6 +234,28 @@ The rolling upgrade is controlled with these ``-e`` flags:
    single-controller cluster still has a short outage while its own controller restarts —
    true zero-downtime requires an HA quorum of 3 or more controllers.
 
+Agent restart recovery
+~~~~~~~~~~~~~~~~~~~~~~
+
+After every agent runs a version with recovery manifests, restarting ``spurd`` preserves a
+top-level batch job when it uses file-backed standard I/O and does not use PMIx. The new agent
+re-adopts the recorded PID, cgroup, exact CPU/GPU allocation, command generation, and pending
+completion obligations before it registers with the controller.
+
+Drain agents before the first upgrade to this manifest format. Older agents did not record the
+state needed for safe adoption. The upgraded agent can settle an old workload only when it can
+discover a surviving Spur cgroup; a non-root or otherwise uncgrouped process is not discoverable
+and could otherwise outlive the agent while its resources are advertised as free.
+
+PTY sessions, PMIx jobs, standalone allocations, active job steps, and process-only recovery
+evidence are not transparently adopted. If any of that evidence is live, recovery fails closed
+and settles the whole allocation before registration; an otherwise eligible file-backed batch
+process is not re-adopted separately.
+
+Spur does not yet run a ``slurmstepd``-style per-allocation supervisor. Recovery manifests and
+the batch shell's exit-status sentinel cover the supported case; preserving terminal ownership,
+file descriptors, a PMIx server, and exact wait status requires a future supervisor design.
+
 Safe Upgrade Order
 ~~~~~~~~~~~~~~~~~~~
 
@@ -230,15 +263,18 @@ Follow this order for any cluster upgrade:
 
 1. **Rebuild all three binaries together** from the same source tree — they share a Raft
    WAL schema and must stay version-matched.
-2. **Upgrade controllers before agents.** Both playbooks do this automatically, one
-   controller at a time to preserve quorum.
-3. **Drain agents before swapping binaries.** The rolling playbook drains automatically; a
-   running job blocks the swap unless you force it.
-4. **Never wipe state during an upgrade.** Keep the default ``spur_wipe_state=false``.
+2. **Drain before the first recovery-manifest upgrade or any WAL-variant boundary.** Older
+   agents cannot describe uncgrouped work, and older controllers cannot decode new operations.
+3. **Upgrade controllers before agents.** Use a coordinated all-controller restart for a new
+   WAL variant. A serial controller rollout is only safe when both versions decode the same WAL.
+4. **Upgrade the agents.** Old agents are temporarily ineligible for new scheduling after the
+   controllers move to durable allocation inventory. Capacity returns as upgraded agents
+   re-register; the rolling playbook drains each node before replacing its binary, and a running
+   job blocks the swap unless you force it.
+5. **Never wipe state during an upgrade.** Keep the default ``spur_wipe_state=false``.
    Wiping resets the Raft job-id counter and destroys accounting history.
-5. **HA membership is fixed at init** in Spur 0.3.0. You can roll new binaries onto the
-   existing controller set freely, but changing *which* hosts are controllers requires
-   ``deploy.yml -e spur_wipe_state=true``.
+6. **HA membership is fixed at init** in Spur 0.3.0. Changing *which* hosts are controllers
+   requires ``deploy.yml -e spur_wipe_state=true``.
 
 See Also
 --------

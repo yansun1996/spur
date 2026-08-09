@@ -305,40 +305,8 @@ async fn main() -> anyhow::Result<()> {
         running_jobs,
     );
 
-    match executor::recover_residual_allocations() {
-        Ok(recovered) => {
-            if recovered > 0 {
-                warn!(
-                    recovered,
-                    "removed residual job cgroups before registration"
-                );
-            }
-            reporter.mark_recovery_complete();
-        }
-        Err(error) => {
-            warn!(error = %error, "node remains unschedulable while residual jobs are cleaned");
-            let recovery_reporter = reporter.clone();
-            tokio::spawn(async move {
-                let mut retry = tokio::time::interval(std::time::Duration::from_secs(2));
-                loop {
-                    retry.tick().await;
-                    match executor::recover_residual_allocations() {
-                        Ok(_) => {
-                            recovery_reporter.mark_recovery_complete();
-                            if let Err(error) = recovery_reporter.register().await {
-                                warn!(error = %error, "failed to publish completed node recovery");
-                                continue;
-                            }
-                            break;
-                        }
-                        Err(error) => {
-                            warn!(error = %error, "residual job cleanup still incomplete");
-                        }
-                    }
-                }
-            });
-        }
-    }
+    agent_service.recover_jobs().await?;
+    reporter.mark_recovery_complete();
 
     // Register with controller
     reporter.register().await?;
@@ -347,6 +315,14 @@ async fn main() -> anyhow::Result<()> {
     let hb_reporter = reporter.clone();
     tokio::spawn(async move {
         hb_reporter.heartbeat_loop().await;
+    });
+    let recovery_service = agent_service.clone();
+    tokio::spawn(async move {
+        let mut retry = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            retry.tick().await;
+            recovery_service.report_recovered_completions().await;
+        }
     });
 
     // the RPC-driven k0s component owner is idle until the controller sends
@@ -378,26 +354,20 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         result = server_future => { result?; }
         _ = sigterm.recv() => {
-            info!("received SIGTERM, cleaning local jobs before deregistration");
-            match shutdown_service.shutdown_jobs().await {
-                Ok(()) => {
-                    let dereg_reporter = reporter.clone();
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        dereg_reporter.deregister("agent shutdown"),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => warn!(error = %e, "deregistration failed"),
-                        Err(_) => warn!("deregistration timed out"),
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "skipping deregistration because local cleanup is incomplete"
-                    );
+            shutdown_service.begin_shutdown();
+            if shutdown_service.has_active_jobs().await {
+                info!("received SIGTERM with active jobs; preserving them for restart adoption");
+            } else {
+                let dereg_reporter = reporter.clone();
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    dereg_reporter.deregister("agent shutdown"),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(error = %e, "deregistration failed"),
+                    Err(_) => warn!("deregistration timed out"),
                 }
             }
         }

@@ -136,7 +136,10 @@ impl NodeReporter {
                     resources: Some(allocations_to_proto(&allocation.exact_resources)),
                     last_command_id: allocation.last_command_id,
                     process_present,
-                    cgroup_present: process_present,
+                    cgroup_present: crate::executor::allocation_cgroup_present(
+                        allocation.job_id,
+                        allocation.run_attempt,
+                    ),
                 }
             })
             .collect()
@@ -176,6 +179,7 @@ impl NodeReporter {
                 allocation_inventory,
                 recovery_complete: self.recovery_complete.load(Ordering::Acquire),
                 supports_command_polling: true,
+                supports_attempt_inventory: false,
             })
             .await
             .context("registration failed")?;
@@ -254,6 +258,7 @@ impl NodeReporter {
                             allocation_inventory,
                             recovery_complete: self.recovery_complete.load(Ordering::Acquire),
                             supports_command_polling: true,
+                            supports_attempt_inventory: false,
                         })
                         .await
                     {
@@ -282,6 +287,8 @@ impl NodeReporter {
 /// this the agent would heartbeat into the same rejection forever.
 fn should_reregister(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::NotFound
+        || (status.code() == tonic::Code::FailedPrecondition
+            && status.message().contains("re-register"))
 }
 
 /// Discover local node resources from sysfs / /proc + device registry.

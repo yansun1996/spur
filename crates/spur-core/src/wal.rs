@@ -24,6 +24,8 @@ pub struct PendingKillReservation {
     pub attempt: u64,
     #[serde(default)]
     pub run_attempt: u32,
+    #[serde(default)]
+    pub supports_command_polling: bool,
 }
 
 /// Identity of a pending-kill hold that a node heartbeat has confirmed released.
@@ -78,18 +80,6 @@ pub enum WalOperation {
         #[serde(default)]
         commands: Vec<AgentCommandRecord>,
     },
-    AllocationBeginRelease {
-        keys: Vec<AllocationKey>,
-        command_id: u64,
-        #[serde(default)]
-        commands: Vec<AgentCommandRecord>,
-    },
-    AllocationConfirmRelease {
-        key: AllocationKey,
-        command_id: u64,
-        agent_session_id: String,
-        node_boot_id: String,
-    },
     AgentCommandAcknowledge {
         command_id: u64,
         key: AllocationKey,
@@ -104,13 +94,12 @@ pub enum WalOperation {
     AgentCommandsEnqueue {
         commands: Vec<AgentCommandRecord>,
     },
-    PendingKillReserve {
-        reservations: Vec<PendingKillReservation>,
-    },
     /// Applies a job lifecycle transition and its release holds in one Raft
     /// entry, so a leader change cannot expose the freed allocation alone.
     PendingKillTransition {
         reservations: Vec<PendingKillReservation>,
+        #[serde(default)]
+        allocation_targets: Vec<AllocationKey>,
         operation: Box<WalOperation>,
     },
     /// A heartbeat established that these exact pending-kill holds are gone.
@@ -161,6 +150,12 @@ pub enum WalOperation {
         exit_code: i32,
         state: JobState,
     },
+    JobCompleteForAttempt {
+        job_id: JobId,
+        exit_code: i32,
+        state: JobState,
+        expected_run_attempt: u32,
+    },
     JobNodeComplete {
         job_id: JobId,
         node_name: String,
@@ -177,6 +172,8 @@ pub enum WalOperation {
     JobTimeLimitSignaled {
         job_id: JobId,
         at: chrono::DateTime<chrono::Utc>,
+        #[serde(default)]
+        expected_run_attempt: Option<u32>,
     },
     /// An srun job step finished. Records the step's exit code durably so the
     /// job's DerivedExitCode (running max over steps) survives restart/replay.
@@ -184,10 +181,20 @@ pub enum WalOperation {
         job_id: JobId,
         step_id: u32,
         exit_code: i32,
+        #[serde(default)]
+        expected_run_attempt: Option<u32>,
+        #[serde(default)]
+        expected_controller_term: Option<u64>,
     },
     /// Record a job step at creation so `run_step` survives controller restart.
     JobStepCreate {
         step: Box<crate::step::JobStep>,
+    },
+    JobStepPmixPrepare {
+        job_id: JobId,
+        step_id: u32,
+        run_attempt: u32,
+        controller_term: u64,
     },
     JobPriorityChange {
         job_id: JobId,
@@ -232,16 +239,22 @@ pub enum WalOperation {
     JobPreemptRequeue {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
+        #[serde(default)]
+        expected_run_attempt: Option<u32>,
     },
     JobSuspend {
         job_id: JobId,
         /// Controller-stamped instant of suspension (for replay-deterministic accounting).
         at: chrono::DateTime<chrono::Utc>,
+        #[serde(default)]
+        expected_run_attempt: Option<u32>,
     },
     JobResume {
         job_id: JobId,
         /// Controller-stamped instant of resume.
         at: chrono::DateTime<chrono::Utc>,
+        #[serde(default)]
+        expected_run_attempt: Option<u32>,
     },
     /// Evict a single job to NodeFail: same effect as a node health-check
     /// failure, but scoped to one job. `reason` drives the requeue path
@@ -253,10 +266,10 @@ pub enum WalOperation {
         /// Human-readable bootstrap failure (shown via scontrol / logs).
         #[serde(default)]
         detail: Option<String>,
-        /// Caller's observed epoch; 0 (legacy/unfenced) always applies.
-        /// A mismatch at apply time means the job already moved on.
+        /// Caller's observed epoch. Missing on a legacy WAL entry; a present
+        /// mismatch at apply time means the job already moved on.
         #[serde(default)]
-        run_attempt: u32,
+        run_attempt: Option<u32>,
     },
     /// Record why a requeued job is back in Pending (survives controller restart).
     JobLaunchFailureDetail {
@@ -289,6 +302,8 @@ pub enum WalOperation {
         recovery_complete: bool,
         #[serde(default)]
         supports_command_polling: bool,
+        #[serde(default)]
+        supports_attempt_inventory: bool,
     },
     NodeAgentState {
         name: String,
@@ -297,6 +312,17 @@ pub enum WalOperation {
         recovery_complete: bool,
         #[serde(default)]
         supports_command_polling: bool,
+        #[serde(default)]
+        supports_attempt_inventory: bool,
+    },
+    NodeAgentRecovery {
+        name: String,
+        agent_session_id: String,
+        node_boot_id: String,
+        recovery_complete: bool,
+        supports_command_polling: bool,
+        #[serde(default)]
+        supports_attempt_inventory: bool,
     },
     NodeUpdate {
         name: String,
@@ -1036,6 +1062,7 @@ mod suspend_wal_tests {
         let op = WalOperation::JobPreemptRequeue {
             job_id: 42,
             begin_time,
+            expected_run_attempt: Some(3),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1043,9 +1070,11 @@ mod suspend_wal_tests {
             WalOperation::JobPreemptRequeue {
                 job_id,
                 begin_time: b,
+                expected_run_attempt,
             } => {
                 assert_eq!(job_id, 42);
                 assert_eq!(b, begin_time);
+                assert_eq!(expected_run_attempt, Some(3));
             }
             _ => panic!("wrong variant"),
         }
@@ -1055,8 +1084,16 @@ mod suspend_wal_tests {
     fn suspend_resume_ops_round_trip() {
         let at = chrono::Utc::now();
         for op in [
-            WalOperation::JobSuspend { job_id: 7, at },
-            WalOperation::JobResume { job_id: 7, at },
+            WalOperation::JobSuspend {
+                job_id: 7,
+                at,
+                expected_run_attempt: Some(2),
+            },
+            WalOperation::JobResume {
+                job_id: 7,
+                at,
+                expected_run_attempt: Some(2),
+            },
         ] {
             let json = serde_json::to_string(&op).unwrap();
             let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1065,27 +1102,33 @@ mod suspend_wal_tests {
                     WalOperation::JobSuspend {
                         job_id: a,
                         at: at_a,
+                        expected_run_attempt: attempt_a,
                     },
                     WalOperation::JobSuspend {
                         job_id: b,
                         at: at_b,
+                        expected_run_attempt: attempt_b,
                     },
                 ) => {
                     assert_eq!(a, b);
                     assert_eq!(at_a, at_b);
+                    assert_eq!(attempt_a, attempt_b);
                 }
                 (
                     WalOperation::JobResume {
                         job_id: a,
                         at: at_a,
+                        expected_run_attempt: attempt_a,
                     },
                     WalOperation::JobResume {
                         job_id: b,
                         at: at_b,
+                        expected_run_attempt: attempt_b,
                     },
                 ) => {
                     assert_eq!(a, b);
                     assert_eq!(at_a, at_b);
+                    assert_eq!(attempt_a, attempt_b);
                 }
                 _ => panic!("variant mismatch after round-trip"),
             }
@@ -1095,18 +1138,57 @@ mod suspend_wal_tests {
     #[test]
     fn job_time_limit_signaled_op_round_trips() {
         let at = chrono::Utc::now();
-        let op = WalOperation::JobTimeLimitSignaled { job_id: 13, at };
+        let op = WalOperation::JobTimeLimitSignaled {
+            job_id: 13,
+            at,
+            expected_run_attempt: Some(4),
+        };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
             WalOperation::JobTimeLimitSignaled {
                 job_id,
                 at: at_back,
+                expected_run_attempt,
             } => {
                 assert_eq!(job_id, 13);
                 assert_eq!(at_back, at);
+                assert_eq!(expected_run_attempt, Some(4));
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn frozen_attempt_unaware_operations_remain_unfenced() {
+        let payloads = [
+            r#"{"JobPreemptRequeue":{"job_id":1,"begin_time":"2026-01-01T00:00:00Z"}}"#,
+            r#"{"JobSuspend":{"job_id":1,"at":"2026-01-01T00:00:00Z"}}"#,
+            r#"{"JobResume":{"job_id":1,"at":"2026-01-01T00:00:00Z"}}"#,
+            r#"{"JobTimeLimitSignaled":{"job_id":1,"at":"2026-01-01T00:00:00Z"}}"#,
+        ];
+        for payload in payloads {
+            let operation: WalOperation = serde_json::from_str(payload).unwrap();
+            let attempt = match operation {
+                WalOperation::JobPreemptRequeue {
+                    expected_run_attempt,
+                    ..
+                }
+                | WalOperation::JobSuspend {
+                    expected_run_attempt,
+                    ..
+                }
+                | WalOperation::JobResume {
+                    expected_run_attempt,
+                    ..
+                }
+                | WalOperation::JobTimeLimitSignaled {
+                    expected_run_attempt,
+                    ..
+                } => expected_run_attempt,
+                _ => panic!("wrong variant"),
+            };
+            assert_eq!(attempt, None);
         }
     }
 }
@@ -1122,7 +1204,7 @@ mod evict_wal_tests {
             job_id: 9,
             reason: PendingReason::NodeDown,
             detail: Some("PMIx prepare failed".into()),
-            run_attempt: 3,
+            run_attempt: Some(3),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1136,7 +1218,7 @@ mod evict_wal_tests {
                 assert_eq!(job_id, 9);
                 assert_eq!(reason, PendingReason::NodeDown);
                 assert_eq!(detail.as_deref(), Some("PMIx prepare failed"));
-                assert_eq!(run_attempt, 3);
+                assert_eq!(run_attempt, Some(3));
             }
             _ => panic!("wrong variant"),
         }
@@ -1170,7 +1252,7 @@ mod evict_wal_tests {
                 assert_eq!(job_id, 9);
                 assert_eq!(reason, PendingReason::JobLaunchFailure);
                 assert_eq!(detail, None);
-                assert_eq!(run_attempt, 0);
+                assert_eq!(run_attempt, None);
             }
             _ => panic!("wrong variant"),
         }
@@ -1191,6 +1273,9 @@ mod evict_wal_tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            run_attempt: 2,
+            controller_term: 3,
+            pmix_prepared: false,
         };
         let op = WalOperation::JobStepCreate {
             step: Box::new(step.clone()),
@@ -1206,6 +1291,22 @@ mod evict_wal_tests {
             _ => panic!("wrong variant"),
         }
     }
+
+    #[test]
+    fn frozen_job_step_complete_defaults_to_no_expected_epoch() {
+        let frozen = r#"{"JobStepComplete":{"job_id":7,"step_id":1,"exit_code":3}}"#;
+        let operation: WalOperation = serde_json::from_str(frozen).unwrap();
+        assert!(matches!(
+            operation,
+            WalOperation::JobStepComplete {
+                job_id: 7,
+                step_id: 1,
+                exit_code: 3,
+                expected_run_attempt: None,
+                expected_controller_term: None,
+            }
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -1219,10 +1320,10 @@ mod allocation_wal_tests {
             r#"{"AllocationBeginLaunch":{"job_id":7,"run_attempt":2,"command_id":11}}"#,
             r#"{"AllocationActivate":{"job_id":7,"run_attempt":2}}"#,
             r#"{"AllocationAbort":{"job_id":7,"run_attempt":2,"releasing_nodes":["n1"],"command_id":12}}"#,
-            r#"{"AllocationBeginRelease":{"keys":[{"job_id":7,"run_attempt":2,"node":"n1"}],"command_id":13}}"#,
-            r#"{"AllocationConfirmRelease":{"key":{"job_id":7,"run_attempt":2,"node":"n1"},"command_id":13,"agent_session_id":"s1","node_boot_id":"b1"}}"#,
             r#"{"AgentCommandAcknowledge":{"command_id":13,"key":{"job_id":7,"run_attempt":2,"node":"n1"},"agent_session_id":"s1","node_boot_id":"b1","success":true}}"#,
             r#"{"AgentCommandsEnqueue":{"commands":[]}}"#,
+            r#"{"NodeAgentRecovery":{"name":"n1","agent_session_id":"s1","node_boot_id":"b1","recovery_complete":true,"supports_command_polling":true}}"#,
+            r#"{"JobCompleteForAttempt":{"job_id":7,"exit_code":0,"state":"COMPLETED","expected_run_attempt":2}}"#,
         ];
 
         for fixture in fixtures {
@@ -1231,7 +1332,7 @@ mod allocation_wal_tests {
     }
 
     #[test]
-    fn old_launch_and_release_variants_default_to_no_outbox_commands() {
+    fn old_launch_variant_defaults_to_no_outbox_commands() {
         let launch: WalOperation = serde_json::from_str(
             r#"{"AllocationBeginLaunch":{"job_id":7,"run_attempt":2,"command_id":11}}"#,
         )
@@ -1240,13 +1341,18 @@ mod allocation_wal_tests {
             launch,
             WalOperation::AllocationBeginLaunch { commands, .. } if commands.is_empty()
         ));
+    }
 
-        let release: WalOperation =
-            serde_json::from_str(r#"{"AllocationBeginRelease":{"keys":[],"command_id":12}}"#)
-                .unwrap();
+    #[test]
+    fn old_pending_kill_transition_defaults_to_no_exact_targets() {
+        let frozen = r#"{"PendingKillTransition":{"reservations":[],"operation":{"JobComplete":{"job_id":7,"exit_code":0,"state":"COMPLETED"}}}}"#;
+        let operation: WalOperation = serde_json::from_str(frozen).unwrap();
         assert!(matches!(
-            release,
-            WalOperation::AllocationBeginRelease { commands, .. } if commands.is_empty()
+            operation,
+            WalOperation::PendingKillTransition {
+                allocation_targets,
+                ..
+            } if allocation_targets.is_empty()
         ));
     }
 
@@ -1259,8 +1365,31 @@ mod allocation_wal_tests {
             WalOperation::NodeRegister {
                 recovery_complete: true,
                 supports_command_polling: false,
+                supports_attempt_inventory: false,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn old_node_agent_variants_default_to_no_attempt_inventory() {
+        let fixtures = [
+            r#"{"NodeAgentState":{"name":"n1","agent_session_id":"s1","node_boot_id":"b1","recovery_complete":true,"supports_command_polling":true}}"#,
+            r#"{"NodeAgentRecovery":{"name":"n1","agent_session_id":"s1","node_boot_id":"b1","recovery_complete":true,"supports_command_polling":true}}"#,
+        ];
+
+        for frozen in fixtures {
+            let operation: WalOperation = serde_json::from_str(frozen).unwrap();
+            assert!(matches!(
+                operation,
+                WalOperation::NodeAgentState {
+                    supports_attempt_inventory: false,
+                    ..
+                } | WalOperation::NodeAgentRecovery {
+                    supports_attempt_inventory: false,
+                    ..
+                }
+            ));
+        }
     }
 }

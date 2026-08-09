@@ -22,7 +22,7 @@ use tracing::{debug, error, info, warn};
 use crate::crd::{to_core_job_spec, SpurJob, SpurJobStatus};
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    CancelJobRequest, GetJobRequest, ReportJobStatusRequest, SubmitJobRequest,
+    CancelJobRequest, GetJobRequest, JobInfo, ReportJobStatusRequest, SubmitJobRequest,
 };
 
 const FINALIZER: &str = "spur.amd.com/cleanup";
@@ -62,6 +62,27 @@ pub(crate) struct PodTracker {
     oom: bool,
     exit_code: i32,
     message: String,
+}
+
+#[tonic::async_trait]
+trait JobLifecycleClient {
+    async fn cancel_for_deletion(&mut self, request: CancelJobRequest)
+        -> Result<(), tonic::Status>;
+    async fn get_for_deletion(&mut self, request: GetJobRequest) -> Result<JobInfo, tonic::Status>;
+}
+
+#[tonic::async_trait]
+impl JobLifecycleClient for SlurmControllerClient<Channel> {
+    async fn cancel_for_deletion(
+        &mut self,
+        request: CancelJobRequest,
+    ) -> Result<(), tonic::Status> {
+        self.cancel_job(request).await.map(|_| ())
+    }
+
+    async fn get_for_deletion(&mut self, request: GetJobRequest) -> Result<JobInfo, tonic::Status> {
+        self.get_job(request).await.map(tonic::Response::into_inner)
+    }
 }
 
 /// Reconcile a SpurJob: delegates to kube's finalizer for atomic cleanup management.
@@ -252,33 +273,70 @@ async fn handle_deletion(job: &SpurJob, ctx: &JobControllerCtx) -> Result<Action
     if let Some(job_id) = status.spur_job_id {
         if !is_terminal(&status.state) {
             let mut ctrl = ctx.ctrl_client.lock().await;
-            let _ = ctrl
-                .cancel_job(CancelJobRequest {
-                    job_id,
-                    signal: 0,
-                    user: String::new(),
-                    run_attempt: 0,
-                })
-                .await;
+            cancel_job_for_deletion(&mut *ctrl, job_id).await?;
         }
 
-        // Delete all Pods by label
-        let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
-        let lp = ListParams::default().labels(&format!("spur.amd.com/job-id={}", job_id));
-        if let Ok(pod_list) = pods.list(&lp).await {
-            for pod in pod_list {
-                let pod_name = pod.metadata.name.unwrap_or_default();
-                let _ = pods.delete(&pod_name, &DeleteParams::default()).await;
-            }
-        }
-
-        // Delete headless Service
-        let services: Api<Service> = Api::namespaced(ctx.client.clone(), &ns);
-        let svc_name = format!("spur-job-{}", job_id);
-        let _ = services.delete(&svc_name, &DeleteParams::default()).await;
+        delete_job_resources(&ctx.client, &ns, job_id).await?;
     }
 
     Ok(Action::await_change())
+}
+
+async fn cancel_job_for_deletion<C>(ctrl: &mut C, job_id: u32) -> Result<(), ReconcileError>
+where
+    C: JobLifecycleClient + Send,
+{
+    let cancel_error = match ctrl
+        .cancel_for_deletion(CancelJobRequest {
+            job_id,
+            signal: 0,
+            user: String::new(),
+            run_attempt: 0,
+        })
+        .await
+    {
+        Ok(()) => return Ok(()),
+        Err(error) if error.code() == tonic::Code::NotFound => return Ok(()),
+        Err(error) => error,
+    };
+
+    match ctrl.get_for_deletion(GetJobRequest { job_id }).await {
+        Ok(job) if is_terminal(&proto_job_state_to_string(job.state)) => Ok(()),
+        Err(error) if error.code() == tonic::Code::NotFound => Ok(()),
+        _ => Err(ReconcileError::Grpc(cancel_error)),
+    }
+}
+
+async fn delete_job_resources(
+    client: &Client,
+    namespace: &str,
+    job_id: u32,
+) -> Result<(), ReconcileError> {
+    let params = ListParams::default().labels(&format!("spur.amd.com/job-id={job_id}"));
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    for pod in pods.list(&params).await? {
+        let Some(name) = pod.metadata.name else {
+            continue;
+        };
+        match pods.delete(&name, &DeleteParams::default()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(status)) if status.code == 404 => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+    for service in services.list(&params).await? {
+        let Some(name) = service.metadata.name else {
+            continue;
+        };
+        match services.delete(&name, &DeleteParams::default()).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(status)) if status.code == 404 => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn error_policy(_job: Arc<SpurJob>, error: &ReconcileError, _ctx: Arc<JobControllerCtx>) -> Action {
@@ -853,7 +911,72 @@ fn core_job_spec_to_proto(spec: &spur_core::job::JobSpec) -> spur_proto::proto::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::{Method, Request, Response, StatusCode};
+    use kube::client::Body;
     use std::collections::BTreeMap;
+    use std::convert::Infallible;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tower::service_fn;
+
+    type SeenRequests = Arc<StdMutex<Vec<(Method, String)>>>;
+
+    fn mock_kube_client<F>(respond: F) -> (Client, SeenRequests)
+    where
+        F: Fn(&Method, &str) -> (StatusCode, serde_json::Value) + Send + Sync + 'static,
+    {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let service_seen = seen.clone();
+        let respond = Arc::new(respond);
+        let service = service_fn(move |request: Request<Body>| {
+            let method = request.method().clone();
+            let uri = request.uri().to_string();
+            service_seen
+                .lock()
+                .expect("request recorder poisoned")
+                .push((method.clone(), uri.clone()));
+            let (status, payload) = respond(&method, &uri);
+            async move {
+                Ok::<_, Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&payload).expect("serialize mock response"),
+                        ))
+                        .expect("build mock response"),
+                )
+            }
+        });
+        (Client::new(service, "default"), seen)
+    }
+
+    struct MockJobLifecycle {
+        cancel_result: Option<Result<(), tonic::Status>>,
+        get_result: Option<Result<JobInfo, tonic::Status>>,
+        get_calls: usize,
+    }
+
+    #[tonic::async_trait]
+    impl JobLifecycleClient for MockJobLifecycle {
+        async fn cancel_for_deletion(
+            &mut self,
+            _request: CancelJobRequest,
+        ) -> Result<(), tonic::Status> {
+            self.cancel_result
+                .take()
+                .expect("cancel result must be configured")
+        }
+
+        async fn get_for_deletion(
+            &mut self,
+            _request: GetJobRequest,
+        ) -> Result<JobInfo, tonic::Status> {
+            self.get_calls += 1;
+            self.get_result
+                .take()
+                .expect("get result must be configured")
+        }
+    }
 
     // --- proto_job_state_to_string ---
 
@@ -895,6 +1018,182 @@ mod tests {
         assert!(!is_terminal("Suspended"));
         assert!(!is_terminal("Unknown"));
         assert!(!is_terminal(""));
+    }
+
+    #[tokio::test]
+    async fn finalizer_retries_when_cancel_did_not_reach_a_running_job() {
+        let mut ctrl = MockJobLifecycle {
+            cancel_result: Some(Err(tonic::Status::unavailable("controller unavailable"))),
+            get_result: Some(Ok(JobInfo {
+                state: spur_core::job::JobState::Running.to_proto_i32(),
+                ..Default::default()
+            })),
+            get_calls: 0,
+        };
+
+        let error = cancel_job_for_deletion(&mut ctrl, 17)
+            .await
+            .expect_err("an unconfirmed cancel must retain the finalizer");
+
+        assert!(
+            matches!(error, ReconcileError::Grpc(ref status) if status.code() == tonic::Code::Unavailable)
+        );
+        assert_eq!(ctrl.get_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn finalizer_accepts_a_terminal_job_after_cancel_race() {
+        let mut ctrl = MockJobLifecycle {
+            cancel_result: Some(Err(tonic::Status::failed_precondition(
+                "job is already terminal",
+            ))),
+            get_result: Some(Ok(JobInfo {
+                state: spur_core::job::JobState::Completed.to_proto_i32(),
+                ..Default::default()
+            })),
+            get_calls: 0,
+        };
+
+        cancel_job_for_deletion(&mut ctrl, 17).await.unwrap();
+
+        assert_eq!(ctrl.get_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn finalizer_accepts_controller_not_found_without_followup() {
+        let mut ctrl = MockJobLifecycle {
+            cancel_result: Some(Err(tonic::Status::not_found("job not found"))),
+            get_result: None,
+            get_calls: 0,
+        };
+
+        cancel_job_for_deletion(&mut ctrl, 17).await.unwrap();
+
+        assert_eq!(ctrl.get_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn finalizer_cleanup_deletes_every_attempt_scoped_resource() {
+        let (client, seen) = mock_kube_client(|method, uri| {
+            if *method == Method::GET && uri.contains("/pods?") {
+                return (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": [
+                            {"metadata": {"name": "spur-job-17"}},
+                            {"metadata": {"name": "spur-job-17-a1"}},
+                            {"metadata": {"name": "spur-job-17-a2"}}
+                        ]
+                    }),
+                );
+            }
+            if *method == Method::GET && uri.contains("/services?") {
+                return (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ServiceList",
+                        "metadata": {},
+                        "items": [
+                            {"metadata": {"name": "spur-job-17"}},
+                            {"metadata": {"name": "spur-job-17-a1"}},
+                            {"metadata": {"name": "spur-job-17-a2"}}
+                        ]
+                    }),
+                );
+            }
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Success"
+                }),
+            )
+        });
+
+        delete_job_resources(&client, "jobs", 17).await.unwrap();
+
+        let requests = seen.lock().expect("request recorder poisoned");
+        let listed = requests
+            .iter()
+            .filter(|(method, _)| *method == Method::GET)
+            .map(|(_, uri)| uri.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|uri| {
+            uri.contains("labelSelector=") && uri.contains("spur.amd.com%2Fjob-id%3D17")
+        }));
+        for resource in ["pods", "services"] {
+            for attempt in [1, 2] {
+                let suffix = format!("/{resource}/spur-job-17-a{attempt}");
+                assert!(requests
+                    .iter()
+                    .any(|(method, uri)| *method == Method::DELETE && uri.contains(&suffix)));
+            }
+        }
+        assert!(requests.iter().any(|(method, uri)| {
+            *method == Method::DELETE
+                && uri
+                    .split('?')
+                    .next()
+                    .is_some_and(|path| path.ends_with("/services/spur-job-17"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn finalizer_cleanup_failure_is_retried() {
+        let (client, seen) = mock_kube_client(|method, uri| {
+            if *method == Method::GET && uri.contains("/pods?") {
+                return (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "PodList",
+                        "metadata": {},
+                        "items": []
+                    }),
+                );
+            }
+            if *method == Method::GET && uri.contains("/services?") {
+                return (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1",
+                        "kind": "ServiceList",
+                        "metadata": {},
+                        "items": [{"metadata": {"name": "spur-job-17-a2"}}]
+                    }),
+                );
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "message": "injected delete failure",
+                    "reason": "InternalError",
+                    "code": 500
+                }),
+            )
+        });
+
+        let error = delete_job_resources(&client, "jobs", 17)
+            .await
+            .expect_err("a failed delete must retain the finalizer for retry");
+
+        assert!(matches!(error, ReconcileError::Kube(_)));
+        assert!(seen
+            .lock()
+            .expect("request recorder poisoned")
+            .iter()
+            .any(|(method, uri)| {
+                *method == Method::DELETE && uri.contains("/services/spur-job-17-a2")
+            }));
     }
 
     // --- resolve_reporting_node ---

@@ -133,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
     // HeartbeatManager is created once so tracked nodes survive watcher restarts.
     let hb = std::sync::Arc::new(heartbeat::HeartbeatManager::new(
         args.controller_addr.clone(),
+        client.clone(),
     ));
 
     // Spawn heartbeat sender.

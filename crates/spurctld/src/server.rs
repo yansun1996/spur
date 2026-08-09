@@ -128,12 +128,19 @@ pub struct ControllerService {
     /// verification of every outstanding node token (7-day TTL), silently
     /// partitioning healthy nodes. Like Slurm's AuthType, it is restart-only.
     jwt_key: String,
+    agent_lifecycle_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 struct LeaderProxy {
     raft: Arc<RaftHandle>,
     client_addrs: BTreeMap<u64, String>,
     cached_client: Mutex<Option<(u64, SlurmControllerClient<tonic::transport::Channel>)>>,
+}
+
+#[derive(Clone, Copy)]
+struct AgentCapabilities {
+    command_polling: bool,
+    attempt_inventory: bool,
 }
 
 impl LeaderProxy {
@@ -214,6 +221,15 @@ fn resolve_startup_jwt_key(config: &spur_core::config::SlurmConfig) -> String {
 }
 
 impl ControllerService {
+    async fn agent_lifecycle_lock(&self, node: &str) -> Arc<Mutex<()>> {
+        self.agent_lifecycle_locks
+            .lock()
+            .await
+            .entry(node.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     // tonic::Status is 176 bytes (over clippy's 128-byte threshold); fixed upstream in tonic 0.13+
     #[allow(clippy::result_large_err)]
     fn check_leader<T>(&self, request: &Request<T>) -> Result<(), Status> {
@@ -247,8 +263,13 @@ impl ControllerService {
     }
 
     /// Legacy agents report job ids only. Unknown jobs may be killed, but an
-    /// omission is never interpreted as proof that an allocation was released.
+    /// omission confirms cleanup only for an already-durable release hold.
     fn reconcile_reported_allocations(&self, node: &str, reported: &[RunningJobStatus]) {
+        let reported_jobs: HashSet<_> = reported.iter().map(|status| status.job_id).collect();
+        if let Err(error) = self.cluster.confirm_legacy_releases(node, &reported_jobs) {
+            warn!(node, error = %error, "failed to confirm legacy allocation cleanup");
+            return;
+        }
         let kill = reported
             .iter()
             .filter(|r| should_kill_reported_job(&self.cluster, r.job_id, node))
@@ -288,13 +309,152 @@ impl ControllerService {
         }
     }
 
+    fn reconcile_reported_attempts(
+        &self,
+        node: &str,
+        reported: &[RunningJobStatus],
+    ) -> Result<bool, Status> {
+        use spur_core::allocation::AllocationPhase;
+
+        let reported_attempts: HashSet<_> = reported
+            .iter()
+            .map(|status| (status.job_id, status.run_attempt))
+            .collect();
+        let expected = self.cluster.allocation_records_on_node(node);
+        let missing_active: HashSet<_> = expected
+            .iter()
+            .filter(|record| {
+                record.phase == AllocationPhase::Active
+                    && !reported_attempts.contains(&(record.key.job_id, record.key.run_attempt))
+            })
+            .map(|record| (record.key.job_id, record.key.run_attempt))
+            .collect();
+        let expected_keys: HashSet<_> = expected
+            .iter()
+            .map(|record| (record.key.job_id, record.key.run_attempt))
+            .collect();
+        let reported_cleanup: Vec<_> = reported_attempts
+            .iter()
+            .filter(|(job_id, run_attempt)| {
+                !expected_keys.contains(&(*job_id, *run_attempt))
+                    || expected.iter().any(|record| {
+                        record.key.job_id == *job_id
+                            && record.key.run_attempt == *run_attempt
+                            && record.phase == AllocationPhase::Releasing
+                    })
+                    || should_kill_reported_attempt(&self.cluster, *job_id, *run_attempt, node)
+            })
+            .copied()
+            .collect();
+        let releasing_present = expected.iter().any(|record| {
+            record.phase == AllocationPhase::Releasing
+                && reported_attempts.contains(&(record.key.job_id, record.key.run_attempt))
+        });
+
+        if !missing_active.is_empty() || !reported_cleanup.is_empty() || releasing_present {
+            self.cluster
+                .update_agent_recovery(node, "", "", false, false, true)
+                .map_err(|error| Status::internal(error.to_string()))?;
+        }
+
+        for (job_id, run_attempt) in missing_active {
+            warn!(
+                job_id,
+                run_attempt, node, "attempt inventory is missing an active controller allocation"
+            );
+            self.cluster
+                .evict_job(job_id, spur_core::job::PendingReason::NodeDown, run_attempt)
+                .map_err(|error| Status::internal(error.to_string()))?;
+        }
+        self.cluster
+            .confirm_attempt_releases(node, &reported_attempts)
+            .map_err(|error| Status::internal(error.to_string()))?;
+
+        let expected = self.cluster.allocation_records_on_node(node);
+        let expected_keys: HashSet<_> = expected
+            .iter()
+            .map(|record| (record.key.job_id, record.key.run_attempt))
+            .collect();
+        let cleanup: Vec<_> = reported_attempts
+            .into_iter()
+            .filter(|(job_id, run_attempt)| {
+                !expected_keys.contains(&(*job_id, *run_attempt))
+                    || expected.iter().any(|record| {
+                        record.key.job_id == *job_id
+                            && record.key.run_attempt == *run_attempt
+                            && record.phase == AllocationPhase::Releasing
+                    })
+                    || should_kill_reported_attempt(&self.cluster, *job_id, *run_attempt, node)
+            })
+            .collect::<Vec<_>>();
+
+        let cleanup_pending = !cleanup.is_empty();
+        if cleanup_pending {
+            let cluster = self.cluster.clone();
+            let node_owned = node.to_string();
+            tokio::spawn(async move {
+                for (job_id, run_attempt) in cleanup {
+                    let record = cluster
+                        .allocation_records_on_node(&node_owned)
+                        .into_iter()
+                        .find(|record| {
+                            record.key.job_id == job_id && record.key.run_attempt == run_attempt
+                        });
+                    let still_requires_cleanup = record.is_none_or(|record| {
+                        record.phase == AllocationPhase::Releasing
+                            || should_kill_reported_attempt(
+                                &cluster,
+                                job_id,
+                                run_attempt,
+                                &node_owned,
+                            )
+                    });
+                    if !still_requires_cleanup {
+                        continue;
+                    }
+                    warn!(
+                        job_id,
+                        run_attempt,
+                        node = %node_owned,
+                        "agent holds an allocation attempt that requires cleanup"
+                    );
+                    crate::scheduler_loop::cancel_job_on_nodes(
+                        &cluster,
+                        job_id,
+                        std::slice::from_ref(&node_owned),
+                        0,
+                        run_attempt,
+                    )
+                    .await;
+                }
+            });
+        }
+
+        Ok(expected.iter().all(|record| match record.phase {
+            AllocationPhase::Active => reported.iter().any(|status| {
+                status.job_id == record.key.job_id
+                    && status.run_attempt == record.key.run_attempt
+                    && !should_kill_reported_attempt(
+                        &self.cluster,
+                        status.job_id,
+                        status.run_attempt,
+                        node,
+                    )
+            }),
+            AllocationPhase::Prepared | AllocationPhase::Launching => true,
+            AllocationPhase::Releasing => false,
+            AllocationPhase::Released => true,
+        }) && reported_cleanup.is_empty()
+            && !cleanup_pending)
+    }
+
     fn reconcile_allocation_inventory(
         &self,
         node: &str,
         agent_session_id: &str,
         node_boot_id: &str,
         agent_recovery_complete: bool,
-        supports_command_polling: bool,
+        capabilities: AgentCapabilities,
         inventory: Vec<AgentAllocationStatus>,
     ) -> Result<(), Status> {
         use spur_core::allocation::{AllocationKey, AllocationPhase};
@@ -332,17 +492,17 @@ impl ControllerService {
 
         for record in expected {
             if record.phase == AllocationPhase::Releasing {
-                reconciled = false;
                 cleanup.push(record.key.clone());
                 continue;
             }
             match reported.get(&record.key) {
-                Some((resources, present, command_id, _))
+                Some((resources, present, command_id, reported_phase))
                     if resources == &record.resources
-                        && *present
-                        && (record.phase == AllocationPhase::Launching
-                            || *command_id == record.last_command_id
-                            || record.agent_session_id.is_none()) => {}
+                        && ((record.phase == AllocationPhase::Launching
+                            && *reported_phase == Some(AgentAllocationPhase::Launching))
+                            || (*present
+                                && (*command_id == record.last_command_id
+                                    || record.agent_session_id.is_none()))) => {}
                 None if matches!(
                     record.phase,
                     AllocationPhase::Prepared | AllocationPhase::Launching
@@ -386,7 +546,8 @@ impl ControllerService {
                 agent_session_id,
                 node_boot_id,
                 reconciled,
-                supports_command_polling,
+                capabilities.command_polling,
+                capabilities.attempt_inventory,
             )
             .map_err(|error| Status::internal(error.to_string()))?;
         Ok(())
@@ -449,12 +610,20 @@ impl ControllerService {
 
     fn spawn_cancel_for_evicted(&self, evicted: &[crate::raft::JobFinalized]) {
         for fin in evicted {
-            if let Some(job) = self.cluster.get_job(fin.job_id) {
-                let cluster = self.cluster.clone();
-                tokio::spawn(async move {
-                    crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 9).await;
-                });
-            }
+            let cluster = self.cluster.clone();
+            let nodes = fin.cleanup_nodes.clone();
+            let job_id = fin.job_id;
+            let run_attempt = fin.run_attempt;
+            tokio::spawn(async move {
+                crate::scheduler_loop::send_cancel_to_nodes(
+                    &cluster,
+                    job_id,
+                    &nodes,
+                    9,
+                    run_attempt,
+                )
+                .await;
+            });
         }
     }
 
@@ -527,6 +696,32 @@ fn should_kill_reported_job(cluster: &ClusterManager, job_id: u32, node: &str) -
         }
         Some(JobState::Pending) => cluster.has_pending_kill(job_id, node),
         Some(_) => false,
+    }
+}
+
+fn should_kill_reported_attempt(
+    cluster: &ClusterManager,
+    job_id: u32,
+    run_attempt: u32,
+    node: &str,
+) -> bool {
+    use spur_core::job::JobState;
+    let Some(job) = cluster.get_job(job_id) else {
+        return true;
+    };
+    if job.run_attempt != run_attempt || job.state.is_terminal() {
+        return true;
+    }
+
+    let bound = job
+        .allocated_nodes
+        .iter()
+        .any(|allocated| allocated == node);
+    match job.state {
+        JobState::Running | JobState::Suspended | JobState::Completing | JobState::Pending => {
+            !bound
+        }
+        _ => false,
     }
 }
 
@@ -680,7 +875,10 @@ impl SlurmController for ControllerService {
         // Snapshot before cancelling so we still have allocated_nodes after.
         let job = self.cluster.get_job(job_id);
 
-        if let Err(e) = self.cluster.cancel_job(job_id, &req.user) {
+        if let Err(e) = self
+            .cluster
+            .cancel_job_for_attempt(job_id, &req.user, req.run_attempt)
+        {
             return Err(cluster_err_to_status(e));
         }
 
@@ -972,9 +1170,20 @@ impl SlurmController for ControllerService {
         if let Some(state) = req.state {
             let node_state = spur_core::node::NodeState::from_proto_i32(state)
                 .ok_or_else(|| Status::invalid_argument("invalid node state"))?;
+            let cleanup_jobs = if node_state == spur_core::node::NodeState::Down {
+                self.cluster.active_jobs_on_node(&req.name)
+            } else {
+                Vec::new()
+            };
             self.cluster
                 .update_node_state(&req.name, node_state, req.reason)
                 .map_err(|e| Status::internal(e.to_string()))?;
+            for job in cleanup_jobs {
+                let cluster = self.cluster.clone();
+                tokio::spawn(async move {
+                    crate::scheduler_loop::send_cancel_to_agents(&cluster, &job, 9).await;
+                });
+            }
         }
         if !req.labels.is_empty() || !req.remove_labels.is_empty() {
             self.cluster
@@ -1048,11 +1257,40 @@ impl SlurmController for ControllerService {
         if self.cluster.get_node(&req.name).is_none() {
             return Err(Status::not_found(format!("node {} not found", req.name)));
         }
+        if req.force {
+            self.cluster
+                .drain_node(&req.name, Some("node removal in progress".into()))
+                .map_err(|error| Status::failed_precondition(error.to_string()))?;
+            let active = self.cluster.active_jobs_on_node(&req.name);
+            if !active.is_empty() {
+                let node = self
+                    .cluster
+                    .get_node(&req.name)
+                    .ok_or_else(|| Status::not_found(format!("node {} not found", req.name)))?;
+                let agent_addr = node_comm_http_url(&node, &req.name)?;
+                let term = self.cluster.current_term();
+                for job in &active {
+                    if !crate::scheduler_loop::cancel_job_at_agent(
+                        agent_addr.clone(),
+                        job.job_id,
+                        nix::sys::signal::Signal::SIGKILL as i32,
+                        term,
+                        job.run_attempt,
+                    )
+                    .await
+                    {
+                        return Err(Status::unavailable(format!(
+                            "node {} still owns job {}; refusing removal",
+                            req.name, job.job_id
+                        )));
+                    }
+                }
+            }
+        }
         let evicted = self
             .cluster
             .remove_node(&req.name, req.force, reason)
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        self.spawn_cancel_for_evicted(&evicted);
         self.cluster.complete_evicted_steps(&evicted);
         Ok(Response::new(spur_proto::proto::DeregisterNodeResponse {
             evicted_jobs_count: evicted.len() as u32,
@@ -1094,6 +1332,9 @@ impl SlurmController for ControllerService {
             }
         }
 
+        let lifecycle_lock = self.agent_lifecycle_lock(&req.hostname).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
+
         if self.cluster.get_node(&req.hostname).is_none() {
             return Ok(Response::new(()));
         }
@@ -1106,13 +1347,13 @@ impl SlurmController for ControllerService {
                 "agent session does not match the registered node",
             ));
         }
+        let reason = Some(req.reason.clone()).filter(|value| !value.is_empty());
+        self.cluster
+            .drain_node(&req.hostname, reason.clone())
+            .map_err(|e| Status::internal(e.to_string()))?;
         let evicted = self
             .cluster
-            .remove_node(
-                &req.hostname,
-                true,
-                Some(req.reason.clone()).filter(|r| !r.is_empty()),
-            )
+            .remove_node(&req.hostname, false, reason)
             .map_err(|e| Status::internal(e.to_string()))?;
         self.spawn_cancel_for_evicted(&evicted);
         self.cluster.complete_evicted_steps(&evicted);
@@ -1293,6 +1534,7 @@ impl SlurmController for ControllerService {
         let legacy_agent = req.agent_session_id.is_empty();
         let recovery_complete = req.recovery_complete;
         let supports_command_polling = !legacy_agent && req.supports_command_polling;
+        let supports_attempt_inventory = req.supports_attempt_inventory;
         let agent_session_id = req.agent_session_id.clone();
         let node_boot_id = req.node_boot_id.clone();
 
@@ -1307,6 +1549,8 @@ impl SlurmController for ControllerService {
         let agent_port = if req.port > 0 { req.port as u16 } else { 6818 };
 
         let node_token_response = self.validate_admission(&req.join_token, &req.hostname)?;
+        let lifecycle_lock = self.agent_lifecycle_lock(&req.hostname).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
 
         let source = spur_core::node::node_source_from_registration(&req.version, &req.labels);
         self.cluster
@@ -1323,8 +1567,9 @@ impl SlurmController for ControllerService {
                 req.labels,
                 req.agent_session_id,
                 req.node_boot_id,
-                legacy_agent,
+                legacy_agent && !supports_attempt_inventory,
                 supports_command_polling,
+                supports_attempt_inventory,
             )
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -1334,7 +1579,10 @@ impl SlurmController for ControllerService {
                 &agent_session_id,
                 &node_boot_id,
                 recovery_complete,
-                supports_command_polling,
+                AgentCapabilities {
+                    command_polling: supports_command_polling,
+                    attempt_inventory: supports_attempt_inventory,
+                },
                 req.allocation_inventory,
             )?;
         }
@@ -1514,6 +1762,8 @@ impl SlurmController for ControllerService {
         }
 
         let req = request.into_inner();
+        let lifecycle_lock = self.agent_lifecycle_lock(&req.hostname).await;
+        let _lifecycle_guard = lifecycle_lock.lock().await;
 
         self.validate_agent_identity(&req.hostname, &req.node_token)?;
 
@@ -1546,14 +1796,42 @@ impl SlurmController for ControllerService {
                 info!(node = %req.hostname, "learned updated WireGuard mesh key from heartbeat");
             }
             if req.agent_session_id.is_empty() {
-                self.reconcile_reported_allocations(&req.hostname, &req.running_jobs);
+                if req.supports_attempt_inventory {
+                    let reconciled =
+                        self.reconcile_reported_attempts(&req.hostname, &req.running_jobs)?;
+                    self.cluster
+                        .update_agent_recovery(
+                            &req.hostname,
+                            &req.agent_session_id,
+                            &req.node_boot_id,
+                            reconciled,
+                            false,
+                            true,
+                        )
+                        .map_err(|error| Status::internal(error.to_string()))?;
+                } else {
+                    self.cluster
+                        .update_agent_recovery(
+                            &req.hostname,
+                            &req.agent_session_id,
+                            &req.node_boot_id,
+                            true,
+                            false,
+                            false,
+                        )
+                        .map_err(|error| Status::internal(error.to_string()))?;
+                    self.reconcile_reported_allocations(&req.hostname, &req.running_jobs);
+                }
             } else {
                 self.reconcile_allocation_inventory(
                     &req.hostname,
                     &req.agent_session_id,
                     &req.node_boot_id,
                     req.recovery_complete,
-                    req.supports_command_polling,
+                    AgentCapabilities {
+                        command_polling: req.supports_command_polling,
+                        attempt_inventory: req.supports_attempt_inventory,
+                    },
                     req.allocation_inventory,
                 )?;
             }
@@ -1860,6 +2138,9 @@ impl SlurmController for ControllerService {
             start_time: Some(chrono::Utc::now()),
             end_time: None,
             exit_code: None,
+            run_attempt: job.run_attempt,
+            controller_term: self.cluster.current_term(),
+            pmix_prepared: false,
         };
 
         self.cluster
@@ -2413,6 +2694,7 @@ impl SlurmController for ControllerService {
         let modex_connect_timeout_secs = self.cluster.config().mpi.modex_connect_timeout_secs;
         let modex_fence_timeout_secs = self.cluster.config().mpi.modex_fence_timeout_secs;
         let modex_verify_timeout_secs = self.cluster.config().mpi.modex_verify_timeout_secs;
+        let term = self.cluster.current_term();
 
         struct NodeDispatch {
             node_name: String,
@@ -2553,15 +2835,46 @@ impl SlurmController for ControllerService {
                     "multi-node PMIx step missing launch plan for one or more nodes",
                 ));
             }
+            self.cluster
+                .mark_step_pmix_prepared(job_id, step_id, run_attempt, term)
+                .map_err(|error| {
+                    Status::internal(format!("failed to persist PMIx prepare intent: {error}"))
+                })?;
             if let Err(detail) =
-                pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, prepare_nodes).await
+                pmix_dispatch::prepare_pmix_on_nodes(job_id, run_attempt, term, prepare_nodes).await
             {
+                let _ = self
+                    .cluster
+                    .record_step_complete(job_id, step_id, 1, run_attempt, term);
                 return Err(Status::failed_precondition(format!(
                     "PMIx prepare failed: {detail}"
                 )));
             }
             let addrs: Vec<String> = dispatches.iter().map(|d| d.agent_addr.clone()).collect();
-            pmix_prepare_guard = Some(pmix_dispatch::PmixPreparedReleaseGuard::new(job_id, addrs));
+            pmix_prepare_guard = Some(pmix_dispatch::PmixPreparedReleaseGuard::new(
+                job_id,
+                run_attempt,
+                term,
+                addrs,
+            ));
+        }
+
+        if !self.raft.ensure_leader().await
+            || !self
+                .cluster
+                .step_dispatch_still_valid(job_id, step_id, run_attempt, term)
+        {
+            if let Some(guard) = pmix_prepare_guard.as_mut() {
+                guard.disarm();
+                let addrs: Vec<String> = dispatches
+                    .iter()
+                    .map(|dispatch| dispatch.agent_addr.clone())
+                    .collect();
+                pmix_dispatch::release_pmix_on_agents(&addrs, job_id, run_attempt, term).await;
+            }
+            return Err(Status::failed_precondition(format!(
+                "step {step_id} for job {job_id} is no longer dispatchable"
+            )));
         }
 
         let mut set = tokio::task::JoinSet::new();
@@ -2598,6 +2911,8 @@ impl SlurmController for ControllerService {
                         pmix_plan,
                         mpi: step_mpi.clone(),
                         pmix_prepared: needs_pmix_prepare,
+                        run_attempt,
+                        term,
                     })
                     .await
                     .map_err(|e| {
@@ -2633,6 +2948,7 @@ impl SlurmController for ControllerService {
                         crate::scheduler_loop::cancel_step_on_nodes(
                             &self.cluster,
                             job_id,
+                            run_attempt,
                             step_id,
                             &step_node_names,
                             15,
@@ -2649,6 +2965,7 @@ impl SlurmController for ControllerService {
                         crate::scheduler_loop::cancel_step_on_nodes(
                             &self.cluster,
                             job_id,
+                            run_attempt,
                             step_id,
                             &step_node_names,
                             15,
@@ -2672,10 +2989,13 @@ impl SlurmController for ControllerService {
                 guard.disarm();
             }
             let addrs: Vec<String> = dispatches.iter().map(|d| d.agent_addr.clone()).collect();
-            pmix_dispatch::release_pmix_on_agents(&addrs, job_id).await;
+            pmix_dispatch::release_pmix_on_agents(&addrs, job_id, run_attempt, term).await;
         }
 
-        if let Err(e) = self.cluster.record_step_complete(job_id, step_id, max_exit) {
+        if let Err(e) =
+            self.cluster
+                .record_step_complete(job_id, step_id, max_exit, run_attempt, term)
+        {
             warn!(
                 job_id,
                 step_id,
@@ -2929,6 +3249,7 @@ pub async fn serve(
         sched_stats: sched_stats.clone(),
         control_plane_replicas,
         jwt_key,
+        agent_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
@@ -3738,6 +4059,7 @@ mod tests {
             sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
             control_plane_replicas: 1,
             jwt_key: String::new(),
+            agent_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -3896,15 +4218,16 @@ mod tests {
         assert_eq!(cluster.job_state(14), Some(JobState::Suspended));
         assert_eq!(cluster.job_state(15), Some(JobState::Preempted));
 
-        apply(&WalOperation::PendingKillReserve {
-            reservations: vec![PendingKillReservation {
+        cluster
+            .reserve_pending_kills(vec![PendingKillReservation {
                 job_id: 10,
                 node: "n1".into(),
                 resources: res.clone(),
                 attempt: 101,
                 run_attempt: 1,
-            }],
-        });
+                supports_command_polling: true,
+            }])
+            .unwrap();
 
         let stale: Vec<u32> = [10, 11, 12, 13, 14, 15, 999]
             .into_iter()
@@ -4110,6 +4433,7 @@ mod tests {
             sched_stats: std::sync::Arc::new(SchedStatsCollector::new("backfill")),
             control_plane_replicas: 1,
             jwt_key: String::new(),
+            agent_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -4227,11 +4551,256 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn legacy_heartbeat_omission_does_not_release_capacity() {
+    async fn exact_inventory_cancels_stale_and_unknown_attempts_but_not_the_replacement() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
         use spur_core::resource::ResourceAllocations;
+        use spur_core::wal::WalOperation;
 
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                &svc.cluster,
+                op,
+            );
+        };
+        apply(&WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::new(JobSpec {
+                name: "replacement".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        apply(&WalOperation::JobDispatchAttempt {
+            job_id: 7,
+            run_attempt: 2,
+        });
+        apply(&WalOperation::job_state_change(
+            7,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let resources = ResourceAllocations::with_scalar(1, 1000);
+        apply(&WalOperation::JobStart {
+            job_id: 7,
+            nodes: vec!["n1".into()],
+            resources: resources.clone(),
+            per_node_alloc: HashMap::from([("n1".into(), resources)]),
+            srun_step_dispatch: false,
+            run_attempt: 2,
+        });
+
+        let reconciled = svc
+            .reconcile_reported_attempts(
+                "n1",
+                &[
+                    RunningJobStatus {
+                        job_id: 7,
+                        run_attempt: 1,
+                        ..Default::default()
+                    },
+                    RunningJobStatus {
+                        job_id: 7,
+                        run_attempt: 2,
+                        ..Default::default()
+                    },
+                    RunningJobStatus {
+                        job_id: 999,
+                        run_attempt: 4,
+                        ..Default::default()
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert!(!reconciled);
+        assert_eq!(svc.cluster.get_job(7).unwrap().state, JobState::Running);
+        assert_eq!(svc.cluster.get_job(7).unwrap().run_attempt, 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn attempt_inventory_registration_waits_for_a_clean_heartbeat() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            supports_attempt_inventory: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        let node = svc.cluster.get_node("n1").unwrap();
+        assert!(!node.recovery_complete);
+        assert!(svc.cluster.schedulable_nodes().is_empty());
+
+        svc.heartbeat(Request::new(HeartbeatRequest {
+            hostname: "n1".into(),
+            supports_attempt_inventory: true,
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+        assert!(svc.cluster.get_node("n1").unwrap().recovery_complete);
+        assert_eq!(svc.cluster.schedulable_nodes().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exact_attempt_inventory_evicts_a_missing_active_allocation() {
+        use crate::raft::StateMachineApply;
+        use spur_core::job::{JobSpec, JobState};
+        use spur_core::node::NodeSource;
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+        use spur_core::wal::WalOperation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .register_node_with_session(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                String::new(),
+                6818,
+                String::new(),
+                String::new(),
+                NodeSource::NativeHost,
+                HashMap::new(),
+                String::new(),
+                String::new(),
+                false,
+                false,
+                true,
+            )
+            .unwrap();
+        let apply = |op: &WalOperation| {
+            <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
+                &svc.cluster,
+                op,
+            );
+        };
+        apply(&WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::new(JobSpec {
+                name: "missing-active".into(),
+                user: "alice".into(),
+                ..Default::default()
+            }),
+        });
+        apply(&WalOperation::JobDispatchAttempt {
+            job_id: 7,
+            run_attempt: 2,
+        });
+        apply(&WalOperation::job_state_change(
+            7,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let resources = ResourceAllocations::with_scalar(1, 1000);
+        apply(&WalOperation::JobStart {
+            job_id: 7,
+            nodes: vec!["n1".into()],
+            resources: resources.clone(),
+            per_node_alloc: HashMap::from([("n1".into(), resources)]),
+            srun_step_dispatch: false,
+            run_attempt: 2,
+        });
+
+        let reconciled = svc.reconcile_reported_attempts("n1", &[]).unwrap();
+
+        assert!(reconciled);
+        assert_eq!(svc.cluster.get_job(7).unwrap().state, JobState::NodeFail);
+        assert_eq!(svc.cluster.get_node("n1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reported_releasing_attempt_keeps_recovery_incomplete_until_absent() {
+        use spur_core::node::NodeSource;
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+        use spur_core::wal::PendingKillReservation;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .register_node_with_session(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                String::new(),
+                6818,
+                String::new(),
+                String::new(),
+                NodeSource::NativeHost,
+                HashMap::new(),
+                String::new(),
+                String::new(),
+                false,
+                false,
+                true,
+            )
+            .unwrap();
+        svc.cluster
+            .reserve_pending_kills(vec![PendingKillReservation {
+                job_id: 7,
+                node: "n1".into(),
+                resources: ResourceAllocations::with_scalar(1, 1000),
+                attempt: 88,
+                run_attempt: 2,
+                supports_command_polling: false,
+            }])
+            .unwrap();
+        let reported = [RunningJobStatus {
+            job_id: 7,
+            run_attempt: 2,
+            ..Default::default()
+        }];
+
+        assert!(!svc.reconcile_reported_attempts("n1", &reported).unwrap());
+        assert!(!svc.cluster.get_node("n1").unwrap().recovery_complete);
+        assert!(svc.reconcile_reported_attempts("n1", &[]).unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_heartbeat_omission_does_not_release_capacity() {
+        use spur_core::node::NodeSource;
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .register_node(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                String::new(),
+                6818,
+                String::new(),
+                String::new(),
+                NodeSource::NativeHost,
+                HashMap::new(),
+            )
+            .unwrap();
 
         svc.cluster
             .note_pending_kill(1, "n1", ResourceAllocations::with_scalar(2, 4000), 101);
@@ -4252,6 +4821,105 @@ mod tests {
             3,
             "omission alone must keep both release holds charged"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launching_inventory_without_a_process_does_not_trigger_release() {
+        use spur_core::allocation::{AgentCommandKind, AllocationKey, AllocationPhase};
+        use spur_core::job::JobSpec;
+        use spur_core::node::NodeSource;
+        use spur_core::resource::{ResourceAllocations as CoreAllocations, ResourceSet};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        svc.cluster
+            .register_node_with_session(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 4,
+                    memory_mb: 8000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                6818,
+                String::new(),
+                String::new(),
+                NodeSource::NativeHost,
+                HashMap::new(),
+                "session-1".into(),
+                "boot-1".into(),
+                true,
+                true,
+                false,
+            )
+            .unwrap();
+        let job_id = svc
+            .cluster
+            .submit_job(JobSpec {
+                name: "slow-launch".into(),
+                user: "alice".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 2,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            })
+            .unwrap()
+            .job_id;
+        let resources = CoreAllocations::with_scalar(2, 4000);
+        let attempt = svc
+            .cluster
+            .prepare_dispatch(
+                job_id,
+                vec!["n1".into()],
+                resources.clone(),
+                HashMap::from([("n1".into(), resources.clone())]),
+                false,
+            )
+            .unwrap();
+        let key = AllocationKey::new(job_id, attempt, "n1");
+        let launch = svc
+            .cluster
+            .begin_allocation_launch_commands(
+                job_id,
+                attempt,
+                vec![(key.clone(), AgentCommandKind::Launch, Vec::new())],
+            )
+            .unwrap()
+            .remove(0);
+
+        svc.reconcile_allocation_inventory(
+            "n1",
+            "session-1",
+            "boot-1",
+            true,
+            AgentCapabilities {
+                command_polling: true,
+                attempt_inventory: false,
+            },
+            vec![AgentAllocationStatus {
+                job_id,
+                run_attempt: attempt,
+                phase: AgentAllocationPhase::Launching as i32,
+                resources: Some(allocations_to_proto(&resources)),
+                last_command_id: launch.command_id,
+                process_present: false,
+                cgroup_present: false,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            svc.cluster.allocation_records()[&key].phase,
+            AllocationPhase::Launching
+        );
+        assert!(svc
+            .cluster
+            .pending_agent_commands("n1", "session-1", "boot-1")
+            .unwrap()
+            .iter()
+            .all(|command| command.key != key || command.kind != AgentCommandKind::Release));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4282,6 +4950,7 @@ mod tests {
                 "boot-1".into(),
                 true,
                 true,
+                false,
             )
             .unwrap();
         let job_id = svc
@@ -4331,7 +5000,10 @@ mod tests {
             "session-1",
             "boot-1",
             true,
-            true,
+            AgentCapabilities {
+                command_polling: true,
+                attempt_inventory: false,
+            },
             vec![AgentAllocationStatus {
                 job_id,
                 run_attempt: attempt,
@@ -4348,8 +5020,18 @@ mod tests {
             JobState::Running
         );
 
-        svc.reconcile_allocation_inventory("n1", "session-1", "boot-1", true, true, Vec::new())
-            .unwrap();
+        svc.reconcile_allocation_inventory(
+            "n1",
+            "session-1",
+            "boot-1",
+            true,
+            AgentCapabilities {
+                command_polling: true,
+                attempt_inventory: false,
+            },
+            Vec::new(),
+        )
+        .unwrap();
 
         assert_eq!(
             svc.cluster.get_job(job_id).unwrap().state,
@@ -4386,8 +5068,18 @@ mod tests {
             AllocationPhase::Releasing
         );
 
-        svc.reconcile_allocation_inventory("n1", "session-1", "boot-1", false, true, Vec::new())
-            .unwrap();
+        svc.reconcile_allocation_inventory(
+            "n1",
+            "session-1",
+            "boot-1",
+            false,
+            AgentCapabilities {
+                command_polling: true,
+                attempt_inventory: false,
+            },
+            Vec::new(),
+        )
+        .unwrap();
         let replacement = svc
             .cluster
             .pending_agent_commands("n1", "session-1", "boot-1")
@@ -4416,8 +5108,18 @@ mod tests {
         );
         assert_eq!(svc.cluster.get_node("n1").unwrap().alloc_resources.cpus, 0);
 
-        svc.reconcile_allocation_inventory("n1", "session-1", "boot-1", true, true, Vec::new())
-            .unwrap();
+        svc.reconcile_allocation_inventory(
+            "n1",
+            "session-1",
+            "boot-1",
+            true,
+            AgentCapabilities {
+                command_polling: true,
+                attempt_inventory: false,
+            },
+            Vec::new(),
+        )
+        .unwrap();
         let node = svc.cluster.get_node("n1").unwrap();
         assert!(node.recovery_complete);
         assert_eq!(node.state, NodeState::Idle);
@@ -4449,6 +5151,7 @@ mod tests {
                 "boot-1".into(),
                 true,
                 true,
+                false,
             )
             .unwrap();
 
@@ -4496,6 +5199,7 @@ mod tests {
                 "boot-1".into(),
                 true,
                 true,
+                false,
             )
             .unwrap();
 
@@ -4581,7 +5285,9 @@ mod tests {
     // each leak a step.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_job_step_unregistered_target_creates_no_step() {
+        use crate::raft::StateMachineApply;
         use spur_core::resource::{ResourceAllocations, ResourceSet};
+        use spur_core::wal::WalOperation;
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
 
@@ -4628,9 +5334,19 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        svc.cluster
-            .start_job(job_id, vec!["n1".into(), "ghost".into()], res, per_node)
-            .unwrap();
+        svc.cluster.apply_operation(&WalOperation::job_state_change(
+            job_id,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        svc.cluster.apply_operation(&WalOperation::JobStart {
+            job_id,
+            nodes: vec!["n1".into(), "ghost".into()],
+            resources: res,
+            per_node_alloc: per_node,
+            srun_step_dispatch: true,
+            run_attempt: 1,
+        });
         for _ in 0..200 {
             if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
                 break;

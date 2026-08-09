@@ -3660,6 +3660,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3784,6 +3785,7 @@ dependencies = [
  "hostname",
  "http",
  "http-body-util",
+ "nix",
  "openraft",
  "parking_lot",
  "prost",

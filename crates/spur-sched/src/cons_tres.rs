@@ -65,6 +65,7 @@ pub struct NodeAllocation {
     /// these until they exceed a TTL so a dropped launch can't pin resources.
     launching: HashMap<u32, Instant>,
     releasing: HashSet<u32>,
+    release_attempts: HashMap<u32, u32>,
 }
 
 impl NodeAllocation {
@@ -84,6 +85,7 @@ impl NodeAllocation {
             owner_last_command_ids: HashMap::new(),
             launching: HashMap::new(),
             releasing: HashSet::new(),
+            release_attempts: HashMap::new(),
         }
     }
 
@@ -158,11 +160,19 @@ impl NodeAllocation {
     }
 
     pub fn begin_release(&mut self, job_id: u32, run_attempt: u32) -> bool {
-        if !self.owns_attempt(job_id, run_attempt) {
+        if self.owners.contains_key(&job_id) && !self.owns_attempt(job_id, run_attempt) {
+            return false;
+        }
+        if self
+            .release_attempts
+            .get(&job_id)
+            .is_some_and(|attempt| run_attempt != 0 && *attempt != 0 && *attempt != run_attempt)
+        {
             return false;
         }
         self.launching.remove(&job_id);
         self.releasing.insert(job_id);
+        self.release_attempts.insert(job_id, run_attempt);
         true
     }
 
@@ -247,7 +257,7 @@ impl NodeAllocation {
         if self.launching.contains_key(&job_id) {
             return Err(AllocError::DuplicateJob);
         }
-        if self.owners.contains_key(&job_id) {
+        if self.owners.contains_key(&job_id) || self.releasing.contains(&job_id) {
             return Err(AllocError::DuplicateJob);
         }
 
@@ -306,13 +316,61 @@ impl NodeAllocation {
     pub fn commit_job(&mut self, job_id: u32) -> bool {
         self.launching.remove(&job_id);
         self.releasing.remove(&job_id);
+        self.release_attempts.remove(&job_id);
         self.owners.contains_key(&job_id)
+    }
+
+    pub fn restore_committed(
+        &mut self,
+        job_id: u32,
+        run_attempt: u32,
+        allocation: AllocationResult,
+        exact_resources: ResourceAllocations,
+    ) -> Result<(), AllocError> {
+        if self.owners.contains_key(&job_id) || self.releasing.contains(&job_id) {
+            return Err(AllocError::DuplicateJob);
+        }
+        if allocation.cpu_ids.iter().any(|cpu| {
+            self.allocated_cpus
+                .get(*cpu as usize)
+                .is_none_or(|allocated| *allocated)
+        }) {
+            return Err(AllocError::GpusUnavailable);
+        }
+        let mut gpu_indices = Vec::with_capacity(allocation.gpu_ids.len());
+        for device_id in &allocation.gpu_ids {
+            let index = self
+                .gpus
+                .iter()
+                .position(|gpu| gpu.device_id == *device_id)
+                .ok_or(AllocError::GpusUnavailable)?;
+            if self.gpu_allocated[index] || gpu_indices.contains(&index) {
+                return Err(AllocError::GpusUnavailable);
+            }
+            gpu_indices.push(index);
+        }
+        for cpu in &allocation.cpu_ids {
+            self.allocated_cpus[*cpu as usize] = true;
+        }
+        self.allocated_memory_mb = self
+            .allocated_memory_mb
+            .saturating_add(allocation.memory_mb);
+        for index in gpu_indices {
+            self.gpu_allocated[index] = true;
+        }
+        self.owners.insert(job_id, allocation);
+        self.owner_attempts.insert(job_id, run_attempt);
+        self.owner_exact_resources.insert(job_id, exact_resources);
+        self.owner_last_command_ids.insert(job_id, 0);
+        Ok(())
     }
 
     /// Release a job's allocation by id. Idempotent: releasing an unknown or
     /// already-released job is a no-op returning false.
     pub fn release_job(&mut self, job_id: u32) -> bool {
         self.launching.remove(&job_id);
+        self.releasing.remove(&job_id);
+        self.release_attempts.remove(&job_id);
         self.owner_attempts.remove(&job_id);
         self.owner_exact_resources.remove(&job_id);
         self.owner_last_command_ids.remove(&job_id);
@@ -326,10 +384,23 @@ impl NodeAllocation {
     /// Release only when `run_attempt` still owns this job id. Zero is the
     /// legacy unfenced value and deliberately releases whichever run is held.
     pub fn release_job_if_attempt(&mut self, job_id: u32, run_attempt: u32) -> bool {
-        if run_attempt != 0 && self.owner_attempts.get(&job_id) != Some(&run_attempt) {
+        if self.owners.contains_key(&job_id)
+            && run_attempt != 0
+            && self.owner_attempts.get(&job_id) != Some(&run_attempt)
+        {
             return false;
         }
-        self.release_job(job_id)
+        if self
+            .release_attempts
+            .get(&job_id)
+            .is_some_and(|attempt| run_attempt != 0 && *attempt != 0 && *attempt != run_attempt)
+        {
+            return false;
+        }
+        let owned = self.owners.contains_key(&job_id);
+        let gated = self.releasing.contains(&job_id);
+        self.release_job(job_id);
+        owned || gated
     }
 
     /// Release owned allocations whose job is neither live nor launching within

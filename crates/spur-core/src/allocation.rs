@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::job::JobId;
 use crate::resource::ResourceAllocations;
 
+pub const LAUNCH_RESERVATION_TTL_SECS: u64 = 600;
+
 /// Stable identity for one job run's allocation on one node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AllocationKey {
@@ -53,6 +55,8 @@ pub struct AllocationRecord {
     pub node_boot_id: Option<String>,
     #[serde(default)]
     pub last_command_id: u64,
+    #[serde(default)]
+    pub release_on_heartbeat_absence: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -130,6 +134,7 @@ impl AllocationRecord {
             agent_session_id: None,
             node_boot_id: None,
             last_command_id: 0,
+            release_on_heartbeat_absence: false,
             launch_started_at: None,
         }
     }
@@ -153,6 +158,7 @@ mod tests {
         assert_eq!(record.agent_session_id, None);
         assert_eq!(record.node_boot_id, None);
         assert_eq!(record.last_command_id, 0);
+        assert!(!record.release_on_heartbeat_absence);
         assert_eq!(record.launch_started_at, None);
     }
 

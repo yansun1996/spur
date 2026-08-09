@@ -46,6 +46,12 @@ pub struct JobStep {
     pub start_time: Option<DateTime<Utc>>,
     pub end_time: Option<DateTime<Utc>>,
     pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub run_attempt: u32,
+    #[serde(default)]
+    pub controller_term: u64,
+    #[serde(default)]
+    pub pmix_prepared: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,6 +372,9 @@ mod tests {
             start_time: None,
             end_time: None,
             exit_code: None,
+            run_attempt: 0,
+            controller_term: 0,
+            pmix_prepared: false,
         };
 
         assert!(!step.state.is_terminal());

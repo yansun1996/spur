@@ -6,6 +6,8 @@
 #[derive(Debug, Clone)]
 pub struct JobEntry {
     pub pid: i32,
+    pub run_attempt: u32,
+    pub cgroup_path: Option<std::path::PathBuf>,
     pub has_pid_namespace: bool,
     pub has_user_namespace: bool,
     pub has_mount_namespace: bool,
@@ -57,6 +59,8 @@ mod tests {
     fn nsenter_args_root_non_container() {
         let entry = JobEntry {
             pid: 1234,
+            run_attempt: 1,
+            cgroup_path: None,
             has_pid_namespace: true,
             has_user_namespace: false,
             has_mount_namespace: true,
@@ -72,6 +76,8 @@ mod tests {
     fn nsenter_args_root_container() {
         let entry = JobEntry {
             pid: 5678,
+            run_attempt: 1,
+            cgroup_path: None,
             has_pid_namespace: true,
             has_user_namespace: true,
             has_mount_namespace: true,
@@ -87,6 +93,8 @@ mod tests {
     fn nsenter_args_non_root_no_namespaces() {
         let entry = JobEntry {
             pid: 9999,
+            run_attempt: 1,
+            cgroup_path: None,
             has_pid_namespace: false,
             has_user_namespace: false,
             has_mount_namespace: false,
@@ -103,6 +111,8 @@ mod tests {
     fn nsenter_args_rootless_container() {
         let entry = JobEntry {
             pid: 4444,
+            run_attempt: 1,
+            cgroup_path: None,
             has_pid_namespace: true,
             has_user_namespace: true,
             has_mount_namespace: true,
