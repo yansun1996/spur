@@ -185,9 +185,10 @@ async fn main() -> anyhow::Result<()> {
     for (path, reason) in discovered_sessions.rejected {
         warn!(path = %path.display(), %reason, "ignoring unusable runtime session descriptor");
     }
-    if !discovered_sessions.live.is_empty() {
+    let recovered_runtime_sessions = discovered_sessions.live;
+    if !recovered_runtime_sessions.is_empty() {
         warn!(
-            sessions = discovered_sessions.live.len(),
+            sessions = recovered_runtime_sessions.len(),
             root = %runtime_sessions.root().display(),
             "discovered live runtime sessions before runtime reconnection is enabled"
         );
@@ -298,6 +299,7 @@ async fn main() -> anyhow::Result<()> {
     // Shared between the reporter (reads held ids for heartbeats) and the agent
     // service (owns/mutates it) so the controller can reconcile stale allocations.
     let running_jobs = agent_server::new_running_jobs();
+    agent_server::recover_runtime_sessions(&running_jobs, recovered_runtime_sessions).await;
 
     // Create the node reporter
     let reporter = Arc::new(NodeReporter::new(

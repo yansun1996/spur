@@ -162,6 +162,36 @@ pub(crate) fn new_running_jobs() -> RunningJobs {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+pub(crate) async fn recover_runtime_sessions(
+    running: &RunningJobs,
+    descriptors: Vec<crate::runtime_session::RuntimeSessionDescriptor>,
+) {
+    let mut jobs = running.lock().await;
+    for descriptor in descriptors {
+        jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
+            job: executor::RunningJob::AllocationOnly,
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            _pty_master: None,
+            work_dir: String::new(),
+            uid: 0,
+            gid: 0,
+            user: String::new(),
+            partition: String::new(),
+            gpu_devices: Vec::new(),
+            cpus: 0,
+            memory_mb: 0,
+            nodelist: String::new(),
+            mpi: String::new(),
+            run_attempt: descriptor.run_attempt,
+        });
+    }
+}
+
 type PmixLaunchSetup = (
     PmixLaunchGuard,
     PmixLaunchPlan,
