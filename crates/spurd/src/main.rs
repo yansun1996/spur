@@ -316,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
     // Shared between the reporter (reads held ids for heartbeats) and the agent
     // service (owns/mutates it) so the controller can reconcile stale allocations.
     let running_jobs = agent_server::new_running_jobs();
-    agent_server::recover_runtime_sessions(&running_jobs, recovered_runtime_sessions).await;
+    agent_server::recover_runtime_sessions(&running_jobs, recovered_runtime_sessions.clone()).await;
 
     // Create the node reporter
     let reporter = Arc::new(NodeReporter::new(
@@ -329,6 +329,12 @@ async fn main() -> anyhow::Result<()> {
         wg_iface,
         running_jobs.clone(),
     ));
+
+    agent_server::monitor_recovered_runtime_sessions(
+        running_jobs.clone(),
+        recovered_runtime_sessions,
+        args.controller.clone(),
+    );
 
     // Register with controller
     reporter.register().await?;

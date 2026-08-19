@@ -192,6 +192,60 @@ pub(crate) async fn recover_runtime_sessions(
     }
 }
 
+pub(crate) fn monitor_recovered_runtime_sessions(
+    running: RunningJobs,
+    descriptors: Vec<crate::runtime_session::RuntimeSessionDescriptor>,
+    controller_addr: String,
+) {
+    tokio::spawn(async move {
+        let mut pending: HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor> =
+            descriptors
+                .into_iter()
+                .map(|descriptor| (descriptor.job_id, descriptor))
+                .collect();
+        let hostname = hostname::get()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "localhost".into());
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        while !pending.is_empty() {
+            interval.tick().await;
+            let mut completed = Vec::new();
+            for (job_id, descriptor) in &pending {
+                match crate::runtime_session::query_state(descriptor, instance_id.clone()).await {
+                    Ok(snapshot) if !snapshot.active => completed.push((
+                        *job_id,
+                        descriptor.run_attempt,
+                        snapshot.exit_code.unwrap_or(0),
+                        snapshot.signal.unwrap_or(0),
+                    )),
+                    Ok(_) => {}
+                    Err(error) => warn!(
+                        job_id,
+                        run_attempt = descriptor.run_attempt,
+                        %error,
+                        "recovered runtime state query failed"
+                    ),
+                }
+            }
+            for (job_id, run_attempt, exit_code, signal) in completed {
+                pending.remove(&job_id);
+                running.lock().await.remove(&job_id);
+                report_completion(
+                    &controller_addr,
+                    job_id,
+                    exit_code,
+                    signal,
+                    run_attempt,
+                    &hostname,
+                    None,
+                )
+                .await;
+            }
+        }
+    });
+}
+
 type PmixLaunchSetup = (
     PmixLaunchGuard,
     PmixLaunchPlan,
