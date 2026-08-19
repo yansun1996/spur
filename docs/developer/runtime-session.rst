@@ -73,3 +73,13 @@ one RuntimeSession per ``(job, attempt, node)``; logical steps are children,
 not per-step supervisors. Promotion requires measured restart recovery,
 protocol compatibility, supervisor reliability, memory/process overhead,
 launch latency, and N/N-1 upgrade behavior.
+
+Current development gate
+------------------------
+
+Set ``SPUR_RUNTIME_SESSION=1`` in the ``spurd`` service environment to route
+the initial plain-batch cohort through RuntimeSession. During this development
+stage, a runtime launch explicitly rejects container, GPU, PTY, and PMIx
+workloads instead of using an incomplete execution contract. ``SPUR_RUNTIME_STATE_DIR``
+overrides the default ``/var/spool/spur`` local runtime directory for isolated
+testing.
