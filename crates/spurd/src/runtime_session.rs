@@ -4,6 +4,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -290,6 +291,33 @@ pub async fn serve_control(stream: UnixStream, session: &RuntimeSession) -> io::
         })?;
         reader.get_mut().write_all(&response).await?;
         reader.get_mut().write_all(b"\n").await?;
+    }
+}
+
+pub async fn run_supervisor(
+    listener: UnixListener,
+    descriptor: RuntimeSessionDescriptor,
+    session: Arc<RuntimeSession>,
+) -> io::Result<()> {
+    let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            _ = poll_interval.tick() => {
+                session.poll_completion().await?;
+                if !session.snapshot().await.active {
+                    return Ok(());
+                }
+            }
+            accepted = accept_hello(&listener, &descriptor, &descriptor.capability) => {
+                let (stream, _) = accepted?;
+                let session = session.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = serve_control(stream, &session).await {
+                        tracing::warn!(%error, "runtime session control connection failed");
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -703,5 +731,67 @@ mod tests {
             RuntimeResponse::Acknowledged
         );
         server.await.expect("server task").expect("serve control");
+    }
+
+    #[tokio::test]
+    async fn supervisor_serves_authenticated_reconnect_until_teardown() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("runtime.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let mut descriptor = descriptor(42, 3, std::process::id());
+        descriptor.socket_path = socket_path.clone();
+        let capability = descriptor.capability.clone();
+        let session = Arc::new(RuntimeSession::new(RunningJob::AllocationOnly, 42, 3));
+        let supervisor = tokio::spawn(run_supervisor(listener, descriptor, session));
+
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect socket");
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let hello = RuntimeRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            capability,
+            spurd_instance_id: "agent-1".into(),
+            run_attempt: 3,
+        };
+        writer
+            .write_all(
+                format!("{}\n", serde_json::to_string(&hello).expect("encode hello")).as_bytes(),
+            )
+            .await
+            .expect("write hello");
+        let mut hello_response = String::new();
+        reader
+            .read_line(&mut hello_response)
+            .await
+            .expect("read hello");
+        assert!(matches!(
+            serde_json::from_str::<RuntimeResponse>(&hello_response).expect("decode hello"),
+            RuntimeResponse::Hello { .. }
+        ));
+        for request in [RuntimeRequest::QueryState, RuntimeRequest::BeginTeardown] {
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&request).expect("encode request")
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            let mut response = String::new();
+            reader
+                .read_line(&mut response)
+                .await
+                .expect("read response");
+            assert!(!response.is_empty());
+        }
+        drop(writer);
+        supervisor
+            .await
+            .expect("supervisor task")
+            .expect("run supervisor");
     }
 }
