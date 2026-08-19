@@ -10,6 +10,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+use crate::executor::RunningJob;
+
 const DESCRIPTOR_FILE: &str = "descriptor.json";
 const FORMAT_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -59,6 +61,60 @@ pub struct RuntimeSnapshot {
     pub active: bool,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
+}
+
+pub struct RuntimeSession {
+    job: Mutex<RunningJob>,
+    snapshot: Mutex<RuntimeSnapshot>,
+}
+
+impl RuntimeSession {
+    pub fn new(job: RunningJob, job_id: u32, run_attempt: u32) -> Self {
+        Self {
+            job: Mutex::new(job),
+            snapshot: Mutex::new(RuntimeSnapshot {
+                job_id,
+                run_attempt,
+                active: true,
+                exit_code: None,
+                signal: None,
+            }),
+        }
+    }
+
+    pub async fn snapshot(&self) -> RuntimeSnapshot {
+        self.snapshot.lock().await.clone()
+    }
+
+    pub async fn poll_completion(&self) -> io::Result<()> {
+        let completed = self.job.lock().await.try_wait().map_err(io::Error::other)?;
+        let Some((exit_code, signal)) = completed else {
+            return Ok(());
+        };
+        let mut snapshot = self.snapshot.lock().await;
+        snapshot.active = false;
+        snapshot.exit_code = Some(exit_code);
+        snapshot.signal = Some(signal);
+        Ok(())
+    }
+
+    pub async fn signal(&self, signal: i32) -> io::Result<()> {
+        let signal = nix::sys::signal::Signal::try_from(signal).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid signal: {error}"),
+            )
+        })?;
+        self.job
+            .lock()
+            .await
+            .kill_signal(signal)
+            .map_err(io::Error::other)
+    }
+
+    pub async fn begin_teardown(&self) {
+        self.snapshot.lock().await.active = false;
+    }
 }
 
 impl RuntimeSnapshot {
@@ -197,10 +253,7 @@ pub async fn accept_hello(
     Ok((stream, spurd_instance_id))
 }
 
-pub async fn serve_control(
-    stream: UnixStream,
-    snapshot: &Mutex<RuntimeSnapshot>,
-) -> io::Result<()> {
+pub async fn serve_control(stream: UnixStream, session: &RuntimeSession) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
@@ -214,12 +267,17 @@ pub async fn serve_control(
             )
         })?;
         let response = match request {
-            RuntimeRequest::QueryState => snapshot.lock().await.response(),
+            RuntimeRequest::QueryState => session.snapshot().await.response(),
             RuntimeRequest::BeginTeardown | RuntimeRequest::Shutdown => {
-                snapshot.lock().await.active = false;
+                session.begin_teardown().await;
                 RuntimeResponse::Acknowledged
             }
-            RuntimeRequest::SignalAllocation { .. } => RuntimeResponse::Acknowledged,
+            RuntimeRequest::SignalAllocation { signal } => match session.signal(signal).await {
+                Ok(()) => RuntimeResponse::Acknowledged,
+                Err(error) => RuntimeResponse::Rejected {
+                    message: error.to_string(),
+                },
+            },
             RuntimeRequest::Hello { .. } => RuntimeResponse::Rejected {
                 message: "runtime hello is only valid as the first request".into(),
             },
@@ -612,14 +670,8 @@ mod tests {
     #[tokio::test]
     async fn control_loop_reports_live_state_and_records_teardown() {
         let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
-        let snapshot = Mutex::new(RuntimeSnapshot {
-            job_id: 42,
-            run_attempt: 3,
-            active: true,
-            exit_code: None,
-            signal: None,
-        });
-        let server = tokio::spawn(async move { serve_control(server_stream, &snapshot).await });
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 42, 3);
+        let server = tokio::spawn(async move { serve_control(server_stream, &session).await });
         let (reader, mut writer) = client_stream.into_split();
         for request in [RuntimeRequest::QueryState, RuntimeRequest::BeginTeardown] {
             writer
