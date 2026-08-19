@@ -6,12 +6,53 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
 
 const DESCRIPTOR_FILE: &str = "descriptor.json";
 const FORMAT_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RuntimeSessionDescriptor {
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum RuntimeRequest {
+    Hello {
+        protocol_version: u32,
+        capability: String,
+        spurd_instance_id: String,
+        run_attempt: u32,
+    },
+    QueryState,
+    SignalAllocation {
+        signal: i32,
+    },
+    BeginTeardown,
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum RuntimeResponse {
+    Hello {
+        protocol_version: u32,
+        job_id: u32,
+        run_attempt: u32,
+    },
+    State {
+        job_id: u32,
+        run_attempt: u32,
+        active: bool,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    },
+    Acknowledged,
+    Rejected {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSessionDescriptor {
     pub format_version: u32,
     pub job_id: u32,
     pub run_attempt: u32,
@@ -19,6 +60,95 @@ pub(crate) struct RuntimeSessionDescriptor {
     pub process_start_ticks: u64,
     pub socket_path: PathBuf,
     pub cgroup_path: PathBuf,
+}
+
+pub fn validate_hello(
+    descriptor: &RuntimeSessionDescriptor,
+    capability: &str,
+    expected_capability: &str,
+    protocol_version: u32,
+    run_attempt: u32,
+) -> RuntimeResponse {
+    if protocol_version != PROTOCOL_VERSION {
+        return RuntimeResponse::Rejected {
+            message: format!(
+                "runtime protocol {protocol_version} is incompatible with {PROTOCOL_VERSION}"
+            ),
+        };
+    }
+    if capability.len() != expected_capability.len()
+        || !bool::from(subtle::ConstantTimeEq::ct_eq(
+            capability.as_bytes(),
+            expected_capability.as_bytes(),
+        ))
+    {
+        return RuntimeResponse::Rejected {
+            message: "runtime capability rejected".into(),
+        };
+    }
+    if run_attempt != descriptor.run_attempt {
+        return RuntimeResponse::Rejected {
+            message: "runtime attempt is stale".into(),
+        };
+    }
+    RuntimeResponse::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        job_id: descriptor.job_id,
+        run_attempt: descriptor.run_attempt,
+    }
+}
+
+pub async fn accept_hello(
+    listener: &UnixListener,
+    descriptor: &RuntimeSessionDescriptor,
+    expected_capability: &str,
+) -> io::Result<(UnixStream, String)> {
+    let (stream, _) = listener.accept().await?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    let request: RuntimeRequest = serde_json::from_str(&line).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid runtime request: {error}"),
+        )
+    })?;
+    let RuntimeRequest::Hello {
+        protocol_version,
+        capability,
+        spurd_instance_id,
+        run_attempt,
+    } = request
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime connection did not begin with hello",
+        ));
+    };
+    let response = validate_hello(
+        descriptor,
+        &capability,
+        expected_capability,
+        protocol_version,
+        run_attempt,
+    );
+    let accepted = matches!(response, RuntimeResponse::Hello { .. });
+    let mut stream = reader.into_inner();
+    let response = serde_json::to_vec(&response).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("encode runtime response: {error}"),
+        )
+    })?;
+    stream.write_all(&response).await?;
+    stream.write_all(b"\n").await?;
+    if !accepted {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "runtime hello rejected",
+        ));
+    }
+    Ok((stream, spurd_instance_id))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,5 +352,75 @@ mod tests {
         assert!(discovered.rejected[0]
             .1
             .contains("identity does not match its directory"));
+    }
+
+    #[test]
+    fn hello_requires_compatible_version_capability_and_attempt() {
+        let descriptor = descriptor(42, 3, std::process::id());
+        assert_eq!(
+            validate_hello(&descriptor, "capability", "capability", PROTOCOL_VERSION, 3),
+            RuntimeResponse::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                job_id: 42,
+                run_attempt: 3,
+            }
+        );
+        assert!(matches!(
+            validate_hello(&descriptor, "wrong", "capability", PROTOCOL_VERSION, 3),
+            RuntimeResponse::Rejected { .. }
+        ));
+        assert!(matches!(
+            validate_hello(&descriptor, "capability", "capability", 2, 3),
+            RuntimeResponse::Rejected { .. }
+        ));
+        assert!(matches!(
+            validate_hello(&descriptor, "capability", "capability", PROTOCOL_VERSION, 4),
+            RuntimeResponse::Rejected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unix_socket_hello_authenticates_before_returning_connection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("runtime.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let descriptor = descriptor(42, 3, std::process::id());
+        let server = tokio::spawn(async move {
+            accept_hello(&listener, &descriptor, "capability")
+                .await
+                .map(|(_, instance_id)| instance_id)
+        });
+
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .expect("connect socket");
+        let (reader, mut writer) = stream.into_split();
+        let request = RuntimeRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            capability: "capability".into(),
+            spurd_instance_id: "agent-1".into(),
+            run_attempt: 3,
+        };
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&request).expect("encode request")
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write hello");
+        let mut reader = BufReader::new(reader);
+        let mut response = String::new();
+        reader.read_line(&mut response).await.expect("read hello");
+        assert!(matches!(
+            serde_json::from_str::<RuntimeResponse>(&response).expect("decode response"),
+            RuntimeResponse::Hello { job_id: 42, .. }
+        ));
+        assert_eq!(
+            server.await.expect("server task").expect("accepted"),
+            "agent-1"
+        );
     }
 }

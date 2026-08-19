@@ -3934,6 +3934,7 @@ dependencies = [
  "spur-sched",
  "spur-spank",
  "spur-update",
+ "subtle",
  "tempfile",
  "tokio",
  "tokio-stream",
