@@ -126,8 +126,7 @@ async fn main() -> anyhow::Result<()> {
         .first()
         .is_some_and(|arg| arg == "__runtime-session")
     {
-        runtime_session::run_process(&runtime_args[1..]).await?;
-        return Ok(());
+        std::process::exit(runtime_session::run_process(&runtime_args[1..]).await?);
     }
 
     let args = Args::parse();

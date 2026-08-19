@@ -433,7 +433,7 @@ pub async fn run_supervisor(
     }
 }
 
-pub async fn run_process(args: &[String]) -> anyhow::Result<()> {
+pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if args.len() != 4 {
         anyhow::bail!(
             "usage: spurd __runtime-session <state-dir> <job-id> <attempt> <launch-spec>"
@@ -471,9 +471,13 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let session = Arc::new(RuntimeSession::new(launch.job, job_id, run_attempt));
-    let result = run_supervisor(listener, descriptor, session).await;
+    let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
-    result.map_err(Into::into)
+    result?;
+    let snapshot = session.snapshot().await;
+    Ok(snapshot
+        .exit_code
+        .unwrap_or_else(|| 128 + snapshot.signal.unwrap_or(0)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
