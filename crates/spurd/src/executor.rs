@@ -360,6 +360,13 @@ fn pidfd_open(pid: i32) -> std::io::Result<OwnedFd> {
 }
 
 impl RunningJob {
+    pub fn managed(child: tokio::process::Child) -> Self {
+        Self::Managed {
+            child,
+            cgroup_path: None,
+        }
+    }
+
     pub fn pid(&self) -> Option<u32> {
         match self {
             RunningJob::Managed { child, .. } => child.id(),

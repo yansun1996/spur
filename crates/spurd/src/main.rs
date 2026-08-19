@@ -121,6 +121,15 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let runtime_args: Vec<String> = std::env::args().skip(1).collect();
+    if runtime_args
+        .first()
+        .is_some_and(|arg| arg == "__runtime-session")
+    {
+        runtime_session::run_process(&runtime_args[1..]).await?;
+        return Ok(());
+    }
+
     let args = Args::parse();
 
     tracing_subscriber::fmt()

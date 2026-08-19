@@ -321,6 +321,48 @@ pub async fn run_supervisor(
     }
 }
 
+pub async fn run_process(args: &[String]) -> anyhow::Result<()> {
+    if args.len() != 4 {
+        anyhow::bail!("usage: spurd __runtime-session <state-dir> <job-id> <attempt> <script>");
+    }
+    let state_dir = PathBuf::from(&args[0]);
+    let job_id: u32 = args[1]
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid job id: {error}"))?;
+    let run_attempt: u32 = args[2]
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid run attempt: {error}"))?;
+    let script = PathBuf::from(&args[3]);
+    let store = RuntimeSessionStore::new(state_dir);
+    let session_dir = store.session_dir(job_id, run_attempt);
+    let socket_path = session_dir.join("runtime.sock");
+    if socket_path.exists() {
+        std::fs::remove_file(&socket_path)?;
+    }
+    let pid = std::process::id();
+    let descriptor = RuntimeSessionDescriptor::new(
+        job_id,
+        run_attempt,
+        pid,
+        process_start_ticks(pid)?,
+        socket_path.clone(),
+        PathBuf::new(),
+    );
+    store.publish(&descriptor)?;
+    let listener = UnixListener::bind(&socket_path)?;
+    let child = tokio::process::Command::new("/bin/bash")
+        .arg(script)
+        .spawn()?;
+    let session = Arc::new(RuntimeSession::new(
+        RunningJob::managed(child),
+        job_id,
+        run_attempt,
+    ));
+    let result = run_supervisor(listener, descriptor, session).await;
+    let _ = std::fs::remove_file(socket_path);
+    result.map_err(Into::into)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionLiveness {
     Live,
