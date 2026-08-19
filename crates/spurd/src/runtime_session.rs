@@ -13,6 +13,118 @@ use tokio::sync::Mutex;
 
 use crate::executor::RunningJob;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeLaunchSpec {
+    pub job_id: u32,
+    pub script: String,
+    pub work_dir: String,
+    pub name: String,
+    pub user: String,
+    pub node: String,
+    pub environment: std::collections::HashMap<String, String>,
+    pub stdout_path: String,
+    pub stderr_path: String,
+    pub stdin_path: String,
+    pub cpus: u32,
+    pub memory_mb: u64,
+    pub cpu_ids: Vec<u32>,
+    pub open_mode: Option<String>,
+    pub uid: u32,
+    pub gid: u32,
+    pub partition: String,
+    pub nodelist: String,
+    pub memlock: RuntimeMemlock,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum RuntimeMemlock {
+    Unlimited,
+    Inherit,
+    Bytes(u64),
+}
+
+impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
+    type Error = String;
+
+    fn try_from(config: &crate::executor::JobLaunchConfig) -> Result<Self, Self::Error> {
+        if config.container.is_some() {
+            return Err("container launches are not yet supported by RuntimeSession".into());
+        }
+        if !config.gpu_devices.is_empty() || config.host_device_plan.is_some() {
+            return Err("GPU launches are not yet supported by RuntimeSession".into());
+        }
+        if config.io_mode != crate::executor::LaunchIo::File {
+            return Err("PTY launches are not yet supported by RuntimeSession".into());
+        }
+        if config.pmix_multi_task {
+            return Err("PMIx launches are not yet supported by RuntimeSession".into());
+        }
+        Ok(Self {
+            job_id: config.job_id,
+            script: config.script.clone(),
+            work_dir: config.work_dir.clone(),
+            name: config.name.clone(),
+            user: config.user.clone(),
+            node: config.node.clone(),
+            environment: config.environment.clone(),
+            stdout_path: config.stdout_path.clone(),
+            stderr_path: config.stderr_path.clone(),
+            stdin_path: config.stdin_path.clone(),
+            cpus: config.cpus,
+            memory_mb: config.memory_mb,
+            cpu_ids: config.cpu_ids.clone(),
+            open_mode: config.open_mode.clone(),
+            uid: config.uid,
+            gid: config.gid,
+            partition: config.partition.clone(),
+            nodelist: config.nodelist.clone(),
+            memlock: match config.memlock {
+                spur_core::config::MemlockLimit::Unlimited => RuntimeMemlock::Unlimited,
+                spur_core::config::MemlockLimit::Inherit => RuntimeMemlock::Inherit,
+                spur_core::config::MemlockLimit::Bytes(value) => RuntimeMemlock::Bytes(value),
+            },
+        })
+    }
+}
+
+impl RuntimeLaunchSpec {
+    pub fn into_launch_config(self) -> crate::executor::JobLaunchConfig {
+        crate::executor::JobLaunchConfig {
+            job_id: self.job_id,
+            script: self.script,
+            work_dir: self.work_dir,
+            name: self.name,
+            user: self.user,
+            node: self.node,
+            array_job_id: None,
+            array_task_id: None,
+            environment: self.environment,
+            stdout_path: self.stdout_path,
+            stderr_path: self.stderr_path,
+            stdin_path: self.stdin_path,
+            cpus: self.cpus,
+            memory_mb: self.memory_mb,
+            gpu_devices: Vec::new(),
+            cpu_ids: self.cpu_ids,
+            open_mode: self.open_mode,
+            uid: self.uid,
+            gid: self.gid,
+            container: None,
+            prolog_script: None,
+            partition: self.partition,
+            nodelist: self.nodelist,
+            host_device_plan: None,
+            memlock: match self.memlock {
+                RuntimeMemlock::Unlimited => spur_core::config::MemlockLimit::Unlimited,
+                RuntimeMemlock::Inherit => spur_core::config::MemlockLimit::Inherit,
+                RuntimeMemlock::Bytes(value) => spur_core::config::MemlockLimit::Bytes(value),
+            },
+            io_mode: crate::executor::LaunchIo::File,
+            pmix_multi_task: false,
+        }
+    }
+}
+
 const DESCRIPTOR_FILE: &str = "descriptor.json";
 const FORMAT_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -323,7 +435,9 @@ pub async fn run_supervisor(
 
 pub async fn run_process(args: &[String]) -> anyhow::Result<()> {
     if args.len() != 4 {
-        anyhow::bail!("usage: spurd __runtime-session <state-dir> <job-id> <attempt> <script>");
+        anyhow::bail!(
+            "usage: spurd __runtime-session <state-dir> <job-id> <attempt> <launch-spec>"
+        );
     }
     let state_dir = PathBuf::from(&args[0]);
     let job_id: u32 = args[1]
@@ -332,7 +446,10 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<()> {
     let run_attempt: u32 = args[2]
         .parse()
         .map_err(|error| anyhow::anyhow!("invalid run attempt: {error}"))?;
-    let script = PathBuf::from(&args[3]);
+    let launch_spec: RuntimeLaunchSpec = serde_json::from_slice(&std::fs::read(&args[3])?)?;
+    if launch_spec.job_id != job_id {
+        anyhow::bail!("runtime launch spec job id does not match process arguments");
+    }
     let store = RuntimeSessionStore::new(state_dir);
     let session_dir = store.session_dir(job_id, run_attempt);
     let socket_path = session_dir.join("runtime.sock");
@@ -350,14 +467,10 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<()> {
     );
     store.publish(&descriptor)?;
     let listener = UnixListener::bind(&socket_path)?;
-    let child = tokio::process::Command::new("/bin/bash")
-        .arg(script)
-        .spawn()?;
-    let session = Arc::new(RuntimeSession::new(
-        RunningJob::managed(child),
-        job_id,
-        run_attempt,
-    ));
+    let launch = crate::executor::launch_job(&launch_spec.into_launch_config(), None)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let session = Arc::new(RuntimeSession::new(launch.job, job_id, run_attempt));
     let result = run_supervisor(listener, descriptor, session).await;
     let _ = std::fs::remove_file(socket_path);
     result.map_err(Into::into)
