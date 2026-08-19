@@ -12,6 +12,7 @@ mod mpi_plugin;
 pub(crate) mod privdrop;
 pub(crate) mod pty;
 mod reporter;
+mod runtime_session;
 mod seccomp;
 
 use std::collections::HashMap;
@@ -167,6 +168,22 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let hooks_config = config.as_ref().map(|c| c.hooks.clone()).unwrap_or_default();
+    let runtime_state_dir = config
+        .as_ref()
+        .map(|c| c.controller.state_dir.clone())
+        .unwrap_or_else(|| "/var/spool/spur".into());
+    let runtime_sessions = runtime_session::RuntimeSessionStore::new(runtime_state_dir);
+    let discovered_sessions = runtime_sessions.discover_live()?;
+    for (path, reason) in discovered_sessions.rejected {
+        warn!(path = %path.display(), %reason, "ignoring unusable runtime session descriptor");
+    }
+    if !discovered_sessions.live.is_empty() {
+        warn!(
+            sessions = discovered_sessions.live.len(),
+            root = %runtime_sessions.root().display(),
+            "discovered live runtime sessions before runtime reconnection is enabled"
+        );
+    }
 
     // Background update check (non-blocking)
     spur_update::spawn_startup_check(

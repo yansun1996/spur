@@ -9,3 +9,4 @@ Spur is a Rust workspace (Cargo) that builds three binaries — ``spurctld``,
 - :doc:`documentation` — build and preview these docs locally.
 - :doc:`contributing` — commit and pull-request conventions, license headers, and
   the pre-commit hook.
+- :doc:`runtime-session` — execution ownership and restart-survival contract.
