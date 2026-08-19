@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
 
 const DESCRIPTOR_FILE: &str = "descriptor.json";
 const FORMAT_VERSION: u32 = 1;
@@ -49,6 +50,27 @@ pub enum RuntimeResponse {
     Rejected {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSnapshot {
+    pub job_id: u32,
+    pub run_attempt: u32,
+    pub active: bool,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+impl RuntimeSnapshot {
+    pub fn response(&self) -> RuntimeResponse {
+        RuntimeResponse::State {
+            job_id: self.job_id,
+            run_attempt: self.run_attempt,
+            active: self.active,
+            exit_code: self.exit_code,
+            signal: self.signal,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +171,44 @@ pub async fn accept_hello(
         ));
     }
     Ok((stream, spurd_instance_id))
+}
+
+pub async fn serve_control(
+    stream: UnixStream,
+    snapshot: &Mutex<RuntimeSnapshot>,
+) -> io::Result<()> {
+    let mut reader = BufReader::new(stream);
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).await? == 0 {
+            return Ok(());
+        }
+        let request: RuntimeRequest = serde_json::from_str(&line).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid runtime request: {error}"),
+            )
+        })?;
+        let response = match request {
+            RuntimeRequest::QueryState => snapshot.lock().await.response(),
+            RuntimeRequest::BeginTeardown | RuntimeRequest::Shutdown => {
+                snapshot.lock().await.active = false;
+                RuntimeResponse::Acknowledged
+            }
+            RuntimeRequest::SignalAllocation { .. } => RuntimeResponse::Acknowledged,
+            RuntimeRequest::Hello { .. } => RuntimeResponse::Rejected {
+                message: "runtime hello is only valid as the first request".into(),
+            },
+        };
+        let response = serde_json::to_vec(&response).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("encode runtime response: {error}"),
+            )
+        })?;
+        reader.get_mut().write_all(&response).await?;
+        reader.get_mut().write_all(b"\n").await?;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -422,5 +482,49 @@ mod tests {
             server.await.expect("server task").expect("accepted"),
             "agent-1"
         );
+    }
+
+    #[tokio::test]
+    async fn control_loop_reports_live_state_and_records_teardown() {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let snapshot = Mutex::new(RuntimeSnapshot {
+            job_id: 42,
+            run_attempt: 3,
+            active: true,
+            exit_code: None,
+            signal: None,
+        });
+        let server = tokio::spawn(async move { serve_control(server_stream, &snapshot).await });
+        let (reader, mut writer) = client_stream.into_split();
+        for request in [RuntimeRequest::QueryState, RuntimeRequest::BeginTeardown] {
+            writer
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&request).expect("encode request")
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write request");
+        }
+        drop(writer);
+        let mut reader = BufReader::new(reader);
+        let mut state = String::new();
+        reader.read_line(&mut state).await.expect("read state");
+        assert!(matches!(
+            serde_json::from_str::<RuntimeResponse>(&state).expect("decode state"),
+            RuntimeResponse::State { active: true, .. }
+        ));
+        let mut acknowledged = String::new();
+        reader
+            .read_line(&mut acknowledged)
+            .await
+            .expect("read teardown acknowledgement");
+        assert_eq!(
+            serde_json::from_str::<RuntimeResponse>(&acknowledged).expect("decode acknowledgement"),
+            RuntimeResponse::Acknowledged
+        );
+        server.await.expect("server task").expect("serve control");
     }
 }
