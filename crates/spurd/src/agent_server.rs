@@ -43,6 +43,44 @@ fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &
     }
 }
 
+async fn launch_runtime_session(
+    config: &executor::JobLaunchConfig,
+    run_attempt: u32,
+) -> Result<executor::LaunchResult, executor::LaunchError> {
+    let launch_spec = crate::runtime_session::RuntimeLaunchSpec::try_from(config)
+        .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
+    let state_dir =
+        std::env::var("SPUR_RUNTIME_STATE_DIR").unwrap_or_else(|_| "/var/spool/spur".into());
+    let store = crate::runtime_session::RuntimeSessionStore::new(&state_dir);
+    let session_dir = store
+        .prepare_session_dir(config.job_id, run_attempt)
+        .map_err(|error| executor::LaunchError::Other(error.into()))?;
+    let launch_path = session_dir.join("launch.json");
+    let launch_json = serde_json::to_vec(&launch_spec)
+        .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
+    std::fs::write(&launch_path, launch_json)
+        .map_err(|error| executor::LaunchError::Other(error.into()))?;
+    let executable =
+        std::env::current_exe().map_err(|error| executor::LaunchError::Other(error.into()))?;
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .arg("__runtime-session")
+        .arg(state_dir)
+        .arg(config.job_id.to_string())
+        .arg(run_attempt.to_string())
+        .arg(launch_path)
+        .process_group(0);
+    let child = command
+        .spawn()
+        .map_err(|error| executor::LaunchError::Other(error.into()))?;
+    Ok(executor::LaunchResult {
+        job: executor::RunningJob::managed(child),
+        stdout_path: config.stdout_path.clone(),
+        stderr_path: config.stderr_path.clone(),
+        pty_master: None,
+    })
+}
+
 #[cfg(test)]
 mod gpu_deny_tests {
     use std::collections::HashMap;
@@ -1500,7 +1538,16 @@ impl SlurmAgent for AgentService {
             },
         };
 
-        match executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await {
+        let runtime_enabled = std::env::var("SPUR_RUNTIME_SESSION")
+            .ok()
+            .is_some_and(|value| value == "1");
+        let launch_result = if runtime_enabled {
+            launch_runtime_session(&launch_cfg, run_attempt).await
+        } else {
+            executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await
+        };
+
+        match launch_result {
             Ok(mut result) => {
                 pmix_guard.as_mut().map(PmixLaunchGuard::disarm);
                 let mut jobs = self.running.lock().await;

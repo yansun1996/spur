@@ -511,10 +511,15 @@ impl RuntimeSessionStore {
         self.root.join(format!("{job_id}.{run_attempt}"))
     }
 
-    pub fn publish(&self, descriptor: &RuntimeSessionDescriptor) -> io::Result<()> {
-        let session_dir = self.session_dir(descriptor.job_id, descriptor.run_attempt);
+    pub fn prepare_session_dir(&self, job_id: u32, run_attempt: u32) -> io::Result<PathBuf> {
         create_private_dir(&self.root)?;
+        let session_dir = self.session_dir(job_id, run_attempt);
         create_private_dir(&session_dir)?;
+        Ok(session_dir)
+    }
+
+    pub fn publish(&self, descriptor: &RuntimeSessionDescriptor) -> io::Result<()> {
+        let session_dir = self.prepare_session_dir(descriptor.job_id, descriptor.run_attempt)?;
         let temporary_path =
             session_dir.join(format!("{DESCRIPTOR_FILE}.{}.tmp", uuid::Uuid::new_v4()));
         let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
