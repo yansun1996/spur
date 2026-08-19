@@ -368,7 +368,7 @@ async fn main() -> anyhow::Result<()> {
         &cluster_config,
         memlock,
         mpi_config,
-        running_jobs,
+        running_jobs.clone(),
         allow_root_jobs,
     );
 
@@ -432,6 +432,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         result = server_future => { result?; }
         _ = sigterm.recv() => {
+            if !running_jobs.lock().await.is_empty() {
+                info!("received SIGTERM with held runtime sessions; preserving controller registration");
+                return Ok(());
+            }
             info!("received SIGTERM, deregistering from controller");
             let dereg_reporter = reporter.clone();
             match tokio::time::timeout(
