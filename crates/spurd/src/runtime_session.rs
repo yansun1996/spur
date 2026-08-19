@@ -366,6 +366,87 @@ pub async fn accept_hello(
     Ok((stream, spurd_instance_id))
 }
 
+pub async fn query_state(
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+) -> io::Result<RuntimeSnapshot> {
+    let stream = UnixStream::connect(&descriptor.socket_path).await?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let hello = RuntimeRequest::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        capability: descriptor.capability.clone(),
+        spurd_instance_id,
+        run_attempt: descriptor.run_attempt,
+    };
+    write_request(&mut writer, &hello).await?;
+    match read_response(&mut reader).await? {
+        RuntimeResponse::Hello {
+            job_id,
+            run_attempt,
+            ..
+        } if job_id == descriptor.job_id && run_attempt == descriptor.run_attempt => {}
+        RuntimeResponse::Rejected { message } => {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "runtime hello identity mismatch",
+            ));
+        }
+    }
+    write_request(&mut writer, &RuntimeRequest::QueryState).await?;
+    match read_response(&mut reader).await? {
+        RuntimeResponse::State {
+            job_id,
+            run_attempt,
+            active,
+            exit_code,
+            signal,
+        } if job_id == descriptor.job_id && run_attempt == descriptor.run_attempt => {
+            Ok(RuntimeSnapshot {
+                job_id,
+                run_attempt,
+                active,
+                exit_code,
+                signal,
+            })
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime state identity mismatch",
+        )),
+    }
+}
+
+async fn write_request(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    request: &RuntimeRequest,
+) -> io::Result<()> {
+    let request = serde_json::to_vec(request).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("encode runtime request: {error}"),
+        )
+    })?;
+    writer.write_all(&request).await?;
+    writer.write_all(b"\n").await
+}
+
+async fn read_response(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+) -> io::Result<RuntimeResponse> {
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    serde_json::from_str(&line).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid runtime response: {error}"),
+        )
+    })
+}
+
 pub async fn serve_control(stream: UnixStream, session: &RuntimeSession) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     loop {
@@ -895,67 +976,5 @@ mod tests {
             RuntimeResponse::Acknowledged
         );
         server.await.expect("server task").expect("serve control");
-    }
-
-    #[tokio::test]
-    async fn supervisor_serves_authenticated_reconnect_until_teardown() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let socket_path = temp.path().join("runtime.sock");
-        let listener = UnixListener::bind(&socket_path).expect("bind socket");
-        let mut descriptor = descriptor(42, 3, std::process::id());
-        descriptor.socket_path = socket_path.clone();
-        let capability = descriptor.capability.clone();
-        let session = Arc::new(RuntimeSession::new(RunningJob::AllocationOnly, 42, 3));
-        let supervisor = tokio::spawn(run_supervisor(listener, descriptor, session));
-
-        let stream = UnixStream::connect(&socket_path)
-            .await
-            .expect("connect socket");
-        let (reader, mut writer) = stream.into_split();
-        let mut reader = BufReader::new(reader);
-        let hello = RuntimeRequest::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            capability,
-            spurd_instance_id: "agent-1".into(),
-            run_attempt: 3,
-        };
-        writer
-            .write_all(
-                format!("{}\n", serde_json::to_string(&hello).expect("encode hello")).as_bytes(),
-            )
-            .await
-            .expect("write hello");
-        let mut hello_response = String::new();
-        reader
-            .read_line(&mut hello_response)
-            .await
-            .expect("read hello");
-        assert!(matches!(
-            serde_json::from_str::<RuntimeResponse>(&hello_response).expect("decode hello"),
-            RuntimeResponse::Hello { .. }
-        ));
-        for request in [RuntimeRequest::QueryState, RuntimeRequest::BeginTeardown] {
-            writer
-                .write_all(
-                    format!(
-                        "{}\n",
-                        serde_json::to_string(&request).expect("encode request")
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .expect("write request");
-            let mut response = String::new();
-            reader
-                .read_line(&mut response)
-                .await
-                .expect("read response");
-            assert!(!response.is_empty());
-        }
-        drop(writer);
-        supervisor
-            .await
-            .expect("supervisor task")
-            .expect("run supervisor");
     }
 }

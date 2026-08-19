@@ -185,7 +185,24 @@ async fn main() -> anyhow::Result<()> {
     for (path, reason) in discovered_sessions.rejected {
         warn!(path = %path.display(), %reason, "ignoring unusable runtime session descriptor");
     }
-    let recovered_runtime_sessions = discovered_sessions.live;
+    let mut recovered_runtime_sessions = Vec::new();
+    let spurd_instance_id = uuid::Uuid::new_v4().to_string();
+    for descriptor in discovered_sessions.live {
+        match runtime_session::query_state(&descriptor, spurd_instance_id.clone()).await {
+            Ok(snapshot) if snapshot.active => recovered_runtime_sessions.push(descriptor),
+            Ok(_) => warn!(
+                job_id = descriptor.job_id,
+                run_attempt = descriptor.run_attempt,
+                "runtime session completed before agent reconnect"
+            ),
+            Err(error) => warn!(
+                job_id = descriptor.job_id,
+                run_attempt = descriptor.run_attempt,
+                %error,
+                "runtime session reconnect rejected"
+            ),
+        }
+    }
     if !recovered_runtime_sessions.is_empty() {
         warn!(
             sessions = recovered_runtime_sessions.len(),
