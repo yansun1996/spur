@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,30 @@ pub struct RuntimeSessionDescriptor {
     pub process_start_ticks: u64,
     pub socket_path: PathBuf,
     pub cgroup_path: PathBuf,
+    #[serde(default)]
+    pub capability: String,
+}
+
+impl RuntimeSessionDescriptor {
+    pub fn new(
+        job_id: u32,
+        run_attempt: u32,
+        pid: u32,
+        process_start_ticks: u64,
+        socket_path: PathBuf,
+        cgroup_path: PathBuf,
+    ) -> Self {
+        Self {
+            format_version: FORMAT_VERSION,
+            job_id,
+            run_attempt,
+            pid,
+            process_start_ticks,
+            socket_path,
+            cgroup_path,
+            capability: uuid::Uuid::new_v4().to_string(),
+        }
+    }
 }
 
 pub fn validate_hello(
@@ -223,23 +247,47 @@ pub(crate) struct DiscoveredRuntimeSessions {
     pub rejected: Vec<(PathBuf, String)>,
 }
 
-pub(crate) struct RuntimeSessionStore {
+pub struct RuntimeSessionStore {
     root: PathBuf,
 }
 
 impl RuntimeSessionStore {
-    pub(crate) fn new(state_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         Self {
             root: state_dir.into().join("runtime"),
         }
     }
 
-    pub(crate) fn root(&self) -> &Path {
+    pub fn root(&self) -> &Path {
         &self.root
     }
 
-    pub(crate) fn session_dir(&self, job_id: u32, run_attempt: u32) -> PathBuf {
+    pub fn session_dir(&self, job_id: u32, run_attempt: u32) -> PathBuf {
         self.root.join(format!("{job_id}.{run_attempt}"))
+    }
+
+    pub fn publish(&self, descriptor: &RuntimeSessionDescriptor) -> io::Result<()> {
+        let session_dir = self.session_dir(descriptor.job_id, descriptor.run_attempt);
+        create_private_dir(&self.root)?;
+        create_private_dir(&session_dir)?;
+        let temporary_path =
+            session_dir.join(format!("{DESCRIPTOR_FILE}.{}.tmp", uuid::Uuid::new_v4()));
+        let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
+        let contents = serde_json::to_vec(descriptor).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("serialize runtime descriptor: {error}"),
+            )
+        })?;
+        let mut temporary = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)?;
+        temporary.write_all(&contents)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        fs::rename(&temporary_path, descriptor_path)?;
+        fs::File::open(session_dir)?.sync_all()
     }
 
     pub(crate) fn discover_live(&self) -> io::Result<DiscoveredRuntimeSessions> {
@@ -314,6 +362,37 @@ impl RuntimeSessionStore {
     }
 }
 
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match fs::create_dir(path) {
+        Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => verify_private_dir(path),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn verify_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("runtime path {} is not a directory", path.display()),
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("runtime directory {} is not private", path.display()),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn process_start_ticks(pid: u32) -> io::Result<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let (_, fields) = stat
@@ -345,15 +424,14 @@ mod tests {
     use super::*;
 
     fn descriptor(job_id: u32, run_attempt: u32, pid: u32) -> RuntimeSessionDescriptor {
-        RuntimeSessionDescriptor {
-            format_version: FORMAT_VERSION,
+        RuntimeSessionDescriptor::new(
             job_id,
             run_attempt,
             pid,
-            process_start_ticks: process_start_ticks(pid).expect("test process must exist"),
-            socket_path: PathBuf::from("/run/spur/runtime.sock"),
-            cgroup_path: PathBuf::from("/sys/fs/cgroup/spur/test"),
-        }
+            process_start_ticks(pid).expect("test process must exist"),
+            PathBuf::from("/run/spur/runtime.sock"),
+            PathBuf::from("/sys/fs/cgroup/spur/test"),
+        )
     }
 
     fn write_descriptor(
@@ -380,7 +458,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = RuntimeSessionStore::new(temp.path());
         let pid = std::process::id();
-        write_descriptor(&store, &descriptor(42, 3, pid));
+        let live = descriptor(42, 3, pid);
+        write_descriptor(&store, &live);
 
         let stale = descriptor(43, 1, pid);
         let mut stale = stale;
@@ -388,7 +467,7 @@ mod tests {
         write_descriptor(&store, &stale);
 
         let discovered = store.discover_live().expect("discover sessions");
-        assert_eq!(discovered.live, vec![descriptor(42, 3, pid)]);
+        assert_eq!(discovered.live, vec![live]);
         assert_eq!(discovered.rejected.len(), 1);
         assert_eq!(discovered.rejected[0].0, store.session_dir(43, 1));
     }
@@ -415,10 +494,37 @@ mod tests {
     }
 
     #[test]
+    fn publish_writes_a_private_reconnectable_descriptor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RuntimeSessionStore::new(temp.path());
+        let descriptor = descriptor(42, 3, std::process::id());
+        store.publish(&descriptor).expect("publish descriptor");
+        let session_dir = store.session_dir(42, 3);
+        assert_eq!(
+            fs::metadata(&session_dir)
+                .expect("session metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let discovered = store.discover_live().expect("discover session");
+        assert_eq!(discovered.live, vec![descriptor]);
+    }
+
+    #[test]
     fn hello_requires_compatible_version_capability_and_attempt() {
         let descriptor = descriptor(42, 3, std::process::id());
         assert_eq!(
-            validate_hello(&descriptor, "capability", "capability", PROTOCOL_VERSION, 3),
+            validate_hello(
+                &descriptor,
+                &descriptor.capability,
+                &descriptor.capability,
+                PROTOCOL_VERSION,
+                3
+            ),
             RuntimeResponse::Hello {
                 protocol_version: PROTOCOL_VERSION,
                 job_id: 42,
@@ -426,15 +532,33 @@ mod tests {
             }
         );
         assert!(matches!(
-            validate_hello(&descriptor, "wrong", "capability", PROTOCOL_VERSION, 3),
+            validate_hello(
+                &descriptor,
+                "wrong",
+                &descriptor.capability,
+                PROTOCOL_VERSION,
+                3
+            ),
             RuntimeResponse::Rejected { .. }
         ));
         assert!(matches!(
-            validate_hello(&descriptor, "capability", "capability", 2, 3),
+            validate_hello(
+                &descriptor,
+                &descriptor.capability,
+                &descriptor.capability,
+                2,
+                3
+            ),
             RuntimeResponse::Rejected { .. }
         ));
         assert!(matches!(
-            validate_hello(&descriptor, "capability", "capability", PROTOCOL_VERSION, 4),
+            validate_hello(
+                &descriptor,
+                &descriptor.capability,
+                &descriptor.capability,
+                PROTOCOL_VERSION,
+                4
+            ),
             RuntimeResponse::Rejected { .. }
         ));
     }
@@ -445,8 +569,9 @@ mod tests {
         let socket_path = temp.path().join("runtime.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind socket");
         let descriptor = descriptor(42, 3, std::process::id());
+        let capability = descriptor.capability.clone();
         let server = tokio::spawn(async move {
-            accept_hello(&listener, &descriptor, "capability")
+            accept_hello(&listener, &descriptor, &descriptor.capability)
                 .await
                 .map(|(_, instance_id)| instance_id)
         });
@@ -457,7 +582,7 @@ mod tests {
         let (reader, mut writer) = stream.into_split();
         let request = RuntimeRequest::Hello {
             protocol_version: PROTOCOL_VERSION,
-            capability: "capability".into(),
+            capability,
             spurd_instance_id: "agent-1".into(),
             run_attempt: 3,
         };
