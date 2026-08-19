@@ -46,9 +46,14 @@ fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &
 async fn launch_runtime_session(
     config: &executor::JobLaunchConfig,
     run_attempt: u32,
+    controller_addr: &str,
+    reporting_node: &str,
 ) -> Result<executor::LaunchResult, executor::LaunchError> {
-    let launch_spec = crate::runtime_session::RuntimeLaunchSpec::try_from(config)
+    let mut launch_spec = crate::runtime_session::RuntimeLaunchSpec::try_from(config)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
+    launch_spec.controller_addr = controller_addr.into();
+    launch_spec.reporting_node = reporting_node.into();
+    launch_spec.run_attempt = run_attempt;
     let state_dir =
         std::env::var("SPUR_RUNTIME_STATE_DIR").unwrap_or_else(|_| "/var/spool/spur".into());
     let store = crate::runtime_session::RuntimeSessionStore::new(&state_dir);
@@ -62,19 +67,25 @@ async fn launch_runtime_session(
         .map_err(|error| executor::LaunchError::Other(error.into()))?;
     let executable =
         std::env::current_exe().map_err(|error| executor::LaunchError::Other(error.into()))?;
-    let mut command = tokio::process::Command::new(executable);
+    let unit = format!("spur-runtime-{}.{}", config.job_id, run_attempt);
+    let mut command = tokio::process::Command::new("systemd-run");
     command
+        .arg("--unit")
+        .arg(unit)
+        .arg("--collect")
+        .arg("--no-block")
+        .arg("--service-type=exec")
+        .arg(executable)
         .arg("__runtime-session")
         .arg(state_dir)
         .arg(config.job_id.to_string())
         .arg(run_attempt.to_string())
-        .arg(launch_path)
-        .process_group(0);
-    let child = command
+        .arg(launch_path);
+    command
         .spawn()
         .map_err(|error| executor::LaunchError::Other(error.into()))?;
     Ok(executor::LaunchResult {
-        job: executor::RunningJob::managed(child),
+        job: executor::RunningJob::AllocationOnly,
         stdout_path: config.stdout_path.clone(),
         stderr_path: config.stderr_path.clone(),
         pty_master: None,
@@ -638,7 +649,7 @@ impl AgentService {
     }
 }
 
-struct DrainRequest {
+pub(crate) struct DrainRequest {
     reason: String,
 }
 
@@ -1016,7 +1027,7 @@ fn inject_script_args(script: &str, args: &[String]) -> Result<String, Status> {
     Ok(format!("{set_line}\n{script}"))
 }
 
-async fn report_completion(
+pub(crate) async fn report_completion(
     controller_addr: &str,
     job_id: u32,
     exit_code: i32,
@@ -1626,7 +1637,13 @@ impl SlurmAgent for AgentService {
             .ok()
             .is_some_and(|value| value == "1");
         let launch_result = if runtime_enabled {
-            launch_runtime_session(&launch_cfg, run_attempt).await
+            launch_runtime_session(
+                &launch_cfg,
+                run_attempt,
+                &self.reporter.controller_addr,
+                &self.reporter.hostname,
+            )
+            .await
         } else {
             executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await
         };

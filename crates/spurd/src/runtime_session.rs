@@ -34,6 +34,12 @@ pub struct RuntimeLaunchSpec {
     pub partition: String,
     pub nodelist: String,
     pub memlock: RuntimeMemlock,
+    #[serde(default)]
+    pub controller_addr: String,
+    #[serde(default)]
+    pub reporting_node: String,
+    #[serde(default)]
+    pub run_attempt: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -50,7 +56,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
         if config.container.is_some() {
             return Err("container launches are not yet supported by RuntimeSession".into());
         }
-        if !config.gpu_devices.is_empty() || config.host_device_plan.is_some() {
+        if !config.gpu_devices.is_empty() {
             return Err("GPU launches are not yet supported by RuntimeSession".into());
         }
         if config.io_mode != crate::executor::LaunchIo::File {
@@ -83,6 +89,9 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
                 spur_core::config::MemlockLimit::Inherit => RuntimeMemlock::Inherit,
                 spur_core::config::MemlockLimit::Bytes(value) => RuntimeMemlock::Bytes(value),
             },
+            controller_addr: String::new(),
+            reporting_node: String::new(),
+            run_attempt: 0,
         })
     }
 }
@@ -548,6 +557,8 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     );
     store.publish(&descriptor)?;
     let listener = UnixListener::bind(&socket_path)?;
+    let controller_addr = launch_spec.controller_addr.clone();
+    let reporting_node = launch_spec.reporting_node.clone();
     let launch = crate::executor::launch_job(&launch_spec.into_launch_config(), None)
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -556,9 +567,22 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let _ = std::fs::remove_file(socket_path);
     result?;
     let snapshot = session.snapshot().await;
-    Ok(snapshot
+    let exit_code = snapshot
         .exit_code
-        .unwrap_or_else(|| 128 + snapshot.signal.unwrap_or(0)))
+        .unwrap_or_else(|| 128 + snapshot.signal.unwrap_or(0));
+    if !controller_addr.is_empty() && !reporting_node.is_empty() {
+        crate::agent_server::report_completion(
+            &controller_addr,
+            job_id,
+            exit_code,
+            snapshot.signal.unwrap_or(0),
+            run_attempt,
+            &reporting_node,
+            None,
+        )
+        .await;
+    }
+    Ok(exit_code)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
