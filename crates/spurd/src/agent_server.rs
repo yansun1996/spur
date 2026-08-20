@@ -2465,11 +2465,13 @@ impl SlurmAgent for AgentService {
                 "step mpi=pmix requires a PMIx launch plan",
             ));
         }
+        let runtime_descriptor = self.runtime_sessions.lock().await.get(&job_id).cloned();
+        let runtime_step_pmix = runtime_descriptor.is_some() && step_mpi;
 
         let mut pmix_step_guard = None;
         let mut pmix_plan: Option<PmixLaunchPlan> = None;
         let mut pmix_per_local_rank_env: Option<Vec<HashMap<String, String>>> = None;
-        if step_mpi {
+        if step_mpi && !runtime_step_pmix {
             let proto = req
                 .pmix_plan
                 .as_ref()
@@ -2490,7 +2492,9 @@ impl SlurmAgent for AgentService {
             return Ok(Response::new(cancelled_step_response()));
         }
 
-        let (program, program_args, step_script_cleanup) = if num_tasks > 1 || req.label {
+        let (program, program_args, step_script_cleanup) = if (num_tasks > 1 && !runtime_step_pmix)
+            || req.label
+        {
             let step_dir =
                 crate::executor::prepare_step_script_dir(&work_dir, job_id, req.uid, req.gid)
                     .map_err(|e| {
@@ -2545,6 +2549,9 @@ impl SlurmAgent for AgentService {
             let wrapper_path_string = wrapper_path.to_string_lossy().into_owned();
             ("bash".to_string(), vec![wrapper_path_string], Some(guard))
         } else {
+            if num_tasks > 1 {
+                senv.set("SPUR_TASK_OFFSET", req.task_offset);
+            }
             SpurEnv::apply_task_rank(&mut senv, req.task_offset, 0, 1);
             let (program, args) = spur_core::task_launch::wrap_command_with_cpu_bind(
                 &req.command[0],
@@ -2578,7 +2585,7 @@ impl SlurmAgent for AgentService {
         if num_tasks > 1 && step_mpi {
             mpi_plugin::strip_launcher_mpi_env(&mut env);
         }
-        if step_mpi && pmix_per_local_rank_env.is_none() {
+        if step_mpi && pmix_per_local_rank_env.is_none() && !runtime_step_pmix {
             let plan = pmix_plan
                 .as_ref()
                 .ok_or_else(|| Status::internal("missing PMIx plan for step"))?;
@@ -2591,7 +2598,23 @@ impl SlurmAgent for AgentService {
             return Ok(Response::new(cancelled_step_response()));
         }
 
-        if let Some(descriptor) = self.runtime_sessions.lock().await.get(&job_id).cloned() {
+        if let Some(descriptor) = runtime_descriptor {
+            let pmix = if runtime_step_pmix {
+                let proto = req
+                    .pmix_plan
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("missing PMIx plan for runtime step"))?;
+                Some(crate::runtime_session::RuntimePmixStepSpec {
+                    config: self.mpi_config.clone(),
+                    plan: mpi_plugin::plan_from_proto(proto)
+                        .map_err(Status::failed_precondition)?,
+                    command: req.command.clone(),
+                    task_offset: req.task_offset,
+                    tasks_on_node: num_tasks,
+                })
+            } else {
+                None
+            };
             let result = crate::runtime_session::launch_step(
                 &descriptor,
                 uuid::Uuid::new_v4().to_string(),
@@ -2614,6 +2637,7 @@ impl SlurmAgent for AgentService {
                             crate::runtime_session::RuntimeMemlock::Bytes(value)
                         }
                     },
+                    pmix,
                 },
             )
             .await

@@ -168,7 +168,7 @@ pub enum RuntimeRequest {
         signal: i32,
     },
     LaunchStep {
-        step: RuntimeStepLaunchSpec,
+        step: Box<RuntimeStepLaunchSpec>,
     },
     SignalStep {
         step_id: u32,
@@ -299,6 +299,17 @@ pub struct RuntimeStepLaunchSpec {
     pub uid: u32,
     pub gid: u32,
     pub memlock: RuntimeMemlock,
+    #[serde(default)]
+    pub pmix: Option<RuntimePmixStepSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePmixStepSpec {
+    pub config: spur_core::config::MpiConfig,
+    pub plan: spur_core::mpi::PmixLaunchPlan,
+    pub command: Vec<String>,
+    pub task_offset: u32,
+    pub tasks_on_node: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,6 +345,39 @@ impl From<RuntimeWindowSize> for crate::pty::WindowSize {
 struct RuntimeStep {
     pid: u32,
     completion: Arc<RuntimeStepCompletion>,
+}
+
+struct RuntimeStepPmixResources {
+    host: Arc<crate::mpi_plugin::MpiPluginHost>,
+    job_id: u32,
+    step_dir: PathBuf,
+    files: Vec<PathBuf>,
+}
+
+impl Drop for RuntimeStepPmixResources {
+    fn drop(&mut self) {
+        if let Err(error) = self.host.release_pmix_server(self.job_id) {
+            tracing::warn!(job_id = self.job_id, %error, "PMIx runtime step release failed");
+        }
+        for file in &self.files {
+            let _ = fs::remove_file(file);
+        }
+        if !self.step_dir.as_os_str().is_empty() {
+            let _ = fs::remove_dir(&self.step_dir);
+        }
+    }
+}
+
+fn write_runtime_step_script(
+    path: &Path,
+    command: &[String],
+    uid: u32,
+    gid: u32,
+) -> io::Result<()> {
+    let command = shlex::try_join(command.iter().map(String::as_str))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    crate::executor::write_job_scratch(path, &format!("#!/bin/bash\nexec {command}\n"), uid, gid)
+        .map_err(io::Error::other)
 }
 
 const PTY_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -422,6 +466,7 @@ pub struct RuntimeSession {
     steps: Arc<Mutex<RuntimeSteps>>,
     pty: Mutex<Option<Arc<RuntimePty>>>,
     environment: std::collections::HashMap<String, String>,
+    pmix_host: Mutex<Option<Arc<crate::mpi_plugin::MpiPluginHost>>>,
 }
 
 impl RuntimeSession {
@@ -435,6 +480,16 @@ impl RuntimeSession {
         run_attempt: u32,
         environment: std::collections::HashMap<String, String>,
     ) -> Self {
+        Self::with_environment_and_pmix(job, job_id, run_attempt, environment, None)
+    }
+
+    pub fn with_environment_and_pmix(
+        job: RunningJob,
+        job_id: u32,
+        run_attempt: u32,
+        environment: std::collections::HashMap<String, String>,
+        pmix_host: Option<Arc<crate::mpi_plugin::MpiPluginHost>>,
+    ) -> Self {
         Self {
             job: Mutex::new(job),
             snapshot: Mutex::new(RuntimeSnapshot {
@@ -447,6 +502,7 @@ impl RuntimeSession {
             steps: Arc::new(Mutex::new(RuntimeSteps::default())),
             pty: Mutex::new(None),
             environment,
+            pmix_host: Mutex::new(pmix_host),
         }
     }
 
@@ -501,6 +557,82 @@ impl RuntimeSession {
     }
 
     async fn launch_step(&self, step: RuntimeStepLaunchSpec) -> io::Result<RuntimeStepResult> {
+        {
+            let steps = self.steps.lock().await;
+            if steps.cancelled.contains(&step.step_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("step {} was cancelled before launch", step.step_id),
+                ));
+            }
+            if let Some(completion) = steps
+                .active
+                .get(&step.step_id)
+                .map(|step| step.completion.clone())
+                .or_else(|| steps.completed.get(&step.step_id).cloned())
+            {
+                drop(steps);
+                return Ok(completion.wait().await);
+            }
+        }
+        let mut step = step;
+        let mut pmix_resources = None;
+        if let Some(pmix) = step.pmix.clone() {
+            let host = self.pmix_host(&pmix.config).await;
+            host.start_pmix_server_and_verify(&pmix.plan)
+                .map_err(io::Error::other)?;
+            pmix_resources = Some(RuntimeStepPmixResources {
+                host: host.clone(),
+                job_id: pmix.plan.job_id,
+                step_dir: PathBuf::new(),
+                files: Vec::new(),
+            });
+            let mut environment = step.environment.clone();
+            if pmix.tasks_on_node > 1 {
+                let per_rank = crate::mpi_plugin::pmix_setup_fork_env_for_node_tasks(
+                    &host,
+                    &pmix.plan,
+                    pmix.task_offset,
+                    pmix.tasks_on_node,
+                )
+                .map_err(io::Error::other)?;
+                let step_dir = crate::executor::prepare_step_script_dir(
+                    &step.work_dir,
+                    pmix.plan.job_id,
+                    step.uid,
+                    step.gid,
+                )
+                .map_err(io::Error::other)?;
+                let user_script = step_dir.join(format!("cmd_{}.sh", step.step_id));
+                let wrapper = step_dir.join(format!("wrapper_{}.sh", step.step_id));
+                write_runtime_step_script(&user_script, &pmix.command, step.uid, step.gid)?;
+                let wrapper_contents = spur_core::task_launch::build_multi_task_pmix_wrapper(
+                    user_script.to_string_lossy().as_ref(),
+                    pmix.tasks_on_node,
+                    &per_rank,
+                    Some(&environment),
+                )
+                .map_err(io::Error::other)?;
+                crate::executor::write_job_scratch(&wrapper, &wrapper_contents, step.uid, step.gid)
+                    .map_err(io::Error::other)?;
+                step.program = "bash".into();
+                step.args = vec![wrapper.to_string_lossy().into_owned()];
+                let resources = pmix_resources
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("missing PMIx step resources"))?;
+                resources.step_dir = step_dir;
+                resources.files = vec![user_script, wrapper];
+            } else {
+                crate::mpi_plugin::apply_pmix_setup_fork_env(
+                    &host,
+                    &pmix.plan,
+                    pmix.task_offset,
+                    &mut environment,
+                )
+                .map_err(io::Error::other)?;
+            }
+            step.environment = environment;
+        }
         let mut command = tokio::process::Command::new(&step.program);
         command
             .args(&step.args)
@@ -559,6 +691,7 @@ impl RuntimeSession {
         drop(steps);
         let steps = self.steps.clone();
         tokio::spawn(async move {
+            let _pmix_resources = pmix_resources;
             let stdout = child
                 .stdout
                 .take()
@@ -592,6 +725,15 @@ impl RuntimeSession {
             completion.complete(result).await;
         });
         Ok(completion.wait().await)
+    }
+
+    async fn pmix_host(
+        &self,
+        config: &spur_core::config::MpiConfig,
+    ) -> Arc<crate::mpi_plugin::MpiPluginHost> {
+        let mut host = self.pmix_host.lock().await;
+        host.get_or_insert_with(|| Arc::new(crate::mpi_plugin::MpiPluginHost::new(config.clone())))
+            .clone()
     }
 
     async fn signal_step(&self, step_id: u32, signal: i32) -> io::Result<()> {
@@ -1095,7 +1237,13 @@ pub(crate) async fn launch_step(
 ) -> io::Result<RuntimeStepResult> {
     let (mut reader, mut writer, _) = runtime_connect(descriptor, spurd_instance_id).await?;
     let step_id = step.step_id;
-    write_request(&mut writer, &RuntimeRequest::LaunchStep { step }).await?;
+    write_request(
+        &mut writer,
+        &RuntimeRequest::LaunchStep {
+            step: Box::new(step),
+        },
+    )
+    .await?;
     match read_response(&mut reader).await? {
         RuntimeResponse::StepCompleted {
             step_id: response_step_id,
@@ -1406,7 +1554,7 @@ pub async fn serve_control(stream: UnixStream, session: &RuntimeSession) -> io::
                     message: error.to_string(),
                 },
             },
-            RuntimeRequest::LaunchStep { step } => match session.launch_step(step.clone()).await {
+            RuntimeRequest::LaunchStep { step } => match session.launch_step(*step.clone()).await {
                 Ok(result) => RuntimeResponse::StepCompleted {
                     step_id: step.step_id,
                     exit_code: result.exit_code,
@@ -1549,7 +1697,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.gid = launch_spec.gid;
     descriptor.work_dir = launch_spec.work_dir.clone();
     store.publish(&descriptor)?;
-    let _pmix_guard = prepare_pmix_launch(&mut launch_spec)?;
+    let pmix_guard = prepare_pmix_launch(&mut launch_spec)?;
     let listener = UnixListener::bind(&socket_path)?;
     let controller_addr = launch_spec.controller_addr.clone();
     let reporting_node = launch_spec.reporting_node.clone();
@@ -1562,11 +1710,12 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             .map_err(|error| anyhow::anyhow!(error.to_string()))?
             .job
     };
-    let session = Arc::new(RuntimeSession::with_environment(
+    let session = Arc::new(RuntimeSession::with_environment_and_pmix(
         job,
         job_id,
         run_attempt,
         runtime_environment,
+        pmix_guard.as_ref().map(|guard| guard.host.clone()),
     ));
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
@@ -2059,6 +2208,35 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("both configuration and plan"));
+    }
+
+    #[test]
+    fn legacy_step_request_deserializes_without_runtime_pmix_inputs() {
+        let request = RuntimeRequest::LaunchStep {
+            step: Box::new(RuntimeStepLaunchSpec {
+                step_id: 7,
+                program: "true".into(),
+                args: Vec::new(),
+                work_dir: "/tmp".into(),
+                environment: HashMap::new(),
+                uid: 1,
+                gid: 1,
+                memlock: RuntimeMemlock::Inherit,
+                pmix: None,
+            }),
+        };
+        let mut request = serde_json::to_value(request).expect("encode request");
+        request
+            .get_mut("step")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("step object")
+            .remove("pmix");
+        let RuntimeRequest::LaunchStep { step } =
+            serde_json::from_value::<RuntimeRequest>(request).expect("decode legacy request")
+        else {
+            panic!("expected runtime step request");
+        };
+        assert!(step.pmix.is_none());
     }
 
     #[test]
@@ -2582,7 +2760,7 @@ mod tests {
         let server = tokio::spawn(async move { serve_control(server_stream, &session).await });
         let (reader, mut writer) = client_stream.into_split();
         let request = RuntimeRequest::LaunchStep {
-            step: RuntimeStepLaunchSpec {
+            step: Box::new(RuntimeStepLaunchSpec {
                 step_id: 7,
                 program: "sh".into(),
                 args: vec!["-c".into(), "printf runtime-step".into()],
@@ -2591,7 +2769,8 @@ mod tests {
                 uid: nix::unistd::geteuid().as_raw(),
                 gid: nix::unistd::getegid().as_raw(),
                 memlock: RuntimeMemlock::Inherit,
-            },
+                pmix: None,
+            }),
         };
         writer
             .write_all(
@@ -2639,6 +2818,7 @@ mod tests {
                 uid: nix::unistd::geteuid().as_raw(),
                 gid: nix::unistd::getegid().as_raw(),
                 memlock: RuntimeMemlock::Inherit,
+                pmix: None,
             })
             .await
             .expect_err("cancelled step must not spawn");
@@ -2658,6 +2838,7 @@ mod tests {
                 uid: nix::unistd::geteuid().as_raw(),
                 gid: nix::unistd::getegid().as_raw(),
                 memlock: RuntimeMemlock::Inherit,
+                pmix: None,
             })
             .await
             .expect("launch original step");
@@ -2671,6 +2852,7 @@ mod tests {
                 uid: nix::unistd::geteuid().as_raw(),
                 gid: nix::unistd::getegid().as_raw(),
                 memlock: RuntimeMemlock::Inherit,
+                pmix: None,
             })
             .await
             .expect("replay completed step");
