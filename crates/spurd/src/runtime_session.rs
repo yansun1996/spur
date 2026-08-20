@@ -1273,7 +1273,10 @@ async fn runtime_connect(
         .await
         {
             Ok(negotiated) => return Ok((reader, writer, negotiated)),
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            Err(error)
+                if error.kind() == io::ErrorKind::PermissionDenied
+                    && protocol_version_rejected(&error) =>
+            {
                 last_error = Some(error);
             }
             Err(error) => return Err(error),
@@ -1285,6 +1288,11 @@ async fn runtime_connect(
             "runtime has no compatible local protocol version",
         )
     }))
+}
+
+fn protocol_version_rejected(error: &io::Error) -> bool {
+    error.to_string().starts_with("runtime protocol ")
+        && error.to_string().contains(" is incompatible with ")
 }
 
 async fn runtime_hello(
@@ -2210,6 +2218,123 @@ mod tests {
             server.await.expect("server task").expect("accepted"),
             "agent-1"
         );
+    }
+
+    #[tokio::test]
+    async fn query_state_falls_back_to_a_v1_runtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("runtime.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let mut descriptor = descriptor(42, 3, std::process::id());
+        descriptor.socket_path = socket_path;
+        let capability = descriptor.capability.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept v2 client");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read v2 hello");
+            assert!(matches!(
+                serde_json::from_str::<RuntimeRequest>(&line).expect("decode v2 hello"),
+                RuntimeRequest::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                    ..
+                }
+            ));
+            write_response(
+                &mut writer,
+                &RuntimeResponse::Rejected {
+                    message: format!(
+                        "runtime protocol {PROTOCOL_VERSION} is incompatible with {MIN_PROTOCOL_VERSION}..={MIN_PROTOCOL_VERSION}"
+                    ),
+                },
+            )
+            .await
+            .expect("reject v2 hello");
+
+            let (stream, _) = listener.accept().await.expect("accept v1 client");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            line.clear();
+            reader.read_line(&mut line).await.expect("read v1 hello");
+            let RuntimeRequest::Hello {
+                protocol_version,
+                capability: received_capability,
+                run_attempt,
+                ..
+            } = serde_json::from_str(&line).expect("decode v1 hello")
+            else {
+                panic!("expected v1 hello");
+            };
+            assert_eq!(protocol_version, MIN_PROTOCOL_VERSION);
+            assert_eq!(received_capability, capability);
+            assert_eq!(run_attempt, 3);
+            write_response(
+                &mut writer,
+                &RuntimeResponse::Hello {
+                    protocol_version: MIN_PROTOCOL_VERSION,
+                    job_id: 42,
+                    run_attempt: 3,
+                },
+            )
+            .await
+            .expect("accept v1 hello");
+            line.clear();
+            reader.read_line(&mut line).await.expect("read state query");
+            assert!(matches!(
+                serde_json::from_str::<RuntimeRequest>(&line).expect("decode state query"),
+                RuntimeRequest::QueryState
+            ));
+            write_response(
+                &mut writer,
+                &RuntimeResponse::State {
+                    job_id: 42,
+                    run_attempt: 3,
+                    active: true,
+                    exit_code: None,
+                    signal: None,
+                },
+            )
+            .await
+            .expect("write state response");
+        });
+
+        let state = query_state(&descriptor, "agent-1".into())
+            .await
+            .expect("query v1 runtime");
+        assert!(state.active);
+        server.await.expect("server task");
+    }
+
+    #[test]
+    fn only_version_rejections_are_retryable() {
+        assert!(protocol_version_rejected(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "runtime protocol 2 is incompatible with 1..=1",
+        )));
+        assert!(!protocol_version_rejected(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "runtime capability rejected",
+        )));
+        assert!(!protocol_version_rejected(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "runtime attempt is stale",
+        )));
+    }
+
+    async fn write_response(
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        response: &RuntimeResponse,
+    ) -> io::Result<()> {
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(response).map_err(io::Error::other)?
+                )
+                .as_bytes(),
+            )
+            .await
     }
 
     #[tokio::test]
