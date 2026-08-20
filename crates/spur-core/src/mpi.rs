@@ -444,6 +444,26 @@ mod tests {
     }
 
     #[test]
+    fn pmix_launch_plan_serializes_without_losing_rank_or_peer_data() {
+        let plan = PmixLaunchPlan::local_tasks(
+            42,
+            8,
+            4,
+            2,
+            "/tmp/pmix",
+            1000,
+            1001,
+            2,
+            1,
+            vec!["node-a".into(), "node-b".into()],
+        )
+        .with_modex_timeouts(1, 2, 3);
+        let encoded = serde_json::to_vec(&plan).expect("serialize plan");
+        let decoded: PmixLaunchPlan = serde_json::from_slice(&encoded).expect("deserialize plan");
+        assert_eq!(decoded, plan);
+    }
+
+    #[test]
     fn parse_mpi_option_values() {
         assert_eq!(parse_mpi_option("list").unwrap(), None);
         assert_eq!(parse_mpi_option("pmix").unwrap(), Some("pmix".into()));
