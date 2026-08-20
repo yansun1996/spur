@@ -8,6 +8,18 @@ import time
 from cluster import job_state, parse_job_id, wait_job, wait_job_state
 
 
+def _read_until(channel, marker, timeout=30):
+    deadline = time.time() + timeout
+    output = ""
+    while time.time() < deadline:
+        if channel.recv_ready():
+            output += channel.recv(65536).decode(errors="replace")
+            if marker in output:
+                return output
+        time.sleep(0.1)
+    raise TimeoutError(f"did not receive {marker!r} from interactive srun: {output}")
+
+
 def _wait_descriptors(cluster, job_id, expected, timeout=30):
     deadline = time.time() + timeout
     descriptors = []
@@ -45,7 +57,73 @@ def _wait_agents_registered(cluster, timeout=60):
     raise TimeoutError("restarted agents did not register with the controller")
 
 
+def _wait_output_lines(cluster, path, expected, timeout=30):
+    deadline = time.time() + timeout
+    output = ""
+    while time.time() < deadline:
+        output = cluster.read_output_all_nodes(path)
+        if expected <= set(output.splitlines()):
+            return
+        time.sleep(1)
+    raise TimeoutError(f"expected output lines were not written: {expected - set(output.splitlines())}")
+
+
 class TestRuntimeSessionRecovery:
+    def test_interactive_pty_reconnects_after_agent_restart(self, runtime_cluster):
+        cluster = runtime_cluster
+        node = cluster.node_names[0]
+        channel = cluster.interactive_srun(
+            ["--pty", "-N", "1", "-w", node, "bash", "-c",
+             "printf READY; IFS= read value; printf 'INPUT=%s\\n' \"$value\"; "
+             "stty size; trap 'printf SIGNALLED; exit 42' INT; sleep 120"],
+            width=80,
+            height=24,
+        )
+        try:
+            _read_until(channel, "READY")
+            channel.resize_pty(width=132, height=47)
+            cluster.stop_agents()
+            cluster.start_agents()
+            _wait_agents_registered(cluster)
+            channel.send("reconnected-input\n")
+            output = _read_until(channel, "47 132", timeout=45)
+            assert "INPUT=reconnected-input" in output
+            channel.send("\x03")
+            output += _read_until(channel, "SIGNALLED", timeout=30)
+            assert "SIGNALLED" in output
+        finally:
+            channel.close()
+
+    def test_runtime_task_epilog_runs_once_per_logical_step(self, runtime_unstarted_cluster):
+        cluster = runtime_unstarted_cluster
+        marker = f"{cluster.remote_dir}/task-epilog.log"
+        epilog = cluster.write_file(
+            "runtime-task-epilog.sh",
+            f"#!/bin/bash\nprintf '%s\\n' \"$SPUR_SCRIPT_CONTEXT:$SPUR_JOB_ID\" >> {marker}\n",
+            all_nodes=True,
+        )
+        cluster.start(
+            {"hooks": {"task_epilog": epilog}},
+            agent_as_root=True,
+            agent_env={"SPUR_RUNTIME_SESSION": "1", "SPUR_RUNTIME_STATE_DIR": cluster.remote_dir},
+        )
+        script = cluster.write_file("runtime-task-epilog-hold.sh", "#!/bin/bash\nsleep 120\n", all_nodes=True)
+        job_id = parse_job_id(cluster.sbatch(["-J", "runtime-task-epilog", "-N", "1", script]))
+        assert job_id is not None
+        try:
+            wait_job_state(cluster, job_id, "R", timeout=60)
+            for marker_text in ("STEP_ONE", "STEP_TWO"):
+                code, output = cluster.srun_in_allocation(job_id, ["bash", "-c", f"echo {marker_text}"])
+                assert code == 0, output
+            _wait_output_lines(
+                cluster,
+                marker,
+                {f"epilog_task:{job_id}"},
+            )
+            lines = cluster.read_output_all_nodes(marker).splitlines()
+            assert lines == [f"epilog_task:{job_id}", f"epilog_task:{job_id}"]
+        finally:
+            cluster.scancel(str(job_id))
     def test_direct_pmix_batch_launch(self, runtime_mpi_cluster):
         cluster = runtime_mpi_cluster
         ranks = min(4, len(cluster.nodes))
@@ -82,6 +160,40 @@ class TestRuntimeSessionRecovery:
             )
             assert code == 0, f"runtime PMIx logical step failed:\n{output}\n{cluster.debug_job(job_id)}"
             assert {f"rank={rank} size={nodes}" for rank in range(nodes)} <= set(output.splitlines())
+        finally:
+            cluster.scancel(str(job_id))
+
+    def test_direct_pmix_batch_survives_agent_restart(self, runtime_mpi_cluster):
+        cluster = runtime_mpi_cluster
+        ranks = min(4, len(cluster.nodes))
+        recovery_mpi = cluster.compile_mpi_fixture("runtime_mpi_recovery.c")
+        out_path = f"{cluster.remote_dir}/runtime-pmix-recovery.out"
+        script = cluster.write_file(
+            "runtime-pmix-recovery.sh",
+            "#!/bin/bash\n#SBATCH --mpi=pmix\n" + recovery_mpi + "\n",
+        )
+        job_id = parse_job_id(
+            cluster.sbatch([
+                "-J", "runtime-pmix-recovery", "-N", str(ranks), "-n", str(ranks),
+                "-o", out_path, script,
+            ])
+        )
+        assert job_id is not None, "PMIx batch submission failed"
+        try:
+            wait_job_state(cluster, job_id, "R", timeout=60)
+            _wait_descriptors(cluster, job_id, expected=ranks)
+            _wait_output_lines(
+                cluster,
+                out_path,
+                {f"before-restart rank={rank} size={ranks}" for rank in range(ranks)},
+            )
+            cluster.stop_agents()
+            cluster.start_agents()
+            _wait_agents_registered(cluster)
+            state = wait_job(cluster, job_id, timeout=90)
+            output = cluster.read_output_all_nodes(out_path)
+            assert state in ("CD", "GONE"), f"recovered PMIx batch failed: {state}\n{cluster.debug_job(job_id)}"
+            assert {f"after-restart rank={rank} size={ranks}" for rank in range(ranks)} <= set(output.splitlines())
         finally:
             cluster.scancel(str(job_id))
 

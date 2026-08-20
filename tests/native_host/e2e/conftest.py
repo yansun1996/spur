@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from cluster import SshNode, SpurCluster, deep_merge, ensure_bins, make_remote_dir
+from cluster import HaSpurCluster, SshNode, SpurCluster, deep_merge, ensure_bins, make_remote_dir
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -215,6 +215,66 @@ def runtime_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
         raise
     yield spur_cluster
     spur_cluster.teardown()
+
+
+@pytest.fixture
+def runtime_ha_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+    """RuntimeSession cluster backed by a three-controller Raft quorum."""
+    if len(ssh_nodes) < 3:
+        pytest.skip(f"Runtime HA tests require at least 3 nodes (got {len(ssh_nodes)})")
+    c = HaSpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+    try:
+        c.deploy(
+            config_overrides=cluster_config_overrides,
+            agent_as_root=True,
+            agent_env={
+                "SPUR_RUNTIME_SESSION": "1",
+                "SPUR_RUNTIME_STATE_DIR": c.remote_dir,
+            },
+        )
+    except Exception:
+        c.teardown()
+        raise
+    yield c
+    c.teardown()
+
+
+@pytest.fixture
+def runtime_unstarted_cluster(ssh_nodes, remote_bin_dir):
+    """Provision a rootful RuntimeSession cluster before test hook setup."""
+    spur_cluster = _provision_cluster(ssh_nodes, remote_bin_dir)
+    try:
+        spur_cluster.root_agent_preflight()
+    except Exception:
+        spur_cluster.teardown()
+        raise
+    yield spur_cluster
+    spur_cluster.teardown()
+
+
+@pytest.fixture
+def runtime_gpu_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+    """RuntimeSession-gated cluster with CDI GPU discovery enabled."""
+    overrides = deep_merge(
+        dict(cluster_config_overrides or {}),
+        SpurCluster.devices_config(auto_detect=True),
+    )
+    c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+    c.gpu_preflight(1)
+    try:
+        c.deploy(
+            config_overrides=overrides,
+            agent_as_root=True,
+            agent_env={
+                "SPUR_RUNTIME_SESSION": "1",
+                "SPUR_RUNTIME_STATE_DIR": c.remote_dir,
+            },
+        )
+    except Exception:
+        c.teardown()
+        raise
+    yield c
+    c.teardown()
 
 
 @pytest.fixture

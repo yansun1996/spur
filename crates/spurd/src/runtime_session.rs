@@ -2878,6 +2878,73 @@ mod tests {
         server.await.expect("server task");
     }
 
+    #[tokio::test]
+    async fn resumable_pty_is_not_sent_to_a_v1_runtime() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("runtime.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let mut descriptor = descriptor(42, 3, std::process::id());
+        descriptor.socket_path = socket_path;
+        let capability = descriptor.capability.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept v2 client");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.expect("read v2 hello");
+            write_response(
+                &mut writer,
+                &RuntimeResponse::Rejected {
+                    message: format!(
+                        "runtime protocol {PROTOCOL_VERSION} is incompatible with {MIN_PROTOCOL_VERSION}..={MIN_PROTOCOL_VERSION}"
+                    ),
+                },
+            )
+            .await
+            .expect("reject v2 hello");
+
+            let (stream, _) = listener.accept().await.expect("accept v1 client");
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            line.clear();
+            reader.read_line(&mut line).await.expect("read v1 hello");
+            let RuntimeRequest::Hello {
+                protocol_version,
+                capability: received_capability,
+                run_attempt,
+                ..
+            } = serde_json::from_str(&line).expect("decode v1 hello")
+            else {
+                panic!("expected v1 hello");
+            };
+            assert_eq!(protocol_version, MIN_PROTOCOL_VERSION);
+            assert_eq!(received_capability, capability);
+            assert_eq!(run_attempt, 3);
+            write_response(
+                &mut writer,
+                &RuntimeResponse::Hello {
+                    protocol_version: MIN_PROTOCOL_VERSION,
+                    job_id: 42,
+                    run_attempt: 3,
+                },
+            )
+            .await
+            .expect("accept v1 hello");
+            line.clear();
+            assert_eq!(
+                reader.read_line(&mut line).await.expect("read post-hello"),
+                0
+            );
+        });
+
+        let error = launch_pty(&descriptor, "agent-1".into(), pty_spec(&["/bin/true"]))
+            .await
+            .expect_err("v1 runtime must reject resumable PTY");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("v1 does not support"));
+        server.await.expect("server task");
+    }
+
     #[test]
     fn only_version_rejections_are_retryable() {
         assert!(protocol_version_rejected(&io::Error::new(

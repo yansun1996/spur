@@ -8,6 +8,7 @@ Handles SSH connections, binary deployment, cluster startup/teardown,
 and CLI wrappers for interacting with the running cluster.
 """
 
+import copy
 import json
 import os
 import re
@@ -30,6 +31,7 @@ ACCOUNTING_SYMLINKS = ["sacct", "sacctmgr", "sshare", "sreport"]
 
 CONTROLLER_PORT = int(os.environ.get("SPUR_TEST_CONTROLLER_PORT", "6817"))
 AGENT_PORT = int(os.environ.get("SPUR_TEST_AGENT_PORT", "6818"))
+RAFT_PORT = int(os.environ.get("SPUR_TEST_RAFT_PORT", "6821"))
 
 
 def make_remote_dir() -> str:
@@ -438,6 +440,18 @@ class SpurCluster:
         _, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
         code = stdout.channel.recv_exit_status()
         return code, stdout.read().decode() + stderr.read().decode()
+
+    def interactive_srun(self, args: list[str], *, width: int = 80, height: int = 24):
+        """Start srun through an SSH PTY and return its interactive channel."""
+        cmd_parts = [
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
+            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+            shlex.quote(f"{self.bin_dir}/srun"),
+        ]
+        cmd_parts.extend(shlex.quote(arg) for arg in args)
+        channel = self.nodes[0].client.invoke_shell(width=width, height=height)
+        channel.send(" ".join(cmd_parts) + "\n")
+        return channel
 
     def squeue(self, args: list[str]) -> str:
         return self.cli(["squeue"] + args)
@@ -1198,6 +1212,83 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
             1 for name in self.node_names if states[name].startswith("idle")
         )
         return idle >= len(self.node_names)
+
+
+class HaSpurCluster(SpurCluster):
+    """A native cluster with a three-member controller Raft quorum."""
+
+    def __init__(self, nodes: list[SshNode], remote_dir: str, bin_dir: str):
+        if len(nodes) < 3:
+            raise ValueError("HA cluster requires at least three controller nodes")
+        super().__init__(nodes, remote_dir, bin_dir)
+        self.controller_indices = (0, 1, 2)
+        self.controller_addrs = [
+            f"http://{nodes[index].host}:{CONTROLLER_PORT}"
+            for index in self.controller_indices
+        ]
+        self.controller_addr = ",".join(self.controller_addrs)
+
+    def _write_config(self):
+        cfg = self._default_config()
+        deep_merge(cfg, self.config_overrides)
+        peers = [f"{self.nodes[index].host}:{RAFT_PORT}" for index in self.controller_indices]
+
+        for index, node in enumerate(self.nodes):
+            node_cfg = copy.deepcopy(cfg)
+            controller_cfg = node_cfg.setdefault("controller", {})
+            controller_cfg["peers"] = peers
+            if index in self.controller_indices:
+                controller_cfg["node_id"] = self.controller_indices.index(index) + 1
+                controller_cfg["raft_listen_addr"] = f"0.0.0.0:{RAFT_PORT}"
+            node.write_file(f"{self.etc_dir}/spur.conf", tomli_w.dumps(node_cfg))
+
+    def _start_controller_on(self, node_index: int):
+        node = self.nodes[node_index]
+        cmd = (
+            f"nohup '{self.bin_dir}/spurctld' "
+            f"-f '{self.etc_dir}/spur.conf' "
+            f"--listen '[::]:{CONTROLLER_PORT}' --state-dir '{self.state_dir}' --log-level info -D "
+            f"> '{self.log_dir}/spurctld.log' 2>&1 & echo $!"
+        )
+        pid = node.exec(cmd).strip()
+        logger.info("HA spurctld started on %s (pid %s)", self.node_names[node_index], pid)
+
+    def _start_controller(self):
+        for index in self.controller_indices:
+            self._start_controller_on(index)
+
+    def start_controller(
+        self, config_overrides: dict | None = None, kill_stale: bool = True
+    ):
+        super().start_controller(config_overrides, kill_stale)
+        self.raft_leader_index()
+
+    def _kill_controller(self):
+        for index in self.controller_indices:
+            self._pkill(self.nodes[index], f"{self.bin_dir}/spurctld")
+
+    def stop_controller_node(self, node_index: int):
+        """Stop one controller so its peers must elect a new Raft leader."""
+        if node_index not in self.controller_indices:
+            raise ValueError(f"node {node_index} is not a controller")
+        self._pkill(self.nodes[node_index], f"{self.bin_dir}/spurctld")
+
+    def raft_leader_index(self, timeout: int = 30) -> int:
+        """Return the controller whose leader-only metrics endpoint is healthy."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            leaders = [
+                index
+                for index in self.controller_indices
+                if "leader" in self.nodes[index].exec_allow_fail(
+                    "curl -fsS http://127.0.0.1:6822/metrics >/dev/null "
+                    "&& echo leader || true"
+                )
+            ]
+            if len(leaders) == 1:
+                return leaders[0]
+            time.sleep(1)
+        raise TimeoutError("HA controller quorum did not elect exactly one leader")
 
 
 # --- Job helpers ---
