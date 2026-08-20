@@ -3079,6 +3079,23 @@ impl SlurmController for ControllerService {
                 "srun step dispatch errors:\n{}\n",
                 dispatch_errors.join("\n")
             ));
+            if dispatches
+                .iter()
+                .any(|dispatch| dispatch.runtime_step_reconnectable)
+                && matches!(
+                    self.probe_runtime_recovery(&step_node_names[0], job_id, run_attempt)
+                        .await?,
+                    RuntimeRecoveryProbe::Incomplete { .. }
+                )
+            {
+                self.fence_runtime_recovery(job_id, run_attempt).await?;
+                return Ok(Response::new(RunStepResponse {
+                    exit_code: max_exit,
+                    stdout,
+                    stderr,
+                    node: ran_nodes.join(","),
+                }));
+            }
         }
 
         if needs_pmix_prepare {
