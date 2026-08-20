@@ -11,9 +11,11 @@ Authority
 
 ``spurctld`` and Raft remain the authority for jobs, placement, global resource
 ownership, and the current allocation generation. ``spurd`` authenticates and
-coordinates node-local requests. A RuntimeSession owns only live execution
-state: process trees, cgroups, logical steps, PTYs and I/O, PMIx namespaces,
-hooks, signals, and observed exit status.
+coordinates node-local requests. In the current rollout cohort, a
+RuntimeSession owns live execution state for plain allocations: process trees,
+cgroups, logical steps, PTYs and I/O, signals, and observed exit status.
+PMIx namespace lifetime, containers/device injection, and hook lifecycle
+remain agent-owned until their recovery contracts are implemented.
 
 RuntimeSession must never choose placement or accept stale execution state as
 truth. Every reconnect and report is fenced by the controller's current job
@@ -41,9 +43,10 @@ exit, epilog completion, acknowledged completion report, and resource release.
 Failure contracts
 -----------------
 
-* A ``spurd`` crash, restart, or compatible upgrade leaves RuntimeSession and
-  its children running. The replacement agent discovers the descriptor,
-  authenticates to the socket, verifies the attempt, and reconnects.
+* For supported cohort workloads, a ``spurd`` crash, restart, or compatible
+  upgrade leaves RuntimeSession and its children running. The replacement
+  agent discovers the descriptor, authenticates to the socket, verifies the
+  attempt, and reconnects.
 * A RuntimeSession crash is fail-closed in v1: fence its cgroup and fail or
   requeue its attempt. Process adoption is not a recovery mechanism.
 * A recovered agent reports ``(job, attempt)`` to the controller. The
