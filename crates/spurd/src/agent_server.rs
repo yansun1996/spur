@@ -104,6 +104,8 @@ async fn launch_runtime_session(
     command
         .arg("--unit")
         .arg(unit)
+        .arg("--slice")
+        .arg("spur-runtime.slice")
         .arg("--collect")
         .arg("--no-block")
         .arg("--service-type=exec")
