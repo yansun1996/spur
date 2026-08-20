@@ -310,6 +310,22 @@ pub struct RuntimeStepLaunchSpec {
     pub memlock: RuntimeMemlock,
     #[serde(default)]
     pub pmix: Option<RuntimePmixStepSpec>,
+    #[serde(default)]
+    pub task_epilog: Option<RuntimeTaskEpilogSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTaskEpilogSpec {
+    pub script: String,
+    pub job_id: u32,
+    pub work_dir: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub partition: String,
+    pub nodelist: String,
+    pub gpu_devices: Vec<u32>,
+    pub cpus: u32,
+    pub memory_mb: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -703,6 +719,7 @@ impl RuntimeSession {
         );
         drop(steps);
         let steps = self.steps.clone();
+        let task_epilog = step.task_epilog.clone();
         tokio::spawn(async move {
             let _pmix_resources = pmix_resources;
             let stdout = child
@@ -725,6 +742,23 @@ impl RuntimeSession {
                     stderr: error.to_string(),
                 },
             };
+            if let Some(epilog) = task_epilog {
+                let context = spur_core::hooks::HookContext {
+                    job_id: epilog.job_id,
+                    work_dir: epilog.work_dir,
+                    uid: epilog.uid,
+                    gid: epilog.gid,
+                    partition: epilog.partition,
+                    nodelist: epilog.nodelist,
+                    script_context: "epilog_task".into(),
+                    gpu_devices: epilog.gpu_devices,
+                    cpus: epilog.cpus,
+                    memory_mb: epilog.memory_mb,
+                };
+                if let Err(error) = spur_core::hooks::run_hook(&epilog.script, &context).await {
+                    tracing::warn!(%error, "runtime task epilog failed");
+                }
+            }
             let mut steps = steps.lock().await;
             let Some(completion) = steps
                 .active
@@ -2303,6 +2337,7 @@ mod tests {
                 gid: 1,
                 memlock: RuntimeMemlock::Inherit,
                 pmix: None,
+                task_epilog: None,
             }),
         };
         let mut request = serde_json::to_value(request).expect("encode request");
@@ -2850,6 +2885,7 @@ mod tests {
                 gid: nix::unistd::getegid().as_raw(),
                 memlock: RuntimeMemlock::Inherit,
                 pmix: None,
+                task_epilog: None,
             }),
         };
         writer
@@ -2899,6 +2935,7 @@ mod tests {
                 gid: nix::unistd::getegid().as_raw(),
                 memlock: RuntimeMemlock::Inherit,
                 pmix: None,
+                task_epilog: None,
             })
             .await
             .expect_err("cancelled step must not spawn");
@@ -2919,6 +2956,7 @@ mod tests {
                 gid: nix::unistd::getegid().as_raw(),
                 memlock: RuntimeMemlock::Inherit,
                 pmix: None,
+                task_epilog: None,
             })
             .await
             .expect("launch original step");
@@ -2933,10 +2971,60 @@ mod tests {
                 gid: nix::unistd::getegid().as_raw(),
                 memlock: RuntimeMemlock::Inherit,
                 pmix: None,
+                task_epilog: None,
             })
             .await
             .expect("replay completed step");
         assert_eq!(first.stdout, "original");
         assert_eq!(replay.stdout, "original");
+    }
+
+    #[tokio::test]
+    async fn runtime_step_runs_its_task_epilog_before_returning() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("task-epilog-ran");
+        let script = temp.path().join("task-epilog.sh");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\nprintf task > {}\n", marker.display()),
+        )
+        .expect("write epilog");
+        let mut permissions = fs::metadata(&script)
+            .expect("script metadata")
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o755);
+        }
+        fs::set_permissions(&script, permissions).expect("make epilog executable");
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 42, 3);
+        session
+            .launch_step(RuntimeStepLaunchSpec {
+                step_id: 8,
+                program: "true".into(),
+                args: Vec::new(),
+                work_dir: temp.path().to_string_lossy().into_owned(),
+                environment: HashMap::new(),
+                uid: nix::unistd::geteuid().as_raw(),
+                gid: nix::unistd::getegid().as_raw(),
+                memlock: RuntimeMemlock::Inherit,
+                pmix: None,
+                task_epilog: Some(RuntimeTaskEpilogSpec {
+                    script: script.to_string_lossy().into_owned(),
+                    job_id: 42,
+                    work_dir: temp.path().to_string_lossy().into_owned(),
+                    uid: nix::unistd::geteuid().as_raw(),
+                    gid: nix::unistd::getegid().as_raw(),
+                    partition: "default".into(),
+                    nodelist: "node-a".into(),
+                    gpu_devices: Vec::new(),
+                    cpus: 1,
+                    memory_mb: 0,
+                }),
+            })
+            .await
+            .expect("run step");
+        assert_eq!(fs::read_to_string(marker).expect("read marker"), "task");
     }
 }

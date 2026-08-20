@@ -2658,6 +2658,20 @@ impl SlurmAgent for AgentService {
                         }
                     },
                     pmix,
+                    task_epilog: self.hooks.task_epilog.as_ref().map(|script| {
+                        crate::runtime_session::RuntimeTaskEpilogSpec {
+                            script: script.clone(),
+                            job_id,
+                            work_dir: work_dir.clone(),
+                            uid: req.uid,
+                            gid: req.gid,
+                            partition: partition.clone(),
+                            nodelist: nodelist.clone(),
+                            gpu_devices: gpu_devices.clone(),
+                            cpus,
+                            memory_mb,
+                        }
+                    }),
                 },
             )
             .await
