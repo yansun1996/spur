@@ -61,9 +61,11 @@ operations are ``Hello``, ``QueryState``, ``LaunchStep``, ``SignalStep``,
 ``LaunchPty``, ``WritePty``, ``ReadPty``, ``ResizePty``, ``SignalPty``,
 ``BeginTeardown``, and ``Shutdown``. ``ReadPty`` uses a monotonic output offset
 and a bounded one-mebibyte live buffer, so an agent or client reconnect can
-resume output without becoming the owner of the terminal. An N/N-1 compatible
-protocol is required for one release during rolling upgrades. Incompatible
-runtimes require draining a node before the agent upgrade.
+resume output without becoming the owner of the terminal. Protocol v2
+negotiates with v1 during one-release rolling upgrades; a current agent retries
+its hello at v1 when reconnecting to a v1 runtime. Resumable PTY operations
+require v2, so nodes carrying a v1 runtime must be drained before enabling the
+PTY cohort.
 
 Rollout
 -------

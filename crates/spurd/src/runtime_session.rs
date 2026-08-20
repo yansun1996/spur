@@ -144,7 +144,8 @@ const DESCRIPTOR_FILE: &str = "descriptor.json";
 const OBLIGATION_FILE: &str = "obligations.jsonl";
 const FAILURE_FILE: &str = "failure.txt";
 const FORMAT_VERSION: u32 = 1;
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+const MIN_PROTOCOL_VERSION: u32 = PROTOCOL_VERSION - 1;
 const STEP_OUTPUT_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -931,10 +932,10 @@ pub fn validate_hello(
     protocol_version: u32,
     run_attempt: u32,
 ) -> RuntimeResponse {
-    if protocol_version != PROTOCOL_VERSION {
+    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&protocol_version) {
         return RuntimeResponse::Rejected {
             message: format!(
-                "runtime protocol {protocol_version} is incompatible with {PROTOCOL_VERSION}"
+                "runtime protocol {protocol_version} is incompatible with {MIN_PROTOCOL_VERSION}..={PROTOCOL_VERSION}"
             ),
         };
     }
@@ -954,7 +955,7 @@ pub fn validate_hello(
         };
     }
     RuntimeResponse::Hello {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version,
         job_id: descriptor.job_id,
         run_attempt: descriptor.run_attempt,
     }
@@ -1017,34 +1018,7 @@ pub async fn query_state(
     descriptor: &RuntimeSessionDescriptor,
     spurd_instance_id: String,
 ) -> io::Result<RuntimeSnapshot> {
-    let stream = UnixStream::connect(&descriptor.socket_path).await?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let hello = RuntimeRequest::Hello {
-        protocol_version: PROTOCOL_VERSION,
-        capability: descriptor.capability.clone(),
-        spurd_instance_id,
-        run_attempt: descriptor.run_attempt,
-    };
-    write_request(&mut writer, &hello).await?;
-    match read_response(&mut reader).await? {
-        RuntimeResponse::Hello {
-            job_id,
-            run_attempt,
-            ..
-        } if job_id == descriptor.job_id && run_attempt == descriptor.run_attempt => {}
-        RuntimeResponse::Rejected { message } => {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "runtime hello identity mismatch",
-            ));
-        }
-    }
-    write_request(&mut writer, &RuntimeRequest::QueryState).await?;
-    match read_response(&mut reader).await? {
+    match runtime_request(descriptor, spurd_instance_id, RuntimeRequest::QueryState).await? {
         RuntimeResponse::State {
             job_id,
             run_attempt,
@@ -1072,34 +1046,13 @@ pub async fn signal_allocation(
     spurd_instance_id: String,
     signal: i32,
 ) -> io::Result<()> {
-    let stream = UnixStream::connect(&descriptor.socket_path).await?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let hello = RuntimeRequest::Hello {
-        protocol_version: PROTOCOL_VERSION,
-        capability: descriptor.capability.clone(),
+    match runtime_request(
+        descriptor,
         spurd_instance_id,
-        run_attempt: descriptor.run_attempt,
-    };
-    write_request(&mut writer, &hello).await?;
-    match read_response(&mut reader).await? {
-        RuntimeResponse::Hello {
-            job_id,
-            run_attempt,
-            ..
-        } if job_id == descriptor.job_id && run_attempt == descriptor.run_attempt => {}
-        RuntimeResponse::Rejected { message } => {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "runtime hello identity mismatch",
-            ));
-        }
-    }
-    write_request(&mut writer, &RuntimeRequest::SignalAllocation { signal }).await?;
-    match read_response(&mut reader).await? {
+        RuntimeRequest::SignalAllocation { signal },
+    )
+    .await?
+    {
         RuntimeResponse::Acknowledged => Ok(()),
         RuntimeResponse::Rejected { message } => {
             Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
@@ -1116,10 +1069,7 @@ pub(crate) async fn launch_step(
     spurd_instance_id: String,
     step: RuntimeStepLaunchSpec,
 ) -> io::Result<RuntimeStepResult> {
-    let stream = UnixStream::connect(&descriptor.socket_path).await?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    runtime_hello(&mut reader, &mut writer, descriptor, spurd_instance_id).await?;
+    let (mut reader, mut writer, _) = runtime_connect(descriptor, spurd_instance_id).await?;
     let step_id = step.step_id;
     write_request(&mut writer, &RuntimeRequest::LaunchStep { step }).await?;
     match read_response(&mut reader).await? {
@@ -1147,10 +1097,7 @@ pub(crate) async fn signal_step(
     step_id: u32,
     signal: i32,
 ) -> io::Result<()> {
-    let stream = UnixStream::connect(&descriptor.socket_path).await?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    runtime_hello(&mut reader, &mut writer, descriptor, spurd_instance_id).await?;
+    let (mut reader, mut writer, _) = runtime_connect(descriptor, spurd_instance_id).await?;
     write_request(&mut writer, &RuntimeRequest::SignalStep { step_id, signal }).await?;
     match read_response(&mut reader).await? {
         RuntimeResponse::Acknowledged => Ok(()),
@@ -1282,12 +1229,62 @@ async fn runtime_request(
     spurd_instance_id: String,
     request: RuntimeRequest,
 ) -> io::Result<RuntimeResponse> {
-    let stream = UnixStream::connect(&descriptor.socket_path).await?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    runtime_hello(&mut reader, &mut writer, descriptor, spurd_instance_id).await?;
+    let (mut reader, mut writer, protocol_version) =
+        runtime_connect(descriptor, spurd_instance_id).await?;
+    if protocol_version < PROTOCOL_VERSION
+        && matches!(
+            request,
+            RuntimeRequest::LaunchPty { .. }
+                | RuntimeRequest::WritePty { .. }
+                | RuntimeRequest::ResizePty { .. }
+                | RuntimeRequest::SignalPty { .. }
+                | RuntimeRequest::ReadPty { .. }
+        )
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime protocol v1 does not support resumable PTY operations",
+        ));
+    }
     write_request(&mut writer, &request).await?;
     read_response(&mut reader).await
+}
+
+async fn runtime_connect(
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+) -> io::Result<(
+    BufReader<tokio::net::unix::OwnedReadHalf>,
+    tokio::net::unix::OwnedWriteHalf,
+    u32,
+)> {
+    let mut last_error = None;
+    for protocol_version in (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).rev() {
+        let stream = UnixStream::connect(&descriptor.socket_path).await?;
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        match runtime_hello(
+            &mut reader,
+            &mut writer,
+            descriptor,
+            spurd_instance_id.clone(),
+            protocol_version,
+        )
+        .await
+        {
+            Ok(negotiated) => return Ok((reader, writer, negotiated)),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "runtime has no compatible local protocol version",
+        )
+    }))
 }
 
 async fn runtime_hello(
@@ -1295,9 +1292,10 @@ async fn runtime_hello(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     descriptor: &RuntimeSessionDescriptor,
     spurd_instance_id: String,
-) -> io::Result<()> {
+    protocol_version: u32,
+) -> io::Result<u32> {
     let hello = RuntimeRequest::Hello {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version,
         capability: descriptor.capability.clone(),
         spurd_instance_id,
         run_attempt: descriptor.run_attempt,
@@ -1305,10 +1303,15 @@ async fn runtime_hello(
     write_request(writer, &hello).await?;
     match read_response(reader).await? {
         RuntimeResponse::Hello {
+            protocol_version,
             job_id,
             run_attempt,
-            ..
-        } if job_id == descriptor.job_id && run_attempt == descriptor.run_attempt => Ok(()),
+        } if job_id == descriptor.job_id
+            && run_attempt == descriptor.run_attempt
+            && (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&protocol_version) =>
+        {
+            Ok(protocol_version)
+        }
         RuntimeResponse::Rejected { message } => {
             Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
         }
@@ -2127,12 +2130,26 @@ mod tests {
             ),
             RuntimeResponse::Rejected { .. }
         ));
+        assert_eq!(
+            validate_hello(
+                &descriptor,
+                &descriptor.capability,
+                &descriptor.capability,
+                MIN_PROTOCOL_VERSION,
+                3
+            ),
+            RuntimeResponse::Hello {
+                protocol_version: MIN_PROTOCOL_VERSION,
+                job_id: 42,
+                run_attempt: 3,
+            }
+        );
         assert!(matches!(
             validate_hello(
                 &descriptor,
                 &descriptor.capability,
                 &descriptor.capability,
-                2,
+                MIN_PROTOCOL_VERSION - 1,
                 3
             ),
             RuntimeResponse::Rejected { .. }
