@@ -46,6 +46,45 @@ def _wait_agents_registered(cluster, timeout=60):
 
 
 class TestRuntimeSessionRecovery:
+    def test_direct_pmix_batch_launch(self, runtime_mpi_cluster):
+        cluster = runtime_mpi_cluster
+        ranks = min(4, len(cluster.nodes))
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        out_path = f"{cluster.remote_dir}/runtime-pmix.out"
+        script = cluster.write_file(
+            "runtime-pmix.sh", "#!/bin/bash\n#SBATCH --mpi=pmix\n" + hello_mpi + "\n"
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "runtime-pmix", "-N", str(ranks), "-n", str(ranks), "-o", out_path, script])
+        )
+        assert job_id is not None, "PMIx batch submission failed"
+        state = wait_job(cluster, job_id, timeout=180)
+        output = cluster.read_output_all_nodes(out_path)
+        assert state in ("CD", "GONE"), f"runtime PMIx batch failed: {state}\n{cluster.debug_job(job_id)}"
+        assert {f"rank={rank} size={ranks}" for rank in range(ranks)} <= set(output.splitlines())
+
+    def test_pmix_logical_step_in_non_pmix_allocation(self, runtime_mpi_cluster):
+        cluster = runtime_mpi_cluster
+        nodes = len(cluster.nodes)
+        hello_mpi = cluster.compile_mpi_fixture("hello_mpi.c")
+        script = cluster.write_file(
+            "runtime-pmix-step-hold.sh", "#!/bin/bash\nsleep 120\n", all_nodes=True
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "runtime-pmix-step", "-N", str(nodes), "-n", str(nodes), script])
+        )
+        assert job_id is not None, "batch submission failed"
+        try:
+            wait_job_state(cluster, job_id, "R", timeout=60)
+            _wait_descriptors(cluster, job_id, expected=nodes)
+            code, output = cluster.srun_in_allocation(
+                job_id, ["--mpi=pmix", "-N", str(nodes), "-n", str(nodes), hello_mpi]
+            )
+            assert code == 0, f"runtime PMIx logical step failed:\n{output}\n{cluster.debug_job(job_id)}"
+            assert {f"rank={rank} size={nodes}" for rank in range(nodes)} <= set(output.splitlines())
+        finally:
+            cluster.scancel(str(job_id))
+
     def test_container_job_completes(self, runtime_cluster, tmp_path):
         cluster = runtime_cluster
         cluster.container_preflight()

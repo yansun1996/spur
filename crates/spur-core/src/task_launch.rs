@@ -112,13 +112,16 @@ pub fn use_multi_task_launch(
     mpi: &str,
     script: &str,
 ) -> bool {
+    if mpi == MPI_PMIX && !batch_script_uses_step_launch(script) {
+        return true;
+    }
     if tasks_per_node <= 1 {
         return false;
     }
     if task_fanout {
         return true;
     }
-    mpi == MPI_PMIX && !batch_script_uses_step_launch(script)
+    false
 }
 
 /// True when batch dispatch already ran multi-node PMIx prepare for this job.
@@ -775,7 +778,7 @@ mod tests {
     #[test]
     fn use_multi_task_launch_batch_pmix_fans_out() {
         assert!(use_multi_task_launch(4, false, MPI_PMIX, "/tmp/hello_mpi"));
-        assert!(!use_multi_task_launch(1, false, MPI_PMIX, "/tmp/hello_mpi"));
+        assert!(use_multi_task_launch(1, false, MPI_PMIX, "/tmp/hello_mpi"));
         assert!(!use_multi_task_launch(4, false, "none", "echo hi"));
         assert!(use_multi_task_launch(4, true, "none", "hostname"));
         assert!(!use_multi_task_launch(1, true, "none", "hostname"));
