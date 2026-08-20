@@ -182,10 +182,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let hooks_config = config.as_ref().map(|c| c.hooks.clone()).unwrap_or_default();
-    let runtime_state_dir = config
-        .as_ref()
-        .map(|c| c.controller.state_dir.clone())
-        .unwrap_or_else(|| "/var/spool/spur".into());
+    let runtime_state_dir = std::env::var("SPUR_RUNTIME_STATE_DIR").unwrap_or_else(|_| {
+        config
+            .as_ref()
+            .map(|c| c.controller.state_dir.clone())
+            .unwrap_or_else(|| "/var/spool/spur".into())
+    });
     let runtime_sessions = runtime_session::RuntimeSessionStore::new(runtime_state_dir);
     let discovered_sessions = runtime_sessions.discover_live()?;
     for (path, reason) in discovered_sessions.rejected {
