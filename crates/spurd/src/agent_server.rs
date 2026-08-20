@@ -50,6 +50,7 @@ async fn launch_runtime_session(
     reporting_node: &str,
     allocation_only: bool,
     pmix_inputs: Option<(MpiConfig, PmixLaunchPlan)>,
+    container_rootfs_mode: Option<crate::container::RootfsMode>,
 ) -> Result<
     (
         executor::LaunchResult,
@@ -63,6 +64,7 @@ async fn launch_runtime_session(
     launch_spec.reporting_node = reporting_node.into();
     launch_spec.run_attempt = run_attempt;
     launch_spec.allocation_only = allocation_only || config.io_mode == executor::LaunchIo::Pty;
+    launch_spec.container_rootfs_mode = container_rootfs_mode;
     if let Some((pmix_config, pmix_plan)) = pmix_inputs {
         launch_spec.pmix_config = Some(pmix_config);
         launch_spec.pmix_plan = Some(pmix_plan);
@@ -1780,6 +1782,7 @@ impl SlurmAgent for AgentService {
                 &self.reporter.hostname,
                 false,
                 runtime_pmix_inputs,
+                launch_cfg.container.as_ref().map(|_| rootfs_mode.clone()),
             )
             .await
             .map(|(result, descriptor)| (result, Some(descriptor)))
@@ -2223,7 +2226,7 @@ impl SlurmAgent for AgentService {
         let runtime_enabled = std::env::var("SPUR_RUNTIME_SESSION")
             .ok()
             .is_some_and(|value| value == "1");
-        let runtime_descriptor = if runtime_enabled && controller_gpu_ids.is_empty() {
+        let runtime_descriptor = if runtime_enabled {
             let config = executor::JobLaunchConfig {
                 job_id: req.job_id,
                 script: String::new(),
@@ -2239,7 +2242,7 @@ impl SlurmAgent for AgentService {
                 stdin_path: String::new(),
                 cpus,
                 memory_mb,
-                gpu_devices: Vec::new(),
+                gpu_devices: controller_gpu_ids.clone(),
                 cpu_ids: Vec::new(),
                 open_mode: None,
                 uid: req.uid,
@@ -2259,6 +2262,7 @@ impl SlurmAgent for AgentService {
                 &self.reporter.controller_addr,
                 &self.reporter.hostname,
                 true,
+                None,
                 None,
             )
             .await

@@ -31,12 +31,20 @@ pub struct RuntimeLaunchSpec {
     pub cpus: u32,
     pub memory_mb: u64,
     pub cpu_ids: Vec<u32>,
+    #[serde(default)]
+    pub gpu_devices: Vec<u32>,
     pub open_mode: Option<String>,
     pub uid: u32,
     pub gid: u32,
     pub partition: String,
     pub nodelist: String,
     pub memlock: RuntimeMemlock,
+    #[serde(default)]
+    pub container: Option<crate::executor::ContainerLaunchConfig>,
+    #[serde(default)]
+    pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
+    #[serde(default)]
+    pub container_rootfs_mode: Option<crate::container::RootfsMode>,
     #[serde(default)]
     pub controller_addr: String,
     #[serde(default)]
@@ -66,12 +74,6 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
     type Error = String;
 
     fn try_from(config: &crate::executor::JobLaunchConfig) -> Result<Self, Self::Error> {
-        if config.container.is_some() {
-            return Err("container launches are not yet supported by RuntimeSession".into());
-        }
-        if !config.gpu_devices.is_empty() {
-            return Err("GPU launches are not yet supported by RuntimeSession".into());
-        }
         Ok(Self {
             job_id: config.job_id,
             script: config.script.clone(),
@@ -85,6 +87,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
             stdin_path: config.stdin_path.clone(),
             cpus: config.cpus,
             memory_mb: config.memory_mb,
+            gpu_devices: config.gpu_devices.clone(),
             cpu_ids: config.cpu_ids.clone(),
             open_mode: config.open_mode.clone(),
             uid: config.uid,
@@ -96,6 +99,9 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
                 spur_core::config::MemlockLimit::Inherit => RuntimeMemlock::Inherit,
                 spur_core::config::MemlockLimit::Bytes(value) => RuntimeMemlock::Bytes(value),
             },
+            container: config.container.clone(),
+            host_device_plan: config.host_device_plan.clone(),
+            container_rootfs_mode: None,
             controller_addr: String::new(),
             reporting_node: String::new(),
             run_attempt: 0,
@@ -125,16 +131,16 @@ impl RuntimeLaunchSpec {
             stdin_path: self.stdin_path,
             cpus: self.cpus,
             memory_mb: self.memory_mb,
-            gpu_devices: Vec::new(),
+            gpu_devices: self.gpu_devices,
             cpu_ids: self.cpu_ids,
             open_mode: self.open_mode,
             uid: self.uid,
             gid: self.gid,
-            container: None,
+            container: self.container,
             prolog_script: None,
             partition: self.partition,
             nodelist: self.nodelist,
-            host_device_plan: None,
+            host_device_plan: self.host_device_plan,
             memlock: match self.memlock {
                 RuntimeMemlock::Unlimited => spur_core::config::MemlockLimit::Unlimited,
                 RuntimeMemlock::Inherit => spur_core::config::MemlockLimit::Inherit,
@@ -508,6 +514,10 @@ impl RuntimeSession {
 
     pub async fn snapshot(&self) -> RuntimeSnapshot {
         self.snapshot.lock().await.clone()
+    }
+
+    async fn take_cgroup(&self) -> Option<PathBuf> {
+        self.job.lock().await.take_cgroup()
     }
 
     pub async fn poll_completion(&self) -> io::Result<()> {
@@ -1702,13 +1712,20 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let controller_addr = launch_spec.controller_addr.clone();
     let reporting_node = launch_spec.reporting_node.clone();
     let runtime_environment = launch_spec.environment.clone();
+    let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     let job = if launch_spec.allocation_only {
         RunningJob::AllocationOnly
     } else {
-        crate::executor::launch_job(&launch_spec.into_launch_config(), None)
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?
-            .job
+        match crate::executor::launch_job(&launch_spec.into_launch_config(), None).await {
+            Ok(result) => result.job,
+            Err(error) => {
+                if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
+                    crate::container::cleanup_rootfs(job_id, rootfs_mode);
+                }
+                crate::executor::cleanup_job_spool(job_id);
+                return Err(anyhow::anyhow!(error.to_string()));
+            }
+        }
     };
     let session = Arc::new(RuntimeSession::with_environment_and_pmix(
         job,
@@ -1719,6 +1736,13 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     ));
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
+    if let Some(cgroup) = session.take_cgroup().await {
+        crate::executor::cleanup_cgroup(&cgroup);
+    }
+    if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
+        crate::container::cleanup_rootfs(job_id, rootfs_mode);
+    }
+    crate::executor::cleanup_job_spool(job_id);
     if let Err(error) = result {
         let failure_path = session_dir.join(FAILURE_FILE);
         if let Err(write_error) = std::fs::write(&failure_path, error.to_string()) {
@@ -2174,6 +2198,7 @@ mod tests {
             stdin_path: String::new(),
             cpus: 1,
             memory_mb: 0,
+            gpu_devices: Vec::new(),
             cpu_ids: Vec::new(),
             open_mode: None,
             uid: nix::unistd::geteuid().as_raw(),
@@ -2181,6 +2206,9 @@ mod tests {
             partition: "default".into(),
             nodelist: "node-a".into(),
             memlock: RuntimeMemlock::Inherit,
+            container: None,
+            host_device_plan: None,
+            container_rootfs_mode: None,
             controller_addr: String::new(),
             reporting_node: String::new(),
             run_attempt: 1,
@@ -2197,6 +2225,29 @@ mod tests {
         let mut spec = launch_spec();
         spec.pmix_multi_task = true;
         assert!(spec.into_launch_config().pmix_multi_task);
+    }
+
+    #[test]
+    fn launch_spec_persists_gpu_injection_plan() {
+        let mut spec = launch_spec();
+        spec.gpu_devices = vec![3, 7];
+        spec.host_device_plan = Some(spur_devices::inject::HostInjectionPlan {
+            env: HashMap::from([("ROCR_VISIBLE_DEVICES".into(), "3,7".into())]),
+            visible_devices: vec!["/dev/dri/renderD128".into()],
+            device_paths: vec!["/dev/dri/renderD128".into()],
+        });
+        let restored: RuntimeLaunchSpec =
+            serde_json::from_slice(&serde_json::to_vec(&spec).expect("encode launch spec"))
+                .expect("decode launch spec");
+        let config = restored.into_launch_config();
+        assert_eq!(config.gpu_devices, vec![3, 7]);
+        assert_eq!(
+            config
+                .host_device_plan
+                .as_ref()
+                .and_then(|plan| plan.env.get("ROCR_VISIBLE_DEVICES")),
+            Some(&"3,7".to_string())
+        );
     }
 
     #[test]
