@@ -1044,7 +1044,6 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     {
         obligations.append(&RuntimeObligation::CompletionAcknowledged)?;
     }
-    obligations.append(&RuntimeObligation::ResourcesReleased)?;
     Ok(exit_code)
 }
 
@@ -1403,7 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn obligations_preserve_terminal_lifecycle_order() {
+    fn obligations_preserve_exit_and_acknowledgement_order() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = RuntimeSessionStore::new(temp.path());
         store
@@ -1419,9 +1418,6 @@ mod tests {
         obligations
             .append(&RuntimeObligation::CompletionAcknowledged)
             .expect("record acknowledgement");
-        obligations
-            .append(&RuntimeObligation::ResourcesReleased)
-            .expect("record release");
         assert_eq!(
             obligations.read().expect("read obligations"),
             vec![
@@ -1430,7 +1426,6 @@ mod tests {
                     signal: 0,
                 },
                 RuntimeObligation::CompletionAcknowledged,
-                RuntimeObligation::ResourcesReleased,
             ]
         );
     }
