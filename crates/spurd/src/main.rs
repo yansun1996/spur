@@ -444,6 +444,7 @@ async fn main() -> anyhow::Result<()> {
         ))
         .add_service(spur_proto::agent_server(agent_service))
         .serve(addr);
+    let server_task = tokio::spawn(server_future);
 
     if !recovered_runtime_sessions.is_empty() {
         let recovery_reporter = reporter.clone();
@@ -475,6 +476,10 @@ async fn main() -> anyhow::Result<()> {
                                 "controller ignored stale recovered runtime session"
                             );
                         }
+                        if response.retained && !response.message.is_empty() {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
                         break;
                     }
                     Err(error) => {
@@ -494,7 +499,7 @@ async fn main() -> anyhow::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     tokio::select! {
-        result = server_future => { result?; }
+        result = server_task => { result??; }
         _ = sigterm.recv() => {
             if !running_jobs.lock().await.is_empty() {
                 info!("received SIGTERM with held runtime sessions; preserving controller registration");
