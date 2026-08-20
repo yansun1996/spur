@@ -214,7 +214,7 @@ class TestRuntimeSessionRecovery:
         cluster.container_preflight()
         image = cluster.build_container_image(tmp_path)
         script = cluster.write_file(
-            "runtime-container.sh", "#!/bin/bash\necho RUNTIME_CONTAINER_OK\n", all_nodes=True
+            "runtime-container.sh", "#!/bin/bash\nsleep 5\necho RUNTIME_CONTAINER_OK\n", all_nodes=True
         )
         out_path = f"{cluster.remote_dir}/runtime-container.out"
         job_id = parse_job_id(
@@ -224,11 +224,11 @@ class TestRuntimeSessionRecovery:
             ])
         )
         assert job_id is not None, "container submission failed"
+        _wait_descriptors(cluster, job_id, expected=1)
         state = wait_job(cluster, job_id, timeout=90)
         output = cluster.wait_output(out_path, "RUNTIME_CONTAINER_OK", timeout=30)
         assert state in ("CD", "GONE"), f"runtime container job ended as {state}\n{cluster.debug_job(job_id)}"
         assert "RUNTIME_CONTAINER_OK" in output, output
-        assert len(cluster.runtime_session_descriptors(job_id)) == 1
 
     def test_cancel_releases_runtime_allocation(self, runtime_cluster):
         cluster = runtime_cluster
