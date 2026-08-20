@@ -2817,6 +2817,13 @@ impl SlurmController for ControllerService {
             let environment = environment.clone();
             let step_mpi = mpi.clone();
             set.spawn(async move {
+                info!(
+                    job_id,
+                    step_id,
+                    node = %node_name,
+                    runtime_step_reconnectable,
+                    "dispatching logical step to agent"
+                );
                 let agent_resp = dispatch_runtime_step(
                     agent_addr,
                     RunCommandRequest {
