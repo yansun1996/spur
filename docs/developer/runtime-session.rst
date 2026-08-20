@@ -38,7 +38,7 @@ anchors needed to locate and fence the live owner:
 The descriptor is not a copy of task state. A restarted agent queries the live
 runtime for its state instead of reconstructing process trees from ``/proc``.
 An append-only obligation WAL records only crash-sensitive boundaries: observed
-exit, epilog completion, acknowledged completion report, and resource release.
+exit, acknowledged completion report, and resource release.
 
 Failure contracts
 -----------------

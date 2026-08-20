@@ -113,7 +113,7 @@ async fn launch_runtime_session(
             anyhow::Error::from(error).context("resolve runtime session executable"),
         )
     })?;
-    let unit = format!("spur-runtime-{}.{}", config.job_id, run_attempt);
+    let unit = runtime_session_unit(config.job_id, run_attempt);
     info!(job_id = config.job_id, run_attempt, unit, state_dir = %state_dir.display(), executable = %executable.display(), "starting runtime session unit");
     let mut command = tokio::process::Command::new("systemd-run");
     command
@@ -135,18 +135,26 @@ async fn launch_runtime_session(
         .await
         .map_err(|error| executor::LaunchError::Other(error.into()))?;
     if !output.status.success() {
+        cleanup_unstarted_runtime_session(&store, config.job_id, run_attempt);
         return Err(executor::LaunchError::Other(anyhow::anyhow!(
             "systemd-run failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    wait_for_runtime_session(&descriptor)
-        .await
-        .map_err(|error| {
-            executor::LaunchError::Other(
-                anyhow::Error::from(error).context("wait for runtime session socket"),
-            )
-        })?;
+    if let Err(error) = wait_for_runtime_session(&descriptor).await {
+        if let Err(stop_error) = stop_runtime_session_unit(config.job_id, run_attempt).await {
+            warn!(
+                job_id = config.job_id,
+                run_attempt,
+                %stop_error,
+                "failed to stop runtime session after readiness failure"
+            );
+        }
+        cleanup_unstarted_runtime_session(&store, config.job_id, run_attempt);
+        return Err(executor::LaunchError::Other(
+            anyhow::Error::from(error).context("wait for runtime session socket"),
+        ));
+    }
     Ok((
         executor::LaunchResult {
             job: executor::RunningJob::AllocationOnly,
@@ -156,6 +164,39 @@ async fn launch_runtime_session(
         },
         descriptor,
     ))
+}
+
+fn runtime_session_unit(job_id: u32, run_attempt: u32) -> String {
+    format!("spur-runtime-{job_id}.{run_attempt}")
+}
+
+async fn stop_runtime_session_unit(job_id: u32, run_attempt: u32) -> std::io::Result<()> {
+    let unit = runtime_session_unit(job_id, run_attempt);
+    let output = tokio::process::Command::new("systemctl")
+        .arg("stop")
+        .arg(&unit)
+        .output()
+        .await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(std::io::Error::other(format!(
+        "systemctl stop {unit} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+fn cleanup_unstarted_runtime_session(
+    store: &crate::runtime_session::RuntimeSessionStore,
+    job_id: u32,
+    run_attempt: u32,
+) {
+    let session_dir = store.session_dir(job_id, run_attempt);
+    if let Err(error) = std::fs::remove_dir_all(&session_dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = %session_dir.display(), %error, "failed to remove unstarted runtime session state");
+        }
+    }
 }
 
 async fn wait_for_runtime_session(
@@ -250,6 +291,99 @@ async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginH
 /// Job ids this node holds, shared with the reporter so heartbeats carry them.
 pub(crate) type RunningJobs = Arc<Mutex<HashMap<u32, TrackedJob>>>;
 
+#[derive(Clone)]
+pub(crate) struct RuntimeRecoveryCleanup {
+    running: RunningJobs,
+    allocation: Arc<Mutex<NodeAllocation>>,
+    runtime_sessions: Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
+}
+
+impl RuntimeRecoveryCleanup {
+    pub(crate) async fn reject(
+        &self,
+        descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
+    ) {
+        let stopped =
+            match stop_runtime_session_unit(descriptor.job_id, descriptor.run_attempt).await {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(
+                        job_id = descriptor.job_id,
+                        run_attempt = descriptor.run_attempt,
+                        %error,
+                        "failed to stop controller-rejected runtime session"
+                    );
+                    false
+                }
+            };
+
+        self.release_tracking(descriptor).await;
+        if stopped {
+            cleanup_runtime_session_files(descriptor);
+        }
+    }
+
+    async fn release_tracking(
+        &self,
+        descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
+    ) {
+        let removed_runtime = {
+            let mut sessions = self.runtime_sessions.lock().await;
+            if sessions
+                .get(&descriptor.job_id)
+                .is_some_and(|current| current == descriptor)
+            {
+                sessions.remove(&descriptor.job_id);
+                true
+            } else {
+                false
+            }
+        };
+
+        let removed_tracked = {
+            let mut jobs = self.running.lock().await;
+            if jobs
+                .get(&descriptor.job_id)
+                .is_some_and(|current| current.run_attempt == descriptor.run_attempt)
+            {
+                jobs.remove(&descriptor.job_id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed_tracked {
+            let job_id = descriptor.job_id;
+            self.allocation.lock().await.release_job(job_id);
+        }
+
+        if removed_runtime || removed_tracked {
+            if let Err(error) = crate::runtime_session::append_obligation(
+                descriptor,
+                &crate::runtime_session::RuntimeObligation::ResourcesReleased,
+            ) {
+                warn!(
+                    job_id = descriptor.job_id,
+                    run_attempt = descriptor.run_attempt,
+                    %error,
+                    "failed to record controller-rejected runtime resource release"
+                );
+            }
+        }
+    }
+}
+
+fn cleanup_runtime_session_files(descriptor: &crate::runtime_session::RuntimeSessionDescriptor) {
+    let Some(session_dir) = descriptor.socket_path.parent() else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_dir_all(session_dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = %session_dir.display(), %error, "failed to remove rejected runtime session state");
+        }
+    }
+}
+
 /// Build an empty running-jobs map to share between the reporter and the agent.
 pub(crate) fn new_running_jobs() -> RunningJobs {
     Arc::new(Mutex::new(HashMap::new()))
@@ -304,7 +438,17 @@ pub(crate) fn monitor_recovered_runtime_sessions(
         while !pending.is_empty() {
             interval.tick().await;
             let mut completed = Vec::new();
+            let mut released = Vec::new();
             for (job_id, descriptor) in &pending {
+                let tracked = running
+                    .lock()
+                    .await
+                    .get(job_id)
+                    .is_some_and(|job| job.run_attempt == descriptor.run_attempt);
+                if !tracked {
+                    released.push(*job_id);
+                    continue;
+                }
                 match crate::runtime_session::query_state(descriptor, instance_id.clone()).await {
                     Ok(snapshot) if !snapshot.active => completed.push((
                         *job_id,
@@ -320,6 +464,9 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                         "recovered runtime state query failed"
                     ),
                 }
+            }
+            for job_id in released {
+                pending.remove(&job_id);
             }
             for (job_id, run_attempt, exit_code, signal) in completed {
                 let descriptor = pending.remove(&job_id);
@@ -350,7 +497,8 @@ pub(crate) async fn replay_unacknowledged_runtime_completions(
     store: &crate::runtime_session::RuntimeSessionStore,
     controller_addr: &str,
     reporting_node: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<(u32, u32)>> {
+    let mut reconciled = Vec::new();
     for completion in store.discover_unacknowledged_completions()? {
         if report_completion(
             controller_addr,
@@ -364,9 +512,10 @@ pub(crate) async fn replay_unacknowledged_runtime_completions(
         .await
         {
             store.acknowledge_completion(&completion)?;
+            reconciled.push((completion.job_id, completion.run_attempt));
         }
     }
-    Ok(())
+    Ok(reconciled)
 }
 
 type PmixLaunchSetup = (
@@ -632,6 +781,14 @@ impl AgentService {
         let mut sessions = self.runtime_sessions.lock().await;
         for descriptor in descriptors {
             sessions.insert(descriptor.job_id, descriptor.clone());
+        }
+    }
+
+    pub(crate) fn runtime_recovery_cleanup(&self) -> RuntimeRecoveryCleanup {
+        RuntimeRecoveryCleanup {
+            running: self.running.clone(),
+            allocation: self.allocation.clone(),
+            runtime_sessions: self.runtime_sessions.clone(),
         }
     }
 
@@ -4045,6 +4202,83 @@ mod tests {
     use super::*;
     use spur_core::resource::ResourceSet;
     use tonic::Request;
+
+    #[test]
+    fn runtime_session_unit_is_attempt_scoped() {
+        assert_eq!(runtime_session_unit(42, 7), "spur-runtime-42.7");
+    }
+
+    #[test]
+    fn unstarted_runtime_cleanup_removes_only_the_failed_attempt() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::runtime_session::RuntimeSessionStore::new(state.path());
+        let failed = store
+            .prepare_session_dir(42, 7)
+            .expect("failed attempt directory");
+        let retained = store
+            .prepare_session_dir(42, 8)
+            .expect("retained attempt directory");
+
+        cleanup_unstarted_runtime_session(&store, 42, 7);
+
+        assert!(!failed.exists());
+        assert!(retained.exists());
+    }
+
+    #[tokio::test]
+    async fn rejected_recovery_releases_only_the_matching_attempt() {
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let cleanup = RuntimeRecoveryCleanup {
+            running: running.clone(),
+            allocation,
+            runtime_sessions: sessions.clone(),
+        };
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let mut descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            0,
+            0,
+            state.path().join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "test-capability".into();
+        sessions.lock().await.insert(42, descriptor.clone());
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 7;
+        running.lock().await.insert(42, tracked);
+
+        cleanup.release_tracking(&descriptor).await;
+
+        assert!(!sessions.lock().await.contains_key(&42));
+        assert!(!running.lock().await.contains_key(&42));
+
+        let newer = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            8,
+            0,
+            0,
+            state.path().join("newer.sock"),
+            std::path::PathBuf::new(),
+        );
+        sessions.lock().await.insert(42, newer.clone());
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 8;
+        running.lock().await.insert(42, tracked);
+
+        cleanup.release_tracking(&descriptor).await;
+
+        assert_eq!(sessions.lock().await.get(&42), Some(&newer));
+        assert_eq!(
+            running.lock().await.get(&42).map(|job| job.run_attempt),
+            Some(8)
+        );
+    }
 
     fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {
         crate::job_entry::JobEntry {

@@ -1975,6 +1975,7 @@ pub(crate) enum SessionLiveness {
 #[derive(Debug)]
 pub(crate) struct DiscoveredRuntimeSessions {
     pub live: Vec<RuntimeSessionDescriptor>,
+    pub stale: Vec<RuntimeSessionDescriptor>,
     pub rejected: Vec<(PathBuf, String)>,
 }
 
@@ -2058,6 +2059,7 @@ impl RuntimeSessionStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(DiscoveredRuntimeSessions {
                     live: Vec::new(),
+                    stale: Vec::new(),
                     rejected: Vec::new(),
                 });
             }
@@ -2065,6 +2067,7 @@ impl RuntimeSessionStore {
         };
 
         let mut live = Vec::new();
+        let mut stale = Vec::new();
         let mut rejected = Vec::new();
         for entry in entries {
             let entry = match entry {
@@ -2083,16 +2086,18 @@ impl RuntimeSessionStore {
             match self.load_descriptor(&path) {
                 Ok(descriptor) => match session_liveness(&descriptor) {
                     Ok(SessionLiveness::Live) => live.push(descriptor),
-                    Ok(SessionLiveness::Stale) => {
-                        rejected.push((path, "runtime PID is stale".into()))
-                    }
+                    Ok(SessionLiveness::Stale) => stale.push(descriptor),
                     Err(error) => rejected.push((path, error.to_string())),
                 },
                 Err(error) => rejected.push((path, error.to_string())),
             }
         }
 
-        Ok(DiscoveredRuntimeSessions { live, rejected })
+        Ok(DiscoveredRuntimeSessions {
+            live,
+            stale,
+            rejected,
+        })
     }
 
     pub(crate) fn discover_unacknowledged_completions(
@@ -2597,8 +2602,8 @@ mod tests {
 
         let discovered = store.discover_live().expect("discover sessions");
         assert_eq!(discovered.live, vec![live]);
-        assert_eq!(discovered.rejected.len(), 1);
-        assert_eq!(discovered.rejected[0].0, store.session_dir(43, 1));
+        assert_eq!(discovered.stale, vec![stale]);
+        assert!(discovered.rejected.is_empty());
     }
 
     #[test]

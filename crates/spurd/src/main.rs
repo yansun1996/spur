@@ -15,7 +15,7 @@ mod reporter;
 pub mod runtime_session;
 mod seccomp;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use clap::Parser;
@@ -194,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
         warn!(path = %path.display(), %reason, "ignoring unusable runtime session descriptor");
     }
     let recovered_runtime_sessions = discovered_sessions.live;
+    let stale_runtime_sessions = discovered_sessions.stale;
     if !recovered_runtime_sessions.is_empty() {
         warn!(
             sessions = recovered_runtime_sessions.len(),
@@ -330,12 +331,14 @@ async fn main() -> anyhow::Result<()> {
     // Register with controller
     reporter.register().await?;
 
-    agent_server::replay_unacknowledged_runtime_completions(
+    let reconciled_runtime_completions = agent_server::replay_unacknowledged_runtime_completions(
         &runtime_sessions,
         &args.controller,
         &hostname,
     )
     .await?;
+    let reconciled_runtime_completions: HashSet<_> =
+        reconciled_runtime_completions.into_iter().collect();
 
     // Start heartbeat loop
     let hb_reporter = reporter.clone();
@@ -390,6 +393,7 @@ async fn main() -> anyhow::Result<()> {
     agent_service
         .adopt_runtime_sessions(&recovered_runtime_sessions)
         .await;
+    let runtime_recovery_cleanup = agent_service.runtime_recovery_cleanup();
 
     // the RPC-driven k0s component owner is idle until the controller sends
     // StartClusterComponent; k0s then runs under its OWN systemd unit — never as a spurd job/child —
@@ -450,10 +454,15 @@ async fn main() -> anyhow::Result<()> {
     if !recovered_runtime_sessions.is_empty() {
         for descriptor in recovered_runtime_sessions {
             let recovery_reporter = reporter.clone();
+            let recovery_cleanup = runtime_recovery_cleanup.clone();
             tokio::spawn(async move {
                 loop {
                     match recovery_reporter
-                        .report_runtime_session_recovery(descriptor.job_id, descriptor.run_attempt)
+                        .report_runtime_session_recovery(
+                            descriptor.job_id,
+                            descriptor.run_attempt,
+                            false,
+                        )
                         .await
                     {
                         Ok(response) => {
@@ -464,6 +473,7 @@ async fn main() -> anyhow::Result<()> {
                                     message = %response.message,
                                     "controller fenced recovered runtime session"
                                 );
+                                recovery_cleanup.reject(&descriptor).await;
                             } else if response.retained {
                                 info!(
                                     job_id = descriptor.job_id,
@@ -477,6 +487,7 @@ async fn main() -> anyhow::Result<()> {
                                     message = %response.message,
                                     "controller ignored stale recovered runtime session"
                                 );
+                                recovery_cleanup.reject(&descriptor).await;
                             }
                             if response.retained && !response.message.is_empty() {
                                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -497,6 +508,45 @@ async fn main() -> anyhow::Result<()> {
                 }
             });
         }
+    }
+
+    for descriptor in stale_runtime_sessions.into_iter().filter(|descriptor| {
+        !reconciled_runtime_completions.contains(&(descriptor.job_id, descriptor.run_attempt))
+    }) {
+        let recovery_reporter = reporter.clone();
+        tokio::spawn(async move {
+            loop {
+                match recovery_reporter
+                    .report_runtime_session_recovery(
+                        descriptor.job_id,
+                        descriptor.run_attempt,
+                        true,
+                    )
+                    .await
+                {
+                    Ok(response) => {
+                        if response.fenced {
+                            warn!(
+                                job_id = descriptor.job_id,
+                                run_attempt = descriptor.run_attempt,
+                                message = %response.message,
+                                "controller fenced stale runtime session"
+                            );
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(
+                            job_id = descriptor.job_id,
+                            run_attempt = descriptor.run_attempt,
+                            %error,
+                            "stale runtime recovery report failed; retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        });
     }
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -33,6 +33,7 @@ const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
 const RUNTIME_STEP_RECONNECT_ATTEMPTS: u32 = 20;
 const RUNTIME_STEP_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+const RUNTIME_RECOVERY_COHORT_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn runtime_step_reconnectable(node: &spur_core::node::Node) -> bool {
     node.labels
@@ -180,6 +181,7 @@ pub struct ControllerService {
     /// verification of every outstanding node token (7-day TTL), silently
     /// partitioning healthy nodes. Like Slurm's AuthType, it is restart-only.
     jwt_key: String,
+    incomplete_runtime_recoveries: Mutex<HashMap<(u32, u32), std::time::Instant>>,
 }
 
 struct LeaderProxy {
@@ -266,6 +268,21 @@ fn resolve_startup_jwt_key(config: &spur_core::config::SlurmConfig) -> String {
 }
 
 impl ControllerService {
+    async fn runtime_recovery_cohort_expired(&self, job_id: u32, run_attempt: u32) -> bool {
+        let mut incomplete = self.incomplete_runtime_recoveries.lock().await;
+        let first_seen = incomplete
+            .entry((job_id, run_attempt))
+            .or_insert_with(std::time::Instant::now);
+        first_seen.elapsed() >= RUNTIME_RECOVERY_COHORT_GRACE
+    }
+
+    async fn clear_runtime_recovery_cohort(&self, job_id: u32, run_attempt: u32) {
+        self.incomplete_runtime_recoveries
+            .lock()
+            .await
+            .remove(&(job_id, run_attempt));
+    }
+
     // tonic::Status is 176 bytes (over clippy's 128-byte threshold); fixed upstream in tonic 0.13+
     #[allow(clippy::result_large_err)]
     fn check_leader<T>(&self, request: &Request<T>) -> Result<(), Status> {
@@ -1967,24 +1984,74 @@ impl SlurmController for ControllerService {
             }
         }
 
-        match self
+        let probe = self
             .probe_runtime_recovery(&request.hostname, request.job_id, request.run_attempt)
-            .await?
-        {
-            RuntimeRecoveryProbe::Stale => Ok(Response::new(RuntimeSessionRecoveryResponse {
-                retained: false,
-                fenced: false,
-                message: "runtime session belongs to an inactive or superseded run".into(),
-            })),
-            RuntimeRecoveryProbe::Retained => Ok(Response::new(RuntimeSessionRecoveryResponse {
-                retained: true,
-                fenced: false,
-                message: String::new(),
-            })),
+            .await?;
+
+        if request.stale_descriptor {
+            match probe {
+                RuntimeRecoveryProbe::Stale => {
+                    self.clear_runtime_recovery_cohort(request.job_id, request.run_attempt)
+                        .await;
+                    return Ok(Response::new(RuntimeSessionRecoveryResponse {
+                        retained: false,
+                        fenced: false,
+                        message: "runtime session belongs to an inactive or superseded run".into(),
+                    }));
+                }
+                RuntimeRecoveryProbe::Retained | RuntimeRecoveryProbe::Incomplete { .. } => {
+                    self.clear_runtime_recovery_cohort(request.job_id, request.run_attempt)
+                        .await;
+                    let fenced = self
+                        .fence_runtime_recovery(request.job_id, request.run_attempt)
+                        .await?;
+                    return Ok(Response::new(RuntimeSessionRecoveryResponse {
+                        retained: false,
+                        fenced,
+                        message: "runtime session descriptor has no live supervisor".into(),
+                    }));
+                }
+            }
+        }
+
+        match probe {
+            RuntimeRecoveryProbe::Stale => {
+                self.clear_runtime_recovery_cohort(request.job_id, request.run_attempt)
+                    .await;
+                Ok(Response::new(RuntimeSessionRecoveryResponse {
+                    retained: false,
+                    fenced: false,
+                    message: "runtime session belongs to an inactive or superseded run".into(),
+                }))
+            }
+            RuntimeRecoveryProbe::Retained => {
+                self.clear_runtime_recovery_cohort(request.job_id, request.run_attempt)
+                    .await;
+                Ok(Response::new(RuntimeSessionRecoveryResponse {
+                    retained: true,
+                    fenced: false,
+                    message: String::new(),
+                }))
+            }
             RuntimeRecoveryProbe::Incomplete {
                 expected_nodes,
                 missing,
             } => {
+                if self
+                    .runtime_recovery_cohort_expired(request.job_id, request.run_attempt)
+                    .await
+                {
+                    let fenced = self
+                        .fence_runtime_recovery(request.job_id, request.run_attempt)
+                        .await?;
+                    self.clear_runtime_recovery_cohort(request.job_id, request.run_attempt)
+                        .await;
+                    return Ok(Response::new(RuntimeSessionRecoveryResponse {
+                        retained: false,
+                        fenced,
+                        message: "runtime recovery cohort did not become available before its grace period elapsed".into(),
+                    }));
+                }
                 let message = format!(
                     "runtime recovery cohort is not yet available: missing {} of {} participants ({})",
                     missing.len(),
@@ -3646,6 +3713,7 @@ pub async fn serve(
         sched_stats: sched_stats.clone(),
         control_plane_replicas,
         jwt_key,
+        incomplete_runtime_recoveries: Mutex::new(HashMap::new()),
     };
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
@@ -4791,6 +4859,7 @@ mod tests {
             sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
             control_plane_replicas: 1,
             jwt_key: String::new(),
+            incomplete_runtime_recoveries: Mutex::new(HashMap::new()),
         }
     }
 
@@ -5393,6 +5462,7 @@ mod tests {
             sched_stats: std::sync::Arc::new(SchedStatsCollector::new("backfill")),
             control_plane_replicas: 1,
             jwt_key: String::new(),
+            incomplete_runtime_recoveries: Mutex::new(HashMap::new()),
         }
     }
 
@@ -5824,6 +5894,7 @@ mod tests {
                 job_id,
                 run_attempt: run_attempt.saturating_sub(1),
                 node_token: String::new(),
+                stale_descriptor: false,
             }))
             .await
             .expect("superseded report is accepted as stale")
@@ -5870,6 +5941,7 @@ mod tests {
                 job_id,
                 run_attempt,
                 node_token: String::new(),
+                stale_descriptor: false,
             }))
             .await
             .expect("partial recovery report")
@@ -5879,6 +5951,87 @@ mod tests {
         assert!(response.message.contains("missing 1 of 1 participants"));
         let job = svc.cluster.get_job(job_id).expect("running job");
         assert_eq!(job.state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_recovery_fences_a_cohort_that_exhausted_its_grace_period() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        svc.cluster
+            .register_node(
+                "n1".into(),
+                "n1".into(),
+                spur_core::resource::ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                1,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+            )
+            .expect("update recovery probe address");
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+        svc.incomplete_runtime_recoveries.lock().await.insert(
+            (job_id, run_attempt),
+            std::time::Instant::now() - RUNTIME_RECOVERY_COHORT_GRACE,
+        );
+
+        let response = svc
+            .report_runtime_session_recovery(Request::new(RuntimeSessionRecoveryRequest {
+                hostname: "n1".into(),
+                job_id,
+                run_attempt,
+                node_token: String::new(),
+                stale_descriptor: false,
+            }))
+            .await
+            .expect("expired cohort report")
+            .into_inner();
+        assert!(!response.retained);
+        assert!(response.fenced);
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("requeued job").state,
+            JobState::Pending
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_runtime_descriptor_fences_the_matching_active_attempt() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        let response = svc
+            .report_runtime_session_recovery(Request::new(RuntimeSessionRecoveryRequest {
+                hostname: "n1".into(),
+                job_id,
+                run_attempt,
+                node_token: String::new(),
+                stale_descriptor: true,
+            }))
+            .await
+            .expect("stale descriptor report")
+            .into_inner();
+        assert!(!response.retained);
+        assert!(response.fenced);
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("requeued job").state,
+            JobState::Pending
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

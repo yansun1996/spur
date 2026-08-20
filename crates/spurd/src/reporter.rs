@@ -164,6 +164,7 @@ impl NodeReporter {
         &self,
         job_id: u32,
         run_attempt: u32,
+        stale_descriptor: bool,
     ) -> anyhow::Result<RuntimeSessionRecoveryResponse> {
         let channel = spur_client::connect_channel(&self.controller_addr)
             .await
@@ -180,6 +181,7 @@ impl NodeReporter {
                 job_id,
                 run_attempt,
                 node_token,
+                stale_descriptor,
             })
             .await
             .context("runtime recovery report failed")?;

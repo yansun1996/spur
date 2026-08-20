@@ -1140,8 +1140,14 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
                 "--no-legend 'spur-runtime-*.service' 2>/dev/null | awk '{print $1}'"
             ).splitlines()
             for unit in units:
+                exec_start = node.exec_allow_fail(
+                    f"{self._sudo_prefix()}systemctl show --value --property=ExecStart "
+                    f"{shlex.quote(unit)} 2>/dev/null"
+                )
+                if self.remote_dir not in exec_start:
+                    continue
                 node.exec_allow_fail(
-                    f"{self._sudo_prefix()}systemctl stop '{unit}' 2>/dev/null"
+                    f"{self._sudo_prefix()}systemctl stop {shlex.quote(unit)} 2>/dev/null"
                 )
 
     def _spurd_start_cmd(self, node_index: int) -> str:

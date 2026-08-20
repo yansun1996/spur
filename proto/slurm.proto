@@ -758,6 +758,7 @@ message RuntimeSessionRecoveryRequest {
   uint32 job_id = 2;
   uint32 run_attempt = 3;
   string node_token = 4;
+  bool stale_descriptor = 5;
 }
 
 message RuntimeSessionRecoveryResponse {
