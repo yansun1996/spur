@@ -101,6 +101,9 @@ async fn launch_runtime_session(
     command
         .spawn()
         .map_err(|error| executor::LaunchError::Other(error.into()))?;
+    wait_for_runtime_session(&descriptor)
+        .await
+        .map_err(|error| executor::LaunchError::Other(error.into()))?;
     Ok((
         executor::LaunchResult {
             job: executor::RunningJob::AllocationOnly,
@@ -110,6 +113,22 @@ async fn launch_runtime_session(
         },
         descriptor,
     ))
+}
+
+async fn wait_for_runtime_session(
+    descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
+) -> std::io::Result<()> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match crate::runtime_session::query_state(descriptor, uuid::Uuid::new_v4().to_string())
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) if tokio::time::Instant::now() >= deadline => return Err(error),
+            Err(_) => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 async fn launch_allocation_runtime_session(
