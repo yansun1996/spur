@@ -142,6 +142,7 @@ impl RuntimeLaunchSpec {
 }
 
 const DESCRIPTOR_FILE: &str = "descriptor.json";
+const OBLIGATION_FILE: &str = "obligations.jsonl";
 const FORMAT_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u32 = 1;
 const STEP_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -204,6 +205,60 @@ pub struct RuntimeSnapshot {
     pub active: bool,
     pub exit_code: Option<i32>,
     pub signal: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "obligation", rename_all = "snake_case")]
+pub enum RuntimeObligation {
+    ExitObserved { exit_code: i32, signal: i32 },
+    CompletionAcknowledged,
+    ResourcesReleased,
+}
+
+pub struct RuntimeObligationLog {
+    path: PathBuf,
+}
+
+impl RuntimeObligationLog {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn append(&self, obligation: &RuntimeObligation) -> io::Result<()> {
+        let mut entry = serde_json::to_vec(obligation).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("serialize runtime obligation: {error}"),
+            )
+        })?;
+        entry.push(b'\n');
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        file.write_all(&entry)?;
+        file.sync_data()
+    }
+
+    pub fn read(&self) -> io::Result<Vec<RuntimeObligation>> {
+        let contents = match fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        contents
+            .lines()
+            .enumerate()
+            .map(|(line, entry)| {
+                serde_json::from_str(entry).map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid runtime obligation at line {}: {error}", line + 1),
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -933,6 +988,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     }
     let store = RuntimeSessionStore::new(state_dir);
     let session_dir = store.session_dir(job_id, run_attempt);
+    let obligations = store.obligations(job_id, run_attempt);
     let socket_path = session_dir.join("runtime.sock");
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
@@ -969,8 +1025,13 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let exit_code = snapshot
         .exit_code
         .unwrap_or_else(|| 128 + snapshot.signal.unwrap_or(0));
-    if !controller_addr.is_empty() && !reporting_node.is_empty() {
-        crate::agent_server::report_completion(
+    obligations.append(&RuntimeObligation::ExitObserved {
+        exit_code,
+        signal: snapshot.signal.unwrap_or(0),
+    })?;
+    if !controller_addr.is_empty()
+        && !reporting_node.is_empty()
+        && crate::agent_server::report_completion(
             &controller_addr,
             job_id,
             exit_code,
@@ -979,8 +1040,11 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             &reporting_node,
             None,
         )
-        .await;
+        .await
+    {
+        obligations.append(&RuntimeObligation::CompletionAcknowledged)?;
     }
+    obligations.append(&RuntimeObligation::ResourcesReleased)?;
     Ok(exit_code)
 }
 
@@ -1013,6 +1077,10 @@ impl RuntimeSessionStore {
 
     pub fn session_dir(&self, job_id: u32, run_attempt: u32) -> PathBuf {
         self.root.join(format!("{job_id}.{run_attempt}"))
+    }
+
+    pub fn obligations(&self, job_id: u32, run_attempt: u32) -> RuntimeObligationLog {
+        RuntimeObligationLog::new(self.session_dir(job_id, run_attempt).join(OBLIGATION_FILE))
     }
 
     pub fn prepare_session_dir(&self, job_id: u32, run_attempt: u32) -> io::Result<PathBuf> {
@@ -1266,6 +1334,39 @@ mod tests {
         );
         let discovered = store.discover_live().expect("discover session");
         assert_eq!(discovered.live, vec![descriptor]);
+    }
+
+    #[test]
+    fn obligations_preserve_terminal_lifecycle_order() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RuntimeSessionStore::new(temp.path());
+        store
+            .prepare_session_dir(42, 3)
+            .expect("prepare session directory");
+        let obligations = store.obligations(42, 3);
+        obligations
+            .append(&RuntimeObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("record exit");
+        obligations
+            .append(&RuntimeObligation::CompletionAcknowledged)
+            .expect("record acknowledgement");
+        obligations
+            .append(&RuntimeObligation::ResourcesReleased)
+            .expect("record release");
+        assert_eq!(
+            obligations.read().expect("read obligations"),
+            vec![
+                RuntimeObligation::ExitObserved {
+                    exit_code: 0,
+                    signal: 0,
+                },
+                RuntimeObligation::CompletionAcknowledged,
+                RuntimeObligation::ResourcesReleased,
+            ]
+        );
     }
 
     #[test]

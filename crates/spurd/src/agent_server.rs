@@ -1094,7 +1094,7 @@ pub(crate) async fn report_completion(
     run_attempt: u32,
     reporting_node: &str,
     drain: Option<&DrainRequest>,
-) {
+) -> bool {
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
     // state<->exit_code agreement. The controller rederives the true Failed /
@@ -1139,13 +1139,16 @@ pub(crate) async fn report_completion(
     })
     .await;
 
+    let acknowledged = result.is_ok();
     match result {
-        Ok(_) => info!(
-            job_id,
-            exit_code,
-            controller = %controller_addr,
-            "reported completion to controller"
-        ),
+        Ok(_) => {
+            info!(
+                job_id,
+                exit_code,
+                controller = %controller_addr,
+                "reported completion to controller"
+            );
+        }
         Err(e) if e.retryable() => error!(
             job_id,
             exit_code,
@@ -1160,6 +1163,7 @@ pub(crate) async fn report_completion(
             "ReportJobStatus failed with non-retryable error"
         ),
     }
+    acknowledged
 }
 
 fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String>) {
