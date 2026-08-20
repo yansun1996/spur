@@ -56,6 +56,7 @@ async fn launch_runtime_session(
     run_attempt: u32,
     controller_addr: &str,
     reporting_node: &str,
+    state_dir: &std::path::Path,
     options: RuntimeSessionLaunchOptions,
 ) -> Result<
     (
@@ -78,9 +79,7 @@ async fn launch_runtime_session(
         launch_spec.pmix_config = Some(pmix_config);
         launch_spec.pmix_plan = Some(pmix_plan);
     }
-    let state_dir =
-        std::env::var("SPUR_RUNTIME_STATE_DIR").unwrap_or_else(|_| "/var/spool/spur".into());
-    let store = crate::runtime_session::RuntimeSessionStore::new(&state_dir);
+    let store = crate::runtime_session::RuntimeSessionStore::new(state_dir);
     let session_dir = store
         .prepare_session_dir(config.job_id, run_attempt)
         .map_err(|error| {
@@ -115,7 +114,7 @@ async fn launch_runtime_session(
         )
     })?;
     let unit = format!("spur-runtime-{}.{}", config.job_id, run_attempt);
-    info!(job_id = config.job_id, run_attempt, unit, state_dir, executable = %executable.display(), "starting runtime session unit");
+    info!(job_id = config.job_id, run_attempt, unit, state_dir = %state_dir.display(), executable = %executable.display(), "starting runtime session unit");
     let mut command = tokio::process::Command::new("systemd-run");
     command
         .arg("--unit")
@@ -489,6 +488,7 @@ pub struct AgentService {
     /// In-flight srun steps keyed by `(job_id, step_id)`.
     active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     runtime_sessions: Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
+    runtime_state_dir: std::path::PathBuf,
     /// `[auth] allow_root_jobs` — when false (default) this agent refuses to execute as uid 0.
     allow_root_jobs: bool,
     /// Whether spurd runs as root. Stored (not queried per call) so tests can drive the refusal
@@ -599,6 +599,9 @@ impl AgentService {
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
             runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
+            runtime_state_dir: std::env::var("SPUR_RUNTIME_STATE_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| std::path::PathBuf::from("/var/spool/spur")),
             allow_root_jobs,
             spurd_is_root: crate::privdrop::spurd_runs_as_root(),
         }
@@ -615,6 +618,11 @@ impl AgentService {
     /// Handle to the RPC-driven k0s component owner. spurd `main()` spawns its supervise loop.
     pub fn k0s(&self) -> Arc<crate::cluster::K0sAgent> {
         self.k0s.clone()
+    }
+
+    pub fn with_runtime_state_dir(mut self, state_dir: impl Into<std::path::PathBuf>) -> Self {
+        self.runtime_state_dir = state_dir.into();
+        self
     }
 
     pub async fn adopt_runtime_sessions(
@@ -1791,6 +1799,7 @@ impl SlurmAgent for AgentService {
                 run_attempt,
                 &self.reporter.controller_addr,
                 &self.reporter.hostname,
+                &self.runtime_state_dir,
                 RuntimeSessionLaunchOptions {
                     allocation_only: false,
                     pmix_inputs: runtime_pmix_inputs,
@@ -2279,6 +2288,7 @@ impl SlurmAgent for AgentService {
                 req.run_attempt,
                 &self.reporter.controller_addr,
                 &self.reporter.hostname,
+                &self.runtime_state_dir,
                 RuntimeSessionLaunchOptions {
                     allocation_only: true,
                     pmix_inputs: None,
@@ -3391,10 +3401,21 @@ impl AgentService {
 
     /// SIGTERM now, escalate to SIGKILL after a 5-second grace period.
     async fn graceful_cancel(&self, job_id: u32) {
-        if self.runtime_sessions.lock().await.contains_key(&job_id) {
-            self.send_explicit_signal(job_id, nix::sys::signal::Signal::SIGTERM as i32)
-                .await;
-            return;
+        let runtime = self.runtime_sessions.lock().await.get(&job_id).cloned();
+        if let Some(descriptor) = runtime {
+            match crate::runtime_session::signal_allocation(
+                &descriptor,
+                uuid::Uuid::new_v4().to_string(),
+                nix::sys::signal::Signal::SIGTERM as i32,
+            )
+            .await
+            {
+                Ok(()) => {
+                    self.schedule_runtime_sigkill(descriptor);
+                    return;
+                }
+                Err(error) => warn!(job_id, %error, "runtime termination request failed"),
+            }
         }
         let is_allocation_only = {
             let jobs = self.running.lock().await;
@@ -3430,6 +3451,33 @@ impl AgentService {
                 info!(job_id, "grace period expired, sending SIGKILL");
                 let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                 // Job stays in `running` and monitor loop reaps it and does full cleanup.
+            }
+        });
+    }
+
+    fn schedule_runtime_sigkill(
+        &self,
+        descriptor: crate::runtime_session::RuntimeSessionDescriptor,
+    ) {
+        let runtime_sessions = self.runtime_sessions.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            let current = runtime_sessions
+                .lock()
+                .await
+                .get(&descriptor.job_id)
+                .is_some_and(|current| current == &descriptor);
+            if !current {
+                return;
+            }
+            if let Err(error) = crate::runtime_session::signal_allocation(
+                &descriptor,
+                uuid::Uuid::new_v4().to_string(),
+                nix::sys::signal::Signal::SIGKILL as i32,
+            )
+            .await
+            {
+                warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error, "runtime SIGKILL escalation failed");
             }
         });
     }
@@ -4249,6 +4297,20 @@ mod tests {
         let job_id = 100;
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
         (svc, job_id)
+    }
+
+    #[test]
+    fn configured_runtime_state_dir_overrides_the_default() {
+        let configured = std::path::PathBuf::from("/var/lib/spur-runtime-test");
+        let service = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(configured.clone());
+
+        assert_eq!(service.runtime_state_dir, configured);
     }
 
     fn test_gpu_registry() -> DeviceRegistry {

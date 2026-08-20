@@ -490,7 +490,7 @@ struct RuntimeSteps {
 
 pub struct RuntimeSession {
     job: Mutex<RunningJob>,
-    snapshot: Mutex<RuntimeSnapshot>,
+    snapshot: Arc<Mutex<RuntimeSnapshot>>,
     steps: Arc<Mutex<RuntimeSteps>>,
     pty: Mutex<Option<Arc<RuntimePty>>>,
     environment: std::collections::HashMap<String, String>,
@@ -520,13 +520,13 @@ impl RuntimeSession {
     ) -> Self {
         Self {
             job: Mutex::new(job),
-            snapshot: Mutex::new(RuntimeSnapshot {
+            snapshot: Arc::new(Mutex::new(RuntimeSnapshot {
                 job_id,
                 run_attempt,
                 active: true,
                 exit_code: None,
                 signal: None,
-            }),
+            })),
             steps: Arc::new(Mutex::new(RuntimeSteps::default())),
             pty: Mutex::new(None),
             environment,
@@ -571,10 +571,15 @@ impl RuntimeSession {
             signal_process_group(step.pid, signal);
         }
         drop(steps);
-        if self.pty.lock().await.is_some() {
-            self.signal_pty(signal as i32).await?;
-        }
-        if allocation_only {
+        let pty = self.pty.lock().await.clone();
+        if let Some(pty) = pty {
+            crate::pty::signal_foreground(
+                pty.master.get_ref().as_raw_fd(),
+                pty.child_pid,
+                signal as i32,
+            )
+            .map_err(io::Error::other)?;
+        } else if allocation_only {
             self.snapshot.lock().await.active = false;
         }
         Ok(())
@@ -803,7 +808,9 @@ impl RuntimeSession {
     }
 
     async fn launch_pty(&self, spec: RuntimePtyLaunchSpec) -> io::Result<()> {
-        if self.pty.lock().await.is_some() {
+        let allocation_only = self.job.lock().await.is_allocation_only();
+        let mut pty_slot = self.pty.lock().await;
+        if pty_slot.is_some() {
             return Ok(());
         }
         let (master, slave) = crate::pty::openpty_with_winsize(
@@ -878,8 +885,10 @@ impl RuntimeSession {
             }),
             output_ready: Notify::new(),
         });
-        *self.pty.lock().await = Some(pty.clone());
+        *pty_slot = Some(pty.clone());
+        drop(pty_slot);
         tokio::spawn(read_runtime_pty(pty.clone()));
+        let snapshot = self.snapshot.clone();
         tokio::spawn(async move {
             let exit_code = match child.wait().await {
                 Ok(status) => spur_core::process::shell_exit_code(&status),
@@ -892,6 +901,12 @@ impl RuntimeSession {
             buffer.exit_code = Some(exit_code);
             drop(buffer);
             pty.output_ready.notify_waiters();
+            if allocation_only {
+                let mut snapshot = snapshot.lock().await;
+                snapshot.active = false;
+                snapshot.exit_code = Some(exit_code);
+                snapshot.signal = Some(0);
+            }
         });
         Ok(())
     }
@@ -2525,6 +2540,46 @@ mod tests {
         assert!(output.start_offset > 0);
         assert_eq!(output.data.len(), PTY_OUTPUT_LIMIT);
         assert_eq!(output.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn runtime_pty_launch_is_idempotent() {
+        let session = Arc::new(RuntimeSession::new(RunningJob::AllocationOnly, 80, 1));
+        let spec = pty_spec(&["/bin/sh", "-c", "printf runtime-pty-once"]);
+        let (first, second) =
+            tokio::join!(session.launch_pty(spec.clone()), session.launch_pty(spec),);
+        first.expect("first PTY launch");
+        second.expect("duplicate PTY launch");
+
+        let output = wait_for_pty_exit(&session).await;
+        assert_eq!(output.data, b"runtime-pty-once");
+    }
+
+    #[tokio::test]
+    async fn allocation_pty_stays_active_until_its_child_exits() {
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 81, 1);
+        session
+            .launch_pty(pty_spec(&[
+                "/bin/sh",
+                "-c",
+                "trap '' TERM; while :; do :; done",
+            ]))
+            .await
+            .expect("launch PTY");
+
+        session
+            .signal(nix::sys::signal::Signal::SIGTERM as i32)
+            .await
+            .expect("send SIGTERM");
+        assert!(session.snapshot().await.active);
+
+        session
+            .signal(nix::sys::signal::Signal::SIGKILL as i32)
+            .await
+            .expect("send SIGKILL");
+        let output = wait_for_pty_exit(&session).await;
+        assert!(output.exit_code.is_some());
+        assert!(!session.snapshot().await.active);
     }
 
     #[test]

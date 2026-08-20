@@ -167,10 +167,13 @@ class TestRuntimeSessionRecovery:
         cluster = runtime_mpi_cluster
         ranks = min(4, len(cluster.nodes))
         recovery_mpi = cluster.compile_mpi_fixture("runtime_mpi_recovery.c")
+        release_path = f"{cluster.remote_dir}/runtime-pmix-recovery.release"
+        for node in cluster.nodes:
+            node.exec(f"rm -f '{release_path}'")
         out_path = f"{cluster.remote_dir}/runtime-pmix-recovery.out"
         script = cluster.write_file(
             "runtime-pmix-recovery.sh",
-            "#!/bin/bash\n#SBATCH --mpi=pmix\n" + recovery_mpi + "\n",
+            "#!/bin/bash\n#SBATCH --mpi=pmix\n" + recovery_mpi + f" '{release_path}'\n",
         )
         job_id = parse_job_id(
             cluster.sbatch([
@@ -190,6 +193,12 @@ class TestRuntimeSessionRecovery:
             cluster.stop_agents()
             cluster.start_agents()
             _wait_agents_registered(cluster)
+            code, output = cluster.srun_in_allocation(
+                job_id,
+                ["-N", str(ranks), "-n", str(ranks), "/bin/true"],
+            )
+            assert code == 0, f"runtime did not recover before PMIx release:\n{output}"
+            cluster.write_file("runtime-pmix-recovery.release", "", all_nodes=True, executable=False)
             state = wait_job(cluster, job_id, timeout=90)
             output = cluster.read_output_all_nodes(out_path)
             assert state in ("CD", "GONE"), f"recovered PMIx batch failed: {state}\n{cluster.debug_job(job_id)}"
@@ -204,15 +213,19 @@ class TestRuntimeSessionRecovery:
         script = cluster.write_file(
             "runtime-container.sh", "#!/bin/bash\necho RUNTIME_CONTAINER_OK\n", all_nodes=True
         )
+        out_path = f"{cluster.remote_dir}/runtime-container.out"
         job_id = parse_job_id(
             cluster.sbatch([
                 "-J", "runtime-container", "-N", "1", "-n", "1",
-                f"--container-image={image}", script,
+                "-o", out_path, f"--container-image={image}", script,
             ])
         )
         assert job_id is not None, "container submission failed"
         state = wait_job(cluster, job_id, timeout=90)
+        output = cluster.wait_output(out_path, "RUNTIME_CONTAINER_OK", timeout=30)
         assert state in ("CD", "GONE"), f"runtime container job ended as {state}\n{cluster.debug_job(job_id)}"
+        assert "RUNTIME_CONTAINER_OK" in output, output
+        assert len(cluster.runtime_session_descriptors(job_id)) == 1
 
     def test_cancel_releases_runtime_allocation(self, runtime_cluster):
         cluster = runtime_cluster

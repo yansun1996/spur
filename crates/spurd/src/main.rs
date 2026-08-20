@@ -188,7 +188,7 @@ async fn main() -> anyhow::Result<()> {
             .map(|c| c.controller.state_dir.clone())
             .unwrap_or_else(|| "/var/spool/spur".into())
     });
-    let runtime_sessions = runtime_session::RuntimeSessionStore::new(runtime_state_dir);
+    let runtime_sessions = runtime_session::RuntimeSessionStore::new(&runtime_state_dir);
     let discovered_sessions = runtime_sessions.discover_live()?;
     for (path, reason) in discovered_sessions.rejected {
         warn!(path = %path.display(), %reason, "ignoring unusable runtime session descriptor");
@@ -385,7 +385,8 @@ async fn main() -> anyhow::Result<()> {
         mpi_config,
         running_jobs.clone(),
         allow_root_jobs,
-    );
+    )
+    .with_runtime_state_dir(runtime_state_dir);
     agent_service
         .adopt_runtime_sessions(&recovered_runtime_sessions)
         .await;
@@ -447,52 +448,54 @@ async fn main() -> anyhow::Result<()> {
     let server_task = tokio::spawn(server_future);
 
     if !recovered_runtime_sessions.is_empty() {
-        let recovery_reporter = reporter.clone();
         for descriptor in recovered_runtime_sessions {
-            loop {
-                match recovery_reporter
-                    .report_runtime_session_recovery(descriptor.job_id, descriptor.run_attempt)
-                    .await
-                {
-                    Ok(response) => {
-                        if response.fenced {
+            let recovery_reporter = reporter.clone();
+            tokio::spawn(async move {
+                loop {
+                    match recovery_reporter
+                        .report_runtime_session_recovery(descriptor.job_id, descriptor.run_attempt)
+                        .await
+                    {
+                        Ok(response) => {
+                            if response.fenced {
+                                warn!(
+                                    job_id = descriptor.job_id,
+                                    run_attempt = descriptor.run_attempt,
+                                    message = %response.message,
+                                    "controller fenced recovered runtime session"
+                                );
+                            } else if response.retained {
+                                info!(
+                                    job_id = descriptor.job_id,
+                                    run_attempt = descriptor.run_attempt,
+                                    "controller retained recovered runtime session"
+                                );
+                            } else {
+                                info!(
+                                    job_id = descriptor.job_id,
+                                    run_attempt = descriptor.run_attempt,
+                                    message = %response.message,
+                                    "controller ignored stale recovered runtime session"
+                                );
+                            }
+                            if response.retained && !response.message.is_empty() {
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                continue;
+                            }
+                            break;
+                        }
+                        Err(error) => {
                             warn!(
                                 job_id = descriptor.job_id,
                                 run_attempt = descriptor.run_attempt,
-                                message = %response.message,
-                                "controller fenced recovered runtime session"
+                                %error,
+                                "runtime recovery report failed; retrying"
                             );
-                        } else if response.retained {
-                            info!(
-                                job_id = descriptor.job_id,
-                                run_attempt = descriptor.run_attempt,
-                                "controller retained recovered runtime session"
-                            );
-                        } else {
-                            info!(
-                                job_id = descriptor.job_id,
-                                run_attempt = descriptor.run_attempt,
-                                message = %response.message,
-                                "controller ignored stale recovered runtime session"
-                            );
-                        }
-                        if response.retained && !response.message.is_empty() {
                             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                            continue;
                         }
-                        break;
-                    }
-                    Err(error) => {
-                        warn!(
-                            job_id = descriptor.job_id,
-                            run_attempt = descriptor.run_attempt,
-                            %error,
-                            "runtime recovery report failed; retrying"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
                 }
-            }
+            });
         }
     }
 

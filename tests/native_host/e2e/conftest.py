@@ -260,9 +260,11 @@ def runtime_gpu_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
         SpurCluster.devices_config(auto_detect=True),
     )
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
-    c.gpu_preflight(1)
     try:
-        c.deploy(
+        c.provision()
+        c.gpu_preflight(1)
+        c.root_agent_preflight()
+        c.start(
             config_overrides=overrides,
             agent_as_root=True,
             agent_env={
