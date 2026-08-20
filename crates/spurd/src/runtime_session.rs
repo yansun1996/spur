@@ -1454,13 +1454,19 @@ pub async fn run_supervisor(
                 }
             }
             accepted = accept_hello(&listener, &descriptor, &descriptor.capability) => {
-                let (stream, _) = accepted?;
-                let session = session.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = serve_control(stream, &session).await {
-                        tracing::warn!(%error, "runtime session control connection failed");
+                match accepted {
+                    Ok((stream, _)) => {
+                        let session = session.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = serve_control(stream, &session).await {
+                                tracing::warn!(%error, "runtime session control connection failed");
+                            }
+                        });
                     }
-                });
+                    Err(error) => {
+                        tracing::warn!(%error, "runtime session connection handshake failed");
+                    }
+                }
             }
         }
     }
