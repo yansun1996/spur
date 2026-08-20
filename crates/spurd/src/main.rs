@@ -315,7 +315,7 @@ async fn main() -> anyhow::Result<()> {
 
     agent_server::monitor_recovered_runtime_sessions(
         running_jobs.clone(),
-        recovered_runtime_sessions,
+        recovered_runtime_sessions.clone(),
         args.controller.clone(),
     );
 
@@ -371,6 +371,9 @@ async fn main() -> anyhow::Result<()> {
         running_jobs.clone(),
         allow_root_jobs,
     );
+    agent_service
+        .adopt_runtime_sessions(&recovered_runtime_sessions)
+        .await;
 
     // the RPC-driven k0s component owner is idle until the controller sends
     // StartClusterComponent; k0s then runs under its OWN systemd unit — never as a spurd job/child —

@@ -429,6 +429,50 @@ pub async fn query_state(
     }
 }
 
+pub async fn signal_allocation(
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+    signal: i32,
+) -> io::Result<()> {
+    let stream = UnixStream::connect(&descriptor.socket_path).await?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    let hello = RuntimeRequest::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        capability: descriptor.capability.clone(),
+        spurd_instance_id,
+        run_attempt: descriptor.run_attempt,
+    };
+    write_request(&mut writer, &hello).await?;
+    match read_response(&mut reader).await? {
+        RuntimeResponse::Hello {
+            job_id,
+            run_attempt,
+            ..
+        } if job_id == descriptor.job_id && run_attempt == descriptor.run_attempt => {}
+        RuntimeResponse::Rejected { message } => {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, message));
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "runtime hello identity mismatch",
+            ));
+        }
+    }
+    write_request(&mut writer, &RuntimeRequest::SignalAllocation { signal }).await?;
+    match read_response(&mut reader).await? {
+        RuntimeResponse::Acknowledged => Ok(()),
+        RuntimeResponse::Rejected { message } => {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime signal response was invalid",
+        )),
+    }
+}
+
 async fn write_request(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     request: &RuntimeRequest,

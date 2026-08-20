@@ -373,6 +373,7 @@ pub struct AgentService {
     k0s: Arc<crate::cluster::K0sAgent>,
     /// In-flight srun steps keyed by `(job_id, step_id)`.
     active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    runtime_sessions: Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
     /// `[auth] allow_root_jobs` — when false (default) this agent refuses to execute as uid 0.
     allow_root_jobs: bool,
     /// Whether spurd runs as root. Stored (not queried per call) so tests can drive the refusal
@@ -480,6 +481,7 @@ impl AgentService {
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
+            runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
             allow_root_jobs,
             spurd_is_root: crate::privdrop::spurd_runs_as_root(),
         }
@@ -496,6 +498,16 @@ impl AgentService {
     /// Handle to the RPC-driven k0s component owner. spurd `main()` spawns its supervise loop.
     pub fn k0s(&self) -> Arc<crate::cluster::K0sAgent> {
         self.k0s.clone()
+    }
+
+    pub async fn adopt_runtime_sessions(
+        &self,
+        descriptors: &[crate::runtime_session::RuntimeSessionDescriptor],
+    ) {
+        let mut sessions = self.runtime_sessions.lock().await;
+        for descriptor in descriptors {
+            sessions.insert(descriptor.job_id, descriptor.clone());
+        }
     }
 
     /// Spawn a background task to monitor running jobs and report completions.
@@ -2933,6 +2945,19 @@ impl AgentService {
 
     /// Send a user-specified signal to a running job.
     async fn send_explicit_signal(&self, job_id: u32, signal: i32) {
+        let runtime = self.runtime_sessions.lock().await.get(&job_id).cloned();
+        if let Some(descriptor) = runtime {
+            match crate::runtime_session::signal_allocation(
+                &descriptor,
+                uuid::Uuid::new_v4().to_string(),
+                signal,
+            )
+            .await
+            {
+                Ok(()) => return,
+                Err(error) => warn!(job_id, %error, "runtime signal request failed"),
+            }
+        }
         let is_allocation_only = {
             let jobs = self.running.lock().await;
             jobs.get(&job_id)
@@ -2970,6 +2995,11 @@ impl AgentService {
 
     /// SIGTERM now, escalate to SIGKILL after a 5-second grace period.
     async fn graceful_cancel(&self, job_id: u32) {
+        if self.runtime_sessions.lock().await.contains_key(&job_id) {
+            self.send_explicit_signal(job_id, nix::sys::signal::Signal::SIGTERM as i32)
+                .await;
+            return;
+        }
         let is_allocation_only = {
             let jobs = self.running.lock().await;
             jobs.get(&job_id)
