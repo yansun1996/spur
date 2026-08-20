@@ -3,15 +3,17 @@
 
 //! MPI launch planning and `--mpi` validation helpers.
 
+use serde::{Deserialize, Serialize};
+
 /// One process entry in a PMIx launch plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PmixLocalProc {
     pub rank: u32,
     pub local_rank: u32,
 }
 
 /// Controller-derived PMIx bootstrap payload for a single agent dispatch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PmixLaunchPlan {
     pub job_id: u32,
     pub namespace: String,
