@@ -46,6 +46,8 @@ pub struct RuntimeLaunchSpec {
     #[serde(default)]
     pub container_rootfs_mode: Option<crate::container::RootfsMode>,
     #[serde(default)]
+    pub hooks: spur_core::config::HooksConfig,
+    #[serde(default)]
     pub controller_addr: String,
     #[serde(default)]
     pub reporting_node: String,
@@ -102,6 +104,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
             container: config.container.clone(),
             host_device_plan: config.host_device_plan.clone(),
             container_rootfs_mode: None,
+            hooks: spur_core::config::HooksConfig::default(),
             controller_addr: String::new(),
             reporting_node: String::new(),
             run_attempt: 0,
@@ -1713,6 +1716,19 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let reporting_node = launch_spec.reporting_node.clone();
     let runtime_environment = launch_spec.environment.clone();
     let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
+    let hooks = launch_spec.hooks.clone();
+    let hook_context = spur_core::hooks::HookContext {
+        job_id,
+        work_dir: launch_spec.work_dir.clone(),
+        uid: launch_spec.uid,
+        gid: launch_spec.gid,
+        partition: launch_spec.partition.clone(),
+        nodelist: launch_spec.nodelist.clone(),
+        script_context: "epilog_slurmd".into(),
+        gpu_devices: launch_spec.gpu_devices.clone(),
+        cpus: launch_spec.cpus,
+        memory_mb: launch_spec.memory_mb,
+    };
     let job = if launch_spec.allocation_only {
         RunningJob::AllocationOnly
     } else {
@@ -1754,6 +1770,16 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let exit_code = snapshot
         .exit_code
         .unwrap_or_else(|| 128 + snapshot.signal.unwrap_or(0));
+    let epilog_failed = if let Some(epilog) = hooks.epilog.as_deref() {
+        if let Err(error) = spur_core::hooks::run_hook(epilog, &hook_context).await {
+            tracing::error!(job_id, %error, "runtime epilog hook failed");
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
     obligations.append(&RuntimeObligation::ExitObserved {
         exit_code,
         signal: snapshot.signal.unwrap_or(0),
@@ -1767,7 +1793,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             snapshot.signal.unwrap_or(0),
             run_attempt,
             &reporting_node,
-            None,
+            epilog_failed.then_some(&crate::agent_server::DrainRequest {
+                reason: "epilog script failed".into(),
+            }),
         )
         .await
     {
@@ -2209,6 +2237,7 @@ mod tests {
             container: None,
             host_device_plan: None,
             container_rootfs_mode: None,
+            hooks: spur_core::config::HooksConfig::default(),
             controller_addr: String::new(),
             reporting_node: String::new(),
             run_attempt: 1,

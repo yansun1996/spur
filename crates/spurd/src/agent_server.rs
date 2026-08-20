@@ -43,14 +43,19 @@ fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &
     }
 }
 
+struct RuntimeSessionLaunchOptions {
+    allocation_only: bool,
+    pmix_inputs: Option<(MpiConfig, PmixLaunchPlan)>,
+    container_rootfs_mode: Option<crate::container::RootfsMode>,
+    hooks: HooksConfig,
+}
+
 async fn launch_runtime_session(
     config: &executor::JobLaunchConfig,
     run_attempt: u32,
     controller_addr: &str,
     reporting_node: &str,
-    allocation_only: bool,
-    pmix_inputs: Option<(MpiConfig, PmixLaunchPlan)>,
-    container_rootfs_mode: Option<crate::container::RootfsMode>,
+    options: RuntimeSessionLaunchOptions,
 ) -> Result<
     (
         executor::LaunchResult,
@@ -63,9 +68,11 @@ async fn launch_runtime_session(
     launch_spec.controller_addr = controller_addr.into();
     launch_spec.reporting_node = reporting_node.into();
     launch_spec.run_attempt = run_attempt;
-    launch_spec.allocation_only = allocation_only || config.io_mode == executor::LaunchIo::Pty;
-    launch_spec.container_rootfs_mode = container_rootfs_mode;
-    if let Some((pmix_config, pmix_plan)) = pmix_inputs {
+    launch_spec.allocation_only =
+        options.allocation_only || config.io_mode == executor::LaunchIo::Pty;
+    launch_spec.container_rootfs_mode = options.container_rootfs_mode;
+    launch_spec.hooks = options.hooks;
+    if let Some((pmix_config, pmix_plan)) = options.pmix_inputs {
         launch_spec.pmix_config = Some(pmix_config);
         launch_spec.pmix_plan = Some(pmix_plan);
     }
@@ -768,7 +775,7 @@ impl AgentService {
 }
 
 pub(crate) struct DrainRequest {
-    reason: String,
+    pub(crate) reason: String,
 }
 
 /// Reclaim a launch reservation that never commits within this bound. Sized
@@ -1780,9 +1787,15 @@ impl SlurmAgent for AgentService {
                 run_attempt,
                 &self.reporter.controller_addr,
                 &self.reporter.hostname,
-                false,
-                runtime_pmix_inputs,
-                launch_cfg.container.as_ref().map(|_| rootfs_mode.clone()),
+                RuntimeSessionLaunchOptions {
+                    allocation_only: false,
+                    pmix_inputs: runtime_pmix_inputs,
+                    container_rootfs_mode: launch_cfg
+                        .container
+                        .as_ref()
+                        .map(|_| rootfs_mode.clone()),
+                    hooks: (*self.hooks).clone(),
+                },
             )
             .await
             .map(|(result, descriptor)| (result, Some(descriptor)))
@@ -2261,9 +2274,12 @@ impl SlurmAgent for AgentService {
                 req.run_attempt,
                 &self.reporter.controller_addr,
                 &self.reporter.hostname,
-                true,
-                None,
-                None,
+                RuntimeSessionLaunchOptions {
+                    allocation_only: true,
+                    pmix_inputs: None,
+                    container_rootfs_mode: None,
+                    hooks: (*self.hooks).clone(),
+                },
             )
             .await
             .map(|(_, descriptor)| descriptor)
