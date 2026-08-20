@@ -1045,4 +1045,37 @@ mod tests {
         );
         server.await.expect("server task").expect("serve control");
     }
+
+    #[tokio::test]
+    async fn control_loop_acknowledges_allocation_signal() {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 42, 3);
+        let server = tokio::spawn(async move { serve_control(server_stream, &session).await });
+        let (reader, mut writer) = client_stream.into_split();
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&RuntimeRequest::SignalAllocation {
+                        signal: nix::sys::signal::Signal::SIGTERM as i32,
+                    })
+                    .expect("encode signal request")
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write signal request");
+        drop(writer);
+        let mut reader = BufReader::new(reader);
+        let mut response = String::new();
+        reader
+            .read_line(&mut response)
+            .await
+            .expect("read response");
+        assert_eq!(
+            serde_json::from_str::<RuntimeResponse>(&response).expect("decode response"),
+            RuntimeResponse::Acknowledged
+        );
+        server.await.expect("server task").expect("serve control");
+    }
 }
