@@ -925,6 +925,24 @@ pub(crate) fn append_obligation(
     RuntimeObligationLog::new(session_dir.join(OBLIGATION_FILE)).append(obligation)
 }
 
+pub(crate) fn record_resources_released(descriptor: &RuntimeSessionDescriptor) -> io::Result<()> {
+    let session_dir = descriptor.socket_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime socket path has no session directory",
+        )
+    })?;
+    let obligations = RuntimeObligationLog::new(session_dir.join(OBLIGATION_FILE));
+    if obligations
+        .read()?
+        .iter()
+        .any(|obligation| matches!(obligation, RuntimeObligation::ResourcesReleased))
+    {
+        return Ok(());
+    }
+    obligations.append(&RuntimeObligation::ResourcesReleased)
+}
+
 pub fn validate_hello(
     descriptor: &RuntimeSessionDescriptor,
     capability: &str,
