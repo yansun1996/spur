@@ -48,6 +48,8 @@ pub struct RuntimeLaunchSpec {
     #[serde(default)]
     pub hooks: spur_core::config::HooksConfig,
     #[serde(default)]
+    pub plugstack_path: String,
+    #[serde(default)]
     pub controller_addr: String,
     #[serde(default)]
     pub reporting_node: String,
@@ -105,6 +107,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
             host_device_plan: config.host_device_plan.clone(),
             container_rootfs_mode: None,
             hooks: spur_core::config::HooksConfig::default(),
+            plugstack_path: String::new(),
             controller_addr: String::new(),
             reporting_node: String::new(),
             run_attempt: 0,
@@ -1751,6 +1754,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let runtime_environment = launch_spec.environment.clone();
     let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     let hooks = launch_spec.hooks.clone();
+    let spank = load_runtime_spank(&launch_spec.plugstack_path);
     let hook_context = spur_core::hooks::HookContext {
         job_id,
         work_dir: launch_spec.work_dir.clone(),
@@ -1766,7 +1770,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let job = if launch_spec.allocation_only {
         RunningJob::AllocationOnly
     } else {
-        match crate::executor::launch_job(&launch_spec.into_launch_config(), None).await {
+        match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref()).await {
             Ok(result) => result.job,
             Err(error) => {
                 if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
@@ -1814,6 +1818,23 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     } else {
         false
     };
+    if let Some(spank) = spank.as_ref() {
+        let context = spur_spank::SpankContext {
+            job_id,
+            uid: hook_context.uid,
+            gid: hook_context.gid,
+            ..Default::default()
+        };
+        let mut handle = spur_spank::SpankHandle::new(context, HashMap::new());
+        for hook in [
+            spur_spank::SpankHook::TaskExit,
+            spur_spank::SpankHook::JobEpilog,
+        ] {
+            if let Err(error) = spank.invoke_hook(hook, &mut handle) {
+                tracing::warn!(job_id, %error, hook = hook.symbol_name(), "runtime SPANK exit hook failed");
+            }
+        }
+    }
     obligations.append(&RuntimeObligation::ExitObserved {
         exit_code,
         signal: snapshot.signal.unwrap_or(0),
@@ -1908,6 +1929,26 @@ fn prepare_pmix_launch(
         host,
         job_id: plan.job_id,
     }))
+}
+
+fn load_runtime_spank(plugstack_path: &str) -> Option<spur_spank::SpankHost> {
+    if plugstack_path.is_empty() || !Path::new(plugstack_path).exists() {
+        return None;
+    }
+    let entries = match spur_spank::parse_plugstack(Path::new(plugstack_path)) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(path = plugstack_path, %error, "failed to parse runtime plugstack");
+            return None;
+        }
+    };
+    let mut host = spur_spank::SpankHost::new();
+    for entry in entries {
+        if let Err(error) = host.load_plugin(&entry.path, &entry.args) {
+            tracing::warn!(plugin = %entry.path.display(), %error, required = entry.required, "runtime SPANK plugin failed to load");
+        }
+    }
+    (host.plugin_count() > 0).then_some(host)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2272,6 +2313,7 @@ mod tests {
             host_device_plan: None,
             container_rootfs_mode: None,
             hooks: spur_core::config::HooksConfig::default(),
+            plugstack_path: String::new(),
             controller_addr: String::new(),
             reporting_node: String::new(),
             run_attempt: 1,

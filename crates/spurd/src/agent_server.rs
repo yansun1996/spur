@@ -48,6 +48,7 @@ struct RuntimeSessionLaunchOptions {
     pmix_inputs: Option<(MpiConfig, PmixLaunchPlan)>,
     container_rootfs_mode: Option<crate::container::RootfsMode>,
     hooks: HooksConfig,
+    plugstack_path: String,
 }
 
 async fn launch_runtime_session(
@@ -72,6 +73,7 @@ async fn launch_runtime_session(
         options.allocation_only || config.io_mode == executor::LaunchIo::Pty;
     launch_spec.container_rootfs_mode = options.container_rootfs_mode;
     launch_spec.hooks = options.hooks;
+    launch_spec.plugstack_path = options.plugstack_path;
     if let Some((pmix_config, pmix_plan)) = options.pmix_inputs {
         launch_spec.pmix_config = Some(pmix_config);
         launch_spec.pmix_plan = Some(pmix_plan);
@@ -475,6 +477,7 @@ pub struct AgentService {
     running: RunningJobs,
     allocation: Arc<Mutex<NodeAllocation>>,
     spank: Arc<Option<SpankHost>>,
+    plugstack_path: String,
     mpi_host: Arc<MpiPluginHost>,
     mpi_config: MpiConfig,
     hooks: Arc<HooksConfig>,
@@ -587,6 +590,7 @@ impl AgentService {
             running,
             allocation: Arc::new(Mutex::new(allocation)),
             spank: Arc::new(spank),
+            plugstack_path,
             mpi_host: Arc::new(MpiPluginHost::new(mpi.clone())),
             mpi_config: mpi,
             hooks: Arc::new(hooks),
@@ -1795,6 +1799,7 @@ impl SlurmAgent for AgentService {
                         .as_ref()
                         .map(|_| rootfs_mode.clone()),
                     hooks: (*self.hooks).clone(),
+                    plugstack_path: self.plugstack_path.clone(),
                 },
             )
             .await
@@ -2279,6 +2284,7 @@ impl SlurmAgent for AgentService {
                     pmix_inputs: None,
                     container_rootfs_mode: None,
                     hooks: (*self.hooks).clone(),
+                    plugstack_path: self.plugstack_path.clone(),
                 },
             )
             .await
