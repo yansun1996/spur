@@ -2095,6 +2095,23 @@ mod tests {
     }
 
     #[test]
+    fn resource_release_obligation_is_idempotent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RuntimeSessionStore::new(temp.path());
+        let mut descriptor = descriptor(42, 3, std::process::id());
+        descriptor.socket_path = store.session_dir(42, 3).join("runtime.sock");
+        store.publish(&descriptor).expect("publish descriptor");
+
+        record_resources_released(&descriptor).expect("record first release");
+        record_resources_released(&descriptor).expect("record duplicate release");
+
+        assert_eq!(
+            store.obligations(42, 3).read().expect("read obligations"),
+            vec![RuntimeObligation::ResourcesReleased]
+        );
+    }
+
+    #[test]
     fn stale_exit_without_acknowledgement_is_recoverable() {
         let temp = tempfile::tempdir().expect("tempdir");
         let store = RuntimeSessionStore::new(temp.path());
