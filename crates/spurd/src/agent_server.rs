@@ -68,7 +68,7 @@ async fn launch_runtime_session(
     let session_dir = store
         .prepare_session_dir(config.job_id, run_attempt)
         .map_err(|error| executor::LaunchError::Other(error.into()))?;
-    let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+    let mut descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
         config.job_id,
         run_attempt,
         0,
@@ -77,6 +77,10 @@ async fn launch_runtime_session(
         std::path::PathBuf::new(),
     );
     launch_spec.capability = descriptor.capability.clone();
+    descriptor.owner = config.user.clone();
+    descriptor.uid = config.uid;
+    descriptor.gid = config.gid;
+    descriptor.work_dir = config.work_dir.clone();
     let launch_path = session_dir.join("launch.json");
     let launch_json = serde_json::to_vec(&launch_spec)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
@@ -235,10 +239,10 @@ pub(crate) async fn recover_runtime_sessions(
             has_user_namespace: false,
             has_mount_namespace: false,
             _pty_master: None,
-            work_dir: String::new(),
-            uid: 0,
-            gid: 0,
-            user: String::new(),
+            work_dir: descriptor.work_dir.clone(),
+            uid: descriptor.uid,
+            gid: descriptor.gid,
+            user: descriptor.owner.clone(),
             partition: String::new(),
             gpu_devices: Vec::new(),
             cpus: 0,
@@ -2765,6 +2769,52 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
+        if let Some(descriptor) = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&init.job_id)
+            .cloned()
+        {
+            let winsize =
+                init.winsize
+                    .as_ref()
+                    .map(|ws| crate::runtime_session::RuntimeWindowSize {
+                        rows: ws.rows as u16,
+                        cols: ws.cols as u16,
+                        xpixel: ws.xpixel as u16,
+                        ypixel: ws.ypixel as u16,
+                    });
+            crate::runtime_session::launch_pty(
+                &descriptor,
+                uuid::Uuid::new_v4().to_string(),
+                crate::runtime_session::RuntimePtyLaunchSpec {
+                    argv: init.argv.clone(),
+                    work_dir: entry.work_dir.clone(),
+                    environment: std::collections::HashMap::new(),
+                    uid: entry.uid,
+                    gid: entry.gid,
+                    memlock: match self.memlock {
+                        spur_core::config::MemlockLimit::Unlimited => {
+                            crate::runtime_session::RuntimeMemlock::Unlimited
+                        }
+                        spur_core::config::MemlockLimit::Inherit => {
+                            crate::runtime_session::RuntimeMemlock::Inherit
+                        }
+                        spur_core::config::MemlockLimit::Bytes(value) => {
+                            crate::runtime_session::RuntimeMemlock::Bytes(value)
+                        }
+                    },
+                    winsize,
+                },
+            )
+            .await
+            .map_err(|error| Status::unavailable(format!("runtime PTY launch failed: {error}")))?;
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
+            tokio::spawn(Self::run_runtime_pty_bridge(descriptor, inbound, tx));
+            return Ok(Response::new(ReceiverStream::new(rx)));
+        }
+
         let (master_fd, child, child_pid) =
             Self::spawn_pty_in_job(&entry, &argv, init.job_id, winsize.as_ref())?;
 
@@ -3444,6 +3494,83 @@ impl AgentService {
                 msg: Some(interactive_output::Msg::ExitStatus(exit_code)),
             }))
             .await;
+    }
+
+    async fn run_runtime_pty_bridge<S>(
+        descriptor: crate::runtime_session::RuntimeSessionDescriptor,
+        mut inbound: S,
+        tx: tokio::sync::mpsc::Sender<Result<InteractiveOutput, Status>>,
+    ) where
+        S: tokio_stream::Stream<Item = Result<InteractiveInput, Status>> + Unpin + Send,
+    {
+        use tokio_stream::StreamExt;
+
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let mut offset = 0;
+        let mut poll = tokio::time::interval(tokio::time::Duration::from_millis(25));
+        loop {
+            tokio::select! {
+                item = inbound.next() => match item {
+                    Some(Ok(input)) => {
+                        let result = match input.msg {
+                            Some(interactive_input::Msg::Stdin(data)) => {
+                                crate::runtime_session::write_pty(&descriptor, instance_id.clone(), data).await
+                            }
+                            Some(interactive_input::Msg::Resize(ws)) => {
+                                crate::runtime_session::resize_pty(
+                                    &descriptor,
+                                    instance_id.clone(),
+                                    crate::runtime_session::RuntimeWindowSize {
+                                        rows: ws.rows as u16,
+                                        cols: ws.cols as u16,
+                                        xpixel: ws.xpixel as u16,
+                                        ypixel: ws.ypixel as u16,
+                                    },
+                                ).await
+                            }
+                            Some(interactive_input::Msg::Signal(signal)) => {
+                                crate::runtime_session::signal_pty(&descriptor, instance_id.clone(), signal).await
+                            }
+                            Some(interactive_input::Msg::Init(_)) | None => Ok(()),
+                        };
+                        if let Err(error) = result {
+                            let _ = tx.send(Err(Status::unavailable(format!("runtime PTY request failed: {error}")))).await;
+                            return;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                    None => return,
+                },
+                _ = poll.tick() => {
+                    match crate::runtime_session::read_pty(&descriptor, instance_id.clone(), offset).await {
+                        Ok(output) => {
+                            offset = output.start_offset + output.data.len() as u64;
+                            if !output.data.is_empty()
+                                && tx.send(Ok(InteractiveOutput {
+                                    msg: Some(interactive_output::Msg::Data(output.data)),
+                                })).await.is_err()
+                            {
+                                return;
+                            }
+                            if output.eof {
+                                let exit_code = output.exit_code.unwrap_or(128);
+                                let _ = tx.send(Ok(InteractiveOutput {
+                                    msg: Some(interactive_output::Msg::ExitStatus(exit_code)),
+                                })).await;
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Err(Status::unavailable(format!("runtime PTY read failed: {error}")))).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Non-blocking read from a PTY master via an AsyncFd ready guard.

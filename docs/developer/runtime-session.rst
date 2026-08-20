@@ -56,13 +56,14 @@ Failure contracts
 Local protocol
 --------------
 
-The Unix-socket protocol is versioned and capability-authenticated. Its stable
+The Unix-socket protocol is versioned and capability-authenticated. Its current
 operations are ``Hello``, ``QueryState``, ``LaunchStep``, ``SignalStep``,
-``KillStep``, ``AttachIO``, ``DetachIO``, ``ResizePTY``,
-``CreatePMIxNamespace``, ``DestroyPMIxNamespace``, ``BeginTeardown``, and
-``Shutdown``. An N/N-1 compatible protocol is required for one release during
-rolling upgrades. Incompatible runtimes require draining a node before the
-agent upgrade.
+``LaunchPty``, ``WritePty``, ``ReadPty``, ``ResizePty``, ``SignalPty``,
+``BeginTeardown``, and ``Shutdown``. ``ReadPty`` uses a monotonic output offset
+and a bounded one-mebibyte live buffer, so an agent or client reconnect can
+resume output without becoming the owner of the terminal. An N/N-1 compatible
+protocol is required for one release during rolling upgrades. Incompatible
+runtimes require draining a node before the agent upgrade.
 
 Rollout
 -------
@@ -78,8 +79,10 @@ Current development gate
 ------------------------
 
 Set ``SPUR_RUNTIME_SESSION=1`` in the ``spurd`` service environment to route
-the initial plain-batch cohort through RuntimeSession. During this development
-stage, a runtime launch explicitly rejects container, GPU, PTY, and PMIx
-workloads instead of using an incomplete execution contract. ``SPUR_RUNTIME_STATE_DIR``
-overrides the default ``/var/spool/spur`` local runtime directory for isolated
-testing.
+the initial plain-batch cohort and interactive allocation attachments through
+RuntimeSession. The runtime owns interactive child PTYs, terminal input,
+resizes, foreground signals, and replayable output; an agent restart no longer
+sends a hangup to an attached terminal. Primary PTY batch launches, container,
+GPU, and PMIx workloads remain rejected until their full execution contracts
+are implemented. ``SPUR_RUNTIME_STATE_DIR`` overrides the default
+``/var/spool/spur`` local runtime directory for isolated testing.

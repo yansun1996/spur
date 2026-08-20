@@ -1,13 +1,15 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify};
@@ -65,7 +67,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
             return Err("GPU launches are not yet supported by RuntimeSession".into());
         }
         if config.io_mode != crate::executor::LaunchIo::File {
-            return Err("PTY launches are not yet supported by RuntimeSession".into());
+            return Err("primary PTY launches are not yet supported by RuntimeSession".into());
         }
         if config.pmix_multi_task {
             return Err("PMIx launches are not yet supported by RuntimeSession".into());
@@ -167,6 +169,21 @@ pub enum RuntimeRequest {
         step_id: u32,
         signal: i32,
     },
+    LaunchPty {
+        pty: RuntimePtyLaunchSpec,
+    },
+    WritePty {
+        data: Vec<u8>,
+    },
+    ResizePty {
+        winsize: RuntimeWindowSize,
+    },
+    SignalPty {
+        signal: i32,
+    },
+    ReadPty {
+        offset: u64,
+    },
     BeginTeardown,
     Shutdown,
 }
@@ -192,6 +209,12 @@ pub enum RuntimeResponse {
         exit_code: i32,
         stdout: String,
         stderr: String,
+    },
+    PtyOutput {
+        start_offset: u64,
+        data: Vec<u8>,
+        eof: bool,
+        exit_code: Option<i32>,
     },
     Rejected {
         message: String,
@@ -273,9 +296,83 @@ pub struct RuntimeStepLaunchSpec {
     pub memlock: RuntimeMemlock,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePtyLaunchSpec {
+    pub argv: Vec<String>,
+    pub work_dir: String,
+    pub environment: std::collections::HashMap<String, String>,
+    pub uid: u32,
+    pub gid: u32,
+    pub memlock: RuntimeMemlock,
+    pub winsize: Option<RuntimeWindowSize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeWindowSize {
+    pub rows: u16,
+    pub cols: u16,
+    pub xpixel: u16,
+    pub ypixel: u16,
+}
+
+impl From<RuntimeWindowSize> for crate::pty::WindowSize {
+    fn from(value: RuntimeWindowSize) -> Self {
+        Self {
+            rows: value.rows,
+            cols: value.cols,
+            xpixel: value.xpixel,
+            ypixel: value.ypixel,
+        }
+    }
+}
+
 struct RuntimeStep {
     pid: u32,
     completion: Arc<RuntimeStepCompletion>,
+}
+
+const PTY_OUTPUT_LIMIT: usize = 1024 * 1024;
+
+struct RuntimePtyBuffer {
+    start_offset: u64,
+    data: VecDeque<u8>,
+    eof: bool,
+    exit_code: Option<i32>,
+}
+
+impl RuntimePtyBuffer {
+    fn append(&mut self, data: &[u8]) {
+        self.data.extend(data);
+        let excess = self.data.len().saturating_sub(PTY_OUTPUT_LIMIT);
+        self.data.drain(..excess);
+        self.start_offset += excess as u64;
+    }
+
+    fn read_from(&self, offset: u64) -> RuntimePtyOutput {
+        let offset = offset.max(self.start_offset);
+        let skip = (offset - self.start_offset) as usize;
+        RuntimePtyOutput {
+            start_offset: offset,
+            data: self.data.iter().skip(skip).copied().collect(),
+            eof: self.eof,
+            exit_code: self.exit_code,
+        }
+    }
+}
+
+struct RuntimePty {
+    master: Arc<AsyncFd<std::os::fd::OwnedFd>>,
+    child_pid: i32,
+    buffer: Mutex<RuntimePtyBuffer>,
+    output_ready: Notify,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimePtyOutput {
+    pub start_offset: u64,
+    pub data: Vec<u8>,
+    pub eof: bool,
+    pub exit_code: Option<i32>,
 }
 
 struct RuntimeStepCompletion {
@@ -318,10 +415,21 @@ pub struct RuntimeSession {
     job: Mutex<RunningJob>,
     snapshot: Mutex<RuntimeSnapshot>,
     steps: Arc<Mutex<RuntimeSteps>>,
+    pty: Mutex<Option<Arc<RuntimePty>>>,
+    environment: std::collections::HashMap<String, String>,
 }
 
 impl RuntimeSession {
     pub fn new(job: RunningJob, job_id: u32, run_attempt: u32) -> Self {
+        Self::with_environment(job, job_id, run_attempt, std::collections::HashMap::new())
+    }
+
+    pub fn with_environment(
+        job: RunningJob,
+        job_id: u32,
+        run_attempt: u32,
+        environment: std::collections::HashMap<String, String>,
+    ) -> Self {
         Self {
             job: Mutex::new(job),
             snapshot: Mutex::new(RuntimeSnapshot {
@@ -332,6 +440,8 @@ impl RuntimeSession {
                 signal: None,
             }),
             steps: Arc::new(Mutex::new(RuntimeSteps::default())),
+            pty: Mutex::new(None),
+            environment,
         }
     }
 
@@ -368,6 +478,9 @@ impl RuntimeSession {
             signal_process_group(step.pid, signal);
         }
         drop(steps);
+        if self.pty.lock().await.is_some() {
+            self.signal_pty(signal as i32).await?;
+        }
         if allocation_only {
             self.snapshot.lock().await.active = false;
         }
@@ -491,6 +604,205 @@ impl RuntimeSession {
         }
         Ok(())
     }
+
+    async fn launch_pty(&self, spec: RuntimePtyLaunchSpec) -> io::Result<()> {
+        if self.pty.lock().await.is_some() {
+            return Ok(());
+        }
+        let (master, slave) = crate::pty::openpty_with_winsize(
+            spec.winsize.map(crate::pty::WindowSize::from).as_ref(),
+        )
+        .map_err(io::Error::other)?;
+        let shell = if spec.argv.is_empty() {
+            if std::path::Path::new("/bin/bash").exists() {
+                vec!["/bin/bash".to_string()]
+            } else {
+                vec!["/bin/sh".to_string()]
+            }
+        } else {
+            spec.argv.clone()
+        };
+        let mut command = tokio::process::Command::new(&shell[0]);
+        command
+            .args(&shell[1..])
+            .current_dir(if spec.work_dir.is_empty() {
+                "/tmp"
+            } else {
+                &spec.work_dir
+            })
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        for (key, value) in &self.environment {
+            command.env(key, value);
+        }
+        for (key, value) in &spec.environment {
+            command.env(key, value);
+        }
+        let memlock = spec.memlock;
+        let master_fd = master.as_raw_fd();
+        let slave_fd = slave.as_raw_fd();
+        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(spec.uid, spec.gid);
+        unsafe {
+            command.pre_exec(move || {
+                crate::pty::pty_pre_exec(slave_fd, master_fd)?;
+                crate::executor::apply_memlock(match memlock {
+                    RuntimeMemlock::Unlimited => spur_core::config::MemlockLimit::Unlimited,
+                    RuntimeMemlock::Inherit => spur_core::config::MemlockLimit::Inherit,
+                    RuntimeMemlock::Bytes(value) => spur_core::config::MemlockLimit::Bytes(value),
+                });
+                if let Some(ref priv_drop) = priv_drop {
+                    priv_drop
+                        .apply()
+                        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn()?;
+        let child_pid = child
+            .id()
+            .ok_or_else(|| io::Error::other("runtime PTY has no pid"))?
+            as i32;
+        drop(slave);
+        nix::fcntl::fcntl(
+            &master,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .map_err(io::Error::other)?;
+        let pty = Arc::new(RuntimePty {
+            master: Arc::new(AsyncFd::new(master)?),
+            child_pid,
+            buffer: Mutex::new(RuntimePtyBuffer {
+                start_offset: 0,
+                data: VecDeque::new(),
+                eof: false,
+                exit_code: None,
+            }),
+            output_ready: Notify::new(),
+        });
+        *self.pty.lock().await = Some(pty.clone());
+        tokio::spawn(read_runtime_pty(pty.clone()));
+        tokio::spawn(async move {
+            let exit_code = match child.wait().await {
+                Ok(status) => spur_core::process::shell_exit_code(&status),
+                Err(error) => {
+                    tracing::warn!(%error, "runtime PTY wait failed");
+                    1
+                }
+            };
+            let mut buffer = pty.buffer.lock().await;
+            buffer.exit_code = Some(exit_code);
+            drop(buffer);
+            pty.output_ready.notify_waiters();
+        });
+        Ok(())
+    }
+
+    async fn write_pty(&self, data: &[u8]) -> io::Result<()> {
+        let pty =
+            self.pty.lock().await.clone().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "runtime PTY is not running")
+            })?;
+        write_runtime_pty(&pty.master, data).await
+    }
+
+    async fn resize_pty(&self, winsize: RuntimeWindowSize) -> io::Result<()> {
+        let pty =
+            self.pty.lock().await.clone().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "runtime PTY is not running")
+            })?;
+        crate::pty::resize(pty.master.get_ref().as_raw_fd(), &winsize.into())
+            .map_err(io::Error::other)
+    }
+
+    async fn signal_pty(&self, signal: i32) -> io::Result<()> {
+        let pty =
+            self.pty.lock().await.clone().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "runtime PTY is not running")
+            })?;
+        crate::pty::signal_foreground(pty.master.get_ref().as_raw_fd(), pty.child_pid, signal)
+            .map_err(io::Error::other)
+    }
+
+    async fn read_pty(&self, offset: u64) -> io::Result<RuntimePtyOutput> {
+        let pty =
+            self.pty.lock().await.clone().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "runtime PTY is not running")
+            })?;
+        let output = pty.buffer.lock().await.read_from(offset);
+        Ok(output)
+    }
+}
+
+async fn read_runtime_pty(pty: Arc<RuntimePty>) {
+    let mut read_buffer = [0u8; 8192];
+    loop {
+        let mut guard = match pty.master.readable().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                tracing::warn!(%error, "runtime PTY readiness failed");
+                break;
+            }
+        };
+        let result = guard.try_io(|fd| {
+            let count = unsafe {
+                libc::read(
+                    fd.get_ref().as_raw_fd(),
+                    read_buffer.as_mut_ptr().cast(),
+                    read_buffer.len(),
+                )
+            };
+            if count < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
+            }
+        });
+        match result {
+            Ok(Ok(0)) => break,
+            Ok(Err(error)) if error.raw_os_error() == Some(libc::EIO) => break,
+            Ok(Ok(count)) => {
+                pty.buffer.lock().await.append(&read_buffer[..count]);
+                pty.output_ready.notify_waiters();
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "runtime PTY read failed");
+                break;
+            }
+            Err(_) => {}
+        }
+    }
+    let mut buffer = pty.buffer.lock().await;
+    buffer.eof = true;
+    drop(buffer);
+    pty.output_ready.notify_waiters();
+}
+
+async fn write_runtime_pty(master: &AsyncFd<std::os::fd::OwnedFd>, data: &[u8]) -> io::Result<()> {
+    let mut written = 0;
+    while written < data.len() {
+        let mut guard = master.writable().await?;
+        match guard.try_io(|fd| {
+            let count = unsafe {
+                libc::write(
+                    fd.get_ref().as_raw_fd(),
+                    data[written..].as_ptr().cast(),
+                    data.len() - written,
+                )
+            };
+            if count < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(count as usize)
+            }
+        }) {
+            Ok(Ok(count)) => written += count,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => continue,
+        }
+    }
+    Ok(())
 }
 
 async fn read_step_output<R>(mut reader: R) -> String
@@ -565,6 +877,14 @@ pub struct RuntimeSessionDescriptor {
     pub cgroup_path: PathBuf,
     #[serde(default)]
     pub capability: String,
+    #[serde(default)]
+    pub owner: String,
+    #[serde(default)]
+    pub uid: u32,
+    #[serde(default)]
+    pub gid: u32,
+    #[serde(default)]
+    pub work_dir: String,
 }
 
 impl RuntimeSessionDescriptor {
@@ -585,6 +905,10 @@ impl RuntimeSessionDescriptor {
             socket_path,
             cgroup_path,
             capability: uuid::Uuid::new_v4().to_string(),
+            owner: String::new(),
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
         }
     }
 }
@@ -840,6 +1164,134 @@ pub(crate) async fn signal_step(
     }
 }
 
+pub(crate) async fn launch_pty(
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+    pty: RuntimePtyLaunchSpec,
+) -> io::Result<()> {
+    match runtime_request(
+        descriptor,
+        spurd_instance_id,
+        RuntimeRequest::LaunchPty { pty },
+    )
+    .await?
+    {
+        RuntimeResponse::Acknowledged => Ok(()),
+        RuntimeResponse::Rejected { message } => Err(io::Error::other(message)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime PTY launch response was invalid",
+        )),
+    }
+}
+
+pub(crate) async fn write_pty(
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+    data: Vec<u8>,
+) -> io::Result<()> {
+    match runtime_request(
+        descriptor,
+        spurd_instance_id,
+        RuntimeRequest::WritePty { data },
+    )
+    .await?
+    {
+        RuntimeResponse::Acknowledged => Ok(()),
+        RuntimeResponse::Rejected { message } => Err(io::Error::other(message)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime PTY write response was invalid",
+        )),
+    }
+}
+
+pub(crate) async fn resize_pty(
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+    winsize: RuntimeWindowSize,
+) -> io::Result<()> {
+    match runtime_request(
+        descriptor,
+        spurd_instance_id,
+        RuntimeRequest::ResizePty { winsize },
+    )
+    .await?
+    {
+        RuntimeResponse::Acknowledged => Ok(()),
+        RuntimeResponse::Rejected { message } => Err(io::Error::other(message)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime PTY resize response was invalid",
+        )),
+    }
+}
+
+pub(crate) async fn signal_pty(
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+    signal: i32,
+) -> io::Result<()> {
+    match runtime_request(
+        descriptor,
+        spurd_instance_id,
+        RuntimeRequest::SignalPty { signal },
+    )
+    .await?
+    {
+        RuntimeResponse::Acknowledged => Ok(()),
+        RuntimeResponse::Rejected { message } => Err(io::Error::other(message)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime PTY signal response was invalid",
+        )),
+    }
+}
+
+pub(crate) async fn read_pty(
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+    offset: u64,
+) -> io::Result<RuntimePtyOutput> {
+    match runtime_request(
+        descriptor,
+        spurd_instance_id,
+        RuntimeRequest::ReadPty { offset },
+    )
+    .await?
+    {
+        RuntimeResponse::PtyOutput {
+            start_offset,
+            data,
+            eof,
+            exit_code,
+        } => Ok(RuntimePtyOutput {
+            start_offset,
+            data,
+            eof,
+            exit_code,
+        }),
+        RuntimeResponse::Rejected { message } => Err(io::Error::other(message)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime PTY read response was invalid",
+        )),
+    }
+}
+
+async fn runtime_request(
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+    request: RuntimeRequest,
+) -> io::Result<RuntimeResponse> {
+    let stream = UnixStream::connect(&descriptor.socket_path).await?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    runtime_hello(&mut reader, &mut writer, descriptor, spurd_instance_id).await?;
+    write_request(&mut writer, &request).await?;
+    read_response(&mut reader).await
+}
+
 async fn runtime_hello(
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
@@ -940,6 +1392,41 @@ pub async fn serve_control(stream: UnixStream, session: &RuntimeSession) -> io::
                     },
                 }
             }
+            RuntimeRequest::LaunchPty { pty } => match session.launch_pty(pty).await {
+                Ok(()) => RuntimeResponse::Acknowledged,
+                Err(error) => RuntimeResponse::Rejected {
+                    message: error.to_string(),
+                },
+            },
+            RuntimeRequest::WritePty { data } => match session.write_pty(&data).await {
+                Ok(()) => RuntimeResponse::Acknowledged,
+                Err(error) => RuntimeResponse::Rejected {
+                    message: error.to_string(),
+                },
+            },
+            RuntimeRequest::ResizePty { winsize } => match session.resize_pty(winsize).await {
+                Ok(()) => RuntimeResponse::Acknowledged,
+                Err(error) => RuntimeResponse::Rejected {
+                    message: error.to_string(),
+                },
+            },
+            RuntimeRequest::SignalPty { signal } => match session.signal_pty(signal).await {
+                Ok(()) => RuntimeResponse::Acknowledged,
+                Err(error) => RuntimeResponse::Rejected {
+                    message: error.to_string(),
+                },
+            },
+            RuntimeRequest::ReadPty { offset } => match session.read_pty(offset).await {
+                Ok(output) => RuntimeResponse::PtyOutput {
+                    start_offset: output.start_offset,
+                    data: output.data,
+                    eof: output.eof,
+                    exit_code: output.exit_code,
+                },
+                Err(error) => RuntimeResponse::Rejected {
+                    message: error.to_string(),
+                },
+            },
             RuntimeRequest::Hello { .. } => RuntimeResponse::Rejected {
                 message: "runtime hello is only valid as the first request".into(),
             },
@@ -1018,10 +1505,15 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if !launch_spec.capability.is_empty() {
         descriptor.capability = launch_spec.capability.clone();
     }
+    descriptor.owner = launch_spec.user.clone();
+    descriptor.uid = launch_spec.uid;
+    descriptor.gid = launch_spec.gid;
+    descriptor.work_dir = launch_spec.work_dir.clone();
     store.publish(&descriptor)?;
     let listener = UnixListener::bind(&socket_path)?;
     let controller_addr = launch_spec.controller_addr.clone();
     let reporting_node = launch_spec.reporting_node.clone();
+    let runtime_environment = launch_spec.environment.clone();
     let job = if launch_spec.allocation_only {
         RunningJob::AllocationOnly
     } else {
@@ -1030,7 +1522,12 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             .map_err(|error| anyhow::anyhow!(error.to_string()))?
             .job
     };
-    let session = Arc::new(RuntimeSession::new(job, job_id, run_attempt));
+    let session = Arc::new(RuntimeSession::with_environment(
+        job,
+        job_id,
+        run_attempt,
+        runtime_environment,
+    ));
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
     result?;
@@ -1323,6 +1820,40 @@ pub(crate) fn session_liveness(
 mod tests {
     use super::*;
 
+    async fn wait_for_pty_exit(session: &RuntimeSession) -> RuntimePtyOutput {
+        loop {
+            let pty = session
+                .pty
+                .lock()
+                .await
+                .clone()
+                .expect("PTY must be running");
+            let notified = pty.output_ready.notified();
+            let output = session.read_pty(0).await.expect("read PTY output");
+            if output.eof && output.exit_code.is_some() {
+                return output;
+            }
+            notified.await;
+        }
+    }
+
+    fn pty_spec(argv: &[&str]) -> RuntimePtyLaunchSpec {
+        RuntimePtyLaunchSpec {
+            argv: argv.iter().map(|arg| (*arg).to_string()).collect(),
+            work_dir: "/tmp".into(),
+            environment: std::collections::HashMap::new(),
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            memlock: RuntimeMemlock::Inherit,
+            winsize: Some(RuntimeWindowSize {
+                rows: 24,
+                cols: 80,
+                xpixel: 0,
+                ypixel: 0,
+            }),
+        }
+    }
+
     fn descriptor(job_id: u32, run_attempt: u32, pid: u32) -> RuntimeSessionDescriptor {
         RuntimeSessionDescriptor::new(
             job_id,
@@ -1351,6 +1882,59 @@ mod tests {
     #[test]
     fn reads_own_process_start_time() {
         assert!(process_start_ticks(std::process::id()).expect("read current process") > 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_pty_replays_output_after_client_disconnect() {
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 77, 1);
+        session
+            .launch_pty(pty_spec(&["/bin/sh", "-c", "printf runtime-pty"]))
+            .await
+            .expect("launch runtime PTY");
+
+        let first = wait_for_pty_exit(&session).await;
+        assert_eq!(first.data, b"runtime-pty");
+        assert_eq!(first.exit_code, Some(0));
+
+        let replay = session.read_pty(0).await.expect("replay runtime PTY");
+        assert_eq!(replay.start_offset, 0);
+        assert_eq!(replay.data, b"runtime-pty");
+        assert!(replay.eof);
+    }
+
+    #[tokio::test]
+    async fn runtime_pty_accepts_input_without_agent_owned_bridge() {
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 78, 1);
+        session
+            .launch_pty(pty_spec(&[
+                "/bin/sh",
+                "-c",
+                "read value; printf got:$value",
+            ]))
+            .await
+            .expect("launch runtime PTY");
+        session
+            .write_pty(b"reconnected\n")
+            .await
+            .expect("write runtime PTY");
+
+        let output = wait_for_pty_exit(&session).await;
+        assert!(String::from_utf8_lossy(&output.data).contains("got:reconnected"));
+        assert_eq!(output.exit_code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn runtime_pty_bounds_replay_buffer_and_advances_offset() {
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 79, 1);
+        session
+            .launch_pty(pty_spec(&["/bin/sh", "-c", "head -c 1052672 /dev/zero"]))
+            .await
+            .expect("launch runtime PTY");
+
+        let output = wait_for_pty_exit(&session).await;
+        assert!(output.start_offset > 0);
+        assert_eq!(output.data.len(), PTY_OUTPUT_LIMIT);
+        assert_eq!(output.exit_code, Some(0));
     }
 
     #[test]
