@@ -51,6 +51,8 @@ pub struct RuntimeLaunchSpec {
     pub pmix_config: Option<spur_core::config::MpiConfig>,
     #[serde(default)]
     pub pmix_plan: Option<spur_core::mpi::PmixLaunchPlan>,
+    #[serde(default)]
+    pub pmix_multi_task: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,9 +71,6 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
         }
         if !config.gpu_devices.is_empty() {
             return Err("GPU launches are not yet supported by RuntimeSession".into());
-        }
-        if config.pmix_multi_task {
-            return Err("PMIx launches are not yet supported by RuntimeSession".into());
         }
         Ok(Self {
             job_id: config.job_id,
@@ -104,6 +103,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
             allocation_only: false,
             pmix_config: None,
             pmix_plan: None,
+            pmix_multi_task: config.pmix_multi_task,
         })
     }
 }
@@ -141,7 +141,7 @@ impl RuntimeLaunchSpec {
                 RuntimeMemlock::Bytes(value) => spur_core::config::MemlockLimit::Bytes(value),
             },
             io_mode: crate::executor::LaunchIo::File,
-            pmix_multi_task: false,
+            pmix_multi_task: self.pmix_multi_task,
         }
     }
 }
@@ -1521,7 +1521,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let run_attempt: u32 = args[2]
         .parse()
         .map_err(|error| anyhow::anyhow!("invalid run attempt: {error}"))?;
-    let launch_spec: RuntimeLaunchSpec = serde_json::from_slice(&std::fs::read(&args[3])?)?;
+    let mut launch_spec: RuntimeLaunchSpec = serde_json::from_slice(&std::fs::read(&args[3])?)?;
     if launch_spec.job_id != job_id {
         anyhow::bail!("runtime launch spec job id does not match process arguments");
     }
@@ -1549,6 +1549,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.gid = launch_spec.gid;
     descriptor.work_dir = launch_spec.work_dir.clone();
     store.publish(&descriptor)?;
+    let _pmix_guard = prepare_pmix_launch(&mut launch_spec)?;
     let listener = UnixListener::bind(&socket_path)?;
     let controller_addr = launch_spec.controller_addr.clone();
     let reporting_node = launch_spec.reporting_node.clone();
@@ -1600,6 +1601,78 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         obligations.append(&RuntimeObligation::CompletionAcknowledged)?;
     }
     Ok(exit_code)
+}
+
+struct RuntimePmixGuard {
+    host: Arc<crate::mpi_plugin::MpiPluginHost>,
+    job_id: u32,
+}
+
+impl Drop for RuntimePmixGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.host.release_pmix_server(self.job_id) {
+            tracing::warn!(job_id = self.job_id, %error, "PMIx runtime release failed");
+        }
+    }
+}
+
+fn prepare_pmix_launch(
+    launch_spec: &mut RuntimeLaunchSpec,
+) -> anyhow::Result<Option<RuntimePmixGuard>> {
+    let (Some(config), Some(plan)) = (
+        launch_spec.pmix_config.clone(),
+        launch_spec.pmix_plan.clone(),
+    ) else {
+        if launch_spec.pmix_config.is_some() || launch_spec.pmix_plan.is_some() {
+            anyhow::bail!("runtime PMIx launch requires both configuration and plan");
+        }
+        return Ok(None);
+    };
+    let host = Arc::new(crate::mpi_plugin::MpiPluginHost::new(config));
+    host.start_pmix_server_and_verify(&plan)
+        .map_err(|error| anyhow::anyhow!(error))?;
+    if launch_spec.pmix_multi_task {
+        let tasks_on_node = u32::try_from(plan.local_procs.len())
+            .map_err(|_| anyhow::anyhow!("too many local PMIx ranks"))?;
+        let envs = crate::mpi_plugin::pmix_setup_fork_env_for_node_tasks(
+            &host,
+            &plan,
+            plan.local_procs
+                .iter()
+                .map(|proc| proc.rank)
+                .min()
+                .unwrap_or(0),
+            tasks_on_node,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        let script_path = PathBuf::from(&launch_spec.work_dir)
+            .join(format!(".spur_user_{}.sh", launch_spec.job_id));
+        crate::executor::write_job_scratch(
+            &script_path,
+            &launch_spec.script,
+            launch_spec.uid,
+            launch_spec.gid,
+        )?;
+        launch_spec.script = spur_core::task_launch::build_multi_task_pmix_wrapper(
+            script_path.to_string_lossy().as_ref(),
+            tasks_on_node,
+            &envs,
+            Some(&launch_spec.environment),
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+    } else {
+        crate::mpi_plugin::apply_pmix_setup_fork_env(
+            &host,
+            &plan,
+            plan.local_procs.first().map(|proc| proc.rank).unwrap_or(0),
+            &mut launch_spec.environment,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+    }
+    Ok(Some(RuntimePmixGuard {
+        host,
+        job_id: plan.job_id,
+    }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1936,6 +2009,56 @@ mod tests {
         )
         .expect("write descriptor");
         session_dir
+    }
+
+    fn launch_spec() -> RuntimeLaunchSpec {
+        RuntimeLaunchSpec {
+            job_id: 42,
+            script: "true".into(),
+            work_dir: "/tmp".into(),
+            name: "runtime-test".into(),
+            user: "spur".into(),
+            node: "node-a".into(),
+            environment: HashMap::new(),
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            stdin_path: String::new(),
+            cpus: 1,
+            memory_mb: 0,
+            cpu_ids: Vec::new(),
+            open_mode: None,
+            uid: nix::unistd::geteuid().as_raw(),
+            gid: nix::unistd::getegid().as_raw(),
+            partition: "default".into(),
+            nodelist: "node-a".into(),
+            memlock: RuntimeMemlock::Inherit,
+            controller_addr: String::new(),
+            reporting_node: String::new(),
+            run_attempt: 1,
+            capability: String::new(),
+            allocation_only: false,
+            pmix_config: None,
+            pmix_plan: None,
+            pmix_multi_task: false,
+        }
+    }
+
+    #[test]
+    fn launch_spec_preserves_pmix_multi_task_execution_mode() {
+        let mut spec = launch_spec();
+        spec.pmix_multi_task = true;
+        assert!(spec.into_launch_config().pmix_multi_task);
+    }
+
+    #[test]
+    fn pmix_runtime_rejects_incomplete_persisted_inputs() {
+        let mut spec = launch_spec();
+        spec.pmix_config = Some(spur_core::config::MpiConfig::default());
+        let error = match prepare_pmix_launch(&mut spec) {
+            Ok(_) => panic!("incomplete PMIx inputs must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("both configuration and plan"));
     }
 
     #[test]

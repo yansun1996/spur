@@ -1328,6 +1328,9 @@ impl SlurmAgent for AgentService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
+        let runtime_enabled = std::env::var("SPUR_RUNTIME_SESSION")
+            .ok()
+            .is_some_and(|value| value == "1");
 
         // The uid is part of the (user-supplied) job spec and no RPC authenticates its caller, so
         // refuse root execution here — before anything is spawned — rather than relying on the
@@ -1569,7 +1572,8 @@ impl SlurmAgent for AgentService {
         let mut pmix_guard = None;
         let mut pmix_plan: Option<PmixLaunchPlan> = None;
         let mut pmix_per_local_rank_env: Option<Vec<HashMap<String, String>>> = None;
-        if spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script) {
+        if spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script) && !runtime_enabled
+        {
             let proto = req.pmix_plan.as_ref().ok_or_else(|| {
                 Status::failed_precondition("missing PMIx launch plan for --mpi=pmix job")
             })?;
@@ -1589,38 +1593,39 @@ impl SlurmAgent for AgentService {
         // out when `task_fanout` is set (standalone `srun` routed through the batch
         // path) or when `--mpi=pmix` is set so a direct batch launch spawns one
         // MPI rank per local task without requiring an inner `srun`.
-        let launch_script =
-            if use_multi_task_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script) {
-                // Write the user script to disk first so the wrapper can reference it
-                let user_script_path = format!("{}/.spur_user_{}.sh", work_dir, job_id);
-                std::fs::write(&user_script_path, &launch_script)
-                    .map_err(|e| Status::internal(format!("failed to write user script: {}", e)))?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(
-                        &user_script_path,
-                        std::fs::Permissions::from_mode(0o755),
-                    );
-                }
+        let launch_script = if runtime_enabled && pmix_multi_task {
+            launch_script
+        } else if use_multi_task_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script) {
+            // Write the user script to disk first so the wrapper can reference it
+            let user_script_path = format!("{}/.spur_user_{}.sh", work_dir, job_id);
+            std::fs::write(&user_script_path, &launch_script)
+                .map_err(|e| Status::internal(format!("failed to write user script: {}", e)))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &user_script_path,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
 
-                if spec.mpi == MPI_PMIX {
-                    warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
-                    build_multi_task_pmix_wrapper(
-                        &user_script_path,
-                        tasks_per_node,
-                        pmix_per_local_rank_env.as_ref().ok_or_else(|| {
-                            Status::internal("missing PMIx per-rank env for multi-task launch")
-                        })?,
-                        Some(&spec.environment),
-                    )
-                    .map_err(Status::failed_precondition)?
-                } else {
-                    build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
-                }
+            if spec.mpi == MPI_PMIX {
+                warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
+                build_multi_task_pmix_wrapper(
+                    &user_script_path,
+                    tasks_per_node,
+                    pmix_per_local_rank_env.as_ref().ok_or_else(|| {
+                        Status::internal("missing PMIx per-rank env for multi-task launch")
+                    })?,
+                    Some(&spec.environment),
+                )
+                .map_err(Status::failed_precondition)?
             } else {
-                launch_script
-            };
+                build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
+            }
+        } else {
+            launch_script
+        };
 
         let (alloc_result, allocated_device_ids) = self
             .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
@@ -1753,9 +1758,20 @@ impl SlurmAgent for AgentService {
             },
         };
 
-        let runtime_enabled = std::env::var("SPUR_RUNTIME_SESSION")
-            .ok()
-            .is_some_and(|value| value == "1");
+        let runtime_pmix_inputs = if runtime_enabled
+            && spec.mpi == MPI_PMIX
+            && !batch_script_uses_step_launch(&spec.script)
+        {
+            let proto = req.pmix_plan.as_ref().ok_or_else(|| {
+                Status::failed_precondition("missing PMIx launch plan for RuntimeSession")
+            })?;
+            Some((
+                self.mpi_config.clone(),
+                mpi_plugin::plan_from_proto(proto).map_err(Status::failed_precondition)?,
+            ))
+        } else {
+            None
+        };
         let launch_result = if runtime_enabled {
             launch_runtime_session(
                 &launch_cfg,
@@ -1763,9 +1779,7 @@ impl SlurmAgent for AgentService {
                 &self.reporter.controller_addr,
                 &self.reporter.hostname,
                 false,
-                pmix_plan
-                    .clone()
-                    .map(|plan| (self.mpi_config.clone(), plan)),
+                runtime_pmix_inputs,
             )
             .await
             .map(|(result, descriptor)| (result, Some(descriptor)))
@@ -1927,6 +1941,15 @@ impl SlurmAgent for AgentService {
             .and_then(|proto| {
                 mpi_plugin::plan_from_proto(proto).map_err(Status::invalid_argument)
             })?;
+        let runtime_sessions_enabled = std::env::var("SPUR_RUNTIME_SESSION")
+            .ok()
+            .is_some_and(|value| value == "1");
+        if runtime_sessions_enabled {
+            return Ok(Response::new(PreparePmixResponse {
+                success: true,
+                error: String::new(),
+            }));
+        }
         match self.mpi_host.prepare_pmix_server(&plan, req.run_attempt) {
             Ok(()) => Ok(Response::new(PreparePmixResponse {
                 success: true,

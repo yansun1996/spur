@@ -428,6 +428,21 @@ impl MpiPluginHost {
         Ok(!joined)
     }
 
+    /// Start a namespace and establish every remote PMIx peer before ranks run.
+    pub fn start_pmix_server_and_verify(&self, plan: &PmixLaunchPlan) -> Result<(), String> {
+        self.start_pmix_server(plan)?;
+        if plan.num_nodes <= 1 {
+            return Ok(());
+        }
+        let mut plan = plan.clone();
+        self.apply_modex_timeouts(&mut plan);
+        if let Err(error) = self.call_verify_peers(&plan) {
+            let _ = self.release_pmix_server(plan.job_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Start PMIx server and verify peers before rank exec (multi-node prepare phase).
     pub fn prepare_pmix_server(
         &self,
