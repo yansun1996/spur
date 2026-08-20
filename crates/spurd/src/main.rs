@@ -322,13 +322,6 @@ async fn main() -> anyhow::Result<()> {
         running_jobs.clone(),
     ));
 
-    agent_server::monitor_recovered_runtime_sessions(
-        running_jobs.clone(),
-        recovered_runtime_sessions.clone(),
-        runtime_sessions.clone(),
-        args.controller.clone(),
-    );
-
     // Register with controller
     reporter.register().await?;
 
@@ -401,6 +394,7 @@ async fn main() -> anyhow::Result<()> {
     agent_service
         .adopt_runtime_sessions(&recovered_runtime_sessions)
         .await;
+    agent_service.monitor_recovered_runtime_sessions(&recovered_runtime_sessions);
     let runtime_recovery_cleanup = agent_service.runtime_recovery_cleanup();
 
     // the RPC-driven k0s component owner is idle until the controller sends

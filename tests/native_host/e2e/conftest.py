@@ -302,13 +302,13 @@ def runtime_mpi_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
         {"mpi": {"plugin_dir": plugin_dir, "pmix_tmpdir": "/tmp/spur-pmix"}},
     )
     try:
+        c.mpi_preflight(1)
         c.deploy(
             config_overrides=overrides,
             agent_as_root=True,
             agent_env={"SPUR_RUNTIME_SESSION": "1", "SPUR_RUNTIME_STATE_DIR": c.remote_dir},
         )
-        c.mpi_preflight(1)
-    except Exception:
+    except BaseException:
         c.teardown()
         raise
     yield c

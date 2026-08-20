@@ -327,47 +327,64 @@ impl RuntimeRecoveryCleanup {
         &self,
         descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
     ) {
-        let removed_runtime = {
-            let mut sessions = self.runtime_sessions.lock().await;
-            if sessions
-                .get(&descriptor.job_id)
-                .is_some_and(|current| current == descriptor)
-            {
-                sessions.remove(&descriptor.job_id);
-                true
-            } else {
-                false
-            }
-        };
+        release_runtime_tracking(
+            &self.running,
+            &self.allocation,
+            &self.runtime_sessions,
+            descriptor,
+            "controller-rejected",
+        )
+        .await;
+    }
+}
 
-        let removed_tracked = {
-            let mut jobs = self.running.lock().await;
-            if jobs
-                .get(&descriptor.job_id)
-                .is_some_and(|current| current.run_attempt == descriptor.run_attempt)
-            {
-                jobs.remove(&descriptor.job_id);
-                true
-            } else {
-                false
-            }
-        };
-        if removed_tracked {
-            let job_id = descriptor.job_id;
-            self.allocation.lock().await.release_job(job_id);
+async fn release_runtime_tracking(
+    running: &RunningJobs,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    runtime_sessions: &Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
+    descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
+    reason: &'static str,
+) -> bool {
+    let removed_runtime = {
+        let mut sessions = runtime_sessions.lock().await;
+        if sessions
+            .get(&descriptor.job_id)
+            .is_some_and(|current| current == descriptor)
+        {
+            sessions.remove(&descriptor.job_id);
+            true
+        } else {
+            false
         }
+    };
 
-        if removed_runtime || removed_tracked {
-            if let Err(error) = crate::runtime_session::record_resources_released(descriptor) {
-                warn!(
-                    job_id = descriptor.job_id,
-                    run_attempt = descriptor.run_attempt,
-                    %error,
-                    "failed to record controller-rejected runtime resource release"
-                );
-            }
+    let removed_tracked = {
+        let mut jobs = running.lock().await;
+        if jobs
+            .get(&descriptor.job_id)
+            .is_some_and(|current| current.run_attempt == descriptor.run_attempt)
+        {
+            jobs.remove(&descriptor.job_id);
+            true
+        } else {
+            false
+        }
+    };
+    if removed_tracked {
+        allocation.lock().await.release_job(descriptor.job_id);
+    }
+
+    if removed_runtime || removed_tracked {
+        if let Err(error) = crate::runtime_session::record_resources_released(descriptor) {
+            warn!(
+                job_id = descriptor.job_id,
+                run_attempt = descriptor.run_attempt,
+                %error,
+                "failed to record runtime resource release after {reason}"
+            );
         }
     }
+    removed_runtime || removed_tracked
 }
 
 fn cleanup_runtime_session_files(descriptor: &crate::runtime_session::RuntimeSessionDescriptor) {
@@ -418,6 +435,8 @@ pub(crate) async fn recover_runtime_sessions(
 
 pub(crate) fn monitor_recovered_runtime_sessions(
     running: RunningJobs,
+    allocation: Arc<Mutex<NodeAllocation>>,
+    runtime_sessions: Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
     descriptors: Vec<crate::runtime_session::RuntimeSessionDescriptor>,
     store: crate::runtime_session::RuntimeSessionStore,
     controller_addr: String,
@@ -447,20 +466,38 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                     released.push(*job_id);
                     continue;
                 }
-                match crate::runtime_session::query_state(descriptor, instance_id.clone()).await {
-                    Ok(snapshot) if !snapshot.active => completed.push((
-                        *job_id,
-                        descriptor.run_attempt,
+                let exit = match crate::runtime_session::query_state(
+                    descriptor,
+                    instance_id.clone(),
+                )
+                .await
+                {
+                    Ok(snapshot) if !snapshot.active => Some((
                         snapshot.exit_code.unwrap_or(0),
                         snapshot.signal.unwrap_or(0),
                     )),
-                    Ok(_) => {}
-                    Err(error) => warn!(
-                        job_id,
-                        run_attempt = descriptor.run_attempt,
-                        %error,
-                        "recovered runtime state query failed"
-                    ),
+                    Ok(_) => None,
+                    Err(error) => match store.observed_exit(*job_id, descriptor.run_attempt) {
+                        Ok(exit) => exit,
+                        Err(obligation_error)
+                            if obligation_error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            None
+                        }
+                        Err(obligation_error) => {
+                            warn!(
+                                job_id,
+                                run_attempt = descriptor.run_attempt,
+                                %error,
+                                %obligation_error,
+                                "failed to read recovered runtime completion state"
+                            );
+                            None
+                        }
+                    },
+                };
+                if let Some((exit_code, signal)) = exit {
+                    completed.push((*job_id, descriptor.run_attempt, exit_code, signal));
                 }
             }
             for job_id in released {
@@ -468,13 +505,15 @@ pub(crate) fn monitor_recovered_runtime_sessions(
             }
             for (job_id, run_attempt, exit_code, signal) in completed {
                 let descriptor = pending.remove(&job_id);
-                running.lock().await.remove(&job_id);
                 if let Some(descriptor) = descriptor {
-                    if let Err(error) =
-                        crate::runtime_session::record_resources_released(&descriptor)
-                    {
-                        warn!(job_id, %error, "failed to record recovered runtime resource release");
-                    }
+                    release_runtime_tracking(
+                        &running,
+                        &allocation,
+                        &runtime_sessions,
+                        &descriptor,
+                        "runtime completion",
+                    )
+                    .await;
                 }
                 if report_completion(
                     &controller_addr,
@@ -792,6 +831,34 @@ impl AgentService {
         for descriptor in descriptors {
             sessions.insert(descriptor.job_id, descriptor.clone());
         }
+    }
+
+    fn monitor_runtime_session(
+        &self,
+        descriptor: crate::runtime_session::RuntimeSessionDescriptor,
+    ) {
+        monitor_recovered_runtime_sessions(
+            self.running.clone(),
+            self.allocation.clone(),
+            self.runtime_sessions.clone(),
+            vec![descriptor],
+            crate::runtime_session::RuntimeSessionStore::new(&self.runtime_state_dir),
+            self.reporter.controller_addr.clone(),
+        );
+    }
+
+    pub(crate) fn monitor_recovered_runtime_sessions(
+        &self,
+        descriptors: &[crate::runtime_session::RuntimeSessionDescriptor],
+    ) {
+        monitor_recovered_runtime_sessions(
+            self.running.clone(),
+            self.allocation.clone(),
+            self.runtime_sessions.clone(),
+            descriptors.to_vec(),
+            crate::runtime_session::RuntimeSessionStore::new(&self.runtime_state_dir),
+            self.reporter.controller_addr.clone(),
+        );
     }
 
     pub(crate) fn runtime_recovery_cleanup(&self) -> RuntimeRecoveryCleanup {
@@ -2075,7 +2142,8 @@ impl SlurmAgent for AgentService {
                     self.runtime_sessions
                         .lock()
                         .await
-                        .insert(job_id, descriptor);
+                        .insert(job_id, descriptor.clone());
+                    self.monitor_runtime_session(descriptor);
                 }
                 // Re-dispatch onto the same node reuses job_id and displaces an
                 // older run. If its process ignored SIGTERM and outlived the
@@ -2508,7 +2576,8 @@ impl SlurmAgent for AgentService {
             self.runtime_sessions
                 .lock()
                 .await
-                .insert(req.job_id, descriptor);
+                .insert(req.job_id, descriptor.clone());
+            self.monitor_runtime_session(descriptor);
         }
 
         Ok(Response::new(RegisterJobAllocationResponse {}))
@@ -4285,6 +4354,74 @@ mod tests {
             running.lock().await.get(&42).map(|job| job.run_attempt),
             Some(8)
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_completion_releases_the_exact_attempt_and_finalizes_its_state() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::runtime_session::RuntimeSessionStore::new(state.path());
+        let mut descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            0,
+            0,
+            store.session_dir(42, 7).join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "test-capability".into();
+        store.publish(&descriptor).expect("publish descriptor");
+        store
+            .obligations(42, 7)
+            .append(&crate::runtime_session::RuntimeObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("record exit");
+        store
+            .acknowledge_completion(&crate::runtime_session::PendingRuntimeCompletion {
+                job_id: 42,
+                run_attempt: 7,
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("acknowledge completion");
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                ..Default::default()
+            },
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 1, 128, &[])
+            .expect("reserve allocation");
+        assert!(allocation.lock().await.commit_job(42));
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 7;
+        running.lock().await.insert(42, tracked);
+        sessions.lock().await.insert(42, descriptor.clone());
+
+        assert!(
+            release_runtime_tracking(
+                &running,
+                &allocation,
+                &sessions,
+                &descriptor,
+                "runtime completion",
+            )
+            .await
+        );
+
+        assert!(!running.lock().await.contains_key(&42));
+        assert!(!sessions.lock().await.contains_key(&42));
+        assert_eq!(allocation.lock().await.allocated_memory_mb, 0);
+        assert!(!store.session_dir(42, 7).exists());
     }
 
     fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {

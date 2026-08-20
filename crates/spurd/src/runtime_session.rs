@@ -2216,6 +2216,23 @@ impl RuntimeSessionStore {
         .map(|_| ())
     }
 
+    pub(crate) fn observed_exit(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> io::Result<Option<(i32, i32)>> {
+        let obligations = self.obligations(job_id, run_attempt).read()?;
+        Ok(obligations
+            .iter()
+            .rev()
+            .find_map(|obligation| match obligation {
+                RuntimeObligation::ExitObserved { exit_code, signal } => {
+                    Some((*exit_code, *signal))
+                }
+                _ => None,
+            }))
+    }
+
     fn load_descriptor(&self, session_dir: &Path) -> io::Result<RuntimeSessionDescriptor> {
         let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
         let contents = fs::read(&descriptor_path)?;
@@ -2800,6 +2817,35 @@ mod tests {
             .discover_unacknowledged_completions()
             .expect("rediscover completion")
             .is_empty());
+    }
+
+    #[test]
+    fn observed_exit_remains_available_after_completion_acknowledgement() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RuntimeSessionStore::new(temp.path());
+        let mut descriptor = descriptor(42, 3, std::process::id());
+        descriptor.socket_path = store.session_dir(42, 3).join("runtime.sock");
+        store.publish(&descriptor).expect("publish descriptor");
+        store
+            .obligations(42, 3)
+            .append(&RuntimeObligation::ExitObserved {
+                exit_code: 7,
+                signal: 9,
+            })
+            .expect("record exit");
+        store
+            .acknowledge_completion(&PendingRuntimeCompletion {
+                job_id: 42,
+                run_attempt: 3,
+                exit_code: 7,
+                signal: 9,
+            })
+            .expect("acknowledge completion");
+
+        assert_eq!(
+            store.observed_exit(42, 3).expect("read observed exit"),
+            Some((7, 9))
+        );
     }
 
     #[test]
