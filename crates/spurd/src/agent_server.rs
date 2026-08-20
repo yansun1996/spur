@@ -307,8 +307,16 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                 }
             }
             for (job_id, run_attempt, exit_code, signal) in completed {
-                pending.remove(&job_id);
+                let descriptor = pending.remove(&job_id);
                 running.lock().await.remove(&job_id);
+                if let Some(descriptor) = descriptor {
+                    if let Err(error) = crate::runtime_session::append_obligation(
+                        &descriptor,
+                        &crate::runtime_session::RuntimeObligation::ResourcesReleased,
+                    ) {
+                        warn!(job_id, %error, "failed to record recovered runtime resource release");
+                    }
+                }
                 report_completion(
                     &controller_addr,
                     job_id,
