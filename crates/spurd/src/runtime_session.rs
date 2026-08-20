@@ -142,6 +142,7 @@ impl RuntimeLaunchSpec {
 
 const DESCRIPTOR_FILE: &str = "descriptor.json";
 const OBLIGATION_FILE: &str = "obligations.jsonl";
+const FAILURE_FILE: &str = "failure.txt";
 const FORMAT_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u32 = 1;
 const STEP_OUTPUT_LIMIT: usize = 1024 * 1024;
@@ -1533,7 +1534,13 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     ));
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
-    result?;
+    if let Err(error) = result {
+        let failure_path = session_dir.join(FAILURE_FILE);
+        if let Err(write_error) = std::fs::write(&failure_path, error.to_string()) {
+            tracing::warn!(%write_error, path = %failure_path.display(), "failed to record runtime session failure");
+        }
+        return Err(error.into());
+    }
     let snapshot = session.snapshot().await;
     let exit_code = snapshot
         .exit_code
