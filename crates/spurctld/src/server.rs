@@ -633,6 +633,87 @@ impl ControllerService {
         }
     }
 
+    async fn probe_runtime_recovery(
+        &self,
+        hostname: &str,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> Result<RuntimeRecoveryProbe, Status> {
+        let Some(job) = self.cluster.get_job(job_id) else {
+            return Ok(RuntimeRecoveryProbe::Stale);
+        };
+        if !job.state.is_active() || job.run_attempt != run_attempt {
+            return Ok(RuntimeRecoveryProbe::Stale);
+        }
+        if !job.allocated_nodes.iter().any(|node| node == hostname) {
+            return Err(Status::permission_denied(
+                "runtime recovery reporter is not allocated to this job",
+            ));
+        }
+
+        let expected_nodes = job.allocated_nodes.clone();
+        let mut missing = Vec::new();
+        for node_name in &expected_nodes {
+            let Some(node) = self.cluster.get_node(node_name) else {
+                missing.push(node_name.clone());
+                continue;
+            };
+            let endpoint = match node_comm_socket(&node, node_name) {
+                Ok(endpoint) => endpoint,
+                Err(_) => {
+                    missing.push(node_name.clone());
+                    continue;
+                }
+            };
+            let active = match crate::agent_client::connect(endpoint).await {
+                Ok(mut client) => client
+                    .probe_runtime_session(RuntimeSessionProbeRequest {
+                        job_id,
+                        run_attempt,
+                    })
+                    .await
+                    .map(|response| response.into_inner().active)
+                    .unwrap_or(false),
+                Err(_) => false,
+            };
+            if !active {
+                missing.push(node_name.clone());
+            }
+        }
+
+        if missing.is_empty() {
+            return Ok(RuntimeRecoveryProbe::Retained);
+        }
+        Ok(RuntimeRecoveryProbe::Incomplete {
+            expected_nodes,
+            missing,
+        })
+    }
+
+    async fn fence_runtime_recovery(&self, job_id: u32, run_attempt: u32) -> Result<bool, Status> {
+        let Some(job) = self.cluster.get_job(job_id) else {
+            return Ok(false);
+        };
+        if !job.state.is_active() || job.run_attempt != run_attempt {
+            return Ok(false);
+        }
+        match self
+            .cluster
+            .preempt_job(job_id, spur_core::partition::PreemptMode::Requeue)
+        {
+            Ok(crate::cluster::PreemptOutcome::Killed) => {
+                crate::scheduler_loop::send_cancel_to_agents(&self.cluster, &job, 0).await;
+                Ok(true)
+            }
+            Ok(crate::cluster::PreemptOutcome::Suspended) => Err(Status::internal(
+                "runtime recovery fence suspended instead of requeuing the job",
+            )),
+            Err(error) => Err(Status::internal(format!(
+                "failed to fence incomplete runtime recovery: {error}"
+            ))),
+        }
+    }
+
     /// Validate an admission token if token mode is enabled.
     /// Returns the node_token JWT to include in the registration response,
     /// or an empty string if admission mode is open.
@@ -658,6 +739,15 @@ impl ControllerService {
         spur_core::admission::generate_node_token(hostname, self.jwt_key.as_bytes())
             .map_err(|e| Status::internal(e.to_string()))
     }
+}
+
+enum RuntimeRecoveryProbe {
+    Stale,
+    Retained,
+    Incomplete {
+        expected_nodes: Vec<String>,
+        missing: Vec<String>,
+    },
 }
 
 /// Resolve a user to the (namespace, ServiceAccount) its scoped kubeconfig must be bound to.
@@ -1838,6 +1928,86 @@ impl SlurmController for ControllerService {
                 "node {} not found — is the node registered?",
                 req.hostname
             )))
+        }
+    }
+
+    async fn report_runtime_session_recovery(
+        &self,
+        request: Request<RuntimeSessionRecoveryRequest>,
+    ) -> Result<Response<RuntimeSessionRecoveryResponse>, Status> {
+        if let Err(status) = self.check_leader(&request) {
+            let proxy = &self.leader_proxy;
+            match proxy.get_leader_client().await {
+                Ok(mut client) => {
+                    let fwd = Self::forward_request(request);
+                    return client.report_runtime_session_recovery(fwd).await;
+                }
+                Err(error) => {
+                    warn!("failed to forward runtime recovery report to leader: {error}");
+                    return Err(status);
+                }
+            }
+        }
+
+        let request = request.into_inner();
+        if matches!(
+            self.cluster.config().admission.mode,
+            spur_core::config::AdmissionMode::Token
+        ) {
+            if request.node_token.is_empty() {
+                return Err(Status::unauthenticated("node token required"));
+            }
+            let identity = spur_core::admission::verify_node_token(
+                &request.node_token,
+                self.jwt_key.as_bytes(),
+            )
+            .map_err(|error| Status::unauthenticated(error.to_string()))?;
+            if identity.hostname != request.hostname {
+                return Err(Status::permission_denied("node token hostname mismatch"));
+            }
+        }
+
+        match self
+            .probe_runtime_recovery(&request.hostname, request.job_id, request.run_attempt)
+            .await?
+        {
+            RuntimeRecoveryProbe::Stale => Ok(Response::new(RuntimeSessionRecoveryResponse {
+                retained: false,
+                fenced: false,
+                message: "runtime session belongs to an inactive or superseded run".into(),
+            })),
+            RuntimeRecoveryProbe::Retained => Ok(Response::new(RuntimeSessionRecoveryResponse {
+                retained: true,
+                fenced: false,
+                message: String::new(),
+            })),
+            RuntimeRecoveryProbe::Incomplete {
+                expected_nodes,
+                missing,
+            } => {
+                let fenced = self
+                    .fence_runtime_recovery(request.job_id, request.run_attempt)
+                    .await?;
+                let message = format!(
+                    "incomplete runtime recovery: missing {} of {} participants ({})",
+                    missing.len(),
+                    expected_nodes.len(),
+                    missing.join(",")
+                );
+                warn!(
+                    job_id = request.job_id,
+                    run_attempt = request.run_attempt,
+                    reporter = %request.hostname,
+                    missing = ?missing,
+                    fenced,
+                    "runtime recovery probe did not confirm every allocated participant"
+                );
+                Ok(Response::new(RuntimeSessionRecoveryResponse {
+                    retained: false,
+                    fenced,
+                    message,
+                }))
+            }
         }
     }
 
@@ -5597,6 +5767,118 @@ mod tests {
         }
 
         job_id
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_recovery_fence_requeues_only_the_matching_attempt() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        assert!(svc
+            .fence_runtime_recovery(job_id, run_attempt)
+            .await
+            .expect("fence matching attempt"));
+        let job = svc.cluster.get_job(job_id).expect("requeued job");
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.allocated_nodes.is_empty());
+
+        assert!(!svc
+            .fence_runtime_recovery(job_id, run_attempt)
+            .await
+            .expect("ignore stale recovery fence"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_recovery_report_ignores_a_superseded_attempt() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        let response = svc
+            .report_runtime_session_recovery(Request::new(RuntimeSessionRecoveryRequest {
+                hostname: "n1".into(),
+                job_id,
+                run_attempt: run_attempt.saturating_sub(1),
+                node_token: String::new(),
+            }))
+            .await
+            .expect("superseded report is accepted as stale")
+            .into_inner();
+        assert!(!response.retained);
+        assert!(!response.fenced);
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("running job").state,
+            JobState::Running
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_recovery_report_fences_an_unconfirmed_participant() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recovery probe listener");
+        let port = listener
+            .local_addr()
+            .expect("probe listener address")
+            .port();
+        svc.cluster
+            .register_node(
+                "n1".into(),
+                "n1".into(),
+                spur_core::resource::ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                port,
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+            )
+            .expect("update recovery probe address");
+        let probe_server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept recovery probe");
+            drop(stream);
+        });
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        let response = svc
+            .report_runtime_session_recovery(Request::new(RuntimeSessionRecoveryRequest {
+                hostname: "n1".into(),
+                job_id,
+                run_attempt,
+                node_token: String::new(),
+            }))
+            .await
+            .expect("partial recovery report")
+            .into_inner();
+        assert!(!response.retained);
+        assert!(response.fenced);
+        assert!(response.message.contains("missing 1 of 1 participants"));
+        let job = svc.cluster.get_job(job_id).expect("requeued job");
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.allocated_nodes.is_empty());
+        probe_server.await.expect("recovery probe task");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -8,7 +8,10 @@ use std::sync::{Arc, RwLock};
 use anyhow::Context;
 use spur_core::resource::{GpuLinkType, GpuResource, ResourceSet};
 use spur_devices::{resolve_link_type, DeviceRegistry, LinkType};
-use spur_proto::proto::{RegisterAgentRequest, ResourceSet as ProtoResourceSet, RunningJobStatus};
+use spur_proto::proto::{
+    RegisterAgentRequest, ResourceSet as ProtoResourceSet, RunningJobStatus,
+    RuntimeSessionRecoveryRequest, RuntimeSessionRecoveryResponse,
+};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -155,6 +158,32 @@ impl NodeReporter {
 
         info!("deregistered from controller");
         Ok(())
+    }
+
+    pub async fn report_runtime_session_recovery(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> anyhow::Result<RuntimeSessionRecoveryResponse> {
+        let channel = spur_client::connect_channel(&self.controller_addr)
+            .await
+            .context("failed to connect to spurctld for runtime recovery")?;
+        let mut client = spur_proto::controller_client(channel);
+        let node_token = self
+            .node_token
+            .read()
+            .map_err(|_| anyhow::anyhow!("runtime recovery node token lock poisoned"))?
+            .clone();
+        let response = client
+            .report_runtime_session_recovery(RuntimeSessionRecoveryRequest {
+                hostname: self.hostname.clone(),
+                job_id,
+                run_attempt,
+                node_token,
+            })
+            .await
+            .context("runtime recovery report failed")?;
+        Ok(response.into_inner())
     }
 
     /// Periodic heartbeat loop.

@@ -2035,6 +2035,29 @@ impl SlurmAgent for AgentService {
         }))
     }
 
+    async fn probe_runtime_session(
+        &self,
+        request: Request<RuntimeSessionProbeRequest>,
+    ) -> Result<Response<RuntimeSessionProbeResponse>, Status> {
+        let request = request.into_inner();
+        let descriptor = self
+            .runtime_sessions
+            .lock()
+            .await
+            .get(&request.job_id)
+            .filter(|descriptor| descriptor.run_attempt == request.run_attempt)
+            .cloned();
+        let Some(descriptor) = descriptor else {
+            return Ok(Response::new(RuntimeSessionProbeResponse { active: false }));
+        };
+        let active =
+            crate::runtime_session::query_state(&descriptor, uuid::Uuid::new_v4().to_string())
+                .await
+                .map(|state| state.active)
+                .unwrap_or(false);
+        Ok(Response::new(RuntimeSessionProbeResponse { active }))
+    }
+
     async fn exec_in_job(
         &self,
         request: Request<ExecInJobRequest>,

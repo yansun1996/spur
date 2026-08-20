@@ -366,6 +366,7 @@ service SlurmController {
   // Agent registration
   rpc RegisterAgent(RegisterAgentRequest) returns (RegisterAgentResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc ReportRuntimeSessionRecovery(RuntimeSessionRecoveryRequest) returns (RuntimeSessionRecoveryResponse);
 
   // Admission token management
   rpc CreateToken(CreateTokenRequest) returns (CreateTokenResponse);
@@ -416,6 +417,7 @@ service SlurmAgent {
   rpc CancelJob(AgentCancelJobRequest) returns (google.protobuf.Empty);
   rpc SuspendJob(AgentSuspendJobRequest) returns (google.protobuf.Empty);
   rpc GetNodeResources(google.protobuf.Empty) returns (NodeResourcesResponse);
+  rpc ProbeRuntimeSession(RuntimeSessionProbeRequest) returns (RuntimeSessionProbeResponse);
   rpc ExecInJob(ExecInJobRequest) returns (ExecInJobResponse);
   // Run a one-shot command on this node (for srun step dispatch).
   rpc RunCommand(RunCommandRequest) returns (RunCommandResponse);
@@ -751,6 +753,19 @@ message RunningJobStatus {
 
 message HeartbeatResponse {}
 
+message RuntimeSessionRecoveryRequest {
+  string hostname = 1;
+  uint32 job_id = 2;
+  uint32 run_attempt = 3;
+  string node_token = 4;
+}
+
+message RuntimeSessionRecoveryResponse {
+  bool retained = 1;
+  bool fenced = 2;
+  string message = 3;
+}
+
 message PmixLocalProc {
   uint32 rank = 1;
   uint32 local_rank = 2;
@@ -854,6 +869,15 @@ message AgentSuspendJobRequest {
 message NodeResourcesResponse {
   ResourceSet total = 1;
   ResourceAllocations used = 2;
+}
+
+message RuntimeSessionProbeRequest {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+}
+
+message RuntimeSessionProbeResponse {
+  bool active = 1;
 }
 
 message ExecInJobRequest {

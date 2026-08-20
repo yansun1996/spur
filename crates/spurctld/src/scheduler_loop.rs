@@ -2883,6 +2883,16 @@ mod tests {
                 Ok(tonic::Response::new(Default::default()))
             }
 
+            async fn probe_runtime_session(
+                &self,
+                _request: tonic::Request<spur_proto::proto::RuntimeSessionProbeRequest>,
+            ) -> Result<
+                tonic::Response<spur_proto::proto::RuntimeSessionProbeResponse>,
+                tonic::Status,
+            > {
+                Ok(tonic::Response::new(Default::default()))
+            }
+
             async fn exec_in_job(
                 &self,
                 _request: tonic::Request<spur_proto::proto::ExecInJobRequest>,
