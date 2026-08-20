@@ -524,6 +524,7 @@ mod tests {
         get_sched_stats(()) -> pb::SchedStats;
         register_agent(pb::RegisterAgentRequest) -> pb::RegisterAgentResponse;
         heartbeat(pb::HeartbeatRequest) -> pb::HeartbeatResponse;
+        report_runtime_session_recovery(pb::RuntimeSessionRecoveryRequest) -> pb::RuntimeSessionRecoveryResponse;
         create_token(pb::CreateTokenRequest) -> pb::CreateTokenResponse;
         list_tokens(pb::ListTokensRequest) -> pb::ListTokensResponse;
         revoke_token(pb::RevokeTokenRequest) -> pb::RevokeTokenResponse;

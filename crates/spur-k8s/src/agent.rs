@@ -615,6 +615,13 @@ impl SlurmAgent for VirtualAgent {
         }))
     }
 
+    async fn probe_runtime_session(
+        &self,
+        _request: Request<RuntimeSessionProbeRequest>,
+    ) -> Result<Response<RuntimeSessionProbeResponse>, Status> {
+        Ok(Response::new(RuntimeSessionProbeResponse { active: false }))
+    }
+
     async fn exec_in_job(
         &self,
         request: Request<ExecInJobRequest>,
