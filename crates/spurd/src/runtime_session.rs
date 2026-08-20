@@ -10,7 +10,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, Notify};
 
 use crate::executor::RunningJob;
 
@@ -220,11 +220,42 @@ pub struct RuntimeStepLaunchSpec {
 
 struct RuntimeStep {
     pid: u32,
+    completion: Arc<RuntimeStepCompletion>,
+}
+
+struct RuntimeStepCompletion {
+    result: Mutex<Option<RuntimeStepResult>>,
+    notify: Notify,
+}
+
+impl RuntimeStepCompletion {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            notify: Notify::new(),
+        }
+    }
+
+    async fn wait(&self) -> RuntimeStepResult {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(result) = self.result.lock().await.clone() {
+                return result;
+            }
+            notified.await;
+        }
+    }
+
+    async fn complete(&self, result: RuntimeStepResult) {
+        *self.result.lock().await = Some(result);
+        self.notify.notify_waiters();
+    }
 }
 
 #[derive(Default)]
 struct RuntimeSteps {
     active: HashMap<u32, RuntimeStep>,
+    completed: HashMap<u32, Arc<RuntimeStepCompletion>>,
     cancelled: HashSet<u32>,
 }
 
@@ -296,10 +327,7 @@ impl RuntimeSession {
         }
     }
 
-    async fn launch_step(
-        &self,
-        step: RuntimeStepLaunchSpec,
-    ) -> io::Result<oneshot::Receiver<RuntimeStepResult>> {
+    async fn launch_step(&self, step: RuntimeStepLaunchSpec) -> io::Result<RuntimeStepResult> {
         let mut command = tokio::process::Command::new(&step.program);
         command
             .args(&step.args)
@@ -334,18 +362,27 @@ impl RuntimeSession {
                 format!("step {} was cancelled before launch", step.step_id),
             ));
         }
-        if steps.active.contains_key(&step.step_id) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("step {} is already active", step.step_id),
-            ));
+        if let Some(completion) = steps
+            .active
+            .get(&step.step_id)
+            .map(|step| step.completion.clone())
+            .or_else(|| steps.completed.get(&step.step_id).cloned())
+        {
+            drop(steps);
+            return Ok(completion.wait().await);
         }
         let mut child = command.spawn()?;
         let pid = child
             .id()
             .ok_or_else(|| io::Error::other("runtime step has no pid"))?;
-        let (sender, receiver) = oneshot::channel();
-        steps.active.insert(step.step_id, RuntimeStep { pid });
+        let completion = Arc::new(RuntimeStepCompletion::new());
+        steps.active.insert(
+            step.step_id,
+            RuntimeStep {
+                pid,
+                completion: completion.clone(),
+            },
+        );
         drop(steps);
         let steps = self.steps.clone();
         tokio::spawn(async move {
@@ -369,10 +406,19 @@ impl RuntimeSession {
                     stderr: error.to_string(),
                 },
             };
-            steps.lock().await.active.remove(&step.step_id);
-            let _ = sender.send(result);
+            let mut steps = steps.lock().await;
+            let Some(completion) = steps
+                .active
+                .remove(&step.step_id)
+                .map(|step| step.completion)
+            else {
+                return;
+            };
+            steps.completed.insert(step.step_id, completion.clone());
+            drop(steps);
+            completion.complete(result).await;
         });
-        Ok(receiver)
+        Ok(completion.wait().await)
     }
 
     async fn signal_step(&self, step_id: u32, signal: i32) -> io::Result<()> {
@@ -427,7 +473,7 @@ async fn join_step_output(output: Option<tokio::task::JoinHandle<String>>) -> St
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RuntimeStepResult {
     pub exit_code: i32,
     pub stdout: String,
@@ -808,16 +854,11 @@ pub async fn serve_control(stream: UnixStream, session: &RuntimeSession) -> io::
                 },
             },
             RuntimeRequest::LaunchStep { step } => match session.launch_step(step.clone()).await {
-                Ok(receiver) => match receiver.await {
-                    Ok(result) => RuntimeResponse::StepCompleted {
-                        step_id: step.step_id,
-                        exit_code: result.exit_code,
-                        stdout: result.stdout,
-                        stderr: result.stderr,
-                    },
-                    Err(_) => RuntimeResponse::Rejected {
-                        message: "runtime step supervisor stopped".into(),
-                    },
+                Ok(result) => RuntimeResponse::StepCompleted {
+                    step_id: step.step_id,
+                    exit_code: result.exit_code,
+                    stdout: result.stdout,
+                    stderr: result.stderr,
                 },
                 Err(error) => RuntimeResponse::Rejected {
                     message: error.to_string(),
@@ -1464,5 +1505,38 @@ mod tests {
             .await
             .expect_err("cancelled step must not spawn");
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn completed_step_replays_its_original_result() {
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 42, 3);
+        let first = session
+            .launch_step(RuntimeStepLaunchSpec {
+                step_id: 7,
+                program: "sh".into(),
+                args: vec!["-c".into(), "printf original".into()],
+                work_dir: "/tmp".into(),
+                environment: HashMap::new(),
+                uid: nix::unistd::geteuid().as_raw(),
+                gid: nix::unistd::getegid().as_raw(),
+                memlock: RuntimeMemlock::Inherit,
+            })
+            .await
+            .expect("launch original step");
+        let replay = session
+            .launch_step(RuntimeStepLaunchSpec {
+                step_id: 7,
+                program: "sh".into(),
+                args: vec!["-c".into(), "printf replacement".into()],
+                work_dir: "/tmp".into(),
+                environment: HashMap::new(),
+                uid: nix::unistd::geteuid().as_raw(),
+                gid: nix::unistd::getegid().as_raw(),
+                memlock: RuntimeMemlock::Inherit,
+            })
+            .await
+            .expect("replay completed step");
+        assert_eq!(first.stdout, "original");
+        assert_eq!(replay.stdout, "original");
     }
 }

@@ -101,6 +101,14 @@ impl NodeReporter {
             .context("failed to connect to spurctld for registration")?;
         let mut client = spur_proto::controller_client(channel);
 
+        let mut labels = self.labels.clone();
+        if std::env::var("SPUR_RUNTIME_SESSION")
+            .ok()
+            .is_some_and(|value| value == "1")
+        {
+            labels.insert("spur.runtime-session".into(), "1".into());
+        }
+
         let resp = client
             .register_agent(RegisterAgentRequest {
                 hostname: self.hostname.clone(),
@@ -109,7 +117,7 @@ impl NodeReporter {
                 address: self.node_address.ip.clone(),
                 port: self.node_address.port as u32,
                 wg_pubkey: self.wg_pubkey(),
-                labels: self.labels.clone(),
+                labels,
                 join_token: self.join_token.clone(),
             })
             .await

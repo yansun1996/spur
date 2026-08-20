@@ -31,6 +31,57 @@ use crate::sched_stats::SchedStatsCollector;
 
 const FORWARDED_HEADER: &str = "x-spur-forwarded";
 const LEADER_HEADER: &str = "x-spur-leader";
+const RUNTIME_STEP_RECONNECT_ATTEMPTS: u32 = 20;
+const RUNTIME_STEP_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn runtime_step_reconnectable(node: &spur_core::node::Node) -> bool {
+    node.labels
+        .get("spur.runtime-session")
+        .is_some_and(|value| value == "1")
+}
+
+fn step_dispatch_retryable(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::Unavailable | Code::Unknown | Code::Cancelled | Code::DeadlineExceeded
+    )
+}
+
+async fn dispatch_runtime_step(
+    agent_addr: String,
+    request: RunCommandRequest,
+    reconnectable: bool,
+) -> Result<RunCommandResponse, Status> {
+    let mut attempt = 0;
+    loop {
+        let result = async {
+            let mut agent = crate::agent_client::connect(agent_addr.clone())
+                .await
+                .map_err(|error| {
+                    Status::unavailable(format!("cannot reach agent at {agent_addr}: {error}"))
+                })?
+                .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
+                .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
+            agent
+                .run_command(request.clone())
+                .await
+                .map(|response| response.into_inner())
+        }
+        .await;
+        match result {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if reconnectable
+                    && step_dispatch_retryable(&error)
+                    && attempt < RUNTIME_STEP_RECONNECT_ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(RUNTIME_STEP_RECONNECT_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 /// Resolve the comm address for an agent registration.
 ///
@@ -2607,6 +2658,7 @@ impl SlurmController for ControllerService {
             node_name: String,
             agent_addr: String,
             node_tasks: spur_core::task_launch::NodeStepTasks,
+            runtime_step_reconnectable: bool,
         }
 
         let mut dispatches = Vec::new();
@@ -2640,6 +2692,7 @@ impl SlurmController for ControllerService {
                 node_name,
                 agent_addr,
                 node_tasks,
+                runtime_step_reconnectable: runtime_step_reconnectable(&node),
             });
         }
 
@@ -2758,21 +2811,15 @@ impl SlurmController for ControllerService {
             let node_name = dispatch.node_name.clone();
             let agent_addr = dispatch.agent_addr.clone();
             let node_tasks = dispatch.node_tasks.clone();
+            let runtime_step_reconnectable = dispatch.runtime_step_reconnectable;
             let command = command.clone();
             let work_dir = work_dir.clone();
             let environment = environment.clone();
             let step_mpi = mpi.clone();
             set.spawn(async move {
-                let mut agent = crate::agent_client::connect(agent_addr.clone())
-                    .await
-                    .map_err(|e| {
-                        Status::unavailable(format!("cannot reach agent at {}: {}", agent_addr, e))
-                    })?
-                    .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
-                    .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
-
-                let agent_resp = agent
-                    .run_command(RunCommandRequest {
+                let agent_resp = dispatch_runtime_step(
+                    agent_addr,
+                    RunCommandRequest {
                         command: command.clone(),
                         uid,
                         gid,
@@ -2787,12 +2834,13 @@ impl SlurmController for ControllerService {
                         pmix_plan,
                         mpi: step_mpi.clone(),
                         pmix_prepared: needs_pmix_prepare,
-                    })
-                    .await
-                    .map_err(|e| {
-                        Status::internal(format!("run_command on {} failed: {}", node_name, e))
-                    })?
-                    .into_inner();
+                    },
+                    runtime_step_reconnectable,
+                )
+                .await
+                .map_err(|error| {
+                    Status::internal(format!("run_command on {node_name} failed: {error}"))
+                })?;
 
                 Ok::<_, Status>((node_name, agent_resp))
             });
@@ -4129,6 +4177,26 @@ fn validate_completion_report_state_for_rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_step_retries_only_transport_failures() {
+        for code in [
+            Code::Unavailable,
+            Code::Unknown,
+            Code::Cancelled,
+            Code::DeadlineExceeded,
+        ] {
+            assert!(step_dispatch_retryable(&Status::new(code, "transient")));
+        }
+        for code in [
+            Code::InvalidArgument,
+            Code::PermissionDenied,
+            Code::FailedPrecondition,
+            Code::Internal,
+        ] {
+            assert!(!step_dispatch_retryable(&Status::new(code, "terminal")));
+        }
+    }
     use chrono::Duration;
     use spur_core::job::{JobState, NodeCompleteError};
     use spur_core::reservation::ReservationFlags;
