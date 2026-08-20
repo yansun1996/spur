@@ -320,7 +320,7 @@ class SpurCluster:
 
     def stop_agents(self):
         """Kill spurd on all nodes only."""
-        self._kill_agents(use_sudo=self.agent_as_root)
+        self._kill_agents(use_sudo=self.agent_as_root, broad=True)
 
     def deploy(
         self,
