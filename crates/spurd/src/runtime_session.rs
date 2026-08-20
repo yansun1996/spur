@@ -1598,6 +1598,20 @@ impl RuntimeSessionStore {
     }
 
     pub fn prepare_session_dir(&self, job_id: u32, run_attempt: u32) -> io::Result<PathBuf> {
+        let state_dir = self.root.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "runtime root has no state directory",
+            )
+        })?;
+        if !state_dir.exists() {
+            fs::create_dir_all(state_dir)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(state_dir, fs::Permissions::from_mode(0o700))?;
+            }
+        }
         create_private_dir(&self.root)?;
         let session_dir = self.session_dir(job_id, run_attempt);
         create_private_dir(&session_dir)?;
@@ -1993,6 +2007,20 @@ mod tests {
         );
         let discovered = store.discover_live().expect("discover session");
         assert_eq!(discovered.live, vec![descriptor]);
+    }
+
+    #[test]
+    fn prepares_a_missing_configured_state_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("missing-state-directory");
+        let store = RuntimeSessionStore::new(&state_dir);
+
+        let session_dir = store
+            .prepare_session_dir(42, 3)
+            .expect("prepare nested runtime session directory");
+
+        assert_eq!(session_dir, state_dir.join("runtime/42.3"));
+        assert!(session_dir.is_dir());
     }
 
     #[test]
