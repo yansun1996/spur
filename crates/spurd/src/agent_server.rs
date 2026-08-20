@@ -67,7 +67,11 @@ async fn launch_runtime_session(
     let store = crate::runtime_session::RuntimeSessionStore::new(&state_dir);
     let session_dir = store
         .prepare_session_dir(config.job_id, run_attempt)
-        .map_err(|error| executor::LaunchError::Other(error.into()))?;
+        .map_err(|error| {
+            executor::LaunchError::Other(
+                anyhow::Error::from(error).context("prepare runtime session directory"),
+            )
+        })?;
     let mut descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
         config.job_id,
         run_attempt,
@@ -84,11 +88,18 @@ async fn launch_runtime_session(
     let launch_path = session_dir.join("launch.json");
     let launch_json = serde_json::to_vec(&launch_spec)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
-    std::fs::write(&launch_path, launch_json)
-        .map_err(|error| executor::LaunchError::Other(error.into()))?;
-    let executable =
-        std::env::current_exe().map_err(|error| executor::LaunchError::Other(error.into()))?;
+    std::fs::write(&launch_path, launch_json).map_err(|error| {
+        executor::LaunchError::Other(
+            anyhow::Error::from(error).context("write runtime launch specification"),
+        )
+    })?;
+    let executable = std::env::current_exe().map_err(|error| {
+        executor::LaunchError::Other(
+            anyhow::Error::from(error).context("resolve runtime session executable"),
+        )
+    })?;
     let unit = format!("spur-runtime-{}.{}", config.job_id, run_attempt);
+    info!(job_id = config.job_id, run_attempt, unit, state_dir, executable = %executable.display(), "starting runtime session unit");
     let mut command = tokio::process::Command::new("systemd-run");
     command
         .arg("--unit")
@@ -114,7 +125,11 @@ async fn launch_runtime_session(
     }
     wait_for_runtime_session(&descriptor)
         .await
-        .map_err(|error| executor::LaunchError::Other(error.into()))?;
+        .map_err(|error| {
+            executor::LaunchError::Other(
+                anyhow::Error::from(error).context("wait for runtime session socket"),
+            )
+        })?;
     Ok((
         executor::LaunchResult {
             job: executor::RunningJob::AllocationOnly,
