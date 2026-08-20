@@ -159,14 +159,6 @@ async fn wait_for_runtime_session(
     }
 }
 
-async fn launch_allocation_runtime_session(
-    config: &executor::JobLaunchConfig,
-) -> Result<crate::runtime_session::RuntimeSessionDescriptor, executor::LaunchError> {
-    launch_runtime_session(config, 0, "", "", true)
-        .await
-        .map(|(_, descriptor)| descriptor)
-}
-
 #[cfg(test)]
 mod gpu_deny_tests {
     use std::collections::HashMap;
@@ -2221,7 +2213,16 @@ impl SlurmAgent for AgentService {
                 io_mode: executor::LaunchIo::File,
                 pmix_multi_task: false,
             };
-            match launch_allocation_runtime_session(&config).await {
+            match launch_runtime_session(
+                &config,
+                req.run_attempt,
+                &self.reporter.controller_addr,
+                &self.reporter.hostname,
+                true,
+            )
+            .await
+            .map(|(_, descriptor)| descriptor)
+            {
                 Ok(descriptor) => Some(descriptor),
                 Err(error) => {
                     self.allocation.lock().await.release_job(req.job_id);
@@ -2255,9 +2256,7 @@ impl SlurmAgent for AgentService {
                 memory_mb,
                 nodelist: req.nodelist,
                 mpi: req.mpi,
-                // srun allocation-only jobs use their own cancel lifecycle;
-                // epoch 0 leaves the stale-report guard disabled for them.
-                run_attempt: 0,
+                run_attempt: req.run_attempt,
             },
         );
         drop(jobs);
@@ -5700,6 +5699,7 @@ mod tests {
         svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
             job_id: 77,
             cpus: 1,
+            run_attempt: 9,
             allocated: Some(ResourceAllocations {
                 cpus: 1,
                 memory_mb: 0,
@@ -5714,6 +5714,15 @@ mod tests {
             reporter.held_job_ids(),
             vec![77],
             "reporter's heartbeat must observe the agent-registered allocation-only job"
+        );
+        assert_eq!(
+            svc.running
+                .lock()
+                .await
+                .get(&77)
+                .expect("tracked allocation")
+                .run_attempt,
+            9
         );
     }
 
