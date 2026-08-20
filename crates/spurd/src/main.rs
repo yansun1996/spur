@@ -325,6 +325,11 @@ async fn main() -> anyhow::Result<()> {
     // Register with controller
     reporter.register().await?;
 
+    let unacknowledged_runtime_completions: HashSet<_> = runtime_sessions
+        .discover_unacknowledged_completions()?
+        .into_iter()
+        .map(|completion| (completion.job_id, completion.run_attempt))
+        .collect();
     let reconciled_runtime_completions = agent_server::replay_unacknowledged_runtime_completions(
         &runtime_sessions,
         &args.controller,
@@ -333,6 +338,13 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let reconciled_runtime_completions: HashSet<_> =
         reconciled_runtime_completions.into_iter().collect();
+    if !unacknowledged_runtime_completions.is_empty() {
+        agent_server::retry_unacknowledged_runtime_completions(
+            runtime_sessions.clone(),
+            args.controller.clone(),
+            hostname.clone(),
+        );
+    }
     let pruned_runtime_sessions = runtime_sessions.prune_finalized()?;
     if pruned_runtime_sessions > 0 {
         info!(
@@ -422,7 +434,9 @@ async fn main() -> anyhow::Result<()> {
     let auth_mode = config.as_ref().map(|c| c.auth.mode).unwrap_or_default();
     let jwt_key = config
         .as_ref()
-        .and_then(|c| c.auth.jwt_key.clone())
+        .map(|c| c.auth.resolved_jwt_key())
+        .transpose()?
+        .flatten()
         .unwrap_or_default();
     match auth_mode {
         spur_core::config::AuthMode::Required if jwt_key.is_empty() => {
@@ -514,6 +528,8 @@ async fn main() -> anyhow::Result<()> {
 
     for descriptor in stale_runtime_sessions.into_iter().filter(|descriptor| {
         !reconciled_runtime_completions.contains(&(descriptor.job_id, descriptor.run_attempt))
+            && !unacknowledged_runtime_completions
+                .contains(&(descriptor.job_id, descriptor.run_attempt))
     }) {
         let recovery_reporter = reporter.clone();
         tokio::spawn(async move {

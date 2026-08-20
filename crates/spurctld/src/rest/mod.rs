@@ -94,18 +94,13 @@ pub async fn serve(
     listen: SocketAddr,
     cluster: Arc<ClusterManager>,
     raft: Arc<RaftHandle>,
+    jwt_key: String,
 ) -> anyhow::Result<()> {
     // Same policy as gRPC: verify a presented credential, and under `required` refuse a request
     // without one. The REST surface has no per-user handling of its own, so this gate is what keeps
     // it from being a way around the authenticated gRPC path.
     let auth_mode = cluster.config().auth.mode;
-    let jwt_key = cluster
-        .config()
-        .auth
-        .jwt_key
-        .clone()
-        .unwrap_or_default()
-        .into_bytes();
+    let jwt_key = jwt_key.into_bytes();
     let state = Arc::new(RestState { cluster, raft });
 
     let app = Router::new()

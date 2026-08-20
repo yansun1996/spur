@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -491,6 +492,8 @@ struct RuntimeSteps {
 pub struct RuntimeSession {
     job: Mutex<RunningJob>,
     snapshot: Arc<Mutex<RuntimeSnapshot>>,
+    teardown_started: AtomicBool,
+    launch_gate: Mutex<()>,
     steps: Arc<Mutex<RuntimeSteps>>,
     pty: Mutex<Option<Arc<RuntimePty>>>,
     environment: std::collections::HashMap<String, String>,
@@ -527,6 +530,8 @@ impl RuntimeSession {
                 exit_code: None,
                 signal: None,
             })),
+            teardown_started: AtomicBool::new(false),
+            launch_gate: Mutex::new(()),
             steps: Arc::new(Mutex::new(RuntimeSteps::default())),
             pty: Mutex::new(None),
             environment,
@@ -586,6 +591,9 @@ impl RuntimeSession {
     }
 
     pub async fn begin_teardown(&self) {
+        let launch_gate = self.launch_gate.lock().await;
+        self.teardown_started.store(true, Ordering::Release);
+        drop(launch_gate);
         self.snapshot.lock().await.active = false;
         let steps = self.steps.lock().await;
         for step in steps.active.values() {
@@ -594,6 +602,12 @@ impl RuntimeSession {
     }
 
     async fn launch_step(&self, step: RuntimeStepLaunchSpec) -> io::Result<RuntimeStepResult> {
+        if self.teardown_started.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "runtime session is tearing down",
+            ));
+        }
         {
             let steps = self.steps.lock().await;
             if steps.cancelled.contains(&step.step_id) {
@@ -697,6 +711,13 @@ impl RuntimeSession {
                 Ok(())
             });
         }
+        let launch_gate = self.launch_gate.lock().await;
+        if self.teardown_started.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "runtime session is tearing down",
+            ));
+        }
         let mut steps = self.steps.lock().await;
         if steps.cancelled.contains(&step.step_id) {
             return Err(io::Error::new(
@@ -726,6 +747,7 @@ impl RuntimeSession {
             },
         );
         drop(steps);
+        drop(launch_gate);
         let steps = self.steps.clone();
         let task_epilog = step.task_epilog.clone();
         tokio::spawn(async move {
@@ -808,6 +830,13 @@ impl RuntimeSession {
     }
 
     async fn launch_pty(&self, spec: RuntimePtyLaunchSpec) -> io::Result<()> {
+        let launch_gate = self.launch_gate.lock().await;
+        if self.teardown_started.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "runtime session is tearing down",
+            ));
+        }
         let allocation_only = self.job.lock().await.is_allocation_only();
         let mut pty_slot = self.pty.lock().await;
         if pty_slot.is_some() {
@@ -887,6 +916,7 @@ impl RuntimeSession {
         });
         *pty_slot = Some(pty.clone());
         drop(pty_slot);
+        drop(launch_gate);
         tokio::spawn(read_runtime_pty(pty.clone()));
         let snapshot = self.snapshot.clone();
         tokio::spawn(async move {
@@ -3378,6 +3408,51 @@ mod tests {
             })
             .await
             .expect_err("cancelled step must not spawn");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn teardown_rejects_new_logical_steps() {
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 42, 3);
+        session.begin_teardown().await;
+
+        let error = session
+            .launch_step(RuntimeStepLaunchSpec {
+                step_id: 7,
+                program: "sh".into(),
+                args: vec!["-c".into(), "exit 1".into()],
+                work_dir: "/tmp".into(),
+                environment: HashMap::new(),
+                uid: nix::unistd::geteuid().as_raw(),
+                gid: nix::unistd::getegid().as_raw(),
+                memlock: RuntimeMemlock::Inherit,
+                pmix: None,
+                task_epilog: None,
+            })
+            .await
+            .expect_err("tearing down session must not launch a step");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[tokio::test]
+    async fn teardown_rejects_new_ptys() {
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 42, 3);
+        session.begin_teardown().await;
+
+        let error = session
+            .launch_pty(RuntimePtyLaunchSpec {
+                argv: vec!["sh".into()],
+                work_dir: "/tmp".into(),
+                environment: HashMap::new(),
+                uid: nix::unistd::geteuid().as_raw(),
+                gid: nix::unistd::getegid().as_raw(),
+                memlock: RuntimeMemlock::Inherit,
+                winsize: None,
+            })
+            .await
+            .expect_err("tearing down session must not launch a PTY");
+
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 

@@ -353,6 +353,8 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let jwt_key = server::resolve_startup_jwt_key(&config)?;
+
     if config.rest_api.enabled {
         let rest_addr: std::net::SocketAddr = config.controller.rest_addr.parse()?;
         if !rest_addr.ip().is_loopback() {
@@ -365,8 +367,9 @@ async fn main() -> anyhow::Result<()> {
         }
         let rest_cluster = cluster.clone();
         let rest_raft = raft_handle.clone();
+        let rest_jwt_key = jwt_key.clone();
         tokio::spawn(async move {
-            if let Err(e) = rest::serve(rest_addr, rest_cluster, rest_raft).await {
+            if let Err(e) = rest::serve(rest_addr, rest_cluster, rest_raft, rest_jwt_key).await {
                 tracing::error!(error = %e, "REST API server failed");
             }
         });
@@ -375,7 +378,7 @@ async fn main() -> anyhow::Result<()> {
     // Start gRPC server
     let addr: std::net::SocketAddr = listen_addr.parse()?;
     // The controller presents this key as its credential to agents (spurd authenticates callers).
-    crate::agent_client::set_signing_key(config.auth.jwt_key.clone().unwrap_or_default());
+    crate::agent_client::set_signing_key(jwt_key.clone());
 
     // State the authentication posture explicitly at startup: it determines whether the listening
     // port is the trust boundary or merely the transport.
@@ -414,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
         sched_stats,
         accounting_service,
         config.cluster.control_plane_replicas,
+        jwt_key,
     )
     .await?;
 

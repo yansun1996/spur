@@ -697,8 +697,10 @@ pub struct AuthConfig {
     /// How strictly callers are authenticated. See [`AuthMode`].
     #[serde(default)]
     pub mode: AuthMode,
-    /// HMAC signing secret (raw bytes) for node admission and user-identity RPC auth; `required`
-    /// refuses to start without one. Captured at startup, not updated by `reconfigure`.
+    /// HMAC signing secret for node admission and user-identity RPC auth; `required` refuses to
+    /// start without one. An existing regular-file value is read at startup, every other value is
+    /// used literally for backwards compatibility, and the resolved key is captured at startup,
+    /// not updated by `reconfigure`.
     pub jwt_key: Option<String>,
     /// Allow jobs to execute as uid 0 (root).
     ///
@@ -717,6 +719,34 @@ impl Default for AuthConfig {
             mode: AuthMode::default(),
             jwt_key: None,
             allow_root_jobs: false,
+        }
+    }
+}
+
+impl AuthConfig {
+    /// Resolve the signing key once at process startup.
+    ///
+    /// Existing file paths are the documented deployment form. Values that do not name a file
+    /// remain inline secrets, preserving existing configurations such as test and development
+    /// clusters. A trailing line ending in a key file is ignored so a file created with `echo`
+    /// has the same secret as its inline form.
+    pub fn resolved_jwt_key(&self) -> Result<Option<String>, ConfigError> {
+        let Some(value) = &self.jwt_key else {
+            return Ok(None);
+        };
+
+        let path = Path::new(value);
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => {
+                let key = std::fs::read_to_string(path)?;
+                Ok(Some(key.trim_end_matches(['\r', '\n']).to_owned()))
+            }
+            Ok(_) => Err(ConfigError::InvalidValue {
+                field: "auth.jwt_key".into(),
+                value: format!("{} is not a regular file", path.display()),
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Some(value.clone())),
+            Err(error) => Err(ConfigError::Io(error)),
         }
     }
 }
@@ -1878,6 +1908,47 @@ pub fn format_time_seconds(total_seconds: Option<i64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn auth_config_reads_an_existing_jwt_key_file() {
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(key_file, "key-from-file").unwrap();
+        let config = AuthConfig {
+            jwt_key: Some(key_file.path().display().to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.resolved_jwt_key().unwrap().as_deref(),
+            Some("key-from-file")
+        );
+    }
+
+    #[test]
+    fn auth_config_preserves_a_non_file_jwt_key_as_an_inline_secret() {
+        let config = AuthConfig {
+            jwt_key: Some("inline-secret".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.resolved_jwt_key().unwrap().as_deref(),
+            Some("inline-secret")
+        );
+    }
+
+    #[test]
+    fn auth_config_rejects_a_directory_as_a_jwt_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = AuthConfig {
+            jwt_key: Some(directory.path().display().to_string()),
+            ..Default::default()
+        };
+
+        let error = config.resolved_jwt_key().unwrap_err();
+        assert!(error.to_string().contains("not a regular file"));
+    }
 
     #[test]
     fn test_controller_endpoints_single_host() {

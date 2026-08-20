@@ -482,9 +482,10 @@ Authentication plugin for client requests.
      - string
      - none
      - Restart
-     - Signing key for node admission tokens, given as a file path or inline
-       value. Deliberately not reloadable: swapping it live would immediately
-       invalidate every outstanding node token.
+     - Signing key for credentials and node admission tokens. An existing regular
+       file path is read at daemon startup; a value that does not name a file is
+       used as an inline secret. Deliberately not reloadable: swapping it live
+       would immediately invalidate every outstanding node token.
    * - ``allow_root_jobs``
      - bool
      - ``false``
@@ -505,7 +506,9 @@ Authentication plugin for client requests.
    "token"``) and the node-only RuntimeSession recovery credential. RuntimeSession
    requires an explicit key even when admission is ``"open"``: a public fallback
    key cannot prove that a recovery report came from its named node. Set the same
-   secret on every controller and agent before enabling RuntimeSession.
+   secret on every controller and agent before enabling RuntimeSession. Store a
+   production secret in a root-readable regular file; a trailing newline in that
+   file is ignored.
 
 ``[[partitions]]``
 ------------------

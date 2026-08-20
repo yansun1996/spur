@@ -989,8 +989,10 @@ identity:
    plugin = "jwt"
    jwt_key = "/etc/spur/jwt.key"
 
-``jwt_key`` is the signing secret, given as a file path or inline value. Only
-``none`` and ``jwt`` are supported.
+``jwt_key`` is the signing secret. An existing regular-file value is read at
+startup (with one trailing line ending ignored); a value that does not name a
+file is treated as an inline secret for compatibility. Keep production key files
+readable only by the daemon account. Only ``none`` and ``jwt`` are supported.
 
 Admission tokens for node join
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -252,9 +252,11 @@ impl LeaderProxy {
 /// `serve` into `ControllerService::jwt_key`; deliberately not re-read on
 /// `reconfigure` (see the field doc). Falls back to a shared default so
 /// key-less dev clusters interoperate.
-fn resolve_startup_jwt_key(config: &spur_core::config::SlurmConfig) -> String {
-    if let Some(key) = &config.auth.jwt_key {
-        return key.clone();
+pub(crate) fn resolve_startup_jwt_key(
+    config: &spur_core::config::SlurmConfig,
+) -> anyhow::Result<String> {
+    if let Some(key) = config.auth.resolved_jwt_key()? {
+        return Ok(key);
     }
     // Token admission signs/verifies node tokens with this key. A well-known
     // default is trivially forgeable by anyone who can reach the controller.
@@ -267,7 +269,7 @@ fn resolve_startup_jwt_key(config: &spur_core::config::SlurmConfig) -> String {
              well-known default key and are forgeable. Set auth.jwt_key to a secret value."
         );
     }
-    "spur-default-key".to_string()
+    Ok("spur-default-key".to_string())
 }
 
 impl ControllerService {
@@ -3697,6 +3699,7 @@ pub async fn serve(
     sched_stats: Arc<SchedStatsCollector>,
     accounting_service: Option<crate::accounting::AccountingService>,
     control_plane_replicas: u32,
+    jwt_key: String,
 ) -> anyhow::Result<()> {
     let client_addrs: BTreeMap<u64, String> = raft_handle
         .peers
@@ -3713,7 +3716,6 @@ pub async fn serve(
 
     let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
 
-    let jwt_key = resolve_startup_jwt_key(&cluster.config());
     let node_identity_key_configured = cluster.config().auth.jwt_key.is_some();
     let auth_mode = cluster.config().auth.mode;
     // Unlike node admission, an unset key here must reject every credential, never fall back
@@ -5398,7 +5400,7 @@ mod tests {
         cluster.set_raft(handle.raft);
 
         // The controller captures the signing key exactly here, at startup.
-        let startup_key = resolve_startup_jwt_key(&cluster.config());
+        let startup_key = resolve_startup_jwt_key(&cluster.config()).unwrap();
         assert_eq!(startup_key, "old-secret");
         let token = generate_node_token("node-1", startup_key.as_bytes()).unwrap();
 
@@ -5472,7 +5474,7 @@ mod tests {
             .unwrap();
         cluster.set_raft(handle.raft.clone());
         let raft = std::sync::Arc::new(handle);
-        let jwt_key = resolve_startup_jwt_key(&cluster.config());
+        let jwt_key = resolve_startup_jwt_key(&cluster.config()).unwrap();
         let node_identity_key_configured = cluster.config().auth.jwt_key.is_some();
         ControllerService {
             cluster,

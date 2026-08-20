@@ -303,24 +303,29 @@ impl RuntimeRecoveryCleanup {
         &self,
         descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
     ) {
-        let stopped =
-            match stop_runtime_session_unit(descriptor.job_id, descriptor.run_attempt).await {
-                Ok(()) => true,
-                Err(error) => {
-                    warn!(
-                        job_id = descriptor.job_id,
-                        run_attempt = descriptor.run_attempt,
-                        %error,
-                        "failed to stop controller-rejected runtime session"
-                    );
-                    false
-                }
-            };
+        self.finish_rejection(
+            descriptor,
+            stop_runtime_session_unit(descriptor.job_id, descriptor.run_attempt).await,
+        )
+        .await;
+    }
 
-        self.release_tracking(descriptor).await;
-        if stopped {
-            cleanup_runtime_session_files(descriptor);
+    async fn finish_rejection(
+        &self,
+        descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
+        stop_result: std::io::Result<()>,
+    ) {
+        if let Err(error) = stop_result {
+            warn!(
+                job_id = descriptor.job_id,
+                run_attempt = descriptor.run_attempt,
+                %error,
+                "failed to stop controller-rejected runtime session"
+            );
+            return;
         }
+        self.release_tracking(descriptor).await;
+        cleanup_runtime_session_files(descriptor);
     }
 
     async fn release_tracking(
@@ -447,6 +452,7 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                 .into_iter()
                 .map(|descriptor| (descriptor.job_id, descriptor))
                 .collect();
+        let mut completed = HashMap::new();
         let hostname = hostname::get()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|_| "localhost".into());
@@ -454,18 +460,17 @@ pub(crate) fn monitor_recovered_runtime_sessions(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
         while !pending.is_empty() {
             interval.tick().await;
-            let mut completed = Vec::new();
+            let mut newly_completed = Vec::new();
             let mut released = Vec::new();
             for (job_id, descriptor) in &pending {
+                if completed.contains_key(job_id) {
+                    continue;
+                }
                 let tracked = running
                     .lock()
                     .await
                     .get(job_id)
                     .is_some_and(|job| job.run_attempt == descriptor.run_attempt);
-                if !tracked {
-                    released.push(*job_id);
-                    continue;
-                }
                 let exit = match crate::runtime_session::query_state(
                     descriptor,
                     instance_id.clone(),
@@ -497,46 +502,63 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                     },
                 };
                 if let Some((exit_code, signal)) = exit {
-                    completed.push((*job_id, descriptor.run_attempt, exit_code, signal));
+                    newly_completed.push((*job_id, descriptor.run_attempt, exit_code, signal));
+                } else if !tracked {
+                    released.push(*job_id);
                 }
             }
             for job_id in released {
                 pending.remove(&job_id);
             }
-            for (job_id, run_attempt, exit_code, signal) in completed {
-                let descriptor = pending.remove(&job_id);
-                if let Some(descriptor) = descriptor {
+            for (job_id, run_attempt, exit_code, signal) in newly_completed {
+                if let Some(descriptor) = pending.get(&job_id) {
                     release_runtime_tracking(
                         &running,
                         &allocation,
                         &runtime_sessions,
-                        &descriptor,
+                        descriptor,
                         "runtime completion",
                     )
                     .await;
                 }
+                completed.insert(
+                    job_id,
+                    crate::runtime_session::PendingRuntimeCompletion {
+                        job_id,
+                        run_attempt,
+                        exit_code,
+                        signal,
+                    },
+                );
+            }
+            let mut acknowledged = Vec::new();
+            for completion in completed.values() {
                 if report_completion(
                     &controller_addr,
-                    job_id,
-                    exit_code,
-                    signal,
-                    run_attempt,
+                    completion.job_id,
+                    completion.exit_code,
+                    completion.signal,
+                    completion.run_attempt,
                     &hostname,
                     None,
                 )
                 .await
                 {
-                    if let Err(error) = store.acknowledge_completion(
-                        &crate::runtime_session::PendingRuntimeCompletion {
-                            job_id,
-                            run_attempt,
-                            exit_code,
-                            signal,
-                        },
-                    ) {
-                        warn!(job_id, run_attempt, %error, "failed to acknowledge recovered runtime completion");
+                    if let Err(error) = store.acknowledge_completion(completion) {
+                        warn!(
+                            job_id = completion.job_id,
+                            run_attempt = completion.run_attempt,
+                            %error,
+                            "failed to acknowledge recovered runtime completion"
+                        );
+                    } else {
+                        acknowledged.push(completion.job_id);
                     }
                 }
+            }
+            for job_id in acknowledged {
+                completed.remove(&job_id);
+                pending.remove(&job_id);
             }
         }
     });
@@ -565,6 +587,36 @@ pub(crate) async fn replay_unacknowledged_runtime_completions(
         }
     }
     Ok(reconciled)
+}
+
+pub(crate) fn retry_unacknowledged_runtime_completions(
+    store: crate::runtime_session::RuntimeSessionStore,
+    controller_addr: String,
+    reporting_node: String,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            match replay_unacknowledged_runtime_completions(
+                &store,
+                &controller_addr,
+                &reporting_node,
+            )
+            .await
+            {
+                Ok(reconciled) if !reconciled.is_empty() => {
+                    tracing::info!(
+                        completions = reconciled.len(),
+                        "reconciled durable runtime completions"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "failed to replay durable runtime completions");
+                }
+            }
+        }
+    });
 }
 
 type PmixLaunchSetup = (
@@ -3594,7 +3646,10 @@ impl AgentService {
             .await
             {
                 Ok(()) => return,
-                Err(error) => warn!(job_id, %error, "runtime signal request failed"),
+                Err(error) => {
+                    warn!(job_id, %error, "runtime signal request failed");
+                    return;
+                }
             }
         }
         let is_allocation_only = {
@@ -3647,7 +3702,10 @@ impl AgentService {
                     self.schedule_runtime_sigkill(descriptor);
                     return;
                 }
-                Err(error) => warn!(job_id, %error, "runtime termination request failed"),
+                Err(error) => {
+                    warn!(job_id, %error, "runtime termination request failed");
+                    return;
+                }
             }
         }
         let is_allocation_only = {
@@ -4353,6 +4411,47 @@ mod tests {
         assert_eq!(
             running.lock().await.get(&42).map(|job| job.run_attempt),
             Some(8)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_recovery_keeps_tracking_when_the_runtime_unit_does_not_stop() {
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let cleanup = RuntimeRecoveryCleanup {
+            running: running.clone(),
+            allocation,
+            runtime_sessions: sessions.clone(),
+        };
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            0,
+            0,
+            state.path().join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        sessions.lock().await.insert(42, descriptor.clone());
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 7;
+        running.lock().await.insert(42, tracked);
+
+        cleanup
+            .finish_rejection(
+                &descriptor,
+                Err(std::io::Error::other("unit remains active")),
+            )
+            .await;
+
+        assert_eq!(sessions.lock().await.get(&42), Some(&descriptor));
+        assert_eq!(
+            running.lock().await.get(&42).map(|job| job.run_attempt),
+            Some(7)
         );
     }
 
@@ -6709,6 +6808,34 @@ mod tests {
             wait_job_reaped(&svc, job_id, 5_000).await,
             "monitor should reap SIGKILL'd job within 5s"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_signal_keeps_the_allocation_tracked() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            902,
+            1,
+            0,
+            0,
+            state.path().join("missing-runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        recover_runtime_sessions(&svc.running, vec![descriptor.clone()]).await;
+        svc.adopt_runtime_sessions(&[descriptor]).await;
+
+        svc.send_explicit_signal(902, nix::sys::signal::Signal::SIGTERM as i32)
+            .await;
+        svc.graceful_cancel(902).await;
+
+        assert!(svc.running.lock().await.contains_key(&902));
+        assert!(svc.runtime_sessions.lock().await.contains_key(&902));
     }
 
     #[tokio::test]
