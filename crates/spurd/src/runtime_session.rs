@@ -1060,6 +1060,14 @@ pub(crate) struct DiscoveredRuntimeSessions {
     pub rejected: Vec<(PathBuf, String)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingRuntimeCompletion {
+    pub job_id: u32,
+    pub run_attempt: u32,
+    pub exit_code: i32,
+    pub signal: i32,
+}
+
 pub struct RuntimeSessionStore {
     root: PathBuf,
 }
@@ -1153,6 +1161,64 @@ impl RuntimeSessionStore {
         }
 
         Ok(DiscoveredRuntimeSessions { live, rejected })
+    }
+
+    pub(crate) fn discover_unacknowledged_completions(
+        &self,
+    ) -> io::Result<Vec<PendingRuntimeCompletion>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        };
+        let mut completions = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let session_dir = entry.path();
+            let descriptor = match self.load_descriptor(&session_dir) {
+                Ok(descriptor) => descriptor,
+                Err(_) => continue,
+            };
+            if !matches!(session_liveness(&descriptor), Ok(SessionLiveness::Stale)) {
+                continue;
+            }
+            let obligations = self.obligations(descriptor.job_id, descriptor.run_attempt);
+            let mut observed_exit = None;
+            let mut acknowledged = false;
+            for obligation in obligations.read()? {
+                match obligation {
+                    RuntimeObligation::ExitObserved { exit_code, signal } => {
+                        observed_exit = Some((exit_code, signal));
+                        acknowledged = false;
+                    }
+                    RuntimeObligation::CompletionAcknowledged if observed_exit.is_some() => {
+                        acknowledged = true;
+                    }
+                    RuntimeObligation::CompletionAcknowledged
+                    | RuntimeObligation::ResourcesReleased => {}
+                }
+            }
+            if let Some((exit_code, signal)) = observed_exit.filter(|_| !acknowledged) {
+                completions.push(PendingRuntimeCompletion {
+                    job_id: descriptor.job_id,
+                    run_attempt: descriptor.run_attempt,
+                    exit_code,
+                    signal,
+                });
+            }
+        }
+        Ok(completions)
+    }
+
+    pub(crate) fn acknowledge_completion(
+        &self,
+        completion: &PendingRuntimeCompletion,
+    ) -> io::Result<()> {
+        self.obligations(completion.job_id, completion.run_attempt)
+            .append(&RuntimeObligation::CompletionAcknowledged)
     }
 
     fn load_descriptor(&self, session_dir: &Path) -> io::Result<RuntimeSessionDescriptor> {
@@ -1367,6 +1433,41 @@ mod tests {
                 RuntimeObligation::ResourcesReleased,
             ]
         );
+    }
+
+    #[test]
+    fn stale_exit_without_acknowledgement_is_recoverable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RuntimeSessionStore::new(temp.path());
+        let mut descriptor = descriptor(42, 3, std::process::id());
+        descriptor.process_start_ticks += 1;
+        write_descriptor(&store, &descriptor);
+        let obligations = store.obligations(42, 3);
+        obligations
+            .append(&RuntimeObligation::ExitObserved {
+                exit_code: 7,
+                signal: 0,
+            })
+            .expect("record exit");
+        let completions = store
+            .discover_unacknowledged_completions()
+            .expect("discover completion");
+        assert_eq!(
+            completions,
+            vec![PendingRuntimeCompletion {
+                job_id: 42,
+                run_attempt: 3,
+                exit_code: 7,
+                signal: 0,
+            }]
+        );
+        store
+            .acknowledge_completion(&completions[0])
+            .expect("acknowledge completion");
+        assert!(store
+            .discover_unacknowledged_completions()
+            .expect("rediscover completion")
+            .is_empty());
     }
 
     #[test]

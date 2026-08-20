@@ -322,6 +322,13 @@ async fn main() -> anyhow::Result<()> {
     // Register with controller
     reporter.register().await?;
 
+    agent_server::replay_unacknowledged_runtime_completions(
+        &runtime_sessions,
+        &args.controller,
+        &hostname,
+    )
+    .await?;
+
     // Start heartbeat loop
     let hb_reporter = reporter.clone();
     tokio::spawn(async move {

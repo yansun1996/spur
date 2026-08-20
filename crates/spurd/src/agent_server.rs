@@ -304,6 +304,29 @@ pub(crate) fn monitor_recovered_runtime_sessions(
     });
 }
 
+pub(crate) async fn replay_unacknowledged_runtime_completions(
+    store: &crate::runtime_session::RuntimeSessionStore,
+    controller_addr: &str,
+    reporting_node: &str,
+) -> anyhow::Result<()> {
+    for completion in store.discover_unacknowledged_completions()? {
+        if report_completion(
+            controller_addr,
+            completion.job_id,
+            completion.exit_code,
+            completion.signal,
+            completion.run_attempt,
+            reporting_node,
+            None,
+        )
+        .await
+        {
+            store.acknowledge_completion(&completion)?;
+        }
+    }
+    Ok(())
+}
+
 type PmixLaunchSetup = (
     PmixLaunchGuard,
     PmixLaunchPlan,
