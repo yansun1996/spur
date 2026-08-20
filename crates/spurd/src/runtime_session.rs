@@ -66,9 +66,6 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
         if !config.gpu_devices.is_empty() {
             return Err("GPU launches are not yet supported by RuntimeSession".into());
         }
-        if config.io_mode != crate::executor::LaunchIo::File {
-            return Err("primary PTY launches are not yet supported by RuntimeSession".into());
-        }
         if config.pmix_multi_task {
             return Err("PMIx launches are not yet supported by RuntimeSession".into());
         }

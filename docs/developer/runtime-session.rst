@@ -82,7 +82,8 @@ Set ``SPUR_RUNTIME_SESSION=1`` in the ``spurd`` service environment to route
 the initial plain-batch cohort and interactive allocation attachments through
 RuntimeSession. The runtime owns interactive child PTYs, terminal input,
 resizes, foreground signals, and replayable output; an agent restart no longer
-sends a hangup to an attached terminal. Primary PTY batch launches, container,
-GPU, and PMIx workloads remain rejected until their full execution contracts
-are implemented. ``SPUR_RUNTIME_STATE_DIR`` overrides the default
+sends a hangup to an attached terminal. An interactive ``srun`` first creates a
+runtime-owned allocation, then launches its terminal as a runtime child.
+Container, GPU, and PMIx workloads remain rejected until their full execution
+contracts are implemented. ``SPUR_RUNTIME_STATE_DIR`` overrides the default
 ``/var/spool/spur`` local runtime directory for isolated testing.

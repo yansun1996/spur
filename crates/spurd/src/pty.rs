@@ -141,7 +141,7 @@ mod tests {
         if pid == 0 {
             let result = unsafe { pty_pre_exec(-1, -1) };
             // setsid succeeds, TIOCSCTTY on -1 fails.
-            std::process::exit(if result.is_err() { 0 } else { 1 });
+            unsafe { libc::_exit(if result.is_err() { 0 } else { 1 }) };
         }
 
         let mut status = 0i32;

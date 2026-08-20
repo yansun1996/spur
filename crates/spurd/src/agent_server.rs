@@ -61,7 +61,7 @@ async fn launch_runtime_session(
     launch_spec.controller_addr = controller_addr.into();
     launch_spec.reporting_node = reporting_node.into();
     launch_spec.run_attempt = run_attempt;
-    launch_spec.allocation_only = allocation_only;
+    launch_spec.allocation_only = allocation_only || config.io_mode == executor::LaunchIo::Pty;
     let state_dir =
         std::env::var("SPUR_RUNTIME_STATE_DIR").unwrap_or_else(|_| "/var/spool/spur".into());
     let store = crate::runtime_session::RuntimeSessionStore::new(&state_dir);
