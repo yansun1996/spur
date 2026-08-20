@@ -8,6 +8,7 @@ Handles SSH connections, binary deployment, cluster startup/teardown,
 and CLI wrappers for interacting with the running cluster.
 """
 
+import json
 import os
 import re
 import shlex
@@ -206,6 +207,7 @@ class SpurCluster:
         self.config_overrides: dict = {}
         self.agent_as_root: bool = False
         self.agent_labels: dict[int, dict[str, str]] = {}
+        self.agent_env: dict[str, str] = {}
         self.agent_token: str | None = None
         self.accounting_enabled: bool = False
         self._pg_container = f"spur-e2e-pg-{os.getpid()}-{time.time_ns()}"
@@ -233,6 +235,7 @@ class SpurCluster:
         kill_stale: bool = True,
         agent_as_root: bool = False,
         agent_labels: dict[int, dict[str, str]] | None = None,
+        agent_env: dict[str, str] | None = None,
     ):
         """Write config and start all daemons.
 
@@ -252,6 +255,7 @@ class SpurCluster:
             raise RuntimeError("provision() must be called before start()")
         self.agent_as_root = agent_as_root
         self.agent_labels = agent_labels or {}
+        self.agent_env = agent_env or {}
         if kill_stale:
             self._kill_controller()
             self._kill_agents(use_sudo=False, broad=True)
@@ -270,6 +274,7 @@ class SpurCluster:
     def stop(self):
         """Kill all daemons but keep the working directory intact."""
         self.stop_agents()
+        self._stop_runtime_sessions()
         self.stop_controller()
         if self.accounting_enabled:
             self._stop_postgres()
@@ -321,12 +326,18 @@ class SpurCluster:
         config_overrides: dict | None = None,
         agent_as_root: bool = False,
         agent_labels: dict[int, dict[str, str]] | None = None,
+        agent_env: dict[str, str] | None = None,
     ):
         """Provision + start in one call."""
         self.provision()
         if agent_as_root:
             self.root_agent_preflight()
-        self.start(config_overrides, agent_as_root=agent_as_root, agent_labels=agent_labels)
+        self.start(
+            config_overrides,
+            agent_as_root=agent_as_root,
+            agent_labels=agent_labels,
+            agent_env=agent_env,
+        )
 
     def teardown(self):
         """Kill all daemons and remove the working directory."""
@@ -612,6 +623,42 @@ class SpurCluster:
             if content.strip():
                 combined.append(content)
         return "\n".join(combined)
+
+    def runtime_session_descriptors(self, job_id: int) -> list[tuple[int, dict]]:
+        """Return persisted RuntimeSession descriptors for *job_id* on all nodes."""
+        return [
+            (index, descriptor)
+            for index, descriptor in self.runtime_session_descriptors_for_all_jobs()
+            if descriptor.get("job_id") == job_id
+        ]
+
+    def runtime_session_descriptors_for_all_jobs(self) -> list[tuple[int, dict]]:
+        """Return every persisted RuntimeSession descriptor on the test cluster."""
+        descriptors = []
+        runtime_root = f"{self.remote_dir}/runtime"
+        for index, node in enumerate(self.nodes):
+            paths = node.exec_allow_fail(
+                f"find '{runtime_root}' -mindepth 2 -maxdepth 2 "
+                "-name descriptor.json -type f 2>/dev/null"
+            ).splitlines()
+            for path in paths:
+                raw = node.read_file(path)
+                try:
+                    descriptor = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning("invalid RuntimeSession descriptor at %s", path)
+                    continue
+                descriptors.append((index, descriptor))
+        return descriptors
+
+    def stop_runtime_session(self, node_index: int, descriptor: dict):
+        """Stop one persisted RuntimeSession service by its fenced identity."""
+        job_id = descriptor["job_id"]
+        run_attempt = descriptor["run_attempt"]
+        unit = f"spur-runtime-{job_id}.{run_attempt}.service"
+        self.nodes[node_index].exec(
+            f"{self._sudo_prefix()}systemctl stop '{unit}'"
+        )
 
     def debug_job(self, job_id: int) -> str:
         """Collect diagnostic info for a failed job."""
@@ -1055,7 +1102,10 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
 
     def _kill_agents(self, use_sudo: bool = False, broad: bool = False):
         for node in self.nodes:
-            self._pkill(node, f"{self.bin_dir}/spurd", use_sudo=use_sudo)
+            # RuntimeSession executes the same binary with ``__runtime-session``.
+            # Match the agent's config-file invocation so a restart exercises
+            # recovery rather than killing the surviving runtime.
+            self._pkill(node, f"{self.bin_dir}/spurd -f", use_sudo=use_sudo)
             # Kill any process holding the agent port, even from a different
             # bin_dir (e.g. a stale spurd left by a previous pytest session).
             if broad:
@@ -1064,15 +1114,25 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
                     f"{prefix}fuser -k {AGENT_PORT}/tcp 2>/dev/null || true"
                 )
 
+    def _stop_runtime_sessions(self):
+        if self.agent_env.get("SPUR_RUNTIME_SESSION") != "1":
+            return
+        for node_index, descriptor in self.runtime_session_descriptors_for_all_jobs():
+            self.stop_runtime_session(node_index, descriptor)
+
     def _spurd_start_cmd(self, node_index: int) -> str:
         node = self.nodes[node_index]
         hostname = self.node_names[node_index]
         address = node.host
         agent_listen = f"0.0.0.0:{AGENT_PORT}"
+        env_args = " ".join(
+            f"{key}={shlex.quote(value)}" for key, value in self.agent_env.items()
+        )
+        env_prefix = f"env {env_args} " if env_args else ""
         spurd_bin = (
-            f"{self._sudo_prefix()}'{self.bin_dir}/spurd'"
+            f"{self._sudo_prefix()}{env_prefix}'{self.bin_dir}/spurd'"
             if self.agent_as_root
-            else f"'{self.bin_dir}/spurd'"
+            else f"{env_prefix}'{self.bin_dir}/spurd'"
         )
         label_args = ""
         labels = self.agent_labels.get(node_index, {})

@@ -118,12 +118,13 @@ def _ensure_bins(ssh_nodes, remote_bin_dir):
 
 def _deploy_cluster(ssh_nodes, remote_bin_dir, *, agent_as_root: bool = False,
                     config_overrides: dict | None = None,
-                    agent_labels: dict[int, dict[str, str]] | None = None):
+                    agent_labels: dict[int, dict[str, str]] | None = None,
+                    agent_env: dict[str, str] | None = None):
     """Helper: create, deploy, and return a SpurCluster. Tears down on deploy failure."""
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     try:
         c.deploy(config_overrides=config_overrides, agent_as_root=agent_as_root,
-                 agent_labels=agent_labels)
+                 agent_labels=agent_labels, agent_env=agent_env)
     except Exception:
         c.teardown()
         raise
@@ -192,6 +193,27 @@ def multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
 
     spur_cluster = _deploy_cluster(ssh_nodes, remote_bin_dir,
                                    config_overrides=cluster_config_overrides)
+    yield spur_cluster
+    spur_cluster.teardown()
+
+
+@pytest.fixture
+def runtime_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
+    """RuntimeSession-gated cluster for restart and fencing E2E coverage."""
+    spur_cluster = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
+    runtime_state_dir = f"{spur_cluster.remote_dir}/runtime"
+    try:
+        spur_cluster.deploy(
+            config_overrides=cluster_config_overrides,
+            agent_as_root=True,
+            agent_env={
+                "SPUR_RUNTIME_SESSION": "1",
+                "SPUR_RUNTIME_STATE_DIR": runtime_state_dir,
+            },
+        )
+    except Exception:
+        spur_cluster.teardown()
+        raise
     yield spur_cluster
     spur_cluster.teardown()
 
