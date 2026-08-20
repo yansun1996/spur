@@ -47,6 +47,10 @@ pub struct RuntimeLaunchSpec {
     pub capability: String,
     #[serde(default)]
     pub allocation_only: bool,
+    #[serde(default)]
+    pub pmix_config: Option<spur_core::config::MpiConfig>,
+    #[serde(default)]
+    pub pmix_plan: Option<spur_core::mpi::PmixLaunchPlan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +102,8 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
             run_attempt: 0,
             capability: String::new(),
             allocation_only: false,
+            pmix_config: None,
+            pmix_plan: None,
         })
     }
 }
