@@ -103,7 +103,10 @@ class TestRuntimeSessionRecovery:
             all_nodes=True,
         )
         cluster.start(
-            {"hooks": {"task_epilog": epilog}},
+            {
+                **cluster.runtime_config_overrides,
+                "hooks": {"task_epilog": epilog},
+            },
             agent_as_root=True,
             agent_env={"SPUR_RUNTIME_SESSION": "1", "SPUR_RUNTIME_STATE_DIR": cluster.remote_dir},
         )

@@ -123,6 +123,9 @@ pub struct NodeTokenClaims {
     pub sub: String, // hostname
     pub exp: u64,
     pub iat: u64,
+    /// Separates an agent credential from an ordinary user JWT signed by the
+    /// same cluster key.
+    pub kind: String,
 }
 
 /// Identity extracted from a verified node token.
@@ -146,6 +149,7 @@ pub fn generate_node_token(hostname: &str, jwt_key: &[u8]) -> Result<String, Adm
         sub: hostname.into(),
         exp: now + NODE_TOKEN_TTL_SECS,
         iat: now,
+        kind: "node".into(),
     };
 
     encode(
@@ -169,6 +173,12 @@ pub fn verify_node_token(token: &str, jwt_key: &[u8]) -> Result<NodeIdentity, Ad
         jsonwebtoken::errors::ErrorKind::ExpiredSignature => AdmissionError::NodeTokenExpired,
         _ => AdmissionError::InvalidNodeToken(e.to_string()),
     })?;
+
+    if data.claims.kind != "node" {
+        return Err(AdmissionError::InvalidNodeToken(
+            "credential is not a node token".into(),
+        ));
+    }
 
     Ok(NodeIdentity {
         hostname: data.claims.sub,

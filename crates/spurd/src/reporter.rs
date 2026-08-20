@@ -104,11 +104,11 @@ impl NodeReporter {
             .context("failed to connect to spurctld for registration")?;
         let mut client = spur_proto::controller_client(channel);
 
-        let mut labels = self.labels.clone();
-        if std::env::var("SPUR_RUNTIME_SESSION")
+        let runtime_session = std::env::var("SPUR_RUNTIME_SESSION")
             .ok()
-            .is_some_and(|value| value == "1")
-        {
+            .is_some_and(|value| value == "1");
+        let mut labels = self.labels.clone();
+        if runtime_session {
             labels.insert("spur.runtime-session".into(), "1".into());
         }
 
@@ -128,6 +128,7 @@ impl NodeReporter {
 
         let inner = resp.into_inner();
         if inner.accepted {
+            require_runtime_node_token(runtime_session, &inner.node_token)?;
             if !inner.node_token.is_empty() {
                 *self.node_token.write().unwrap() = inner.node_token;
             }
@@ -256,6 +257,15 @@ impl NodeReporter {
 /// this the agent would heartbeat into the same rejection forever.
 fn should_reregister(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::NotFound
+}
+
+fn require_runtime_node_token(runtime_session: bool, node_token: &str) -> anyhow::Result<()> {
+    if runtime_session && node_token.is_empty() {
+        anyhow::bail!(
+            "RuntimeSession requires [auth] jwt_key so this agent can prove its node identity"
+        );
+    }
+    Ok(())
 }
 
 /// Discover local node resources from sysfs / /proc + device registry.
@@ -631,6 +641,13 @@ mod tests {
             "node token required"
         )));
         assert!(!should_reregister(&tonic::Status::internal("boom")));
+    }
+
+    #[test]
+    fn runtime_session_registration_requires_a_node_credential() {
+        assert!(require_runtime_node_token(false, "").is_ok());
+        assert!(require_runtime_node_token(true, "node-credential").is_ok());
+        assert!(require_runtime_node_token(true, "").is_err());
     }
 
     #[test]

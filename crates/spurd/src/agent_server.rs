@@ -358,10 +358,7 @@ impl RuntimeRecoveryCleanup {
         }
 
         if removed_runtime || removed_tracked {
-            if let Err(error) = crate::runtime_session::append_obligation(
-                descriptor,
-                &crate::runtime_session::RuntimeObligation::ResourcesReleased,
-            ) {
+            if let Err(error) = crate::runtime_session::record_resources_released(descriptor) {
                 warn!(
                     job_id = descriptor.job_id,
                     run_attempt = descriptor.run_attempt,
@@ -422,6 +419,7 @@ pub(crate) async fn recover_runtime_sessions(
 pub(crate) fn monitor_recovered_runtime_sessions(
     running: RunningJobs,
     descriptors: Vec<crate::runtime_session::RuntimeSessionDescriptor>,
+    store: crate::runtime_session::RuntimeSessionStore,
     controller_addr: String,
 ) {
     tokio::spawn(async move {
@@ -478,7 +476,7 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                         warn!(job_id, %error, "failed to record recovered runtime resource release");
                     }
                 }
-                report_completion(
+                if report_completion(
                     &controller_addr,
                     job_id,
                     exit_code,
@@ -487,7 +485,19 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                     &hostname,
                     None,
                 )
-                .await;
+                .await
+                {
+                    if let Err(error) = store.acknowledge_completion(
+                        &crate::runtime_session::PendingRuntimeCompletion {
+                            job_id,
+                            run_attempt,
+                            exit_code,
+                            signal,
+                        },
+                    ) {
+                        warn!(job_id, run_attempt, %error, "failed to acknowledge recovered runtime completion");
+                    }
+                }
             }
         }
     });
@@ -3376,10 +3386,7 @@ impl AgentService {
         if self.running.lock().await.remove(&job_id).is_some() {
             self.allocation.lock().await.release_job(job_id);
             if let Some(descriptor) = self.runtime_sessions.lock().await.remove(&job_id) {
-                if let Err(error) = crate::runtime_session::append_obligation(
-                    &descriptor,
-                    &crate::runtime_session::RuntimeObligation::ResourcesReleased,
-                ) {
+                if let Err(error) = crate::runtime_session::record_resources_released(&descriptor) {
                     warn!(job_id, %error, "failed to record runtime resource release");
                 }
             }

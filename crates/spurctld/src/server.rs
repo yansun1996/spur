@@ -181,6 +181,9 @@ pub struct ControllerService {
     /// verification of every outstanding node token (7-day TTL), silently
     /// partitioning healthy nodes. Like Slurm's AuthType, it is restart-only.
     jwt_key: String,
+    /// Runtime-session agents need an explicit signing secret. The built-in
+    /// compatibility fallback is public and cannot establish node identity.
+    node_identity_key_configured: bool,
     incomplete_runtime_recoveries: Mutex<HashMap<(u32, u32), std::time::Instant>>,
 }
 
@@ -731,30 +734,57 @@ impl ControllerService {
         }
     }
 
-    /// Validate an admission token if token mode is enabled.
-    /// Returns the node_token JWT to include in the registration response,
-    /// or an empty string if admission mode is open.
+    /// Validate an admission token if token mode is enabled and mint a node
+    /// credential when the deployment configured a non-public signing key.
     #[allow(clippy::result_large_err)]
     fn validate_admission(&self, join_token: &str, hostname: &str) -> Result<String, Status> {
         use spur_core::config::AdmissionMode;
 
-        if !matches!(self.cluster.config().admission.mode, AdmissionMode::Token) {
+        if matches!(self.cluster.config().admission.mode, AdmissionMode::Token) {
+            if join_token.is_empty() {
+                return Err(Status::unauthenticated("admission token required"));
+            }
+
+            let (token_id, secret) = spur_core::admission::parse_token(join_token)
+                .map_err(|e| Status::permission_denied(e.to_string()))?;
+
+            let token_store = self.cluster.get_tokens();
+            spur_core::admission::validate_token(token_id, secret, &token_store)
+                .map_err(|e| Status::permission_denied(e.to_string()))?;
+        }
+
+        if !self.node_identity_key_configured {
             return Ok(String::new());
         }
 
-        if join_token.is_empty() {
-            return Err(Status::unauthenticated("admission token required"));
-        }
-
-        let (token_id, secret) = spur_core::admission::parse_token(join_token)
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
-
-        let token_store = self.cluster.get_tokens();
-        spur_core::admission::validate_token(token_id, secret, &token_store)
-            .map_err(|e| Status::permission_denied(e.to_string()))?;
-
         spur_core::admission::generate_node_token(hostname, self.jwt_key.as_bytes())
             .map_err(|e| Status::internal(e.to_string()))
+    }
+
+    fn authorize_runtime_recovery_report(
+        &self,
+        hostname: &str,
+        node_token: &str,
+    ) -> Result<(), Status> {
+        if !self.node_identity_key_configured {
+            return Err(Status::failed_precondition(
+                "runtime session recovery requires [auth] jwt_key",
+            ));
+        }
+        if node_token.is_empty() {
+            return Err(Status::unauthenticated("node token required"));
+        }
+        let identity = spur_core::admission::verify_node_token(node_token, self.jwt_key.as_bytes())
+            .map_err(|error| Status::unauthenticated(error.to_string()))?;
+        if identity.hostname != hostname {
+            return Err(Status::permission_denied("node token hostname mismatch"));
+        }
+        if self.cluster.get_node(hostname).is_none() {
+            return Err(Status::not_found(format!(
+                "node {hostname} is not registered"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1967,22 +1997,7 @@ impl SlurmController for ControllerService {
         }
 
         let request = request.into_inner();
-        if matches!(
-            self.cluster.config().admission.mode,
-            spur_core::config::AdmissionMode::Token
-        ) {
-            if request.node_token.is_empty() {
-                return Err(Status::unauthenticated("node token required"));
-            }
-            let identity = spur_core::admission::verify_node_token(
-                &request.node_token,
-                self.jwt_key.as_bytes(),
-            )
-            .map_err(|error| Status::unauthenticated(error.to_string()))?;
-            if identity.hostname != request.hostname {
-                return Err(Status::permission_denied("node token hostname mismatch"));
-            }
-        }
+        self.authorize_runtime_recovery_report(&request.hostname, &request.node_token)?;
 
         let probe = self
             .probe_runtime_recovery(&request.hostname, request.job_id, request.run_attempt)
@@ -3699,6 +3714,7 @@ pub async fn serve(
     let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
 
     let jwt_key = resolve_startup_jwt_key(&cluster.config());
+    let node_identity_key_configured = cluster.config().auth.jwt_key.is_some();
     let auth_mode = cluster.config().auth.mode;
     // Unlike node admission, an unset key here must reject every credential, never fall back
     // to a forgeable constant; `required` mode refuses to start key-less (see config validation).
@@ -3713,6 +3729,7 @@ pub async fn serve(
         sched_stats: sched_stats.clone(),
         control_plane_replicas,
         jwt_key,
+        node_identity_key_configured,
         incomplete_runtime_recoveries: Mutex::new(HashMap::new()),
     };
 
@@ -4859,6 +4876,7 @@ mod tests {
             sched_stats: Arc::new(SchedStatsCollector::new("sched/backfill")),
             control_plane_replicas: 1,
             jwt_key: String::new(),
+            node_identity_key_configured: false,
             incomplete_runtime_recoveries: Mutex::new(HashMap::new()),
         }
     }
@@ -5425,6 +5443,7 @@ mod tests {
         spur_core::config::SlurmConfig::load_from_str(
             "cluster_name = \"test\"\n\
              [controller]\nfirst_job_id = 1\n\
+             [auth]\nplugin = \"jwt\"\njwt_key = \"test-node-identity-key\"\n\
              [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n",
         )
         .unwrap()
@@ -5453,6 +5472,8 @@ mod tests {
             .unwrap();
         cluster.set_raft(handle.raft.clone());
         let raft = std::sync::Arc::new(handle);
+        let jwt_key = resolve_startup_jwt_key(&cluster.config());
+        let node_identity_key_configured = cluster.config().auth.jwt_key.is_some();
         ControllerService {
             cluster,
             raft: raft.clone(),
@@ -5461,7 +5482,8 @@ mod tests {
             rpc_stats: std::sync::Arc::new(RpcStatsCollector::new()),
             sched_stats: std::sync::Arc::new(SchedStatsCollector::new("backfill")),
             control_plane_replicas: 1,
-            jwt_key: String::new(),
+            jwt_key,
+            node_identity_key_configured,
             incomplete_runtime_recoveries: Mutex::new(HashMap::new()),
         }
     }
@@ -5852,6 +5874,70 @@ mod tests {
         job_id
     }
 
+    fn runtime_recovery_request(
+        svc: &ControllerService,
+        hostname: &str,
+        job_id: u32,
+        run_attempt: u32,
+        stale_descriptor: bool,
+    ) -> RuntimeSessionRecoveryRequest {
+        RuntimeSessionRecoveryRequest {
+            hostname: hostname.into(),
+            job_id,
+            run_attempt,
+            node_token: spur_core::admission::generate_node_token(hostname, svc.jwt_key.as_bytes())
+                .expect("node token"),
+            stale_descriptor,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_recovery_requires_a_registered_node_credential_in_open_admission() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let issued_token = svc
+            .validate_admission("", "n1")
+            .expect("open admission registration");
+        assert_eq!(
+            spur_core::admission::verify_node_token(&issued_token, svc.jwt_key.as_bytes())
+                .expect("issued node token")
+                .hostname,
+            "n1"
+        );
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        let mut missing = runtime_recovery_request(&svc, "n1", job_id, run_attempt, false);
+        missing.node_token.clear();
+        let error = svc
+            .report_runtime_session_recovery(Request::new(missing))
+            .await
+            .expect_err("an unsigned hostname must not report recovery");
+        assert_eq!(error.code(), Code::Unauthenticated);
+
+        let user_token =
+            spur_core::auth::generate_token("n1", 1000, false, svc.jwt_key.as_bytes(), 60)
+                .expect("user token");
+        let mut ordinary_user = runtime_recovery_request(&svc, "n1", job_id, run_attempt, false);
+        ordinary_user.node_token = user_token;
+        let error = svc
+            .report_runtime_session_recovery(Request::new(ordinary_user))
+            .await
+            .expect_err("a user JWT must not be accepted as a node credential");
+        assert_eq!(error.code(), Code::Unauthenticated);
+
+        let mismatched = runtime_recovery_request(&svc, "n2", job_id, run_attempt, false);
+        let error = svc
+            .report_runtime_session_recovery(Request::new(mismatched))
+            .await
+            .expect_err("a node credential must not authorize another hostname");
+        assert_eq!(error.code(), Code::NotFound);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runtime_recovery_fence_requeues_only_the_matching_attempt() {
         let dir = tempfile::TempDir::new().expect("tempdir");
@@ -5889,13 +5975,13 @@ mod tests {
             .run_attempt;
 
         let response = svc
-            .report_runtime_session_recovery(Request::new(RuntimeSessionRecoveryRequest {
-                hostname: "n1".into(),
+            .report_runtime_session_recovery(Request::new(runtime_recovery_request(
+                &svc,
+                "n1",
                 job_id,
-                run_attempt: run_attempt.saturating_sub(1),
-                node_token: String::new(),
-                stale_descriptor: false,
-            }))
+                run_attempt.saturating_sub(1),
+                false,
+            )))
             .await
             .expect("superseded report is accepted as stale")
             .into_inner();
@@ -5936,13 +6022,13 @@ mod tests {
             .run_attempt;
 
         let response = svc
-            .report_runtime_session_recovery(Request::new(RuntimeSessionRecoveryRequest {
-                hostname: "n1".into(),
+            .report_runtime_session_recovery(Request::new(runtime_recovery_request(
+                &svc,
+                "n1",
                 job_id,
                 run_attempt,
-                node_token: String::new(),
-                stale_descriptor: false,
-            }))
+                false,
+            )))
             .await
             .expect("partial recovery report")
             .into_inner();
@@ -5986,13 +6072,13 @@ mod tests {
         );
 
         let response = svc
-            .report_runtime_session_recovery(Request::new(RuntimeSessionRecoveryRequest {
-                hostname: "n1".into(),
+            .report_runtime_session_recovery(Request::new(runtime_recovery_request(
+                &svc,
+                "n1",
                 job_id,
                 run_attempt,
-                node_token: String::new(),
-                stale_descriptor: false,
-            }))
+                false,
+            )))
             .await
             .expect("expired cohort report")
             .into_inner();
@@ -6016,13 +6102,13 @@ mod tests {
             .run_attempt;
 
         let response = svc
-            .report_runtime_session_recovery(Request::new(RuntimeSessionRecoveryRequest {
-                hostname: "n1".into(),
+            .report_runtime_session_recovery(Request::new(runtime_recovery_request(
+                &svc,
+                "n1",
                 job_id,
                 run_attempt,
-                node_token: String::new(),
-                stale_descriptor: true,
-            }))
+                true,
+            )))
             .await
             .expect("stale descriptor report")
             .into_inner();

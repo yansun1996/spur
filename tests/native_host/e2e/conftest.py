@@ -8,6 +8,7 @@ See docs/developer/building.rst for full environment variable reference.
 """
 
 import os
+import secrets
 import time
 from pathlib import Path
 
@@ -57,6 +58,13 @@ def _get_binaries_dir() -> str:
     return os.environ.get(
         "SPUR_TEST_BINARIES_DIR",
         str(_REPO_ROOT / "target" / "release"),
+    )
+
+
+def _runtime_config_overrides(overrides: dict | None) -> dict:
+    return deep_merge(
+        dict(overrides or {}),
+        {"auth": {"jwt_key": secrets.token_urlsafe(32)}},
     )
 
 
@@ -203,7 +211,7 @@ def runtime_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     spur_cluster = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     try:
         spur_cluster.deploy(
-            config_overrides=cluster_config_overrides,
+            config_overrides=_runtime_config_overrides(cluster_config_overrides),
             agent_as_root=True,
             agent_env={
                 "SPUR_RUNTIME_SESSION": "1",
@@ -225,7 +233,7 @@ def runtime_ha_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     c = HaSpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     try:
         c.deploy(
-            config_overrides=cluster_config_overrides,
+            config_overrides=_runtime_config_overrides(cluster_config_overrides),
             agent_as_root=True,
             agent_env={
                 "SPUR_RUNTIME_SESSION": "1",
@@ -243,6 +251,7 @@ def runtime_ha_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
 def runtime_unstarted_cluster(ssh_nodes, remote_bin_dir):
     """Provision a rootful RuntimeSession cluster before test hook setup."""
     spur_cluster = _provision_cluster(ssh_nodes, remote_bin_dir)
+    spur_cluster.runtime_config_overrides = _runtime_config_overrides(None)
     try:
         spur_cluster.root_agent_preflight()
     except Exception:
@@ -256,7 +265,7 @@ def runtime_unstarted_cluster(ssh_nodes, remote_bin_dir):
 def runtime_gpu_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """RuntimeSession-gated cluster with CDI GPU discovery enabled."""
     overrides = deep_merge(
-        dict(cluster_config_overrides or {}),
+        _runtime_config_overrides(cluster_config_overrides),
         SpurCluster.devices_config(auto_detect=True),
     )
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
@@ -289,7 +298,7 @@ def runtime_mpi_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     plugin_dir = str(Path(remote_bin_dir).parent / "lib" / "spur")
     overrides = deep_merge(
-        dict(cluster_config_overrides or {}),
+        _runtime_config_overrides(cluster_config_overrides),
         {"mpi": {"plugin_dir": plugin_dir, "pmix_tmpdir": "/tmp/spur-pmix"}},
     )
     try:

@@ -325,6 +325,7 @@ async fn main() -> anyhow::Result<()> {
     agent_server::monitor_recovered_runtime_sessions(
         running_jobs.clone(),
         recovered_runtime_sessions.clone(),
+        runtime_sessions.clone(),
         args.controller.clone(),
     );
 
@@ -339,6 +340,13 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let reconciled_runtime_completions: HashSet<_> =
         reconciled_runtime_completions.into_iter().collect();
+    let pruned_runtime_sessions = runtime_sessions.prune_finalized()?;
+    if pruned_runtime_sessions > 0 {
+        info!(
+            sessions = pruned_runtime_sessions,
+            "pruned finalized runtime session state"
+        );
+    }
 
     // Start heartbeat loop
     let hb_reporter = reporter.clone();

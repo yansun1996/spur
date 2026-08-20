@@ -1125,19 +1125,6 @@ impl RuntimeSessionDescriptor {
     }
 }
 
-pub(crate) fn append_obligation(
-    descriptor: &RuntimeSessionDescriptor,
-    obligation: &RuntimeObligation,
-) -> io::Result<()> {
-    let session_dir = descriptor.socket_path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "runtime socket path has no session directory",
-        )
-    })?;
-    RuntimeObligationLog::new(session_dir.join(OBLIGATION_FILE)).append(obligation)
-}
-
 pub(crate) fn record_resources_released(descriptor: &RuntimeSessionDescriptor) -> io::Result<()> {
     let session_dir = descriptor.socket_path.parent().ok_or_else(|| {
         io::Error::new(
@@ -1151,9 +1138,43 @@ pub(crate) fn record_resources_released(descriptor: &RuntimeSessionDescriptor) -
         .iter()
         .any(|obligation| matches!(obligation, RuntimeObligation::ResourcesReleased))
     {
-        return Ok(());
+        return prune_finalized_session(session_dir, &obligations).map(|_| ());
     }
-    obligations.append(&RuntimeObligation::ResourcesReleased)
+    obligations.append(&RuntimeObligation::ResourcesReleased)?;
+    prune_finalized_session(session_dir, &obligations).map(|_| ())
+}
+
+fn finalized_obligations(obligations: &[RuntimeObligation]) -> bool {
+    let mut exit_observed = false;
+    let mut completion_acknowledged = false;
+    let mut resources_released = false;
+
+    for obligation in obligations {
+        match obligation {
+            RuntimeObligation::ExitObserved { .. } => {
+                exit_observed = true;
+                completion_acknowledged = false;
+            }
+            RuntimeObligation::CompletionAcknowledged if exit_observed => {
+                completion_acknowledged = true;
+            }
+            RuntimeObligation::ResourcesReleased => resources_released = true,
+            RuntimeObligation::CompletionAcknowledged => {}
+        }
+    }
+
+    completion_acknowledged && resources_released
+}
+
+fn prune_finalized_session(
+    session_dir: &Path,
+    obligations: &RuntimeObligationLog,
+) -> io::Result<bool> {
+    if !finalized_obligations(&obligations.read()?) {
+        return Ok(false);
+    }
+    fs::remove_dir_all(session_dir)?;
+    Ok(true)
 }
 
 pub fn validate_hello(
@@ -1869,7 +1890,12 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         )
         .await
     {
-        obligations.append(&RuntimeObligation::CompletionAcknowledged)?;
+        store.acknowledge_completion(&PendingRuntimeCompletion {
+            job_id,
+            run_attempt,
+            exit_code,
+            signal: snapshot.signal.unwrap_or(0),
+        })?;
     }
     Ok(exit_code)
 }
@@ -1987,6 +2013,7 @@ pub(crate) struct PendingRuntimeCompletion {
     pub signal: i32,
 }
 
+#[derive(Clone)]
 pub struct RuntimeSessionStore {
     root: PathBuf,
 }
@@ -2150,12 +2177,43 @@ impl RuntimeSessionStore {
         Ok(completions)
     }
 
+    pub(crate) fn prune_finalized(&self) -> io::Result<usize> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error),
+        };
+
+        let mut pruned = 0;
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let session_dir = entry.path();
+            let descriptor = match self.load_descriptor(&session_dir) {
+                Ok(descriptor) => descriptor,
+                Err(_) => continue,
+            };
+            let obligations = self.obligations(descriptor.job_id, descriptor.run_attempt);
+            if prune_finalized_session(&session_dir, &obligations)? {
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+
     pub(crate) fn acknowledge_completion(
         &self,
         completion: &PendingRuntimeCompletion,
     ) -> io::Result<()> {
-        self.obligations(completion.job_id, completion.run_attempt)
-            .append(&RuntimeObligation::CompletionAcknowledged)
+        let obligations = self.obligations(completion.job_id, completion.run_attempt);
+        obligations.append(&RuntimeObligation::CompletionAcknowledged)?;
+        prune_finalized_session(
+            &self.session_dir(completion.job_id, completion.run_attempt),
+            &obligations,
+        )
+        .map(|_| ())
     }
 
     fn load_descriptor(&self, session_dir: &Path) -> io::Result<RuntimeSessionDescriptor> {
@@ -2714,6 +2772,7 @@ mod tests {
         let store = RuntimeSessionStore::new(temp.path());
         let mut descriptor = descriptor(42, 3, std::process::id());
         descriptor.process_start_ticks += 1;
+        descriptor.socket_path = store.session_dir(42, 3).join("runtime.sock");
         write_descriptor(&store, &descriptor);
         let obligations = store.obligations(42, 3);
         obligations
@@ -2741,6 +2800,98 @@ mod tests {
             .discover_unacknowledged_completions()
             .expect("rediscover completion")
             .is_empty());
+    }
+
+    #[test]
+    fn finalized_attempt_is_pruned_only_after_acknowledgement_and_resource_release() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RuntimeSessionStore::new(temp.path());
+        let mut descriptor = descriptor(42, 3, std::process::id());
+        descriptor.process_start_ticks += 1;
+        descriptor.socket_path = store.session_dir(42, 3).join("runtime.sock");
+        let session_dir = write_descriptor(&store, &descriptor);
+        let obligations = store.obligations(42, 3);
+        obligations
+            .append(&RuntimeObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("record exit");
+        let completion = PendingRuntimeCompletion {
+            job_id: 42,
+            run_attempt: 3,
+            exit_code: 0,
+            signal: 0,
+        };
+
+        store
+            .acknowledge_completion(&completion)
+            .expect("acknowledge completion");
+        assert!(session_dir.is_dir());
+
+        record_resources_released(&descriptor).expect("record resource release");
+        assert!(!session_dir.exists());
+    }
+
+    #[test]
+    fn startup_pruning_keeps_unacknowledged_and_unreleased_attempts() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RuntimeSessionStore::new(temp.path());
+
+        let mut unacknowledged = descriptor(42, 3, std::process::id());
+        unacknowledged.process_start_ticks += 1;
+        unacknowledged.socket_path = store.session_dir(42, 3).join("runtime.sock");
+        let unacknowledged_dir = write_descriptor(&store, &unacknowledged);
+        let unacknowledged_obligations = store.obligations(42, 3);
+        unacknowledged_obligations
+            .append(&RuntimeObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("record exit");
+        record_resources_released(&unacknowledged).expect("record resource release");
+
+        let mut unreleased = descriptor(43, 3, std::process::id());
+        unreleased.process_start_ticks += 1;
+        unreleased.socket_path = store.session_dir(43, 3).join("runtime.sock");
+        let unreleased_dir = write_descriptor(&store, &unreleased);
+        let unreleased_obligations = store.obligations(43, 3);
+        unreleased_obligations
+            .append(&RuntimeObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("record exit");
+        store
+            .acknowledge_completion(&PendingRuntimeCompletion {
+                job_id: 43,
+                run_attempt: 3,
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("acknowledge completion");
+
+        let mut finalized = descriptor(44, 3, std::process::id());
+        finalized.process_start_ticks += 1;
+        let finalized_dir = write_descriptor(&store, &finalized);
+        let finalized_obligations = store.obligations(44, 3);
+        for obligation in [
+            RuntimeObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            },
+            RuntimeObligation::CompletionAcknowledged,
+            RuntimeObligation::ResourcesReleased,
+        ] {
+            finalized_obligations
+                .append(&obligation)
+                .expect("record finalized obligation");
+        }
+
+        assert_eq!(store.prune_finalized().expect("prune attempts"), 1);
+        assert!(unacknowledged_dir.is_dir());
+        assert!(unreleased_dir.is_dir());
+        assert!(!finalized_dir.exists());
     }
 
     #[test]

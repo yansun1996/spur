@@ -501,11 +501,11 @@ Authentication plugin for client requests.
 
 .. note::
 
-   ``jwt_key`` is used for node admission tokens (``[admission] mode = "token"``),
-   which is a separate mechanism from the unimplemented ``plugin`` field. When
-   ``jwt_key`` is unset, admission tokens are signed with a well-known built-in
-   key and are therefore forgeable; set an explicit key before enabling token
-   admission.
+   ``jwt_key`` signs both node admission credentials (``[admission] mode =
+   "token"``) and the node-only RuntimeSession recovery credential. RuntimeSession
+   requires an explicit key even when admission is ``"open"``: a public fallback
+   key cannot prove that a recovery report came from its named node. Set the same
+   secret on every controller and agent before enabling RuntimeSession.
 
 ``[[partitions]]``
 ------------------
