@@ -5,7 +5,7 @@
 
 import time
 
-from cluster import job_state, parse_job_id, wait_job_state
+from cluster import job_state, parse_job_id, wait_job, wait_job_state
 
 
 def _wait_descriptors(cluster, job_id, expected, timeout=30):
@@ -46,6 +46,28 @@ def _wait_agents_registered(cluster, timeout=60):
 
 
 class TestRuntimeSessionRecovery:
+    def test_cancel_releases_runtime_allocation(self, runtime_cluster):
+        cluster = runtime_cluster
+        nodes = len(cluster.nodes)
+        script = cluster.write_file(
+            "runtime-cancel.sh", "#!/bin/bash\ntrap '' TERM\nsleep 120\n", all_nodes=True
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "runtime-cancel", "-N", str(nodes), "-n", str(nodes), script])
+        )
+        assert job_id is not None, "batch submission failed"
+        wait_job_state(cluster, job_id, "R", timeout=60)
+        _wait_descriptors(cluster, job_id, expected=nodes)
+        cluster.scancel(str(job_id))
+        state = wait_job(cluster, job_id, timeout=60)
+        assert state in ("CA", "F", "GONE"), f"cancelled runtime job ended as {state}"
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            if cluster._cluster_is_ready():
+                return
+            time.sleep(1)
+        raise TimeoutError(f"runtime cancellation did not release nodes:\n{cluster.sinfo()}")
+
     def test_allocation_runs_multiple_logical_steps(self, runtime_cluster):
         cluster = runtime_cluster
         nodes = len(cluster.nodes)
