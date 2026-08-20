@@ -1,15 +1,16 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 
 use crate::executor::RunningJob;
 
@@ -40,9 +41,13 @@ pub struct RuntimeLaunchSpec {
     pub reporting_node: String,
     #[serde(default)]
     pub run_attempt: u32,
+    #[serde(default)]
+    pub capability: String,
+    #[serde(default)]
+    pub allocation_only: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RuntimeMemlock {
     Unlimited,
     Inherit,
@@ -92,6 +97,8 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
             controller_addr: String::new(),
             reporting_node: String::new(),
             run_attempt: 0,
+            capability: String::new(),
+            allocation_only: false,
         })
     }
 }
@@ -137,6 +144,7 @@ impl RuntimeLaunchSpec {
 const DESCRIPTOR_FILE: &str = "descriptor.json";
 const FORMAT_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u32 = 1;
+const STEP_OUTPUT_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
@@ -149,6 +157,13 @@ pub enum RuntimeRequest {
     },
     QueryState,
     SignalAllocation {
+        signal: i32,
+    },
+    LaunchStep {
+        step: RuntimeStepLaunchSpec,
+    },
+    SignalStep {
+        step_id: u32,
         signal: i32,
     },
     BeginTeardown,
@@ -171,6 +186,12 @@ pub enum RuntimeResponse {
         signal: Option<i32>,
     },
     Acknowledged,
+    StepCompleted {
+        step_id: u32,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
     Rejected {
         message: String,
     },
@@ -185,9 +206,32 @@ pub struct RuntimeSnapshot {
     pub signal: Option<i32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeStepLaunchSpec {
+    pub step_id: u32,
+    pub program: String,
+    pub args: Vec<String>,
+    pub work_dir: String,
+    pub environment: std::collections::HashMap<String, String>,
+    pub uid: u32,
+    pub gid: u32,
+    pub memlock: RuntimeMemlock,
+}
+
+struct RuntimeStep {
+    pid: u32,
+}
+
+#[derive(Default)]
+struct RuntimeSteps {
+    active: HashMap<u32, RuntimeStep>,
+    cancelled: HashSet<u32>,
+}
+
 pub struct RuntimeSession {
     job: Mutex<RunningJob>,
     snapshot: Mutex<RuntimeSnapshot>,
+    steps: Arc<Mutex<RuntimeSteps>>,
 }
 
 impl RuntimeSession {
@@ -201,6 +245,7 @@ impl RuntimeSession {
                 exit_code: None,
                 signal: None,
             }),
+            steps: Arc::new(Mutex::new(RuntimeSteps::default())),
         }
     }
 
@@ -227,15 +272,172 @@ impl RuntimeSession {
                 format!("invalid signal: {error}"),
             )
         })?;
-        self.job
-            .lock()
-            .await
-            .kill_signal(signal)
-            .map_err(io::Error::other)
+        let allocation_only = {
+            let job = self.job.lock().await;
+            job.kill_signal(signal).map_err(io::Error::other)?;
+            job.is_allocation_only()
+        };
+        let steps = self.steps.lock().await;
+        for step in steps.active.values() {
+            signal_process_group(step.pid, signal);
+        }
+        drop(steps);
+        if allocation_only {
+            self.snapshot.lock().await.active = false;
+        }
+        Ok(())
     }
 
     pub async fn begin_teardown(&self) {
         self.snapshot.lock().await.active = false;
+        let steps = self.steps.lock().await;
+        for step in steps.active.values() {
+            signal_process_group(step.pid, nix::sys::signal::Signal::SIGTERM);
+        }
+    }
+
+    async fn launch_step(
+        &self,
+        step: RuntimeStepLaunchSpec,
+    ) -> io::Result<oneshot::Receiver<RuntimeStepResult>> {
+        let mut command = tokio::process::Command::new(&step.program);
+        command
+            .args(&step.args)
+            .current_dir(&step.work_dir)
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for (key, value) in &step.environment {
+            command.env(key, value);
+        }
+        let memlock = step.memlock;
+        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(step.uid, step.gid);
+        unsafe {
+            command.pre_exec(move || {
+                crate::executor::apply_memlock(match memlock {
+                    RuntimeMemlock::Unlimited => spur_core::config::MemlockLimit::Unlimited,
+                    RuntimeMemlock::Inherit => spur_core::config::MemlockLimit::Inherit,
+                    RuntimeMemlock::Bytes(value) => spur_core::config::MemlockLimit::Bytes(value),
+                });
+                if let Some(ref priv_drop) = priv_drop {
+                    priv_drop
+                        .apply()
+                        .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+                }
+                Ok(())
+            });
+        }
+        let mut steps = self.steps.lock().await;
+        if steps.cancelled.contains(&step.step_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!("step {} was cancelled before launch", step.step_id),
+            ));
+        }
+        if steps.active.contains_key(&step.step_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("step {} is already active", step.step_id),
+            ));
+        }
+        let mut child = command.spawn()?;
+        let pid = child
+            .id()
+            .ok_or_else(|| io::Error::other("runtime step has no pid"))?;
+        let (sender, receiver) = oneshot::channel();
+        steps.active.insert(step.step_id, RuntimeStep { pid });
+        drop(steps);
+        let steps = self.steps.clone();
+        tokio::spawn(async move {
+            let stdout = child
+                .stdout
+                .take()
+                .map(|stdout| tokio::spawn(read_step_output(stdout)));
+            let stderr = child
+                .stderr
+                .take()
+                .map(|stderr| tokio::spawn(read_step_output(stderr)));
+            let result = match child.wait().await {
+                Ok(status) => RuntimeStepResult {
+                    exit_code: spur_core::process::shell_exit_code(&status),
+                    stdout: join_step_output(stdout).await,
+                    stderr: join_step_output(stderr).await,
+                },
+                Err(error) => RuntimeStepResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: error.to_string(),
+                },
+            };
+            steps.lock().await.active.remove(&step.step_id);
+            let _ = sender.send(result);
+        });
+        Ok(receiver)
+    }
+
+    async fn signal_step(&self, step_id: u32, signal: i32) -> io::Result<()> {
+        let signal = nix::sys::signal::Signal::try_from(signal).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid signal: {error}"),
+            )
+        })?;
+        let mut steps = self.steps.lock().await;
+        if let Some(step) = steps.active.get(&step_id) {
+            signal_process_group(step.pid, signal);
+        } else {
+            steps.cancelled.insert(step_id);
+        }
+        Ok(())
+    }
+}
+
+async fn read_step_output<R>(mut reader: R) -> String
+where
+    R: AsyncRead + Unpin,
+{
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let count = match reader.read(&mut buffer).await {
+            Ok(count) => count,
+            Err(error) => return format!("runtime output read failed: {error}"),
+        };
+        if count == 0 {
+            break;
+        }
+        let remaining = STEP_OUTPUT_LIMIT.saturating_sub(output.len());
+        let retained = count.min(remaining);
+        output.extend_from_slice(&buffer[..retained]);
+        truncated |= retained != count;
+    }
+    if truncated {
+        output.extend_from_slice(b"\n[spur runtime output truncated]\n");
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+async fn join_step_output(output: Option<tokio::task::JoinHandle<String>>) -> String {
+    match output {
+        Some(output) => output
+            .await
+            .unwrap_or_else(|error| format!("runtime output task failed: {error}")),
+        None => String::new(),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeStepResult {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+fn signal_process_group(pid: u32, signal: nix::sys::signal::Signal) {
+    let process = nix::unistd::Pid::from_raw(pid as i32);
+    if nix::sys::signal::killpg(process, signal).is_err() {
+        let _ = nix::sys::signal::kill(process, signal);
     }
 }
 
@@ -473,6 +675,86 @@ pub async fn signal_allocation(
     }
 }
 
+pub(crate) async fn launch_step(
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+    step: RuntimeStepLaunchSpec,
+) -> io::Result<RuntimeStepResult> {
+    let stream = UnixStream::connect(&descriptor.socket_path).await?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    runtime_hello(&mut reader, &mut writer, descriptor, spurd_instance_id).await?;
+    let step_id = step.step_id;
+    write_request(&mut writer, &RuntimeRequest::LaunchStep { step }).await?;
+    match read_response(&mut reader).await? {
+        RuntimeResponse::StepCompleted {
+            step_id: response_step_id,
+            exit_code,
+            stdout,
+            stderr,
+        } if response_step_id == step_id => Ok(RuntimeStepResult {
+            exit_code,
+            stdout,
+            stderr,
+        }),
+        RuntimeResponse::Rejected { message } => Err(io::Error::other(message)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime step response was invalid",
+        )),
+    }
+}
+
+pub(crate) async fn signal_step(
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+    step_id: u32,
+    signal: i32,
+) -> io::Result<()> {
+    let stream = UnixStream::connect(&descriptor.socket_path).await?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+    runtime_hello(&mut reader, &mut writer, descriptor, spurd_instance_id).await?;
+    write_request(&mut writer, &RuntimeRequest::SignalStep { step_id, signal }).await?;
+    match read_response(&mut reader).await? {
+        RuntimeResponse::Acknowledged => Ok(()),
+        RuntimeResponse::Rejected { message } => Err(io::Error::other(message)),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime step signal response was invalid",
+        )),
+    }
+}
+
+async fn runtime_hello(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+) -> io::Result<()> {
+    let hello = RuntimeRequest::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        capability: descriptor.capability.clone(),
+        spurd_instance_id,
+        run_attempt: descriptor.run_attempt,
+    };
+    write_request(writer, &hello).await?;
+    match read_response(reader).await? {
+        RuntimeResponse::Hello {
+            job_id,
+            run_attempt,
+            ..
+        } if job_id == descriptor.job_id && run_attempt == descriptor.run_attempt => Ok(()),
+        RuntimeResponse::Rejected { message } => {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime hello identity mismatch",
+        )),
+    }
+}
+
 async fn write_request(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     request: &RuntimeRequest,
@@ -525,6 +807,30 @@ pub async fn serve_control(stream: UnixStream, session: &RuntimeSession) -> io::
                     message: error.to_string(),
                 },
             },
+            RuntimeRequest::LaunchStep { step } => match session.launch_step(step.clone()).await {
+                Ok(receiver) => match receiver.await {
+                    Ok(result) => RuntimeResponse::StepCompleted {
+                        step_id: step.step_id,
+                        exit_code: result.exit_code,
+                        stdout: result.stdout,
+                        stderr: result.stderr,
+                    },
+                    Err(_) => RuntimeResponse::Rejected {
+                        message: "runtime step supervisor stopped".into(),
+                    },
+                },
+                Err(error) => RuntimeResponse::Rejected {
+                    message: error.to_string(),
+                },
+            },
+            RuntimeRequest::SignalStep { step_id, signal } => {
+                match session.signal_step(step_id, signal).await {
+                    Ok(()) => RuntimeResponse::Acknowledged,
+                    Err(error) => RuntimeResponse::Rejected {
+                        message: error.to_string(),
+                    },
+                }
+            }
             RuntimeRequest::Hello { .. } => RuntimeResponse::Rejected {
                 message: "runtime hello is only valid as the first request".into(),
             },
@@ -591,7 +897,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         std::fs::remove_file(&socket_path)?;
     }
     let pid = std::process::id();
-    let descriptor = RuntimeSessionDescriptor::new(
+    let mut descriptor = RuntimeSessionDescriptor::new(
         job_id,
         run_attempt,
         pid,
@@ -599,14 +905,22 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         socket_path.clone(),
         PathBuf::new(),
     );
+    if !launch_spec.capability.is_empty() {
+        descriptor.capability = launch_spec.capability.clone();
+    }
     store.publish(&descriptor)?;
     let listener = UnixListener::bind(&socket_path)?;
     let controller_addr = launch_spec.controller_addr.clone();
     let reporting_node = launch_spec.reporting_node.clone();
-    let launch = crate::executor::launch_job(&launch_spec.into_launch_config(), None)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let session = Arc::new(RuntimeSession::new(launch.job, job_id, run_attempt));
+    let job = if launch_spec.allocation_only {
+        RunningJob::AllocationOnly
+    } else {
+        crate::executor::launch_job(&launch_spec.into_launch_config(), None)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+            .job
+    };
+    let session = Arc::new(RuntimeSession::new(job, job_id, run_attempt));
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
     result?;
@@ -1049,8 +1363,10 @@ mod tests {
     #[tokio::test]
     async fn control_loop_acknowledges_allocation_signal() {
         let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
-        let session = RuntimeSession::new(RunningJob::AllocationOnly, 42, 3);
-        let server = tokio::spawn(async move { serve_control(server_stream, &session).await });
+        let session = Arc::new(RuntimeSession::new(RunningJob::AllocationOnly, 42, 3));
+        let server_session = session.clone();
+        let server =
+            tokio::spawn(async move { serve_control(server_stream, &server_session).await });
         let (reader, mut writer) = client_stream.into_split();
         writer
             .write_all(
@@ -1077,5 +1393,76 @@ mod tests {
             RuntimeResponse::Acknowledged
         );
         server.await.expect("server task").expect("serve control");
+        assert!(!session.snapshot().await.active);
+    }
+
+    #[tokio::test]
+    async fn control_loop_runs_a_logical_step_and_returns_its_output() {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 42, 3);
+        let server = tokio::spawn(async move { serve_control(server_stream, &session).await });
+        let (reader, mut writer) = client_stream.into_split();
+        let request = RuntimeRequest::LaunchStep {
+            step: RuntimeStepLaunchSpec {
+                step_id: 7,
+                program: "sh".into(),
+                args: vec!["-c".into(), "printf runtime-step".into()],
+                work_dir: "/tmp".into(),
+                environment: std::collections::HashMap::new(),
+                uid: nix::unistd::geteuid().as_raw(),
+                gid: nix::unistd::getegid().as_raw(),
+                memlock: RuntimeMemlock::Inherit,
+            },
+        };
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&request).expect("encode launch step")
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write launch step");
+        drop(writer);
+        let mut reader = BufReader::new(reader);
+        let mut response = String::new();
+        reader
+            .read_line(&mut response)
+            .await
+            .expect("read response");
+        assert_eq!(
+            serde_json::from_str::<RuntimeResponse>(&response).expect("decode response"),
+            RuntimeResponse::StepCompleted {
+                step_id: 7,
+                exit_code: 0,
+                stdout: "runtime-step".into(),
+                stderr: String::new(),
+            }
+        );
+        server.await.expect("server task").expect("serve control");
+    }
+
+    #[tokio::test]
+    async fn cancelled_step_cannot_start_after_agent_reconnect() {
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 42, 3);
+        session
+            .signal_step(7, nix::sys::signal::Signal::SIGTERM as i32)
+            .await
+            .expect("record cancellation");
+        let error = session
+            .launch_step(RuntimeStepLaunchSpec {
+                step_id: 7,
+                program: "sh".into(),
+                args: vec!["-c".into(), "exit 1".into()],
+                work_dir: "/tmp".into(),
+                environment: HashMap::new(),
+                uid: nix::unistd::geteuid().as_raw(),
+                gid: nix::unistd::getegid().as_raw(),
+                memlock: RuntimeMemlock::Inherit,
+            })
+            .await
+            .expect_err("cancelled step must not spawn");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
 }

@@ -48,18 +48,35 @@ async fn launch_runtime_session(
     run_attempt: u32,
     controller_addr: &str,
     reporting_node: &str,
-) -> Result<executor::LaunchResult, executor::LaunchError> {
+    allocation_only: bool,
+) -> Result<
+    (
+        executor::LaunchResult,
+        crate::runtime_session::RuntimeSessionDescriptor,
+    ),
+    executor::LaunchError,
+> {
     let mut launch_spec = crate::runtime_session::RuntimeLaunchSpec::try_from(config)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
     launch_spec.controller_addr = controller_addr.into();
     launch_spec.reporting_node = reporting_node.into();
     launch_spec.run_attempt = run_attempt;
+    launch_spec.allocation_only = allocation_only;
     let state_dir =
         std::env::var("SPUR_RUNTIME_STATE_DIR").unwrap_or_else(|_| "/var/spool/spur".into());
     let store = crate::runtime_session::RuntimeSessionStore::new(&state_dir);
     let session_dir = store
         .prepare_session_dir(config.job_id, run_attempt)
         .map_err(|error| executor::LaunchError::Other(error.into()))?;
+    let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+        config.job_id,
+        run_attempt,
+        0,
+        0,
+        session_dir.join("runtime.sock"),
+        std::path::PathBuf::new(),
+    );
+    launch_spec.capability = descriptor.capability.clone();
     let launch_path = session_dir.join("launch.json");
     let launch_json = serde_json::to_vec(&launch_spec)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
@@ -84,12 +101,23 @@ async fn launch_runtime_session(
     command
         .spawn()
         .map_err(|error| executor::LaunchError::Other(error.into()))?;
-    Ok(executor::LaunchResult {
-        job: executor::RunningJob::AllocationOnly,
-        stdout_path: config.stdout_path.clone(),
-        stderr_path: config.stderr_path.clone(),
-        pty_master: None,
-    })
+    Ok((
+        executor::LaunchResult {
+            job: executor::RunningJob::AllocationOnly,
+            stdout_path: config.stdout_path.clone(),
+            stderr_path: config.stderr_path.clone(),
+            pty_master: None,
+        },
+        descriptor,
+    ))
+}
+
+async fn launch_allocation_runtime_session(
+    config: &executor::JobLaunchConfig,
+) -> Result<crate::runtime_session::RuntimeSessionDescriptor, executor::LaunchError> {
+    launch_runtime_session(config, 0, "", "", true)
+        .await
+        .map(|(_, descriptor)| descriptor)
 }
 
 #[cfg(test)]
@@ -1654,14 +1682,18 @@ impl SlurmAgent for AgentService {
                 run_attempt,
                 &self.reporter.controller_addr,
                 &self.reporter.hostname,
+                false,
             )
             .await
+            .map(|(result, descriptor)| (result, Some(descriptor)))
         } else {
-            executor::launch_job(&launch_cfg, (*self.spank).as_ref()).await
+            executor::launch_job(&launch_cfg, (*self.spank).as_ref())
+                .await
+                .map(|result| (result, None))
         };
 
         match launch_result {
-            Ok(mut result) => {
+            Ok((mut result, runtime_descriptor)) => {
                 pmix_guard.as_mut().map(PmixLaunchGuard::disarm);
                 let mut jobs = self.running.lock().await;
                 // Commit the reservation: the job now has a tracked process, so
@@ -1745,6 +1777,12 @@ impl SlurmAgent for AgentService {
                     },
                 );
                 drop(jobs);
+                if let Some(descriptor) = runtime_descriptor {
+                    self.runtime_sessions
+                        .lock()
+                        .await
+                        .insert(job_id, descriptor);
+                }
                 // Re-dispatch onto the same node reuses job_id and displaces an
                 // older run. If its process ignored SIGTERM and outlived the
                 // requeue, kill and reap it here — the monitor loop no longer
@@ -1872,6 +1910,7 @@ impl SlurmAgent for AgentService {
         } else {
             nix::sys::signal::Signal::SIGTERM as i32
         };
+        let runtime = self.runtime_sessions.lock().await.get(&req.job_id).cloned();
         let pid = {
             let mut steps = self.active_steps.lock().await;
             match steps.get_mut(&step_key) {
@@ -1879,9 +1918,20 @@ impl SlurmAgent for AgentService {
                     step.cancel_requested = true;
                     step.pid
                 }
-                None => return Ok(Response::new(())),
+                None => None,
             }
         };
+        if let Some(descriptor) = runtime {
+            crate::runtime_session::signal_step(
+                &descriptor,
+                uuid::Uuid::new_v4().to_string(),
+                req.step_id,
+                signal,
+            )
+            .await
+            .map_err(|error| Status::unavailable(format!("runtime step signal failed: {error}")))?;
+            return Ok(Response::new(()));
+        }
         if let Some(pid) = pid {
             signal_step_process_group(pid, signal);
         }
@@ -2041,6 +2091,52 @@ impl SlurmAgent for AgentService {
             "registered srun allocation"
         );
 
+        let runtime_enabled = std::env::var("SPUR_RUNTIME_SESSION")
+            .ok()
+            .is_some_and(|value| value == "1");
+        let runtime_descriptor = if runtime_enabled && controller_gpu_ids.is_empty() {
+            let config = executor::JobLaunchConfig {
+                job_id: req.job_id,
+                script: String::new(),
+                work_dir: req.work_dir.clone(),
+                name: String::new(),
+                user: req.user.clone(),
+                node: self.reporter.hostname.clone(),
+                array_job_id: None,
+                array_task_id: None,
+                environment: HashMap::new(),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                stdin_path: String::new(),
+                cpus,
+                memory_mb,
+                gpu_devices: Vec::new(),
+                cpu_ids: Vec::new(),
+                open_mode: None,
+                uid: req.uid,
+                gid: req.gid,
+                container: None,
+                prolog_script: None,
+                partition: req.partition.clone(),
+                nodelist: req.nodelist.clone(),
+                host_device_plan: None,
+                memlock: self.memlock,
+                io_mode: executor::LaunchIo::File,
+                pmix_multi_task: false,
+            };
+            match launch_allocation_runtime_session(&config).await {
+                Ok(descriptor) => Some(descriptor),
+                Err(error) => {
+                    self.allocation.lock().await.release_job(req.job_id);
+                    return Err(Status::unavailable(format!(
+                        "failed to start allocation runtime session: {error}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         jobs.insert(
             req.job_id,
             TrackedJob {
@@ -2068,6 +2164,12 @@ impl SlurmAgent for AgentService {
             },
         );
         drop(jobs);
+        if let Some(descriptor) = runtime_descriptor {
+            self.runtime_sessions
+                .lock()
+                .await
+                .insert(req.job_id, descriptor);
+        }
 
         Ok(Response::new(RegisterJobAllocationResponse {}))
     }
@@ -2350,6 +2452,40 @@ impl SlurmAgent for AgentService {
 
         if step_cancel_requested(&self.active_steps, step_key).await {
             return Ok(Response::new(cancelled_step_response()));
+        }
+
+        if let Some(descriptor) = self.runtime_sessions.lock().await.get(&job_id).cloned() {
+            let result = crate::runtime_session::launch_step(
+                &descriptor,
+                uuid::Uuid::new_v4().to_string(),
+                crate::runtime_session::RuntimeStepLaunchSpec {
+                    step_id,
+                    program,
+                    args: program_args,
+                    work_dir: work_dir.clone(),
+                    environment: env,
+                    uid: req.uid,
+                    gid: req.gid,
+                    memlock: match self.memlock {
+                        spur_core::config::MemlockLimit::Unlimited => {
+                            crate::runtime_session::RuntimeMemlock::Unlimited
+                        }
+                        spur_core::config::MemlockLimit::Inherit => {
+                            crate::runtime_session::RuntimeMemlock::Inherit
+                        }
+                        spur_core::config::MemlockLimit::Bytes(value) => {
+                            crate::runtime_session::RuntimeMemlock::Bytes(value)
+                        }
+                    },
+                },
+            )
+            .await
+            .map_err(|error| Status::unavailable(format!("runtime step launch failed: {error}")))?;
+            return Ok(Response::new(RunCommandResponse {
+                exit_code: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+            }));
         }
 
         let mut cmd = tokio::process::Command::new(&program);
