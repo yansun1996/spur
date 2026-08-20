@@ -462,11 +462,18 @@ async fn main() -> anyhow::Result<()> {
                                     message = %response.message,
                                     "controller fenced recovered runtime session"
                                 );
-                            } else {
+                            } else if response.retained {
                                 info!(
                                     job_id = descriptor.job_id,
                                     run_attempt = descriptor.run_attempt,
                                     "controller retained recovered runtime session"
+                                );
+                            } else {
+                                info!(
+                                    job_id = descriptor.job_id,
+                                    run_attempt = descriptor.run_attempt,
+                                    message = %response.message,
+                                    "controller ignored stale recovered runtime session"
                                 );
                             }
                             break;

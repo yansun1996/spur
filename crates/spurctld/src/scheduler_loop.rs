@@ -320,6 +320,11 @@ async fn process_assignment(
         }
     }
 
+    // `start_job_impl` advances the run epoch after the allocation has been
+    // registered. Give agents that impending epoch so their RuntimeSessions
+    // identify the controller-owned run rather than the pending job record.
+    let prospective_run_attempt = job.run_attempt.saturating_add(1);
+
     if spec.srun_job && srun_step_dispatch {
         match register_allocation_on_nodes(
             cluster.clone(),
@@ -328,7 +333,7 @@ async fn process_assignment(
             &spec,
             per_node_allocs.clone(),
             allocated_nodelist.clone(),
-            job.run_attempt,
+            prospective_run_attempt,
         )
         .await
         {
@@ -416,8 +421,6 @@ async fn process_assignment(
         // the only place that can advance a Pending job's run_attempt,
         // and nothing here yields back to another iteration for the
         // same job in between.
-        let prospective_run_attempt = job.run_attempt.saturating_add(1);
-
         match confirm_dispatch_on_nodes(
             cluster.clone(),
             job_id,
