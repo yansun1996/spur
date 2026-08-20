@@ -49,6 +49,7 @@ async fn launch_runtime_session(
     controller_addr: &str,
     reporting_node: &str,
     allocation_only: bool,
+    pmix_inputs: Option<(MpiConfig, PmixLaunchPlan)>,
 ) -> Result<
     (
         executor::LaunchResult,
@@ -62,6 +63,10 @@ async fn launch_runtime_session(
     launch_spec.reporting_node = reporting_node.into();
     launch_spec.run_attempt = run_attempt;
     launch_spec.allocation_only = allocation_only || config.io_mode == executor::LaunchIo::Pty;
+    if let Some((pmix_config, pmix_plan)) = pmix_inputs {
+        launch_spec.pmix_config = Some(pmix_config);
+        launch_spec.pmix_plan = Some(pmix_plan);
+    }
     let state_dir =
         std::env::var("SPUR_RUNTIME_STATE_DIR").unwrap_or_else(|_| "/var/spool/spur".into());
     let store = crate::runtime_session::RuntimeSessionStore::new(&state_dir);
@@ -462,6 +467,7 @@ pub struct AgentService {
     allocation: Arc<Mutex<NodeAllocation>>,
     spank: Arc<Option<SpankHost>>,
     mpi_host: Arc<MpiPluginHost>,
+    mpi_config: MpiConfig,
     hooks: Arc<HooksConfig>,
     memlock: spur_core::config::MemlockLimit,
     #[allow(dead_code)]
@@ -572,7 +578,8 @@ impl AgentService {
             running,
             allocation: Arc::new(Mutex::new(allocation)),
             spank: Arc::new(spank),
-            mpi_host: Arc::new(MpiPluginHost::new(mpi)),
+            mpi_host: Arc::new(MpiPluginHost::new(mpi.clone())),
+            mpi_config: mpi,
             hooks: Arc::new(hooks),
             memlock,
             device_registry,
@@ -1756,6 +1763,9 @@ impl SlurmAgent for AgentService {
                 &self.reporter.controller_addr,
                 &self.reporter.hostname,
                 false,
+                pmix_plan
+                    .clone()
+                    .map(|plan| (self.mpi_config.clone(), plan)),
             )
             .await
             .map(|(result, descriptor)| (result, Some(descriptor)))
@@ -2226,6 +2236,7 @@ impl SlurmAgent for AgentService {
                 &self.reporter.controller_addr,
                 &self.reporter.hostname,
                 true,
+                None,
             )
             .await
             .map(|(_, descriptor)| descriptor)
