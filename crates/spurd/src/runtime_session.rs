@@ -2356,6 +2356,53 @@ mod tests {
     }
 
     #[test]
+    fn legacy_launch_spec_deserializes_runtime_defaults() {
+        let mut serialized = serde_json::to_value(launch_spec()).expect("encode launch spec");
+        let fields = serialized
+            .as_object_mut()
+            .expect("launch spec must encode as an object");
+        for field in [
+            "gpu_devices",
+            "container",
+            "host_device_plan",
+            "container_rootfs_mode",
+            "hooks",
+            "plugstack_path",
+            "controller_addr",
+            "reporting_node",
+            "run_attempt",
+            "capability",
+            "allocation_only",
+            "pmix_config",
+            "pmix_plan",
+            "pmix_multi_task",
+        ] {
+            fields.remove(field);
+        }
+
+        let restored: RuntimeLaunchSpec =
+            serde_json::from_value(serialized).expect("decode legacy launch spec");
+        assert!(restored.gpu_devices.is_empty());
+        assert!(restored.container.is_none());
+        assert!(restored.host_device_plan.is_none());
+        assert!(restored.container_rootfs_mode.is_none());
+        assert_eq!(
+            serde_json::to_value(&restored.hooks).expect("encode default hooks"),
+            serde_json::to_value(spur_core::config::HooksConfig::default())
+                .expect("encode expected hooks")
+        );
+        assert!(restored.plugstack_path.is_empty());
+        assert!(restored.controller_addr.is_empty());
+        assert!(restored.reporting_node.is_empty());
+        assert_eq!(restored.run_attempt, 0);
+        assert!(restored.capability.is_empty());
+        assert!(!restored.allocation_only);
+        assert!(restored.pmix_config.is_none());
+        assert!(restored.pmix_plan.is_none());
+        assert!(!restored.pmix_multi_task);
+    }
+
+    #[test]
     fn pmix_runtime_rejects_incomplete_persisted_inputs() {
         let mut spec = launch_spec();
         spec.pmix_config = Some(spur_core::config::MpiConfig::default());
@@ -2367,7 +2414,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_step_request_deserializes_without_runtime_pmix_inputs() {
+    fn legacy_step_request_deserializes_without_runtime_session_extensions() {
         let request = RuntimeRequest::LaunchStep {
             step: Box::new(RuntimeStepLaunchSpec {
                 step_id: 7,
@@ -2388,12 +2435,38 @@ mod tests {
             .and_then(serde_json::Value::as_object_mut)
             .expect("step object")
             .remove("pmix");
+        request
+            .get_mut("step")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("step object")
+            .remove("task_epilog");
         let RuntimeRequest::LaunchStep { step } =
             serde_json::from_value::<RuntimeRequest>(request).expect("decode legacy request")
         else {
             panic!("expected runtime step request");
         };
         assert!(step.pmix.is_none());
+        assert!(step.task_epilog.is_none());
+    }
+
+    #[test]
+    fn legacy_descriptor_deserializes_runtime_defaults() {
+        let descriptor = descriptor(42, 3, std::process::id());
+        let mut serialized = serde_json::to_value(descriptor).expect("encode descriptor");
+        let fields = serialized
+            .as_object_mut()
+            .expect("descriptor must encode as an object");
+        for field in ["capability", "owner", "uid", "gid", "work_dir"] {
+            fields.remove(field);
+        }
+
+        let restored: RuntimeSessionDescriptor =
+            serde_json::from_value(serialized).expect("decode legacy descriptor");
+        assert!(restored.capability.is_empty());
+        assert!(restored.owner.is_empty());
+        assert_eq!(restored.uid, 0);
+        assert_eq!(restored.gid, 0);
+        assert!(restored.work_dir.is_empty());
     }
 
     #[test]
