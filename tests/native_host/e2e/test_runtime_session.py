@@ -46,6 +46,23 @@ def _wait_agents_registered(cluster, timeout=60):
 
 
 class TestRuntimeSessionRecovery:
+    def test_container_job_completes(self, runtime_cluster, tmp_path):
+        cluster = runtime_cluster
+        cluster.container_preflight()
+        image = cluster.build_container_image(tmp_path)
+        script = cluster.write_file(
+            "runtime-container.sh", "#!/bin/bash\necho RUNTIME_CONTAINER_OK\n", all_nodes=True
+        )
+        job_id = parse_job_id(
+            cluster.sbatch([
+                "-J", "runtime-container", "-N", "1", "-n", "1",
+                f"--container-image={image}", script,
+            ])
+        )
+        assert job_id is not None, "container submission failed"
+        state = wait_job(cluster, job_id, timeout=90)
+        assert state in ("CD", "GONE"), f"runtime container job ended as {state}\n{cluster.debug_job(job_id)}"
+
     def test_cancel_releases_runtime_allocation(self, runtime_cluster):
         cluster = runtime_cluster
         nodes = len(cluster.nodes)
