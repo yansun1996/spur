@@ -102,9 +102,16 @@ async fn launch_runtime_session(
         .arg(config.job_id.to_string())
         .arg(run_attempt.to_string())
         .arg(launch_path);
-    command
-        .spawn()
+    let output = command
+        .output()
+        .await
         .map_err(|error| executor::LaunchError::Other(error.into()))?;
+    if !output.status.success() {
+        return Err(executor::LaunchError::Other(anyhow::anyhow!(
+            "systemd-run failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
     wait_for_runtime_session(&descriptor)
         .await
         .map_err(|error| executor::LaunchError::Other(error.into()))?;
