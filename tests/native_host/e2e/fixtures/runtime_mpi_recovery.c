@@ -20,13 +20,11 @@ int main(int argc, char **argv)
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
-    MPI_Barrier(MPI_COMM_WORLD);
     printf("before-restart rank=%d size=%d\n", rank, size);
     fflush(stdout);
     while (stat(argv[1], &status) != 0) {
         sleep(1);
     }
-    MPI_Barrier(MPI_COMM_WORLD);
     printf("after-restart rank=%d size=%d\n", rank, size);
     fflush(stdout);
     MPI_Finalize();
