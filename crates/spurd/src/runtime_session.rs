@@ -589,6 +589,19 @@ impl RuntimeSessionDescriptor {
     }
 }
 
+pub(crate) fn append_obligation(
+    descriptor: &RuntimeSessionDescriptor,
+    obligation: &RuntimeObligation,
+) -> io::Result<()> {
+    let session_dir = descriptor.socket_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "runtime socket path has no session directory",
+        )
+    })?;
+    RuntimeObligationLog::new(session_dir.join(OBLIGATION_FILE)).append(obligation)
+}
+
 pub fn validate_hello(
     descriptor: &RuntimeSessionDescriptor,
     capability: &str,

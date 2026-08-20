@@ -3002,6 +3002,14 @@ impl AgentService {
     async fn drop_tracked_job(&self, job_id: u32) {
         if self.running.lock().await.remove(&job_id).is_some() {
             self.allocation.lock().await.release_job(job_id);
+            if let Some(descriptor) = self.runtime_sessions.lock().await.remove(&job_id) {
+                if let Err(error) = crate::runtime_session::append_obligation(
+                    &descriptor,
+                    &crate::runtime_session::RuntimeObligation::ResourcesReleased,
+                ) {
+                    warn!(job_id, %error, "failed to record runtime resource release");
+                }
+            }
             if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
                 warn!(job_id, error = %e, "PMIx stop failed on job drop");
             }
