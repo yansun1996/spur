@@ -5,7 +5,7 @@
 
 import time
 
-from cluster import job_state, parse_job_id, wait_job, wait_job_state
+from cluster import job_state, parse_job_id, wait_job_state
 
 
 def _wait_descriptors(cluster, job_id, expected, timeout=30):
@@ -35,41 +35,49 @@ def _wait_pending(cluster, job_id, timeout=60):
     raise TimeoutError(f"job {job_id} did not requeue (last state: {last})")
 
 
+def _wait_agents_registered(cluster, timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        states = cluster.sinfo_nodes()
+        if all(name in states for name in cluster.node_names):
+            return
+        time.sleep(1)
+    raise TimeoutError("restarted agents did not register with the controller")
+
+
 class TestRuntimeSessionRecovery:
     def test_batch_survives_agent_restart(self, runtime_cluster):
         cluster = runtime_cluster
         nodes = len(cluster.nodes)
-        out_path = f"{cluster.remote_dir}/runtime-restart.out"
         script = cluster.write_file(
             "runtime-restart.sh",
-            "#!/bin/bash\n"
-            f"srun -N{nodes} -n{nodes} bash -c 'echo STEP_BEFORE_RESTART $(hostname); "
-            "sleep 12; echo STEP_AFTER_RESTART $(hostname)'\n"
-            "echo BATCH_AFTER_RESTART $(hostname)\n",
+            "#!/bin/bash\nsleep 120\n",
             all_nodes=True,
         )
         job_id = parse_job_id(
-            cluster.sbatch([
-                "-J", "runtime-restart", "-N", str(nodes), "-n", str(nodes), "-o", out_path, script,
-            ])
+            cluster.sbatch(["-J", "runtime-restart", "-N", str(nodes), "-n", str(nodes), script])
         )
         assert job_id is not None, "batch submission failed"
+        try:
+            wait_job_state(cluster, job_id, "R", timeout=60)
+            _wait_descriptors(cluster, job_id, expected=nodes)
+            cluster.stop_agents()
+            cluster.start_agents()
+            _wait_agents_registered(cluster)
 
-        wait_job_state(cluster, job_id, "R", timeout=60)
-        _wait_descriptors(cluster, job_id, expected=nodes)
-        cluster.stop_agents()
-        cluster.start_agents()
-        cluster.wait_ready(timeout=90)
-
-        state = wait_job(cluster, job_id, timeout=90)
-        output = cluster.read_output_all_nodes(out_path)
-        assert state in ("CD", "GONE"), f"job did not survive agent restart: {state}\n{cluster.debug_job(job_id)}"
-        assert output.count("STEP_AFTER_RESTART") == nodes, (
-            f"all logical-step tasks must survive restart:\n{output}"
-        )
-        assert output.count("BATCH_AFTER_RESTART") == nodes, (
-            f"the batch owner must complete after its logical step:\n{output}"
-        )
+            code, output = cluster.srun_in_allocation(
+                job_id,
+                ["-N", str(nodes), "-n", str(nodes), "bash", "-c", "echo STEP_AFTER_RESTART $(hostname)"],
+            )
+            assert code == 0, f"recovered logical step failed:\n{output}\n{cluster.debug_job(job_id)}"
+            assert output.count("STEP_AFTER_RESTART") == nodes, (
+                f"all logical-step tasks must run after agent restart:\n{output}"
+            )
+            assert job_state(cluster.squeue_all(), job_id) == "R", (
+                f"allocation was not retained after agent restart:\n{cluster.debug_job(job_id)}"
+            )
+        finally:
+            cluster.scancel(str(job_id))
 
     def test_missing_runtime_session_requeues_whole_allocation(self, runtime_cluster):
         cluster = runtime_cluster
@@ -85,6 +93,10 @@ class TestRuntimeSessionRecovery:
             wait_job_state(cluster, job_id, "R", timeout=60)
             descriptors = _wait_descriptors(cluster, job_id, expected=nodes)
             cluster.stop_runtime_session(*descriptors[0])
+            code, _ = cluster.srun_in_allocation(
+                job_id, ["-N", str(nodes), "-n", str(nodes), "/bin/true"]
+            )
+            assert code != 0, "step unexpectedly succeeded after its runtime session was stopped"
             _wait_pending(cluster, job_id)
         finally:
             cluster.scancel(str(job_id))

@@ -1985,11 +1985,8 @@ impl SlurmController for ControllerService {
                 expected_nodes,
                 missing,
             } => {
-                let fenced = self
-                    .fence_runtime_recovery(request.job_id, request.run_attempt)
-                    .await?;
                 let message = format!(
-                    "incomplete runtime recovery: missing {} of {} participants ({})",
+                    "runtime recovery cohort is not yet available: missing {} of {} participants ({})",
                     missing.len(),
                     expected_nodes.len(),
                     missing.join(",")
@@ -1999,12 +1996,11 @@ impl SlurmController for ControllerService {
                     run_attempt = request.run_attempt,
                     reporter = %request.hostname,
                     missing = ?missing,
-                    fenced,
-                    "runtime recovery probe did not confirm every allocated participant"
+                    "deferring incomplete runtime recovery probe until the cohort is available"
                 );
                 Ok(Response::new(RuntimeSessionRecoveryResponse {
-                    retained: false,
-                    fenced,
+                    retained: true,
+                    fenced: false,
                     message,
                 }))
             }
@@ -5841,17 +5837,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn runtime_recovery_report_fences_an_unconfirmed_participant() {
+    async fn runtime_recovery_report_defers_an_unconfirmed_participant() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service(&dir).await;
         let job_id = running_job_owned_by(&svc, "alice").await;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind recovery probe listener");
-        let port = listener
-            .local_addr()
-            .expect("probe listener address")
-            .port();
         svc.cluster
             .register_node(
                 "n1".into(),
@@ -5862,17 +5851,13 @@ mod tests {
                     ..Default::default()
                 },
                 "127.0.0.1".into(),
-                port,
+                1,
                 String::new(),
                 String::new(),
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
             )
             .expect("update recovery probe address");
-        let probe_server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept recovery probe");
-            drop(stream);
-        });
         let run_attempt = svc
             .cluster
             .get_job(job_id)
@@ -5889,13 +5874,11 @@ mod tests {
             .await
             .expect("partial recovery report")
             .into_inner();
-        assert!(!response.retained);
-        assert!(response.fenced);
+        assert!(response.retained);
+        assert!(!response.fenced);
         assert!(response.message.contains("missing 1 of 1 participants"));
-        let job = svc.cluster.get_job(job_id).expect("requeued job");
-        assert_eq!(job.state, JobState::Pending);
-        assert!(job.allocated_nodes.is_empty());
-        probe_server.await.expect("recovery probe task");
+        let job = svc.cluster.get_job(job_id).expect("running job");
+        assert_eq!(job.state, JobState::Running);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

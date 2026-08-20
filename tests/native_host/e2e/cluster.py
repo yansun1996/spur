@@ -257,6 +257,7 @@ class SpurCluster:
         self.agent_labels = agent_labels or {}
         self.agent_env = agent_env or {}
         if kill_stale:
+            self._stop_runtime_sessions()
             self._kill_controller()
             self._kill_agents(use_sudo=False, broad=True)
             self._kill_agents(use_sudo=True, broad=True)  # best-effort for rootful
@@ -638,11 +639,13 @@ class SpurCluster:
         runtime_root = f"{self.remote_dir}/runtime"
         for index, node in enumerate(self.nodes):
             paths = node.exec_allow_fail(
-                f"find '{runtime_root}' -mindepth 2 -maxdepth 2 "
+                f"{self._sudo_prefix()}find '{runtime_root}' -mindepth 2 -maxdepth 2 "
                 "-name descriptor.json -type f 2>/dev/null"
             ).splitlines()
             for path in paths:
-                raw = node.read_file(path)
+                raw = node.exec_allow_fail(
+                    f"{self._sudo_prefix()}cat '{path}' 2>/dev/null"
+                )
                 try:
                     descriptor = json.loads(raw)
                 except json.JSONDecodeError:
@@ -1117,8 +1120,15 @@ mksquashfs "$R" '{local_img}' -noappend -quiet >/dev/null 2>&1
     def _stop_runtime_sessions(self):
         if self.agent_env.get("SPUR_RUNTIME_SESSION") != "1":
             return
-        for node_index, descriptor in self.runtime_session_descriptors_for_all_jobs():
-            self.stop_runtime_session(node_index, descriptor)
+        for node in self.nodes:
+            units = node.exec_allow_fail(
+                f"{self._sudo_prefix()}systemctl list-units --all --type=service "
+                "--no-legend 'spur-runtime-*.service' 2>/dev/null | awk '{print $1}'"
+            ).splitlines()
+            for unit in units:
+                node.exec_allow_fail(
+                    f"{self._sudo_prefix()}systemctl stop '{unit}' 2>/dev/null"
+                )
 
     def _spurd_start_cmd(self, node_index: int) -> str:
         node = self.nodes[node_index]

@@ -201,14 +201,13 @@ def multi_node_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
 def runtime_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """RuntimeSession-gated cluster for restart and fencing E2E coverage."""
     spur_cluster = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
-    runtime_state_dir = f"{spur_cluster.remote_dir}/runtime"
     try:
         spur_cluster.deploy(
             config_overrides=cluster_config_overrides,
             agent_as_root=True,
             agent_env={
                 "SPUR_RUNTIME_SESSION": "1",
-                "SPUR_RUNTIME_STATE_DIR": runtime_state_dir,
+                "SPUR_RUNTIME_STATE_DIR": spur_cluster.remote_dir,
             },
         )
     except Exception:
