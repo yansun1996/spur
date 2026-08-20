@@ -1277,7 +1277,19 @@ async fn run_interactive_pty(
         .await
         {
             Ok(handle) => {
-                return crate::interactive::drive_interactive_session(handle).await;
+                return crate::interactive::drive_interactive_session(
+                    &mut agent,
+                    handle,
+                    crate::interactive::InteractiveSessionSpec {
+                        job_id,
+                        step_id,
+                        argv: command.clone(),
+                        winsize,
+                        overlap: true,
+                        user: user.to_string(),
+                    },
+                )
+                .await;
             }
             Err(status) if is_retryable_status(&status) && attempt < 4 => {
                 last_err = Some(anyhow::anyhow!("InteractiveSession: {}", status.message()));

@@ -103,6 +103,17 @@ pub fn get_terminal_size() -> spur_proto::proto::WindowSize {
 pub struct InteractiveSessionHandle {
     pub in_tx: tokio::sync::mpsc::Sender<InteractiveInput>,
     pub out_stream: tonic::Streaming<spur_proto::proto::InteractiveOutput>,
+    runtime_session: bool,
+}
+
+#[derive(Clone)]
+pub struct InteractiveSessionSpec {
+    pub job_id: u32,
+    pub step_id: u32,
+    pub argv: Vec<String>,
+    pub winsize: spur_proto::proto::WindowSize,
+    pub overlap: bool,
+    pub user: String,
 }
 
 /// Open the InteractiveSession RPC, returning the raw handle.
@@ -135,19 +146,29 @@ pub async fn open_interactive_session(
 
     let in_stream = tokio_stream::wrappers::ReceiverStream::new(in_rx);
     let response = agent.interactive_session(in_stream).await?;
+    let runtime_session = response
+        .metadata()
+        .get("spur-runtime-session")
+        .is_some_and(|value| value == "1");
 
     Ok(InteractiveSessionHandle {
         in_tx,
         out_stream: response.into_inner(),
+        runtime_session,
     })
 }
 
 /// Drive the I/O loop for an already-opened interactive session.
 /// Returns the remote exit code.
-pub async fn drive_interactive_session(handle: InteractiveSessionHandle) -> Result<i32> {
+pub async fn drive_interactive_session(
+    agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
+    handle: InteractiveSessionHandle,
+    spec: InteractiveSessionSpec,
+) -> Result<i32> {
     let InteractiveSessionHandle {
         in_tx,
         mut out_stream,
+        mut runtime_session,
     } = handle;
 
     let prev_hook = std::panic::take_hook();
@@ -172,6 +193,50 @@ pub async fn drive_interactive_session(handle: InteractiveSessionHandle) -> Resu
     let mut stdin_open = true;
     let mut in_tx = Some(in_tx);
 
+    async fn reconnect_runtime_session(
+        agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
+        job_id: u32,
+        step_id: u32,
+        argv: &[String],
+        winsize: &spur_proto::proto::WindowSize,
+        overlap: bool,
+        user: &str,
+    ) -> Result<InteractiveSessionHandle> {
+        let mut last_error = None;
+        for _ in 0..20 {
+            match open_interactive_session(
+                agent,
+                job_id,
+                step_id,
+                argv.to_vec(),
+                *winsize,
+                overlap,
+                user,
+            )
+            .await
+            {
+                Ok(handle) => return Ok(handle),
+                Err(status)
+                    if matches!(
+                        status.code(),
+                        tonic::Code::Unavailable
+                            | tonic::Code::Unknown
+                            | tonic::Code::Cancelled
+                            | tonic::Code::DeadlineExceeded
+                    ) =>
+                {
+                    last_error = Some(status);
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Err(status) => return Err(anyhow::anyhow!(status.message().to_string())),
+            }
+        }
+        let message = last_error
+            .map(|status| status.message().to_string())
+            .unwrap_or_else(|| "runtime session reconnect failed".into());
+        Err(anyhow::anyhow!(message))
+    }
+
     let exit_code: i32 = loop {
         tokio::select! {
             msg = out_stream.message() => {
@@ -186,6 +251,27 @@ pub async fn drive_interactive_session(handle: InteractiveSessionHandle) -> Resu
                                 break code;
                             }
                             None => {}
+                        }
+                    }
+                    Ok(None) | Err(_) if runtime_session => {
+                        match reconnect_runtime_session(
+                            agent,
+                            spec.job_id,
+                            spec.step_id,
+                            &spec.argv,
+                            &spec.winsize,
+                            spec.overlap,
+                            &spec.user,
+                        ).await {
+                            Ok(handle) => {
+                                in_tx = Some(handle.in_tx);
+                                out_stream = handle.out_stream;
+                                runtime_session = handle.runtime_session;
+                            }
+                            Err(error) => {
+                                eprintln!("\r\nruntime session reconnect failed: {error}");
+                                break 1;
+                            }
                         }
                     }
                     Ok(None) => break 1,
@@ -246,10 +332,30 @@ pub async fn run_interactive_session(
     overlap: bool,
 ) -> Result<i32> {
     let user = current_user()?;
-    let handle = open_interactive_session(agent, job_id, step_id, argv, winsize, overlap, &user)
-        .await
-        .map_err(|status| anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message()))?;
-    drive_interactive_session(handle).await
+    let handle = open_interactive_session(
+        agent,
+        job_id,
+        step_id,
+        argv.clone(),
+        winsize,
+        overlap,
+        &user,
+    )
+    .await
+    .map_err(|status| anyhow::anyhow!("InteractiveSession RPC failed: {}", status.message()))?;
+    drive_interactive_session(
+        agent,
+        handle,
+        InteractiveSessionSpec {
+            job_id,
+            step_id,
+            argv,
+            winsize,
+            overlap,
+            user,
+        },
+    )
+    .await
 }
 
 /// RAII guard that puts the terminal into raw mode and restores it on drop.

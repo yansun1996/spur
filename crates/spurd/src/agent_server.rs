@@ -2812,7 +2812,12 @@ impl SlurmAgent for AgentService {
             .map_err(|error| Status::unavailable(format!("runtime PTY launch failed: {error}")))?;
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
             tokio::spawn(Self::run_runtime_pty_bridge(descriptor, inbound, tx));
-            return Ok(Response::new(ReceiverStream::new(rx)));
+            let mut response = Response::new(ReceiverStream::new(rx));
+            response.metadata_mut().insert(
+                "spur-runtime-session",
+                tonic::metadata::MetadataValue::from_static("1"),
+            );
+            return Ok(response);
         }
 
         let (master_fd, child, child_pid) =
