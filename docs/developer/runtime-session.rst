@@ -12,10 +12,10 @@ Authority
 ``spurctld`` and Raft remain the authority for jobs, placement, global resource
 ownership, and the current allocation generation. ``spurd`` authenticates and
 coordinates node-local requests. In the current rollout cohort, a
-RuntimeSession owns live execution state for plain allocations: process trees,
-cgroups, logical steps, PTYs and I/O, signals, and observed exit status.
-PMIx namespace lifetime, containers/device injection, and hook lifecycle
-remain agent-owned until their recovery contracts are implemented.
+RuntimeSession owns live execution state: process trees, cgroups, logical
+steps, PTYs and I/O, signals, observed exit status, PMIx namespace lifetime,
+container and device-injection launch state, and compute-node epilogs/SPANK
+exit hooks.
 
 RuntimeSession must never choose placement or accept stale execution state as
 truth. Every reconnect and report is fenced by the controller's current job
@@ -86,11 +86,10 @@ Current development gate
 ------------------------
 
 Set ``SPUR_RUNTIME_SESSION=1`` in the ``spurd`` service environment to route
-the initial plain-batch cohort and interactive allocation attachments through
-RuntimeSession. The runtime owns interactive child PTYs, terminal input,
-resizes, foreground signals, and replayable output; an agent restart no longer
-sends a hangup to an attached terminal. An interactive ``srun`` first creates a
-runtime-owned allocation, then launches its terminal as a runtime child.
-Container, GPU, and PMIx workloads remain rejected until their full execution
-contracts are implemented. ``SPUR_RUNTIME_STATE_DIR`` overrides the default
-``/var/spool/spur`` local runtime directory for isolated testing.
+batch, container, GPU, PMIx, step, and interactive allocation attachments
+through RuntimeSession. The runtime owns interactive child PTYs, terminal
+input, resizes, foreground signals, and replayable output; an agent restart no
+longer sends a hangup to an attached terminal. An interactive ``srun`` first
+creates a runtime-owned allocation, then launches its terminal as a runtime
+child. ``SPUR_RUNTIME_STATE_DIR`` overrides the default ``/var/spool/spur``
+local runtime directory for isolated testing.

@@ -447,50 +447,48 @@ async fn main() -> anyhow::Result<()> {
 
     if !recovered_runtime_sessions.is_empty() {
         let recovery_reporter = reporter.clone();
-        tokio::spawn(async move {
-            for descriptor in recovered_runtime_sessions {
-                loop {
-                    match recovery_reporter
-                        .report_runtime_session_recovery(descriptor.job_id, descriptor.run_attempt)
-                        .await
-                    {
-                        Ok(response) => {
-                            if response.fenced {
-                                warn!(
-                                    job_id = descriptor.job_id,
-                                    run_attempt = descriptor.run_attempt,
-                                    message = %response.message,
-                                    "controller fenced recovered runtime session"
-                                );
-                            } else if response.retained {
-                                info!(
-                                    job_id = descriptor.job_id,
-                                    run_attempt = descriptor.run_attempt,
-                                    "controller retained recovered runtime session"
-                                );
-                            } else {
-                                info!(
-                                    job_id = descriptor.job_id,
-                                    run_attempt = descriptor.run_attempt,
-                                    message = %response.message,
-                                    "controller ignored stale recovered runtime session"
-                                );
-                            }
-                            break;
-                        }
-                        Err(error) => {
+        for descriptor in recovered_runtime_sessions {
+            loop {
+                match recovery_reporter
+                    .report_runtime_session_recovery(descriptor.job_id, descriptor.run_attempt)
+                    .await
+                {
+                    Ok(response) => {
+                        if response.fenced {
                             warn!(
                                 job_id = descriptor.job_id,
                                 run_attempt = descriptor.run_attempt,
-                                %error,
-                                "runtime recovery report failed; retrying"
+                                message = %response.message,
+                                "controller fenced recovered runtime session"
                             );
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        } else if response.retained {
+                            info!(
+                                job_id = descriptor.job_id,
+                                run_attempt = descriptor.run_attempt,
+                                "controller retained recovered runtime session"
+                            );
+                        } else {
+                            info!(
+                                job_id = descriptor.job_id,
+                                run_attempt = descriptor.run_attempt,
+                                message = %response.message,
+                                "controller ignored stale recovered runtime session"
+                            );
                         }
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(
+                            job_id = descriptor.job_id,
+                            run_attempt = descriptor.run_attempt,
+                            %error,
+                            "runtime recovery report failed; retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
                 }
             }
-        });
+        }
     }
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
