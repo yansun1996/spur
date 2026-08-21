@@ -262,7 +262,7 @@ fn should_reregister(status: &tonic::Status) -> bool {
 fn require_runtime_node_token(runtime_session: bool, node_token: &str) -> anyhow::Result<()> {
     if runtime_session && node_token.is_empty() {
         anyhow::bail!(
-            "RuntimeSession requires [auth] jwt_key so this agent can prove its node identity"
+            "RuntimeSession requires [auth] jwt_key or jwt_key_file so this agent can prove its node identity"
         );
     }
     Ok(())

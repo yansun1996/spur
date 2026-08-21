@@ -410,6 +410,7 @@ fn write_runtime_step_script(
 }
 
 const PTY_OUTPUT_LIMIT: usize = 1024 * 1024;
+const RUNTIME_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 struct RuntimePtyBuffer {
     start_offset: u64,
@@ -1249,6 +1250,14 @@ pub async fn accept_hello(
     expected_capability: &str,
 ) -> io::Result<(UnixStream, String)> {
     let (stream, _) = listener.accept().await?;
+    accept_hello_stream(stream, descriptor, expected_capability).await
+}
+
+async fn accept_hello_stream(
+    stream: UnixStream,
+    descriptor: &RuntimeSessionDescriptor,
+    expected_capability: &str,
+) -> io::Result<(UnixStream, String)> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line).await?;
@@ -1753,21 +1762,44 @@ pub async fn run_supervisor(
                     return Ok(());
                 }
             }
-            accepted = accept_hello(&listener, &descriptor, &descriptor.capability) => {
+            accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _)) => {
                         let session = session.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = serve_control(stream, &session).await {
-                                tracing::warn!(%error, "runtime session control connection failed");
-                            }
-                        });
+                        let descriptor = descriptor.clone();
+                        tokio::spawn(serve_supervisor_connection(stream, descriptor, session));
                     }
                     Err(error) => {
                         tracing::warn!(%error, "runtime session connection handshake failed");
                     }
                 }
             }
+        }
+    }
+}
+
+async fn serve_supervisor_connection(
+    stream: UnixStream,
+    descriptor: RuntimeSessionDescriptor,
+    session: Arc<RuntimeSession>,
+) {
+    let capability = descriptor.capability.clone();
+    match tokio::time::timeout(
+        RUNTIME_HANDSHAKE_TIMEOUT,
+        accept_hello_stream(stream, &descriptor, &capability),
+    )
+    .await
+    {
+        Ok(Ok((stream, _))) => {
+            if let Err(error) = serve_control(stream, &session).await {
+                tracing::warn!(%error, "runtime session control connection failed");
+            }
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "runtime session connection handshake failed");
+        }
+        Err(_) => {
+            tracing::warn!("runtime session connection handshake timed out");
         }
     }
 }
@@ -3077,6 +3109,48 @@ mod tests {
             server.await.expect("server task").expect("accepted"),
             "agent-1"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incomplete_hello_does_not_block_a_later_control_connection() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("runtime.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind socket");
+        let mut descriptor = descriptor(42, 3, std::process::id());
+        descriptor.socket_path = socket_path;
+        let session = Arc::new(RuntimeSession::new(RunningJob::AllocationOnly, 42, 3));
+        let supervisor = tokio::spawn(run_supervisor(listener, descriptor.clone(), session));
+
+        let _partial = UnixStream::connect(&descriptor.socket_path)
+            .await
+            .expect("connect incomplete client");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        let query_descriptor = descriptor.clone();
+        let query =
+            tokio::spawn(async move { query_state(&query_descriptor, "agent-1".into()).await });
+        for _ in 0..64 {
+            if query.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            query.is_finished(),
+            "a partial hello must not prevent later control connections"
+        );
+        assert!(
+            query
+                .await
+                .expect("query task")
+                .expect("query state")
+                .active
+        );
+
+        supervisor.abort();
+        let _ = supervisor.await;
     }
 
     #[tokio::test]

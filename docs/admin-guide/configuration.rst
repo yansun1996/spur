@@ -482,10 +482,15 @@ Authentication plugin for client requests.
      - string
      - none
      - Restart
-     - Signing key for credentials and node admission tokens. An existing regular
-       file path is read at daemon startup; a value that does not name a file is
-       used as an inline secret. Deliberately not reloadable: swapping it live
-       would immediately invalidate every outstanding node token.
+     - Literal signing key for credentials and node admission tokens. Deliberately
+       not reloadable: swapping it live would immediately invalidate every
+       outstanding node token.
+   * - ``jwt_key_file``
+     - string
+     - none
+     - Restart
+     - Path to a regular file containing the signing key. Mutually exclusive with
+       ``jwt_key``. A trailing line ending is ignored.
    * - ``allow_root_jobs``
      - bool
      - ``false``
@@ -507,8 +512,8 @@ Authentication plugin for client requests.
    requires an explicit key even when admission is ``"open"``: a public fallback
    key cannot prove that a recovery report came from its named node. Set the same
    secret on every controller and agent before enabling RuntimeSession. Store a
-   production secret in a root-readable regular file; a trailing newline in that
-   file is ignored.
+   production secret with ``jwt_key_file`` pointing to a root-readable regular
+   file; a trailing newline in that file is ignored.
 
 ``[[partitions]]``
 ------------------

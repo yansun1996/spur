@@ -987,12 +987,12 @@ identity:
 
    [auth]
    plugin = "jwt"
-   jwt_key = "/etc/spur/jwt.key"
+   jwt_key_file = "/etc/spur/jwt.key"
 
-``jwt_key`` is the signing secret. An existing regular-file value is read at
-startup (with one trailing line ending ignored); a value that does not name a
-file is treated as an inline secret for compatibility. Keep production key files
-readable only by the daemon account. Only ``none`` and ``jwt`` are supported.
+``jwt_key`` is a literal signing secret. To read the secret from a regular file,
+set ``jwt_key_file`` instead; the two settings are mutually exclusive. A trailing
+line ending in a key file is ignored. Keep production key files readable only by
+the daemon account. Only ``none`` and ``jwt`` are supported.
 
 Admission tokens for node join
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

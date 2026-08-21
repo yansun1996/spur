@@ -41,7 +41,7 @@ pub enum TokenCommand {
     /// Mint a USER credential for authenticating RPCs (distinct from the admission tokens above,
     /// which admit a node to the cluster).
     ///
-    /// Signed locally from `[auth] jwt_key` in the config, so it needs read access to that file —
+    /// Signed locally from `[auth] jwt_key` or `jwt_key_file` in the config, so it needs read access to that file —
     /// run it on the controller host. Local signing is deliberate: under `[auth] mode = required`
     /// an RPC-based mint would need a credential to obtain a credential.
     ///
@@ -56,7 +56,7 @@ pub enum TokenCommand {
         /// Token time-to-live (e.g. "24h", "7d", "3600s"). Default 24h.
         #[arg(long)]
         ttl: Option<String>,
-        /// Config file to read `[auth] jwt_key` from.
+        /// Config file to read `[auth] jwt_key` or `jwt_key_file` from.
         #[arg(long, default_value = "/etc/spur/spur.conf")]
         config: String,
     },
@@ -93,11 +93,11 @@ fn cmd_user_token(user: &str, admin: bool, ttl: Option<String>, config_path: &st
     let key = cfg
         .auth
         .resolved_jwt_key()
-        .map_err(|e| anyhow::anyhow!("resolve auth.jwt_key from {config_path}: {e}"))?
+        .map_err(|e| anyhow::anyhow!("resolve auth JWT key from {config_path}: {e}"))?
         .unwrap_or_default();
     if key.is_empty() {
         anyhow::bail!(
-            "[auth] jwt_key is not set in {config_path}; a signing key is required to mint user \
+            "[auth] jwt_key or jwt_key_file is not set in {config_path}; a signing key is required to mint user \
              credentials (the same key is used for node admission)"
         );
     }

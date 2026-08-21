@@ -441,7 +441,7 @@ async fn main() -> anyhow::Result<()> {
     match auth_mode {
         spur_core::config::AuthMode::Required if jwt_key.is_empty() => {
             anyhow::bail!(
-                "[auth] mode = \"required\" but no jwt_key is configured on this node: the agent \
+                "[auth] mode = \"required\" but no jwt_key or jwt_key_file is configured on this node: the agent \
                  could never verify a credential and would refuse every launch"
             )
         }
