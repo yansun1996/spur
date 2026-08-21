@@ -180,9 +180,17 @@ async fn stop_runtime_session_unit(job_id: u32, run_attempt: u32) -> std::io::Re
     if output.status.success() {
         return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Units are started with `--collect`, so a process that already exited
+    // (the common case when stopping a session the controller has already
+    // fenced or marked stale) is no longer loaded by the time this runs.
+    // That is a successful "already gone" outcome, not a failed stop.
+    if stderr.contains("not loaded") {
+        return Ok(());
+    }
     Err(std::io::Error::other(format!(
         "systemctl stop {unit} failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        stderr.trim()
     )))
 }
 
@@ -196,14 +204,25 @@ async fn fence_displaced_runtime_session(
         return Ok(());
     };
     let displaced_attempt = displaced_runtime_attempt(&displaced, run_attempt)?;
-    stop_runtime_session_unit(displaced.job_id, displaced_attempt).await
+    stop_runtime_session_unit(displaced.job_id, displaced_attempt).await?;
+    // Only remove the entry we just fenced: a concurrent claim (a newer
+    // attempt racing this one) may have already replaced it while the stop
+    // was in flight, and that entry must not be dropped.
+    let mut sessions = runtime_sessions.lock().await;
+    if sessions
+        .get(&job_id)
+        .is_some_and(|current| runtime_session_is_current(current, &displaced))
+    {
+        sessions.remove(&job_id);
+    }
+    Ok(())
 }
 
 fn displaced_runtime_attempt(
     displaced: &crate::runtime_session::RuntimeSessionDescriptor,
     run_attempt: u32,
 ) -> std::io::Result<u32> {
-    if displaced.run_attempt >= run_attempt {
+    if displaced.run_attempt > run_attempt {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
@@ -213,6 +232,42 @@ fn displaced_runtime_attempt(
         ));
     }
     Ok(displaced.run_attempt)
+}
+
+/// Atomically claims this job's `runtime_sessions` slot for `descriptor`,
+/// refusing to clobber an already-tracked strictly-newer attempt. Two
+/// concurrent LaunchJob calls for the same job (e.g. a re-dispatch racing the
+/// tail of a slow, now-superseded launch) can both pass fencing before either
+/// is tracked; without this check whichever finishes last would silently
+/// overwrite a newer, already-tracked session.
+async fn claim_runtime_session_slot(
+    runtime_sessions: &Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
+    descriptor: crate::runtime_session::RuntimeSessionDescriptor,
+) -> Result<(), crate::runtime_session::RuntimeSessionDescriptor> {
+    let mut sessions = runtime_sessions.lock().await;
+    if sessions
+        .get(&descriptor.job_id)
+        .is_some_and(|existing| existing.run_attempt > descriptor.run_attempt)
+    {
+        return Err(descriptor);
+    }
+    sessions.insert(descriptor.job_id, descriptor);
+    Ok(())
+}
+
+/// True when `job_id`'s runtime session is already tracked under the exact
+/// same `run_attempt` — a retried LaunchJob for an attempt already alive on
+/// this node, not a genuine new dispatch.
+async fn runtime_attempt_already_tracked(
+    runtime_sessions: &Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
+    job_id: u32,
+    run_attempt: u32,
+) -> bool {
+    runtime_sessions
+        .lock()
+        .await
+        .get(&job_id)
+        .is_some_and(|existing| existing.run_attempt == run_attempt)
 }
 
 fn runtime_session_is_current(
@@ -515,13 +570,17 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                 {
                     Ok(snapshot) => !snapshot.active,
                     Err(error) => {
+                        // A transient IO/socket error is not evidence the
+                        // session is gone — treat it as still-unknown and let
+                        // the next tick retry, rather than risk classifying a
+                        // live session as exited off a single failed probe.
                         tracing::debug!(
                             job_id,
                             run_attempt = descriptor.run_attempt,
                             %error,
-                            "failed to query recovered runtime session"
+                            "failed to query recovered runtime session; will retry"
                         );
-                        true
+                        false
                     }
                 };
                 let exit = if inactive {
@@ -1706,6 +1765,41 @@ impl SlurmAgent for AgentService {
             "received job launch request"
         );
 
+        if runtime_enabled {
+            let already_tracked =
+                runtime_attempt_already_tracked(&self.runtime_sessions, job_id, run_attempt).await;
+            if already_tracked {
+                // Idempotent retry: this exact attempt is already tracked and
+                // alive on this node (e.g. spurctld retried after losing the
+                // ack for a LaunchJob it had already delivered, since a
+                // dispatch failure never advances run_attempt before the next
+                // requeue). Report success without touching the live
+                // allocation or session — allocate_local_resources below
+                // would otherwise release and reallocate resources out from
+                // under the still-running process before fencing ever runs.
+                let paths = self
+                    .running
+                    .lock()
+                    .await
+                    .get(&job_id)
+                    .filter(|tracked| tracked.run_attempt == run_attempt)
+                    .map(|tracked| (tracked.stdout_path.clone(), tracked.stderr_path.clone()))
+                    .unwrap_or_default();
+                info!(
+                    job_id,
+                    run_attempt,
+                    "runtime session already tracked for this attempt; treating retried launch as success"
+                );
+                return Ok(Response::new(LaunchJobResponse {
+                    success: true,
+                    error: String::new(),
+                    stdout_path: paths.0,
+                    stderr_path: paths.1,
+                    failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                }));
+            }
+        }
+
         let work_dir = if spec.work_dir.is_empty() {
             spur_core::job::DEFAULT_WORK_DIR.to_string()
         } else {
@@ -2162,6 +2256,44 @@ impl SlurmAgent for AgentService {
         match launch_result {
             Ok((mut result, runtime_descriptor)) => {
                 pmix_guard.as_mut().map(PmixLaunchGuard::disarm);
+
+                // Claim the runtime-session slot before committing anything
+                // else. A concurrent LaunchJob for the same job (a retry
+                // racing the tail of this slower, now-superseded launch) may
+                // have already tracked a strictly newer attempt; if so, this
+                // launch lost the race and must not clobber it or commit the
+                // allocation it just (redundantly) reserved.
+                if let Some(descriptor) = runtime_descriptor.clone() {
+                    if let Err(descriptor) =
+                        claim_runtime_session_slot(&self.runtime_sessions, descriptor).await
+                    {
+                        warn!(
+                            job_id,
+                            run_attempt,
+                            "runtime session superseded by a newer attempt before it could be tracked; aborting"
+                        );
+                        if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+                            warn!(job_id, error = %e, "PMIx stop failed after superseded runtime session");
+                        }
+                        if let Err(error) =
+                            stop_runtime_session_unit(descriptor.job_id, descriptor.run_attempt)
+                                .await
+                        {
+                            warn!(job_id, run_attempt, %error, "failed to stop superseded runtime session");
+                        }
+                        cleanup_runtime_session_files(&descriptor);
+                        let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+                        tokio::spawn(reap_killed_job(result.job));
+                        return Ok(Response::new(LaunchJobResponse {
+                            success: false,
+                            error: "runtime session superseded by a newer attempt".into(),
+                            stdout_path: String::new(),
+                            stderr_path: String::new(),
+                            failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
+                        }));
+                    }
+                }
+
                 let mut jobs = self.running.lock().await;
                 // Commit the reservation: the job now has a tracked process, so
                 // it is no longer exempt from reconcile. Take the running lock
@@ -2245,10 +2377,8 @@ impl SlurmAgent for AgentService {
                 );
                 drop(jobs);
                 if let Some(descriptor) = runtime_descriptor {
-                    self.runtime_sessions
-                        .lock()
-                        .await
-                        .insert(job_id, descriptor.clone());
+                    // Already claimed into `runtime_sessions` above, before
+                    // the allocation/running commit.
                     self.monitor_runtime_session(descriptor);
                 }
                 // Re-dispatch onto the same node reuses job_id and displaces an
@@ -4435,18 +4565,77 @@ mod tests {
         );
 
         assert_eq!(displaced_runtime_attempt(&displaced, 8).unwrap(), 7);
-        assert_eq!(
-            displaced_runtime_attempt(&displaced, 7)
-                .expect_err("the current attempt must not displace itself")
-                .kind(),
-            std::io::ErrorKind::AlreadyExists
-        );
+        // A same-attempt retry (e.g. spurctld re-dispatching after losing the
+        // ack for a LaunchJob it already delivered) is idempotent, not a
+        // displacement: it must not fence/stop the still-current attempt.
+        assert_eq!(displaced_runtime_attempt(&displaced, 7).unwrap(), 7);
         assert_eq!(
             displaced_runtime_attempt(&displaced, 6)
                 .expect_err("an older attempt must not replace a newer one")
                 .kind(),
             std::io::ErrorKind::AlreadyExists
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_attempt_already_tracked_detects_only_an_exact_match() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        sessions.lock().await.insert(42, descriptor);
+
+        assert!(!runtime_attempt_already_tracked(&sessions, 42, 6).await);
+        assert!(runtime_attempt_already_tracked(&sessions, 42, 7).await);
+        assert!(!runtime_attempt_already_tracked(&sessions, 42, 8).await);
+        assert!(!runtime_attempt_already_tracked(&sessions, 99, 7).await);
+    }
+
+    #[tokio::test]
+    async fn claim_runtime_session_slot_refuses_to_clobber_a_newer_attempt() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let newer = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            8,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        sessions.lock().await.insert(42, newer.clone());
+
+        // A slower, now-superseded launch for an older attempt loses the race
+        // and must not overwrite the already-tracked newer session.
+        let older = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        let result = claim_runtime_session_slot(&sessions, older.clone()).await;
+        assert_eq!(result, Err(older));
+        assert_eq!(sessions.lock().await.get(&42), Some(&newer));
+
+        // A same-or-newer claim succeeds and updates the tracked descriptor.
+        let same = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            8,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        assert!(claim_runtime_session_slot(&sessions, same.clone())
+            .await
+            .is_ok());
+        assert_eq!(sessions.lock().await.get(&42), Some(&same));
     }
 
     #[test]

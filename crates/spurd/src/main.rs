@@ -325,6 +325,16 @@ async fn main() -> anyhow::Result<()> {
     // Register with controller
     reporter.register().await?;
 
+    // Start the heartbeat loop right after registration, before the
+    // completion-replay step below: replaying unacknowledged completions
+    // retries against the controller (bounded, but can add several seconds
+    // per pending completion) and must never delay heartbeats from resuming
+    // after a restart — a slow replay must not look like a dead node.
+    let hb_reporter = reporter.clone();
+    tokio::spawn(async move {
+        hb_reporter.heartbeat_loop().await;
+    });
+
     let unacknowledged_runtime_completions: HashSet<_> = runtime_sessions
         .discover_unacknowledged_completions()?
         .into_iter()
@@ -352,12 +362,6 @@ async fn main() -> anyhow::Result<()> {
             "pruned finalized runtime session state"
         );
     }
-
-    // Start heartbeat loop
-    let hb_reporter = reporter.clone();
-    tokio::spawn(async move {
-        hb_reporter.heartbeat_loop().await;
-    });
 
     // Start agent gRPC server (receives job launches + cluster-component RPCs from spurctld).
     // Pass the [cluster] config so the K0sAgent uses the operator's k0s version + install path.

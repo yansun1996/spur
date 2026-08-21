@@ -411,6 +411,27 @@ fn write_runtime_step_script(
 
 const PTY_OUTPUT_LIMIT: usize = 1024 * 1024;
 const RUNTIME_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const CONTROL_LINE_LIMIT: usize = 64 * 1024;
+const CONTROL_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `read_line` with no cap on line length; a peer that never sends `\n` grows
+/// `line` unboundedly. Bound it to a sane control-protocol frame size.
+async fn read_line_bounded<R>(reader: &mut R, line: &mut String) -> io::Result<usize>
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    let n = reader
+        .take(CONTROL_LINE_LIMIT as u64)
+        .read_line(line)
+        .await?;
+    if n >= CONTROL_LINE_LIMIT && !line.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control line exceeded maximum length",
+        ));
+    }
+    Ok(n)
+}
 
 struct RuntimePtyBuffer {
     start_offset: u64,
@@ -1253,7 +1274,8 @@ pub fn validate_hello(
             ),
         };
     }
-    if capability.len() != expected_capability.len()
+    if expected_capability.is_empty()
+        || capability.len() != expected_capability.len()
         || !bool::from(subtle::ConstantTimeEq::ct_eq(
             capability.as_bytes(),
             expected_capability.as_bytes(),
@@ -1291,7 +1313,7 @@ async fn accept_hello_stream(
 ) -> io::Result<(UnixStream, String)> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    read_line_bounded(&mut reader, &mut line).await?;
     let request: RuntimeRequest = serde_json::from_str(&line).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1692,7 +1714,7 @@ async fn read_response(
     reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
 ) -> io::Result<RuntimeResponse> {
     let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    read_line_bounded(reader, &mut line).await?;
     serde_json::from_str(&line).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1705,7 +1727,19 @@ pub async fn serve_control(stream: UnixStream, session: &RuntimeSession) -> io::
     let mut reader = BufReader::new(stream);
     loop {
         let mut line = String::new();
-        if reader.read_line(&mut line).await? == 0 {
+        // A connected client that never sends another request (hung, or
+        // deliberately holding the socket open) must not pin this task
+        // forever; the handshake already bounds how long accepting a new
+        // connection can take, this bounds each subsequent request on it.
+        let read = tokio::time::timeout(
+            CONTROL_REQUEST_IDLE_TIMEOUT,
+            read_line_bounded(&mut reader, &mut line),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, "control connection idle timeout")
+        })??;
+        if read == 0 {
             return Ok(());
         }
         let request: RuntimeRequest = serde_json::from_str(&line).map_err(|error| {
