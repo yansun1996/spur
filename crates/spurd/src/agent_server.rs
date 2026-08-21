@@ -186,6 +186,35 @@ async fn stop_runtime_session_unit(job_id: u32, run_attempt: u32) -> std::io::Re
     )))
 }
 
+async fn fence_displaced_runtime_session(
+    runtime_sessions: &Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
+    job_id: u32,
+    run_attempt: u32,
+) -> std::io::Result<()> {
+    let displaced = runtime_sessions.lock().await.get(&job_id).cloned();
+    let Some(displaced) = displaced else {
+        return Ok(());
+    };
+    let displaced_attempt = displaced_runtime_attempt(&displaced, run_attempt)?;
+    stop_runtime_session_unit(displaced.job_id, displaced_attempt).await
+}
+
+fn displaced_runtime_attempt(
+    displaced: &crate::runtime_session::RuntimeSessionDescriptor,
+    run_attempt: u32,
+) -> std::io::Result<u32> {
+    if displaced.run_attempt >= run_attempt {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "runtime attempt {} is still tracked for job {}",
+                displaced.run_attempt, displaced.job_id
+            ),
+        ));
+    }
+    Ok(displaced.run_attempt)
+}
+
 fn cleanup_unstarted_runtime_session(
     store: &crate::runtime_session::RuntimeSessionStore,
     job_id: u32,
@@ -471,35 +500,39 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                     .await
                     .get(job_id)
                     .is_some_and(|job| job.run_attempt == descriptor.run_attempt);
-                let exit = match crate::runtime_session::query_state(
+                let inactive = match crate::runtime_session::query_state(
                     descriptor,
                     instance_id.clone(),
                 )
                 .await
                 {
-                    Ok(snapshot) if !snapshot.active => Some((
-                        snapshot.exit_code.unwrap_or(0),
-                        snapshot.signal.unwrap_or(0),
-                    )),
-                    Ok(_) => None,
-                    Err(error) => match store.observed_exit(*job_id, descriptor.run_attempt) {
+                    Ok(snapshot) => !snapshot.active,
+                    Err(error) => {
+                        tracing::debug!(
+                            job_id,
+                            run_attempt = descriptor.run_attempt,
+                            %error,
+                            "failed to query recovered runtime session"
+                        );
+                        true
+                    }
+                };
+                let exit = if inactive {
+                    match durable_runtime_exit(&store, descriptor) {
                         Ok(exit) => exit,
-                        Err(obligation_error)
-                            if obligation_error.kind() == std::io::ErrorKind::NotFound =>
-                        {
-                            None
-                        }
-                        Err(obligation_error) => {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => {
                             warn!(
                                 job_id,
                                 run_attempt = descriptor.run_attempt,
                                 %error,
-                                %obligation_error,
-                                "failed to read recovered runtime completion state"
+                                "failed to read durable recovered runtime completion"
                             );
                             None
                         }
-                    },
+                    }
+                } else {
+                    None
                 };
                 if let Some((exit_code, signal)) = exit {
                     newly_completed.push((*job_id, descriptor.run_attempt, exit_code, signal));
@@ -562,6 +595,13 @@ pub(crate) fn monitor_recovered_runtime_sessions(
             }
         }
     });
+}
+
+fn durable_runtime_exit(
+    store: &crate::runtime_session::RuntimeSessionStore,
+    descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
+) -> std::io::Result<Option<(i32, i32)>> {
+    store.observed_exit(descriptor.job_id, descriptor.run_attempt)
 }
 
 pub(crate) async fn replay_unacknowledged_runtime_completions(
@@ -2080,6 +2120,13 @@ impl SlurmAgent for AgentService {
             None
         };
         let launch_result = if runtime_enabled {
+            fence_displaced_runtime_session(&self.runtime_sessions, job_id, run_attempt)
+                .await
+                .map_err(|error| {
+                    Status::unavailable(format!(
+                        "failed to fence displaced runtime session before launch: {error}"
+                    ))
+                })?;
             launch_runtime_session(
                 &launch_cfg,
                 run_attempt,
@@ -2570,6 +2617,15 @@ impl SlurmAgent for AgentService {
                 io_mode: executor::LaunchIo::File,
                 pmix_multi_task: false,
             };
+            if let Err(error) =
+                fence_displaced_runtime_session(&self.runtime_sessions, req.job_id, req.run_attempt)
+                    .await
+            {
+                self.allocation.lock().await.release_job(req.job_id);
+                return Err(Status::unavailable(format!(
+                    "failed to fence displaced runtime session before allocation launch: {error}"
+                )));
+            }
             match launch_runtime_session(
                 &config,
                 req.run_attempt,
@@ -4357,6 +4413,64 @@ mod tests {
 
         assert!(!failed.exists());
         assert!(retained.exists());
+    }
+
+    #[test]
+    fn runtime_displacement_requires_a_strictly_newer_attempt() {
+        let displaced = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        assert_eq!(displaced_runtime_attempt(&displaced, 8).unwrap(), 7);
+        assert_eq!(
+            displaced_runtime_attempt(&displaced, 7)
+                .expect_err("the current attempt must not displace itself")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            displaced_runtime_attempt(&displaced, 6)
+                .expect_err("an older attempt must not replace a newer one")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[test]
+    fn runtime_completion_requires_a_durable_exit_obligation() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::runtime_session::RuntimeSessionStore::new(state.path());
+        let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            0,
+            0,
+            store.session_dir(42, 7).join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        store.publish(&descriptor).expect("publish descriptor");
+
+        assert_eq!(
+            durable_runtime_exit(&store, &descriptor).expect("read missing exit"),
+            None
+        );
+
+        store
+            .obligations(42, 7)
+            .append(&crate::runtime_session::RuntimeObligation::ExitObserved {
+                exit_code: 9,
+                signal: 15,
+            })
+            .expect("record exit");
+        assert_eq!(
+            durable_runtime_exit(&store, &descriptor).expect("read durable exit"),
+            Some((9, 15))
+        );
     }
 
     #[tokio::test]

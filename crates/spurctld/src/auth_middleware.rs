@@ -80,6 +80,12 @@ fn decide(config: &AuthConfig, header: Option<&str>) -> BearerOutcome {
     )
 }
 
+const RUNTIME_SESSION_RECOVERY_PATH: &str = "/slurm.SlurmController/ReportRuntimeSessionRecovery";
+
+fn permits_node_authenticated_recovery(path: &str) -> bool {
+    path == RUNTIME_SESSION_RECOVERY_PATH
+}
+
 impl<S, B> Service<Request<B>> for AuthMiddleware<S>
 where
     S: Service<Request<B>, Response = Response<tonic::body::Body>> + Clone + Send + 'static,
@@ -98,6 +104,7 @@ where
 
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
         let config = self.config.clone();
+        let has_authorization = req.headers().contains_key(http::header::AUTHORIZATION);
         let header = req
             .headers()
             .get(http::header::AUTHORIZATION)
@@ -121,6 +128,16 @@ where
                 }
             }
             BearerOutcome::Reject(msg) => {
+                // The handler verifies the registered node credential in the request body. This
+                // one daemon-to-controller RPC cannot use a user bearer token without conflating
+                // node and user authority.
+                if config.mode == AuthMode::Required
+                    && !has_authorization
+                    && permits_node_authenticated_recovery(req.uri().path())
+                {
+                    let mut inner = self.inner.clone();
+                    return Box::pin(async move { inner.call(req).await.map_err(Into::into) });
+                }
                 let resp = tonic::Status::unauthenticated(msg).into_http();
                 return Box::pin(async move { Ok(resp) });
             }
@@ -135,6 +152,7 @@ where
 mod tests {
     use super::*;
     use spur_core::auth::generate_token;
+    use tower::{service_fn, ServiceExt};
 
     fn cfg(mode: AuthMode, key: &str) -> AuthConfig {
         AuthConfig {
@@ -218,5 +236,61 @@ mod tests {
             decide(&cfg(AuthMode::Permissive, ""), Some(&header)),
             BearerOutcome::Reject(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn required_mode_only_passes_missing_bearers_to_node_authenticated_recovery() {
+        let inner = service_fn(|_request: Request<()>| async move {
+            Ok::<_, std::convert::Infallible>(Response::new(tonic::body::Body::empty()))
+        });
+        let layer = AuthLayer::new(AuthMode::Required, "k");
+
+        let recovery = Request::builder()
+            .uri(RUNTIME_SESSION_RECOVERY_PATH)
+            .body(())
+            .expect("recovery request");
+        let response = layer.clone().layer(inner).oneshot(recovery).await;
+        assert!(response
+            .expect("recovery reaches node-token handler")
+            .status()
+            .is_success());
+
+        let ordinary = Request::builder()
+            .uri("/slurm.SlurmController/SubmitJob")
+            .body(())
+            .expect("ordinary request");
+        let response = layer.layer(inner).oneshot(ordinary).await;
+        assert_eq!(
+            response
+                .expect("middleware response")
+                .headers()
+                .get("grpc-status")
+                .and_then(|value| value.to_str().ok()),
+            Some("16")
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_exception_does_not_accept_a_malformed_bearer() {
+        let inner = service_fn(|_request: Request<()>| async move {
+            Ok::<_, std::convert::Infallible>(Response::new(tonic::body::Body::empty()))
+        });
+        let request = Request::builder()
+            .uri(RUNTIME_SESSION_RECOVERY_PATH)
+            .header(http::header::AUTHORIZATION, "Bearer")
+            .body(())
+            .expect("recovery request");
+        let response = AuthLayer::new(AuthMode::Required, "k")
+            .layer(inner)
+            .oneshot(request)
+            .await
+            .expect("middleware response");
+        assert_eq!(
+            response
+                .headers()
+                .get("grpc-status")
+                .and_then(|value| value.to_str().ok()),
+            Some("16")
+        );
     }
 }
