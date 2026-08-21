@@ -675,6 +675,8 @@ impl ControllerService {
 
         let expected_nodes = job.allocated_nodes.clone();
         let mut missing = Vec::new();
+        let mut set = tokio::task::JoinSet::new();
+        let mut handle_to_node = HashMap::new();
         for node_name in &expected_nodes {
             let Some(node) = self.cluster.get_node(node_name) else {
                 missing.push(node_name.clone());
@@ -687,19 +689,39 @@ impl ControllerService {
                     continue;
                 }
             };
-            let active = match crate::agent_client::connect(endpoint).await {
-                Ok(mut client) => client
-                    .probe_runtime_session(RuntimeSessionProbeRequest {
-                        job_id,
-                        run_attempt,
-                    })
-                    .await
-                    .map(|response| response.into_inner().active)
-                    .unwrap_or(false),
-                Err(_) => false,
-            };
-            if !active {
-                missing.push(node_name.clone());
+            let node_name = node_name.clone();
+            let handle = set.spawn(async move {
+                match crate::agent_client::connect(endpoint).await {
+                    Ok(mut client) => client
+                        .probe_runtime_session(RuntimeSessionProbeRequest {
+                            job_id,
+                            run_attempt,
+                        })
+                        .await
+                        .map(|response| response.into_inner().active)
+                        .unwrap_or(false),
+                    Err(_) => false,
+                }
+            });
+            handle_to_node.insert(handle.id(), node_name);
+        }
+        while let Some(result) = set.join_next_with_id().await {
+            match result {
+                Ok((id, active)) => {
+                    if !active {
+                        if let Some(node_name) = handle_to_node.remove(&id) {
+                            missing.push(node_name);
+                        }
+                    }
+                }
+                // A probe task panicking tells us nothing about the node's
+                // liveness; treat it the same as a failed probe rather than
+                // silently counting the node as confirmed-active.
+                Err(error) => {
+                    if let Some(node_name) = handle_to_node.remove(&error.id()) {
+                        missing.push(node_name);
+                    }
+                }
             }
         }
 
@@ -6089,6 +6111,56 @@ mod tests {
         assert_eq!(
             svc.cluster.get_job(job_id).expect("requeued job").state,
             JobState::Pending
+        );
+    }
+
+    /// A job that actually completed while spurd was down (or restarting)
+    /// must land as Completed once the real completion report arrives, even
+    /// though it also has a stale, expired runtime-recovery cohort entry
+    /// racing it. `fence_runtime_recovery`'s `is_active()` guard exists
+    /// exactly to keep the delayed/racing fence from resurrecting a job the
+    /// controller already finalized correctly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_during_spurd_downtime_wins_over_a_racing_recovery_fence() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        // The job actually finished during the spurd-down window; on restart
+        // spurd replays the durable exit via ReportJobStatus before any
+        // recovery/stale-descriptor report is sent for it.
+        svc.cluster
+            .node_complete(job_id, "n1", 0, 0, run_attempt)
+            .expect("node completion accepted");
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("completed job").state,
+            JobState::Completed
+        );
+
+        // A stale, already-expired recovery cohort entry for the same
+        // (job_id, run_attempt) — as if a delayed recovery report is still
+        // in flight — must not resurrect or requeue the now-terminal job.
+        svc.incomplete_runtime_recoveries.lock().await.insert(
+            (job_id, run_attempt),
+            std::time::Instant::now() - RUNTIME_RECOVERY_COHORT_GRACE,
+        );
+        let fenced = svc
+            .fence_runtime_recovery(job_id, run_attempt)
+            .await
+            .expect("fencing a terminal job must not error");
+        assert!(
+            !fenced,
+            "fencing must no-op once the job already reached a terminal state"
+        );
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("still completed").state,
+            JobState::Completed,
+            "a racing fence must not undo a real completion"
         );
     }
 

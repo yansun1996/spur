@@ -687,7 +687,12 @@ pub(crate) async fn try_preempt(
             } else {
                 None
             };
-            match cluster.preempt_job(candidate.job_id, mode, pending.job_id, preempt_qos) {
+            match cluster.preempt_job_with_provenance(
+                candidate.job_id,
+                mode,
+                Some(pending.job_id),
+                preempt_qos,
+            ) {
                 Ok(PreemptOutcome::Killed) => {
                     // Signal 0 = graceful cancel (SIGTERM then SIGKILL).
                     send_cancel_to_agents(cluster, candidate, 0).await;

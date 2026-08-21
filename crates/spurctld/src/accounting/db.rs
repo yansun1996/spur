@@ -638,15 +638,6 @@ pub async fn get_transactions(
     Ok(records)
 }
 
-/// Delete audit rows older than `older_than`, returning the number removed.
-pub async fn purge_txn(pool: &PgPool, older_than: DateTime<Utc>) -> anyhow::Result<u64> {
-    let res = sqlx::query("DELETE FROM txn WHERE ts < $1")
-        .bind(older_than)
-        .execute(pool)
-        .await?;
-    Ok(res.rows_affected())
-}
-
 /// Get usage data for fair-share calculation.
 pub async fn get_usage(
     pool: &PgPool,

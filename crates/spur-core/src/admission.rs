@@ -124,7 +124,10 @@ pub struct NodeTokenClaims {
     pub exp: u64,
     pub iat: u64,
     /// Separates an agent credential from an ordinary user JWT signed by the
-    /// same cluster key.
+    /// same cluster key. Deliberately has no default: an ordinary user JWT
+    /// (`auth::TokenClaims`) shares the `sub`/`exp`/`iat` field names, so a
+    /// default here would let a user token silently decode as a valid node
+    /// credential — exactly the confusion this field exists to prevent.
     pub kind: String,
 }
 
@@ -254,6 +257,39 @@ mod tests {
         let jwt = generate_node_token("node1", b"key1").unwrap();
         let result = verify_node_token(&jwt, b"key2");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_node_token_rejects_a_payload_with_no_kind_field() {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+
+        // Shares `sub`/`exp`/`iat` with `NodeTokenClaims` but omits `kind` —
+        // the same shape an ordinary user JWT (`auth::TokenClaims`) has. This
+        // must fail to decode as a node token: a default value for `kind`
+        // would let a user token impersonate a node credential.
+        #[derive(Serialize)]
+        struct ClaimsWithoutKind {
+            sub: String,
+            exp: u64,
+            iat: u64,
+        }
+
+        let key = b"test-jwt-key";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = ClaimsWithoutKind {
+            sub: "some-user-or-node".into(),
+            exp: now + 3600,
+            iat: now,
+        };
+        let jwt = encode(&Header::default(), &claims, &EncodingKey::from_secret(key)).unwrap();
+
+        assert!(
+            verify_node_token(&jwt, key).is_err(),
+            "a payload missing `kind` must not decode as a node credential"
+        );
     }
 
     #[test]
