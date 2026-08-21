@@ -2597,13 +2597,15 @@ impl SlurmAgent for AgentService {
                         reap_killed_job(result.job).await;
                         // rootfs/spool paths are derived from job_id, so the
                         // controller re-dispatching the same id to this node
-                        // would reuse them. Skip that cleanup if a live run for
-                        // job_id reappeared, or this reap would delete its files.
-                        // The cgroup handle is this launch's own, so it is always
-                        // safe to release.
-                        if !running.lock().await.contains_key(&job_id) {
-                            crate::container::cleanup_rootfs(job_id, &rootfs_mode);
-                            crate::executor::cleanup_job_spool(job_id);
+                        // would reuse them. Hold `running` across the check and
+                        // the cleanup so a redispatch landing in between can't
+                        // have its just-tracked job's files deleted here.
+                        {
+                            let jobs = running.lock().await;
+                            if !jobs.contains_key(&job_id) {
+                                crate::container::cleanup_rootfs(job_id, &rootfs_mode);
+                                crate::executor::cleanup_job_spool(job_id);
+                            }
                         }
                         if let Some(ref cg) = cgroup {
                             crate::executor::cleanup_cgroup(cg).await;
@@ -7194,11 +7196,38 @@ mod tests {
         );
     }
 
-    // A job removed from `running` this same tick must already be released
-    // before reconcile runs, or reconcile misclassifies every ordinary
-    // completion as an orphan and reports it as one.
+    #[derive(Clone, Default)]
+    struct CapturingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    // start_monitor's real completion tick must release a job's allocation
+    // before reconcile can see it as parentless, or reconcile misclassifies
+    // every ordinary completion as an orphan and logs it as one.
     #[tokio::test]
-    async fn a_just_completed_job_is_not_reclaimed_as_an_orphan() {
+    async fn start_monitor_does_not_log_an_orphan_reclaim_for_an_ordinary_completion() {
+        let log = CapturingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _trace_guard = tracing::subscriber::set_default(subscriber);
+
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
             HooksConfig::default(),
@@ -7211,21 +7240,32 @@ mod tests {
             alloc.allocate_for_job(job_id, 1, 0, &[0]).unwrap();
             alloc.commit_job(job_id);
         }
-        // Mirror start_monitor's order for this tick: the job is already gone
-        // from `running` and its allocation already released before reconcile
-        // ever runs — matching release_job happening ahead of the backstop.
-        svc.allocation.lock().await.release_job(job_id);
+        let child = tokio::process::Command::new("/bin/true")
+            .process_group(0)
+            .spawn()
+            .expect("spawn short-lived job");
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.job = executor::RunningJob::Managed {
+            child,
+            cgroup_path: None,
+        };
+        svc.insert_test_job(job_id, tracked).await;
 
-        let jobs = svc.running.lock().await;
-        let reclaimed = svc.allocation.lock().await.reconcile(
-            &jobs.keys().copied().collect(),
-            std::time::Instant::now(),
-            LAUNCHING_TTL,
+        svc.start_monitor("http://127.0.0.1:1".into());
+        assert!(
+            wait_job_reaped(&svc, job_id, 5_000).await,
+            "monitor should reap the exited job within 5s"
         );
 
+        assert_eq!(
+            svc.free_gpu_count().await,
+            1,
+            "the completed job's GPU must be released"
+        );
+        let output = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
         assert!(
-            reclaimed.is_empty(),
-            "a job already released this tick must not also be reclaimed as an orphan"
+            !output.contains("reconciled orphaned"),
+            "an ordinary completion must not be reported as an orphan reclaim: {output}"
         );
     }
 
