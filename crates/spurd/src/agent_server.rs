@@ -1352,20 +1352,6 @@ impl AgentService {
 
                 for c in &completed {
                     jobs.remove(&c.job_id);
-                }
-
-                // Self-heal backstop: reclaim allocations with no tracked,
-                // non-launching job. `jobs` is held so the live set is a
-                // consistent snapshot that can't race a committing launch
-                // (commit_job takes the running lock first).
-                reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
-
-                // Release the lock before the per-job cleanup pass below (rootfs/spool/cgroup
-                // I/O, network RPCs) — none of it touches `jobs`, and holding it would block
-                // new job launches and other RPCs needing `running` for no reason.
-                drop(jobs);
-
-                for c in &completed {
                     crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
                     crate::executor::cleanup_job_spool(c.job_id);
                     if let Some(ref cgroup) = c.cgroup {
@@ -1374,6 +1360,17 @@ impl AgentService {
                     allocation.lock().await.release_job(c.job_id);
                     cleanup_completed_job_mpi(c.job_id, &c.mpi, &mpi_host).await;
                 }
+
+                // Self-heal backstop: reclaim allocations with no tracked,
+                // non-launching job. `jobs` is held so the live set is a
+                // consistent snapshot that can't race a committing launch
+                // (commit_job takes the running lock first).
+                reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
+
+                // Release lock BEFORE network I/O — holding the lock during
+                // report_completion blocks new job launches and can lose
+                // completions if the RPC times out.
+                drop(jobs);
 
                 let local_hostname = hostname::get()
                     .map(|h| h.to_string_lossy().to_string())
