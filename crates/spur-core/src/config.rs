@@ -2316,6 +2316,34 @@ grp_wall_window_days = {days}
     }
 
     #[test]
+    fn txn_retention_days_defaults_to_disabled_and_preserves_zero() {
+        let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
+        assert_eq!(config.accounting.txn_retention_days, None);
+
+        let config = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "x"
+
+[accounting]
+txn_retention_days = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.accounting.txn_retention_days, Some(0));
+
+        let config = SlurmConfig::load_from_str(
+            r#"
+cluster_name = "x"
+
+[accounting]
+txn_retention_days = 365
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.accounting.txn_retention_days, Some(365));
+    }
+
+    #[test]
     fn test_metrics_defaults() {
         let config = SlurmConfig::load_from_str(r#"cluster_name = "x""#).unwrap();
         assert!(config.metrics.enabled);

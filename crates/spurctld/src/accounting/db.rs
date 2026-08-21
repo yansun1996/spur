@@ -25,6 +25,15 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Delete audit rows older than `older_than`, returning the number removed.
+pub async fn purge_txn(pool: &PgPool, older_than: DateTime<Utc>) -> anyhow::Result<u64> {
+    let result = sqlx::query("DELETE FROM txn WHERE ts < $1")
+        .bind(older_than)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 // Advisory-lock keys that serialize `migrate` across controllers. The two-int4
 // form is a distinct lock space from the single-bigint per-user locks
 // `add_user` takes, so the keys can never collide.
@@ -185,22 +194,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_default_account_per_user
 -- Administrative action / audit log. Records who ran reservation admin commands
 -- (create/update/delete) and their outcome. Entity-agnostic so other admin ops
 -- can reuse it later. `details` is a JSON string (sqlx has no json feature).
-CREATE TABLE IF NOT EXISTS txn (
-    id           BIGSERIAL PRIMARY KEY,
-    ts           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    actor        TEXT NOT NULL DEFAULT '',
-    actor_uid    BIGINT,
-    verified     BOOLEAN NOT NULL DEFAULT FALSE,
-    source       TEXT NOT NULL DEFAULT 'api',
-    action       TEXT NOT NULL,
-    entity_type  TEXT NOT NULL,
-    entity_name  TEXT NOT NULL DEFAULT '',
-    outcome      TEXT NOT NULL DEFAULT 'success',
-    details      TEXT NOT NULL DEFAULT '{}'
-);
-CREATE INDEX IF NOT EXISTS idx_txn_ts ON txn(ts);
-CREATE INDEX IF NOT EXISTS idx_txn_actor ON txn(actor);
-CREATE INDEX IF NOT EXISTS idx_txn_entity ON txn(entity_type, entity_name);
 "#;
 
 /// What accounting persists when a job starts. Named fields rather than positional

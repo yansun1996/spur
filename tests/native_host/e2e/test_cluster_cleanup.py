@@ -40,20 +40,29 @@ def test_runtime_mpi_preflight_skip_cleans_up_before_deploy(monkeypatch):
     cluster = object.__new__(SpurCluster)
     cluster.remote_dir = "/tmp/runtime-mpi"
     cluster.teardown_called = False
-    cluster.deploy_called = False
+    cluster.events = []
 
     def mpi_preflight(_min_nodes):
+        cluster.events.append("mpi_preflight")
         pytest.skip("PMIx is unavailable")
+
+    def provision():
+        cluster.events.append("provision")
+
+    def root_agent_preflight():
+        cluster.events.append("root_preflight")
+
+    def start(**_kwargs):
+        cluster.events.append("start")
 
     def teardown():
         cluster.teardown_called = True
 
-    def deploy(**_kwargs):
-        cluster.deploy_called = True
-
+    cluster.provision = provision
     cluster.mpi_preflight = mpi_preflight
+    cluster.root_agent_preflight = root_agent_preflight
     cluster.teardown = teardown
-    cluster.deploy = deploy
+    cluster.start = start
     monkeypatch.setattr(conftest, "ensure_bins", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(conftest, "SpurCluster", lambda *_args: cluster)
     monkeypatch.setattr(conftest, "make_remote_dir", lambda: cluster.remote_dir)
@@ -63,7 +72,57 @@ def test_runtime_mpi_preflight_skip_cleans_up_before_deploy(monkeypatch):
         next(fixture)
 
     assert cluster.teardown_called
-    assert not cluster.deploy_called
+    assert cluster.events == ["provision", "mpi_preflight"]
+
+
+def test_runtime_mpi_fixture_preflights_before_start(monkeypatch):
+    cluster = object.__new__(SpurCluster)
+    cluster.remote_dir = "/tmp/runtime-mpi"
+    cluster.events = []
+
+    cluster.provision = lambda: cluster.events.append("provision")
+    cluster.mpi_preflight = lambda _min_nodes: cluster.events.append("mpi_preflight")
+    cluster.root_agent_preflight = lambda: cluster.events.append("root_preflight")
+    cluster.start = lambda **_kwargs: cluster.events.append("start")
+    cluster.teardown = lambda: cluster.events.append("teardown")
+
+    monkeypatch.setattr(conftest, "ensure_bins", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(conftest, "SpurCluster", lambda *_args: cluster)
+    monkeypatch.setattr(conftest, "make_remote_dir", lambda: cluster.remote_dir)
+
+    fixture = conftest.runtime_mpi_cluster.__wrapped__([object()], "/tmp/bin", {})
+    assert next(fixture) is cluster
+    assert cluster.events == ["provision", "mpi_preflight", "root_preflight", "start"]
+
+    with pytest.raises(StopIteration):
+        next(fixture)
+    assert cluster.events == [
+        "provision",
+        "mpi_preflight",
+        "root_preflight",
+        "start",
+        "teardown",
+    ]
+
+
+def test_runtime_mpi_missing_plugin_skips_after_cleanup(monkeypatch):
+    cluster = object.__new__(SpurCluster)
+    cluster.remote_dir = "/tmp/runtime-mpi"
+    cluster.teardown_called = False
+    cluster.teardown = lambda: setattr(cluster, "teardown_called", True)
+
+    def missing_plugin(*_args, **_kwargs):
+        raise FileNotFoundError("spur_mpi_pmix.so is missing")
+
+    monkeypatch.setattr(conftest, "ensure_bins", missing_plugin)
+    monkeypatch.setattr(conftest, "SpurCluster", lambda *_args: cluster)
+    monkeypatch.setattr(conftest, "make_remote_dir", lambda: cluster.remote_dir)
+
+    fixture = conftest.runtime_mpi_cluster.__wrapped__([object()], "/tmp/bin", {})
+    with pytest.raises(pytest.skip.Exception):
+        next(fixture)
+
+    assert cluster.teardown_called
 
 
 class _RuntimeFixtureCluster:

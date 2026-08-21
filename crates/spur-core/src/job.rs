@@ -2520,6 +2520,17 @@ mod tests {
     }
 
     #[test]
+    fn legacy_job_payload_defaults_preemption_provenance() {
+        const LEGACY_JOB: &str = r#"{"job_id":7,"spec":{"name":"","partition":null,"account":null,"user":"","uid":0,"gid":0,"num_nodes":1,"num_tasks":1,"tasks_per_node":null,"cpus_per_task":1,"memory_per_node_mb":null,"memory_per_cpu_mb":null,"gres":[],"gpus":null,"gpus_per_node":null,"gpus_per_task":null,"script":null,"argv":[],"script_args":[],"work_dir":"/tmp","stdout_path":null,"stderr_path":null,"stdin_path":null,"environment":{},"time_limit":null,"time_min":null,"qos":null,"priority":null,"reservation":null,"dependency":[],"nodelist":null,"exclude":null,"constraint":null,"mpi":null,"distribution":null,"het_group":null,"array_spec":null,"array_job_id":null,"array_task_id":null,"array_max_concurrent":null,"requeue":false,"exclusive":false,"hold":false,"interactive":false,"srun_job":false,"mail_type":[],"mail_user":null,"comment":null,"wckey":null,"container_image":null,"container_mounts":[],"container_workdir":null,"container_name":null,"container_readonly":false,"container_mount_home":false,"container_env":{},"container_entrypoint":null,"container_remap_root":false,"burst_buffer":null,"begin_time":null,"deadline":null,"spread_job":false,"topology":null,"host_network":false,"privileged":false,"host_ipc":false,"shm_size":null,"extra_resources":{},"open_mode":null,"pty":false},"state":"PENDING","pending_reason":"None","priority":1000,"submit_time":"2026-01-01T00:00:00Z","start_time":null,"end_time":null,"allocated_nodes":[],"allocated_resources":null,"per_node_alloc":{},"exit_code":null,"exit_signal":0,"derived_exit_code":0,"requeue_count":0,"preempt_requeue_count":0,"user_requeue_count":0,"run_attempt":0,"het_job_id":null,"het_group":null,"node_completions":{},"srun_step_dispatch":false,"time_limit_signaled_at":null,"suspended_at":null,"suspended_secs":0,"bb_stage_state":"NONE","actual_stdout_path":null,"actual_stderr_path":null,"launch_failure_detail":null}"#;
+
+        let job: Job = serde_json::from_str(LEGACY_JOB)
+            .expect("a snapshot written before preemption provenance must still deserialize");
+        assert_eq!(job.preempted_by, None);
+        assert_eq!(job.preempt_mode, None);
+        assert_eq!(job.preempt_qos, None);
+    }
+
+    #[test]
     fn sort_rank_follows_slurm_state_order_not_enum_order() {
         // SUSPENDED ranks right after RUNNING and before COMPLETING, unlike the
         // enum's declaration order (Completing before Suspended).

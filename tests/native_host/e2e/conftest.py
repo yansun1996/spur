@@ -295,10 +295,6 @@ def runtime_gpu_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
 @pytest.fixture
 def runtime_mpi_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """RuntimeSession-gated PMIx cluster with the PMIx plugin deployed."""
-    try:
-        ensure_bins(ssh_nodes, _get_binaries_dir(), remote_bin_dir, with_mpi_plugin=True)
-    except FileNotFoundError as exc:
-        pytest.skip(str(exc))
     c = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     plugin_dir = str(Path(remote_bin_dir).parent / "lib" / "spur")
     overrides = deep_merge(
@@ -306,8 +302,14 @@ def runtime_mpi_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
         {"mpi": {"plugin_dir": plugin_dir, "pmix_tmpdir": "/tmp/spur-pmix"}},
     )
     try:
+        try:
+            ensure_bins(ssh_nodes, _get_binaries_dir(), remote_bin_dir, with_mpi_plugin=True)
+        except FileNotFoundError as exc:
+            pytest.skip(str(exc))
+        c.provision()
         c.mpi_preflight(1)
-        c.deploy(
+        c.root_agent_preflight()
+        c.start(
             config_overrides=overrides,
             agent_as_root=True,
             agent_env={"SPUR_RUNTIME_SESSION": "1", "SPUR_RUNTIME_STATE_DIR": c.remote_dir},

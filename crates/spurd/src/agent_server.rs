@@ -215,6 +215,13 @@ fn displaced_runtime_attempt(
     Ok(displaced.run_attempt)
 }
 
+fn runtime_session_is_current(
+    current: &crate::runtime_session::RuntimeSessionDescriptor,
+    expected: &crate::runtime_session::RuntimeSessionDescriptor,
+) -> bool {
+    current == expected
+}
+
 fn cleanup_unstarted_runtime_session(
     store: &crate::runtime_session::RuntimeSessionStore,
     job_id: u32,
@@ -3753,7 +3760,39 @@ impl AgentService {
             )
             .await
             {
-                Ok(()) => return,
+                Ok(()) => {
+                    let runtime_sessions = self.runtime_sessions.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        let still_current =
+                            runtime_sessions
+                                .lock()
+                                .await
+                                .get(&job_id)
+                                .is_some_and(|current| {
+                                    runtime_session_is_current(current, &descriptor)
+                                });
+                        if !still_current {
+                            return;
+                        }
+                        info!(
+                            job_id,
+                            run_attempt = descriptor.run_attempt,
+                            "runtime grace period expired, sending SIGKILL"
+                        );
+                        if let Err(error) = crate::runtime_session::signal_allocation(
+                            &descriptor,
+                            uuid::Uuid::new_v4().to_string(),
+                            nix::sys::signal::Signal::SIGKILL as i32,
+                        )
+                        .await
+                        {
+                            warn!(job_id, run_attempt = descriptor.run_attempt, %error,
+                                "failed to SIGKILL runtime session after grace period");
+                        }
+                    });
+                    return;
+                }
                 Err(error) => {
                     warn!(job_id, %error, "runtime termination request failed");
                     return;
@@ -4408,6 +4447,27 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::AlreadyExists
         );
+    }
+
+    #[test]
+    fn runtime_sigkill_escalation_requires_the_exact_session_attempt() {
+        let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            101,
+            202,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        assert!(runtime_session_is_current(&descriptor, &descriptor));
+
+        let mut replacement = descriptor.clone();
+        replacement.run_attempt = 8;
+        assert!(!runtime_session_is_current(&replacement, &descriptor));
+
+        let mut restarted = descriptor.clone();
+        restarted.process_start_ticks = 203;
+        assert!(!runtime_session_is_current(&restarted, &descriptor));
     }
 
     #[test]
@@ -6695,6 +6755,82 @@ mod tests {
             wait_job_reaped(&svc, job_id, 10_000).await,
             "monitor should reap job after SIGKILL escalation"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_cancel_runtime_session_escalates_to_sigkill() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("runtime socket directory");
+        let socket_path = state.path().join("runtime.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind runtime socket");
+        let mut descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            903,
+            4,
+            0,
+            0,
+            socket_path,
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "runtime-cancel-test".into();
+        svc.runtime_sessions
+            .lock()
+            .await
+            .insert(descriptor.job_id, descriptor.clone());
+
+        let server_descriptor = descriptor.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = crate::runtime_session::accept_hello(
+                    &listener,
+                    &server_descriptor,
+                    &server_descriptor.capability,
+                )
+                .await
+                .expect("accept runtime hello");
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .await
+                    .expect("read runtime request");
+                requests.push(serde_json::from_str(&line).expect("decode runtime request"));
+                writer
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            serde_json::to_string(
+                                &crate::runtime_session::RuntimeResponse::Acknowledged
+                            )
+                            .expect("encode acknowledgement")
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("acknowledge runtime request");
+            }
+            requests
+        });
+
+        svc.graceful_cancel(descriptor.job_id).await;
+        tokio::time::advance(tokio::time::Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+
+        let requests = server.await.expect("runtime control server");
+        assert!(matches!(
+            requests.as_slice(),
+            [crate::runtime_session::RuntimeRequest::Shutdown,
+             crate::runtime_session::RuntimeRequest::SignalAllocation { signal }]
+                if *signal == nix::sys::signal::Signal::SIGKILL as i32
+        ));
     }
 
     // The grace-period SIGKILL must not fire if job_id was reused by a newer

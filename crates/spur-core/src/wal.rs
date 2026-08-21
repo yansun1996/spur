@@ -1069,6 +1069,39 @@ mod suspend_wal_tests {
     }
 
     #[test]
+    fn legacy_preempt_wal_payloads_deserialize_without_provenance() {
+        const CANCEL: &str = r#"{"JobPreemptCancel":{"job_id":7}}"#;
+        const REQUEUE: &str =
+            r#"{"JobPreemptRequeue":{"job_id":7,"begin_time":"2026-01-01T00:00:00Z"}}"#;
+        const SUSPEND: &str = r#"{"JobSuspend":{"job_id":7,"at":"2026-01-01T00:00:00Z"}}"#;
+
+        for payload in [CANCEL, REQUEUE, SUSPEND] {
+            let op: WalOperation = serde_json::from_str(payload).unwrap();
+            match op {
+                WalOperation::JobPreemptCancel {
+                    preempted_by,
+                    preempt_qos,
+                    ..
+                }
+                | WalOperation::JobPreemptRequeue {
+                    preempted_by,
+                    preempt_qos,
+                    ..
+                }
+                | WalOperation::JobSuspend {
+                    preempted_by,
+                    preempt_qos,
+                    ..
+                } => {
+                    assert_eq!(preempted_by, None);
+                    assert_eq!(preempt_qos, None);
+                }
+                _ => panic!("wrong variant"),
+            }
+        }
+    }
+
+    #[test]
     fn preempt_requeue_op_round_trips() {
         let begin_time = chrono::Utc::now();
         let op = WalOperation::JobPreemptRequeue {

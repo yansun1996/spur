@@ -1756,6 +1756,7 @@ impl ClusterManager {
                     job_id,
                     preempted_by: Some(preempted_by),
                     preempt_qos,
+
                 })?;
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, "job preempted (cancel)");
@@ -1787,6 +1788,7 @@ impl ClusterManager {
                     begin_time,
                     preempted_by: Some(preempted_by),
                     preempt_qos,
+
                 })?;
                 self.run_all_finalized_side_effects(&resp);
                 info!(job_id, hold_secs, "job preempted (requeue)");

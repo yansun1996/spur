@@ -7178,6 +7178,21 @@ mod tests {
     }
 
     #[test]
+    fn job_to_proto_exposes_preemption_provenance_on_appended_tags() {
+        use spur_core::job::{Job, JobSpec};
+
+        let mut job = Job::new(42, JobSpec::default());
+        job.preempted_by = Some(99);
+        job.preempt_mode = Some("Requeue".into());
+        job.preempt_qos = Some("urgent".into());
+
+        let info = job_to_proto(&job);
+        assert_eq!(info.preempted_by, 99);
+        assert_eq!(info.preempt_mode, "Requeue");
+        assert_eq!(info.preempt_qos, "urgent");
+    }
+
+    #[test]
     fn resolve_max_nodes_update_maps_intents() {
         // `--max-nodes 0` (Some(0), flag unset) must resolve to a clear, not a
         // silent no-op: cluster.rs only clears when the passed bool is true.
