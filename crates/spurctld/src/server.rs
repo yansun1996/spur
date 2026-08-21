@@ -266,7 +266,7 @@ pub(crate) fn resolve_startup_jwt_key(
     ) {
         warn!(
             "admission.mode=Token but auth.jwt_key is unset: node tokens are signed with a \
-             well-known default key and are forgeable. Set auth.jwt_key to a secret value."
+             well-known default key and are forgeable. Set auth.jwt_key or auth.jwt_key_file."
         );
     }
     Ok("spur-default-key".to_string())
@@ -770,7 +770,7 @@ impl ControllerService {
     ) -> Result<(), Status> {
         if !self.node_identity_key_configured {
             return Err(Status::failed_precondition(
-                "runtime session recovery requires [auth] jwt_key",
+                "runtime session recovery requires [auth] jwt_key or jwt_key_file",
             ));
         }
         if node_token.is_empty() {
@@ -3716,7 +3716,7 @@ pub async fn serve(
 
     let leader_proxy = LeaderProxy::new(raft_handle.clone(), client_addrs.clone());
 
-    let node_identity_key_configured = cluster.config().auth.jwt_key.is_some();
+    let node_identity_key_configured = cluster.config().auth.has_jwt_key();
     let auth_mode = cluster.config().auth.mode;
     // Unlike node admission, an unset key here must reject every credential, never fall back
     // to a forgeable constant; `required` mode refuses to start key-less (see config validation).
@@ -5475,7 +5475,7 @@ mod tests {
         cluster.set_raft(handle.raft.clone());
         let raft = std::sync::Arc::new(handle);
         let jwt_key = resolve_startup_jwt_key(&cluster.config()).unwrap();
-        let node_identity_key_configured = cluster.config().auth.jwt_key.is_some();
+        let node_identity_key_configured = cluster.config().auth.has_jwt_key();
         ControllerService {
             cluster,
             raft: raft.clone(),
