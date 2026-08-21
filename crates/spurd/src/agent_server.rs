@@ -562,24 +562,13 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                     .await
                     .get(job_id)
                     .is_some_and(|job| job.run_attempt == descriptor.run_attempt);
-                let exit = match crate::runtime_session::query_state(
+                let inactive = match crate::runtime_session::query_state(
                     descriptor,
                     instance_id.clone(),
                 )
                 .await
                 {
-                    Ok(snapshot) if !snapshot.active => {
-                        resolve_runtime_exit(&store, descriptor, &snapshot)
-                    }
-                    Ok(_) => None,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        // `run_supervisor` unlinks the control socket right
-                        // after it locally observes the session end — a much
-                        // shorter window than this poll's ~2s cadence, so a
-                        // missing socket is the COMMON way a completed
-                        // session is observed here, not a rare race.
-                        resolve_exit_after_missing_socket(&store, descriptor, *job_id)
-                    }
+                    Ok(snapshot) => !snapshot.active,
                     Err(error) => {
                         // A transient IO/socket error is not evidence the
                         // session is gone — treat it as still-unknown and let
@@ -591,8 +580,25 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                             %error,
                             "failed to query recovered runtime session; will retry"
                         );
-                        None
+                        false
                     }
+                };
+                let exit = if inactive {
+                    match durable_runtime_exit(&store, descriptor) {
+                        Ok(exit) => exit,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                        Err(error) => {
+                            warn!(
+                                job_id,
+                                run_attempt = descriptor.run_attempt,
+                                %error,
+                                "failed to read durable recovered runtime completion"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
                 };
                 if let Some((exit_code, signal)) = exit {
                     newly_completed.push((*job_id, descriptor.run_attempt, exit_code, signal));
@@ -662,101 +668,6 @@ fn durable_runtime_exit(
     descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
 ) -> std::io::Result<Option<(i32, i32)>> {
     store.observed_exit(descriptor.job_id, descriptor.run_attempt)
-}
-
-/// Resolve the exit for a session already known to be inactive (`snapshot`
-/// came from a successful `query_state` reporting `active: false`).
-///
-/// A live, responding session reporting itself inactive is authoritative —
-/// it can only say so once its own teardown is done — but an allocation-only
-/// session (no single process to `try_wait`) never produces a real exit
-/// event to record durably. Without this fallback, such a job would sit
-/// inactive-but-untracked forever: neither completed (no durable exit found)
-/// nor released (still present in `running`). Trust and persist the live
-/// snapshot instead of waiting for a durable record that structurally never
-/// appears for this shape of completion.
-fn resolve_runtime_exit(
-    store: &crate::runtime_session::RuntimeSessionStore,
-    descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
-    snapshot: &crate::runtime_session::RuntimeSnapshot,
-) -> Option<(i32, i32)> {
-    match durable_runtime_exit(store, descriptor) {
-        Ok(Some(exit)) => Some(exit),
-        Ok(None) => {
-            let exit_code = snapshot.exit_code.unwrap_or(0);
-            let signal = snapshot.signal.unwrap_or(0);
-            if let Err(error) = store
-                .obligations(descriptor.job_id, descriptor.run_attempt)
-                .append(&crate::runtime_session::RuntimeObligation::ExitObserved {
-                    exit_code,
-                    signal,
-                })
-            {
-                warn!(
-                    job_id = descriptor.job_id,
-                    run_attempt = descriptor.run_attempt,
-                    %error,
-                    "failed to persist inferred runtime exit"
-                );
-            }
-            Some((exit_code, signal))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            warn!(
-                job_id = descriptor.job_id,
-                run_attempt = descriptor.run_attempt,
-                %error,
-                "failed to read durable recovered runtime completion"
-            );
-            None
-        }
-    }
-}
-
-/// Resolve the exit for a session whose control socket is already gone.
-///
-/// A missing socket is the *common* way this poll observes a completed
-/// session, not a rare error: `run_supervisor` unlinks it immediately after
-/// locally detecting the session end, well inside this poll's ~2s cadence.
-/// Confirm via the descriptor's own PID+start-time identity (authoritative
-/// even with the socket gone) instead of treating a missing socket the same
-/// as a transient query error and stalling forever.
-fn resolve_exit_after_missing_socket(
-    store: &crate::runtime_session::RuntimeSessionStore,
-    descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
-    job_id: u32,
-) -> Option<(i32, i32)> {
-    match crate::runtime_session::session_liveness(descriptor) {
-        Ok(crate::runtime_session::SessionLiveness::Stale) => resolve_runtime_exit(
-            store,
-            descriptor,
-            &crate::runtime_session::RuntimeSnapshot {
-                job_id: descriptor.job_id,
-                run_attempt: descriptor.run_attempt,
-                active: false,
-                exit_code: None,
-                signal: None,
-            },
-        ),
-        Ok(crate::runtime_session::SessionLiveness::Live) => {
-            tracing::debug!(
-                job_id,
-                run_attempt = descriptor.run_attempt,
-                "runtime session socket missing but process still live; will retry"
-            );
-            None
-        }
-        Err(error) => {
-            tracing::debug!(
-                job_id,
-                run_attempt = descriptor.run_attempt,
-                %error,
-                "failed to check runtime session liveness after missing socket; will retry"
-            );
-            None
-        }
-    }
 }
 
 pub(crate) async fn replay_unacknowledged_runtime_completions(
@@ -4777,143 +4688,6 @@ mod tests {
         assert_eq!(
             durable_runtime_exit(&store, &descriptor).expect("read durable exit"),
             Some((9, 15))
-        );
-    }
-
-    #[test]
-    fn resolve_runtime_exit_infers_and_persists_completion_with_no_durable_record() {
-        // An allocation-only session (interactive/step-based, no single
-        // process to `try_wait`) reports itself inactive via its own
-        // teardown-complete logic, but never has a real process-exit event
-        // to record durably. Without falling back to the live snapshot, this
-        // job would stay inactive-but-untracked forever.
-        let state = tempfile::tempdir().expect("runtime state directory");
-        let store = crate::runtime_session::RuntimeSessionStore::new(state.path());
-        let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
-            42,
-            7,
-            0,
-            0,
-            store.session_dir(42, 7).join("runtime.sock"),
-            std::path::PathBuf::new(),
-        );
-        store.publish(&descriptor).expect("publish descriptor");
-        let snapshot = crate::runtime_session::RuntimeSnapshot {
-            job_id: 42,
-            run_attempt: 7,
-            active: false,
-            exit_code: None,
-            signal: Some(nix::sys::signal::Signal::SIGTERM as i32),
-        };
-
-        assert_eq!(
-            resolve_runtime_exit(&store, &descriptor, &snapshot),
-            Some((0, nix::sys::signal::Signal::SIGTERM as i32))
-        );
-        // The inferred exit must be persisted, not just returned once — a
-        // later poll (or a restart before the completion report is
-        // acknowledged) must see the same durable record.
-        assert_eq!(
-            durable_runtime_exit(&store, &descriptor).expect("read persisted exit"),
-            Some((0, nix::sys::signal::Signal::SIGTERM as i32))
-        );
-    }
-
-    #[test]
-    fn resolve_runtime_exit_prefers_an_existing_durable_record_over_the_snapshot() {
-        let state = tempfile::tempdir().expect("runtime state directory");
-        let store = crate::runtime_session::RuntimeSessionStore::new(state.path());
-        let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
-            42,
-            7,
-            0,
-            0,
-            store.session_dir(42, 7).join("runtime.sock"),
-            std::path::PathBuf::new(),
-        );
-        store.publish(&descriptor).expect("publish descriptor");
-        store
-            .obligations(42, 7)
-            .append(&crate::runtime_session::RuntimeObligation::ExitObserved {
-                exit_code: 9,
-                signal: 15,
-            })
-            .expect("record exit");
-        let snapshot = crate::runtime_session::RuntimeSnapshot {
-            job_id: 42,
-            run_attempt: 7,
-            active: false,
-            exit_code: Some(0),
-            signal: Some(0),
-        };
-
-        assert_eq!(
-            resolve_runtime_exit(&store, &descriptor, &snapshot),
-            Some((9, 15)),
-            "a real recorded exit must win over the snapshot's own fields"
-        );
-    }
-
-    #[test]
-    fn resolve_exit_after_missing_socket_infers_completion_for_a_dead_process() {
-        // `run_supervisor` unlinks the control socket right after it locally
-        // observes the session end — well inside the outer poll's ~2s
-        // cadence — so `query_state` most commonly fails with NotFound for a
-        // session that has already, correctly, finished. pid 0 has no
-        // `/proc/0/stat`, so `session_liveness` reports it Stale, matching a
-        // process that has genuinely exited.
-        let state = tempfile::tempdir().expect("runtime state directory");
-        let store = crate::runtime_session::RuntimeSessionStore::new(state.path());
-        let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
-            42,
-            7,
-            0,
-            0,
-            store.session_dir(42, 7).join("runtime.sock"),
-            std::path::PathBuf::new(),
-        );
-        store.publish(&descriptor).expect("publish descriptor");
-
-        assert_eq!(
-            resolve_exit_after_missing_socket(&store, &descriptor, 42),
-            Some((0, 0))
-        );
-        assert_eq!(
-            durable_runtime_exit(&store, &descriptor).expect("read persisted exit"),
-            Some((0, 0)),
-            "the inferred exit must be persisted so a later poll doesn't re-derive it"
-        );
-    }
-
-    #[test]
-    fn resolve_exit_after_missing_socket_waits_out_a_live_process() {
-        // A socket can go missing for reasons other than the session ending
-        // (e.g. the state directory being cleaned up around it) while the
-        // process itself is still alive; this must not be treated as
-        // completion just because the socket is gone.
-        let state = tempfile::tempdir().expect("runtime state directory");
-        let store = crate::runtime_session::RuntimeSessionStore::new(state.path());
-        let mut descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
-            42,
-            7,
-            std::process::id(),
-            0,
-            store.session_dir(42, 7).join("runtime.sock"),
-            std::path::PathBuf::new(),
-        );
-        descriptor.process_start_ticks =
-            crate::runtime_session::process_start_ticks(std::process::id())
-                .expect("read own process start ticks");
-        store.publish(&descriptor).expect("publish descriptor");
-
-        assert_eq!(
-            resolve_exit_after_missing_socket(&store, &descriptor, 42),
-            None
-        );
-        assert_eq!(
-            durable_runtime_exit(&store, &descriptor).expect("read exit"),
-            None,
-            "nothing must be inferred or persisted while the process is confirmed alive"
         );
     }
 
