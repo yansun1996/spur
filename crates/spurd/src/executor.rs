@@ -1013,18 +1013,28 @@ pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
 
 /// Kill any leftover processes in the job's cgroup and remove the directory.
 pub fn cleanup_cgroup(cgroup_path: &Path) {
-    // Kill any remaining processes
-    if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
-        for pid_str in pids.lines() {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+    if cgroup_kill(cgroup_path).is_err() {
+        // No cgroup.kill (e.g. cgroup v1): fall back to a manual per-pid sweep.
+        if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
+            for pid_str in pids.lines() {
+                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                    let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+                }
             }
         }
     }
 
-    // Remove cgroup directory
-    if let Err(e) = std::fs::remove_dir(cgroup_path) {
-        warn!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup");
+    // SIGKILL delivery/reaping is async; a v2 rmdir fails until the cgroup is
+    // empty, so retry briefly instead of leaking the directory on one miss.
+    const REMOVE_ATTEMPTS: u32 = 5;
+    for attempt in 1..=REMOVE_ATTEMPTS {
+        match std::fs::remove_dir(cgroup_path) {
+            Ok(()) => return,
+            Err(_) if attempt < REMOVE_ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => warn!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup"),
+        }
     }
 }
 

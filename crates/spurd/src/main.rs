@@ -111,13 +111,21 @@ struct Args {
     log_level: String,
 }
 
-/// True when retrying a runtime-recovery report can never help, e.g. a
-/// `failed_precondition` from a controller with no jwt_key configured.
+/// True when retrying a runtime-recovery report can never help: the
+/// controller has no jwt_key configured, or this node's own identity/token
+/// is invalid — none of which a retry loop can fix on its own.
 fn is_permanent_recovery_error(error: &anyhow::Error) -> bool {
     error
         .chain()
         .filter_map(|cause| cause.downcast_ref::<tonic::Status>())
-        .any(|status| status.code() == tonic::Code::FailedPrecondition)
+        .any(|status| {
+            matches!(
+                status.code(),
+                tonic::Code::FailedPrecondition
+                    | tonic::Code::Unauthenticated
+                    | tonic::Code::PermissionDenied
+            )
+        })
 }
 
 #[tokio::main]
@@ -715,6 +723,16 @@ mod tests {
     #[test]
     fn permanent_recovery_error_detects_failed_precondition() {
         let error = anyhow::Error::new(tonic::Status::failed_precondition("no jwt_key configured"))
+            .context("runtime recovery report failed");
+        assert!(is_permanent_recovery_error(&error));
+    }
+
+    #[test]
+    fn permanent_recovery_error_detects_a_bad_node_identity() {
+        let error = anyhow::Error::new(tonic::Status::unauthenticated("node token required"))
+            .context("runtime recovery report failed");
+        assert!(is_permanent_recovery_error(&error));
+        let error = anyhow::Error::new(tonic::Status::permission_denied("hostname mismatch"))
             .context("runtime recovery report failed");
         assert!(is_permanent_recovery_error(&error));
     }

@@ -159,8 +159,10 @@ async fn launch_runtime_session(
     // Readiness confirmed the subprocess is up and has published its real
     // pid/start-ticks; track those instead of the pid:0 placeholder so a
     // later liveness check can tell this session apart from a dead one.
-    if let Ok(published) = store.load_descriptor(&session_dir) {
-        descriptor = published;
+    match store.load_descriptor(&session_dir) {
+        Ok(published) => descriptor = published,
+        Err(error) => warn!(job_id = config.job_id, run_attempt, %error,
+            "failed to reload runtime descriptor; liveness checks will skip this session"),
     }
     Ok((
         executor::LaunchResult {
@@ -732,6 +734,25 @@ pub(crate) fn monitor_runtime_session_liveness(
     });
 }
 
+/// Atomically removes `descriptor`'s tracking entry if it's still the
+/// current one, so a completion push and the crash watchdog can never both
+/// proceed to report or record the same session's exit.
+async fn claim_runtime_session(
+    runtime_sessions: &Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
+    descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
+) -> bool {
+    let mut sessions = runtime_sessions.lock().await;
+    if sessions
+        .get(&descriptor.job_id)
+        .is_some_and(|current| current == descriptor)
+    {
+        sessions.remove(&descriptor.job_id);
+        true
+    } else {
+        false
+    }
+}
+
 async fn fence_dead_runtime_session(
     running: &RunningJobs,
     allocation: &Arc<Mutex<NodeAllocation>>,
@@ -739,14 +760,7 @@ async fn fence_dead_runtime_session(
     store: &crate::runtime_session::RuntimeSessionStore,
     descriptor: crate::runtime_session::RuntimeSessionDescriptor,
 ) {
-    // Re-check under lock: a completion push racing this liveness check may
-    // have already resolved the session between the snapshot and now.
-    let still_tracked = runtime_sessions
-        .lock()
-        .await
-        .get(&descriptor.job_id)
-        .is_some_and(|current| current == &descriptor);
-    if !still_tracked {
+    if !claim_runtime_session(runtime_sessions, &descriptor).await {
         return;
     }
     warn!(
@@ -768,7 +782,6 @@ async fn fence_dead_runtime_session(
         {
             warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
                 "failed to record synthetic exit for a dead runtime session");
-            return;
         }
     }
     release_runtime_tracking(
@@ -878,6 +891,12 @@ async fn handle_completion_notification(
     };
 
     let response = match descriptor {
+        Some(descriptor)
+            if !claim_runtime_session(&context.runtime_sessions, &descriptor).await =>
+        {
+            // The liveness watchdog already claimed and fenced this session.
+            crate::runtime_session::AgentNotificationResponse::Acknowledged
+        }
         Some(descriptor) => {
             let reported = report_completion(
                 &context.controller_addr,
@@ -5192,8 +5211,12 @@ mod tests {
 
         fence_dead_runtime_session(&running, &allocation, &sessions, &store, descriptor).await;
 
-        assert!(
-            !cgroup.path().exists(),
+        // A plain tempdir can't model real cgroupfs rmdir semantics (its
+        // pseudo-files don't count as directory entries there); check that
+        // cleanup actually reached the cgroup instead.
+        assert_eq!(
+            std::fs::read(cgroup.path().join("cgroup.kill")).expect("read cgroup.kill"),
+            b"1",
             "an orphaned cgroup left by a crashed session must be cleaned up"
         );
     }
@@ -5288,6 +5311,69 @@ mod tests {
             "local tracking must be released regardless of controller reachability"
         );
         assert!(!sessions.lock().await.contains_key(&42));
+    }
+
+    #[tokio::test]
+    async fn a_completion_push_racing_the_liveness_watchdog_never_double_reports() {
+        let (context, _running, sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::runtime_session::RuntimeSessionStore::new(state.path());
+        let mut descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "test-capability".into();
+        store.publish(&descriptor).expect("publish descriptor");
+
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::runtime_session::AgentNotification::RuntimeSessionCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            exit_code: 0,
+            signal: 0,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+
+        // Give the push a moment to claim the session and enter its (slow,
+        // unreachable-controller) report before the watchdog races it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        fence_dead_runtime_session(&running, &allocation, &sessions, &store, descriptor).await;
+
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        crate::runtime_session::read_line_bounded(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handle notification");
+
+        assert_eq!(
+            store.observed_exit(42, 7).expect("read exit"),
+            None,
+            "the watchdog must not write a synthetic exit once the push already claimed the session"
+        );
     }
 
     #[tokio::test(start_paused = true)]
