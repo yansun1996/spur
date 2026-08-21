@@ -559,9 +559,9 @@ async fn main() -> anyhow::Result<()> {
                             warn!(
                                 job_id = descriptor.job_id,
                                 run_attempt = descriptor.run_attempt,
-                                %error,
-                                "runtime recovery report permanently rejected by the controller \
-                                 (missing jwt_key or an invalid node identity); giving up on this session"
+                                ?error,
+                                "runtime recovery report permanently rejected by the controller; \
+                                 giving up on this session"
                             );
                             break;
                         }
@@ -611,9 +611,9 @@ async fn main() -> anyhow::Result<()> {
                         warn!(
                             job_id = descriptor.job_id,
                             run_attempt = descriptor.run_attempt,
-                            %error,
-                            "stale runtime recovery report permanently rejected by the controller \
-                             (missing jwt_key or an invalid node identity); giving up on this session"
+                            ?error,
+                            "stale runtime recovery report permanently rejected by the controller; \
+                             giving up on this session"
                         );
                         break;
                     }

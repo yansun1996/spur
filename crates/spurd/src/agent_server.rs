@@ -1352,13 +1352,6 @@ impl AgentService {
 
                 for c in &completed {
                     jobs.remove(&c.job_id);
-                    crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
-                    crate::executor::cleanup_job_spool(c.job_id);
-                    if let Some(ref cgroup) = c.cgroup {
-                        crate::executor::cleanup_cgroup(cgroup).await;
-                    }
-                    allocation.lock().await.release_job(c.job_id);
-                    cleanup_completed_job_mpi(c.job_id, &c.mpi, &mpi_host).await;
                 }
 
                 // Self-heal backstop: reclaim allocations with no tracked,
@@ -1367,10 +1360,20 @@ impl AgentService {
                 // (commit_job takes the running lock first).
                 reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
 
-                // Release lock BEFORE network I/O — holding the lock during
-                // report_completion blocks new job launches and can lose
-                // completions if the RPC times out.
+                // Release the lock before the per-job cleanup pass below (rootfs/spool/cgroup
+                // I/O, network RPCs) — none of it touches `jobs`, and holding it would block
+                // new job launches and other RPCs needing `running` for no reason.
                 drop(jobs);
+
+                for c in &completed {
+                    crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
+                    crate::executor::cleanup_job_spool(c.job_id);
+                    if let Some(ref cgroup) = c.cgroup {
+                        crate::executor::cleanup_cgroup(cgroup).await;
+                    }
+                    allocation.lock().await.release_job(c.job_id);
+                    cleanup_completed_job_mpi(c.job_id, &c.mpi, &mpi_host).await;
+                }
 
                 let local_hostname = hostname::get()
                     .map(|h| h.to_string_lossy().to_string())
@@ -7948,6 +7951,62 @@ mod tests {
             Some(2),
             "a stale-epoch drop must not evict a newer, already-retracked job"
         );
+    }
+
+    // The running-map guard passing (a stale caller genuinely still matches
+    // running) must not let a stale drop also evict a runtime_sessions entry
+    // that a redispatch already retracked under a newer attempt.
+    #[tokio::test]
+    async fn drop_tracked_job_skips_a_reused_runtime_session() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 904;
+        svc.insert_test_job(
+            job_id,
+            TrackedJob {
+                job: executor::RunningJob::AllocationOnly,
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+                stdout_path: "/dev/null".into(),
+                stderr_path: "/dev/null".into(),
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
+                _pty_master: None,
+                work_dir: "/tmp".into(),
+                uid: 0,
+                gid: 0,
+                user: "testuser".into(),
+                partition: String::new(),
+                gpu_devices: Vec::new(),
+                cpus: 1,
+                memory_mb: 0,
+                nodelist: String::new(),
+                mpi: String::new(),
+                run_attempt: 1,
+            },
+        )
+        .await;
+
+        let newer = crate::runtime_session::RuntimeSessionDescriptor::new(
+            job_id,
+            2,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        svc.runtime_sessions
+            .lock()
+            .await
+            .insert(job_id, newer.clone());
+
+        svc.drop_tracked_job(job_id, 1).await;
+
+        assert_eq!(svc.runtime_sessions.lock().await.get(&job_id), Some(&newer));
     }
 
     fn proc_state(pid: i32) -> char {
