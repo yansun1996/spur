@@ -348,13 +348,13 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     let reconciled_runtime_completions: HashSet<_> =
         reconciled_runtime_completions.into_iter().collect();
-    if !unacknowledged_runtime_completions.is_empty() {
-        agent_server::retry_unacknowledged_runtime_completions(
-            runtime_sessions.clone(),
-            args.controller.clone(),
-            hostname.clone(),
-        );
-    }
+    // Runs for the daemon's life, not just when this scan found something —
+    // a push notification deferred later needs the same reconciliation.
+    agent_server::retry_unacknowledged_runtime_completions(
+        runtime_sessions.clone(),
+        args.controller.clone(),
+        hostname.clone(),
+    );
     let pruned_runtime_sessions = runtime_sessions.prune_finalized()?;
     if pruned_runtime_sessions > 0 {
         info!(
@@ -406,10 +406,32 @@ async fn main() -> anyhow::Result<()> {
         running_jobs.clone(),
         allow_root_jobs,
     )
-    .with_runtime_state_dir(runtime_state_dir);
+    .with_runtime_state_dir(runtime_state_dir.clone());
     agent_service
         .adopt_runtime_sessions(&recovered_runtime_sessions)
         .await;
+    let agent_notify_socket_dir = std::path::Path::new(&runtime_state_dir);
+    if !agent_notify_socket_dir.exists() {
+        std::fs::create_dir_all(agent_notify_socket_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                agent_notify_socket_dir,
+                std::fs::Permissions::from_mode(0o700),
+            )?;
+        }
+    }
+    let agent_notify_socket =
+        agent_notify_socket_dir.join(runtime_session::AGENT_NOTIFY_SOCKET_NAME);
+    if agent_notify_socket.exists() {
+        std::fs::remove_file(&agent_notify_socket)?;
+    }
+    let agent_notify_listener = tokio::net::UnixListener::bind(&agent_notify_socket)?;
+    tokio::spawn(agent_server::serve_completion_notifications(
+        agent_notify_listener,
+        agent_service.completion_listener_context(),
+    ));
     agent_service.monitor_recovered_runtime_sessions(&recovered_runtime_sessions);
     let runtime_recovery_cleanup = agent_service.runtime_recovery_cleanup();
 

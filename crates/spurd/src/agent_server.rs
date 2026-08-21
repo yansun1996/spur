@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
@@ -389,6 +390,15 @@ pub(crate) struct RuntimeRecoveryCleanup {
     runtime_sessions: Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct CompletionListenerContext {
+    running: RunningJobs,
+    allocation: Arc<Mutex<NodeAllocation>>,
+    runtime_sessions: Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
+    controller_addr: String,
+    hostname: String,
+}
+
 impl RuntimeRecoveryCleanup {
     pub(crate) async fn reject(
         &self,
@@ -661,6 +671,136 @@ pub(crate) fn monitor_recovered_runtime_sessions(
             }
         }
     });
+}
+
+/// Accept runtime-session completion pushes for the daemon's life; spurd,
+/// not the subprocess, owns forwarding to the controller and local cleanup.
+const COMPLETION_NOTIFICATION_READ_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+const COMPLETION_ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+pub(crate) async fn serve_completion_notifications(
+    listener: tokio::net::UnixListener,
+    context: CompletionListenerContext,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                let context = context.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = handle_completion_notification(stream, &context).await {
+                        warn!(%error, "failed to handle runtime session completion notification");
+                    }
+                });
+            }
+            Err(error) => {
+                warn!(%error, "completion notification listener accept failed");
+                tokio::time::sleep(COMPLETION_ACCEPT_ERROR_BACKOFF).await;
+            }
+        }
+    }
+}
+
+fn capability_matches(capability: &str, expected: &str) -> bool {
+    !expected.is_empty()
+        && capability.len() == expected.len()
+        && bool::from(subtle::ConstantTimeEq::ct_eq(
+            capability.as_bytes(),
+            expected.as_bytes(),
+        ))
+}
+
+async fn handle_completion_notification(
+    stream: tokio::net::UnixStream,
+    context: &CompletionListenerContext,
+) -> std::io::Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(reader);
+    let mut line = String::new();
+    tokio::time::timeout(
+        COMPLETION_NOTIFICATION_READ_TIMEOUT,
+        crate::runtime_session::read_line_bounded(&mut reader, &mut line),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "notification read timeout")
+    })??;
+    let notification: crate::runtime_session::AgentNotification =
+        serde_json::from_str(&line).map_err(std::io::Error::other)?;
+    let (job_id, run_attempt, exit_code, signal, epilog_failed, capability) = match notification {
+        crate::runtime_session::AgentNotification::RuntimeSessionCompleted {
+            job_id,
+            run_attempt,
+            exit_code,
+            signal,
+            epilog_failed,
+            capability,
+        } => (
+            job_id,
+            run_attempt,
+            exit_code,
+            signal,
+            epilog_failed,
+            capability,
+        ),
+    };
+
+    let descriptor = context
+        .runtime_sessions
+        .lock()
+        .await
+        .get(&job_id)
+        .filter(|descriptor| descriptor.run_attempt == run_attempt)
+        .cloned();
+    let descriptor = match descriptor {
+        Some(descriptor) if capability_matches(&capability, &descriptor.capability) => {
+            Some(descriptor)
+        }
+        Some(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "runtime session completion capability mismatch",
+            ));
+        }
+        None => None,
+    };
+
+    let response = match descriptor {
+        Some(descriptor) => {
+            let reported = report_completion(
+                &context.controller_addr,
+                job_id,
+                exit_code,
+                signal,
+                run_attempt,
+                &context.hostname,
+                epilog_failed.then_some(&DrainRequest {
+                    reason: "epilog script failed".into(),
+                }),
+            )
+            .await;
+            release_runtime_tracking(
+                &context.running,
+                &context.allocation,
+                &context.runtime_sessions,
+                &descriptor,
+                "runtime completion",
+            )
+            .await;
+            if reported {
+                crate::runtime_session::AgentNotificationResponse::Acknowledged
+            } else {
+                crate::runtime_session::AgentNotificationResponse::Deferred
+            }
+        }
+        // Nothing local to release (already handled, or a duplicate retry
+        // after a lost ack) — safe to let the caller prune.
+        None => crate::runtime_session::AgentNotificationResponse::Acknowledged,
+    };
+
+    let payload = serde_json::to_vec(&response).map_err(std::io::Error::other)?;
+    writer.write_all(&payload).await?;
+    writer.write_all(b"\n").await
 }
 
 fn durable_runtime_exit(
@@ -991,20 +1131,6 @@ impl AgentService {
         }
     }
 
-    fn monitor_runtime_session(
-        &self,
-        descriptor: crate::runtime_session::RuntimeSessionDescriptor,
-    ) {
-        monitor_recovered_runtime_sessions(
-            self.running.clone(),
-            self.allocation.clone(),
-            self.runtime_sessions.clone(),
-            vec![descriptor],
-            crate::runtime_session::RuntimeSessionStore::new(&self.runtime_state_dir),
-            self.reporter.controller_addr.clone(),
-        );
-    }
-
     pub(crate) fn monitor_recovered_runtime_sessions(
         &self,
         descriptors: &[crate::runtime_session::RuntimeSessionDescriptor],
@@ -1024,6 +1150,16 @@ impl AgentService {
             running: self.running.clone(),
             allocation: self.allocation.clone(),
             runtime_sessions: self.runtime_sessions.clone(),
+        }
+    }
+
+    pub(crate) fn completion_listener_context(&self) -> CompletionListenerContext {
+        CompletionListenerContext {
+            running: self.running.clone(),
+            allocation: self.allocation.clone(),
+            runtime_sessions: self.runtime_sessions.clone(),
+            controller_addr: self.reporter.controller_addr.clone(),
+            hostname: self.reporter.hostname.clone(),
         }
     }
 
@@ -2376,11 +2512,9 @@ impl SlurmAgent for AgentService {
                     },
                 );
                 drop(jobs);
-                if let Some(descriptor) = runtime_descriptor {
-                    // Already claimed into `runtime_sessions` above, before
-                    // the allocation/running commit.
-                    self.monitor_runtime_session(descriptor);
-                }
+                // Already claimed into `runtime_sessions` above, before the
+                // allocation/running commit; completion arrives by push
+                // notification, not by polling.
                 // Re-dispatch onto the same node reuses job_id and displaces an
                 // older run. If its process ignored SIGTERM and outlived the
                 // requeue, kill and reap it here — the monitor loop no longer
@@ -2821,8 +2955,7 @@ impl SlurmAgent for AgentService {
             self.runtime_sessions
                 .lock()
                 .await
-                .insert(req.job_id, descriptor.clone());
-            self.monitor_runtime_session(descriptor);
+                .insert(req.job_id, descriptor);
         }
 
         Ok(Response::new(RegisterJobAllocationResponse {}))
@@ -4853,6 +4986,220 @@ mod tests {
         assert!(!sessions.lock().await.contains_key(&42));
         assert_eq!(allocation.lock().await.allocated_memory_mb, 0);
         assert!(!store.session_dir(42, 7).exists());
+    }
+
+    async fn completion_listener_fixture(
+        controller_addr: &str,
+    ) -> (
+        CompletionListenerContext,
+        RunningJobs,
+        Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
+    ) {
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                ..Default::default()
+            },
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let mut descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "test-capability".into();
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 1, 128, &[])
+            .expect("reserve allocation");
+        assert!(allocation.lock().await.commit_job(42));
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 7;
+        running.lock().await.insert(42, tracked);
+        sessions.lock().await.insert(42, descriptor);
+        let context = CompletionListenerContext {
+            running: running.clone(),
+            allocation,
+            runtime_sessions: sessions.clone(),
+            controller_addr: controller_addr.into(),
+            hostname: "test-node".into(),
+        };
+        (context, running, sessions)
+    }
+
+    #[tokio::test]
+    async fn completion_notification_releases_local_tracking_even_when_controller_is_unreachable() {
+        let (context, running, sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::runtime_session::AgentNotification::RuntimeSessionCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            exit_code: 0,
+            signal: 0,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        crate::runtime_session::read_line_bounded(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        let response: crate::runtime_session::AgentNotificationResponse =
+            serde_json::from_str(&line).expect("decode response");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handle notification");
+
+        assert_eq!(
+            response,
+            crate::runtime_session::AgentNotificationResponse::Deferred
+        );
+        assert!(
+            !running.lock().await.contains_key(&42),
+            "local tracking must be released regardless of controller reachability"
+        );
+        assert!(!sessions.lock().await.contains_key(&42));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_notification_acks_immediately_when_nothing_is_tracked() {
+        let (context, _running, sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        sessions.lock().await.remove(&42);
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::runtime_session::AgentNotification::RuntimeSessionCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            exit_code: 0,
+            signal: 0,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        crate::runtime_session::read_line_bounded(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        let response: crate::runtime_session::AgentNotificationResponse =
+            serde_json::from_str(&line).expect("decode response");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handle notification");
+
+        assert_eq!(
+            response,
+            crate::runtime_session::AgentNotificationResponse::Acknowledged
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_notification_rejects_a_capability_mismatch() {
+        let (context, running, sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::runtime_session::AgentNotification::RuntimeSessionCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            exit_code: 0,
+            signal: 0,
+            epilog_failed: false,
+            capability: "forged-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        let read_result = crate::runtime_session::read_line_bounded(&mut reader, &mut line).await;
+
+        assert!(
+            read_result.is_err() || line.is_empty(),
+            "a forged capability must not get a usable response"
+        );
+        assert!(handler.await.expect("handler task").is_err());
+        assert!(
+            running.lock().await.contains_key(&42),
+            "a rejected notification must not release tracking for the real session"
+        );
+        assert!(sessions.lock().await.contains_key(&42));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn notify_agent_completion_gives_up_after_the_retry_budget() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("nobody-listens.sock");
+        let notification = crate::runtime_session::AgentNotification::RuntimeSessionCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            exit_code: 0,
+            signal: 0,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        let response =
+            crate::runtime_session::notify_agent_completion(&socket_path, &notification).await;
+        assert_eq!(response, None);
+    }
+
+    #[tokio::test]
+    async fn completion_notification_round_trips_over_a_real_socket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("agent.sock");
+        let (context, running, _sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
+        tokio::spawn(serve_completion_notifications(listener, context));
+        let notification = crate::runtime_session::AgentNotification::RuntimeSessionCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            exit_code: 0,
+            signal: 0,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        let response =
+            crate::runtime_session::notify_agent_completion(&socket_path, &notification).await;
+        assert_eq!(
+            response,
+            Some(crate::runtime_session::AgentNotificationResponse::Deferred)
+        );
+        assert!(!running.lock().await.contains_key(&42));
     }
 
     fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {

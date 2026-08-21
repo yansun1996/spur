@@ -239,6 +239,29 @@ pub enum RuntimeResponse {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "notification", rename_all = "snake_case")]
+pub enum AgentNotification {
+    RuntimeSessionCompleted {
+        job_id: u32,
+        run_attempt: u32,
+        exit_code: i32,
+        signal: i32,
+        epilog_failed: bool,
+        capability: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "result", rename_all = "snake_case")]
+pub enum AgentNotificationResponse {
+    /// spurd forwarded the completion to the controller; safe to prune.
+    Acknowledged,
+    /// spurd released its local tracking but could not reach the
+    /// controller; leave the durable record for the next startup scan.
+    Deferred,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeSnapshot {
     pub job_id: u32,
@@ -413,10 +436,13 @@ const PTY_OUTPUT_LIMIT: usize = 1024 * 1024;
 const RUNTIME_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CONTROL_LINE_LIMIT: usize = 64 * 1024;
 const CONTROL_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Sibling of the runtime session store root, not inside it, so directory
+/// scans over session state (`discover_live`, `prune_finalized`) never see it.
+pub(crate) const AGENT_NOTIFY_SOCKET_NAME: &str = "agent.sock";
 
 /// `read_line` with no cap on line length; a peer that never sends `\n` grows
 /// `line` unboundedly. Bound it to a sane control-protocol frame size.
-async fn read_line_bounded<R>(reader: &mut R, line: &mut String) -> io::Result<usize>
+pub(crate) async fn read_line_bounded<R>(reader: &mut R, line: &mut String) -> io::Result<usize>
 where
     R: AsyncBufReadExt + Unpin,
 {
@@ -1723,6 +1749,60 @@ async fn read_response(
     })
 }
 
+const AGENT_NOTIFY_ATTEMPTS: u32 = 5;
+const AGENT_NOTIFY_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+const AGENT_NOTIFY_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Push this session's completion to spurd. `None` means the caller must
+/// leave the durable record for spurd's next-startup recovery scan.
+pub(crate) async fn notify_agent_completion(
+    agent_socket: &Path,
+    notification: &AgentNotification,
+) -> Option<AgentNotificationResponse> {
+    for attempt in 1..=AGENT_NOTIFY_ATTEMPTS {
+        let outcome = tokio::time::timeout(
+            AGENT_NOTIFY_ATTEMPT_TIMEOUT,
+            try_notify_agent(agent_socket, notification),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "spurd did not answer",
+            ))
+        });
+        match outcome {
+            Ok(response) => return Some(response),
+            Err(error) => {
+                tracing::warn!(
+                    attempt,
+                    %error,
+                    "failed to notify spurd of runtime session completion"
+                );
+                if attempt < AGENT_NOTIFY_ATTEMPTS {
+                    tokio::time::sleep(AGENT_NOTIFY_RETRY_GAP).await;
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn try_notify_agent(
+    agent_socket: &Path,
+    notification: &AgentNotification,
+) -> io::Result<AgentNotificationResponse> {
+    let stream = UnixStream::connect(agent_socket).await?;
+    let (reader, mut writer) = stream.into_split();
+    let payload = serde_json::to_vec(notification).map_err(io::Error::other)?;
+    writer.write_all(&payload).await?;
+    writer.write_all(b"\n").await?;
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    read_line_bounded(&mut reader, &mut line).await?;
+    serde_json::from_str(&line).map_err(io::Error::other)
+}
+
 pub async fn serve_control(stream: UnixStream, session: &RuntimeSession) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     loop {
@@ -1902,6 +1982,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if launch_spec.job_id != job_id {
         anyhow::bail!("runtime launch spec job id does not match process arguments");
     }
+    let agent_socket = state_dir.join(AGENT_NOTIFY_SOCKET_NAME);
     let store = RuntimeSessionStore::new(state_dir);
     let session_dir = store.session_dir(job_id, run_attempt);
     let obligations = store.obligations(job_id, run_attempt);
@@ -1928,8 +2009,6 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     store.publish(&descriptor)?;
     let pmix_guard = prepare_pmix_launch(&mut launch_spec)?;
     let listener = UnixListener::bind(&socket_path)?;
-    let controller_addr = launch_spec.controller_addr.clone();
-    let reporting_node = launch_spec.reporting_node.clone();
     let runtime_environment = launch_spec.environment.clone();
     let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     let hooks = launch_spec.hooks.clone();
@@ -1967,6 +2046,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         runtime_environment,
         pmix_guard.as_ref().map(|guard| guard.host.clone()),
     ));
+    let capability = descriptor.capability.clone();
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
     if let Some(cgroup) = session.take_cgroup().await {
@@ -2014,30 +2094,24 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             }
         }
     }
-    obligations.append(&RuntimeObligation::ExitObserved {
+    let signal = snapshot.signal.unwrap_or(0);
+    obligations.append(&RuntimeObligation::ExitObserved { exit_code, signal })?;
+    let notification = AgentNotification::RuntimeSessionCompleted {
+        job_id,
+        run_attempt,
         exit_code,
-        signal: snapshot.signal.unwrap_or(0),
-    })?;
-    if !controller_addr.is_empty()
-        && !reporting_node.is_empty()
-        && crate::agent_server::report_completion(
-            &controller_addr,
-            job_id,
-            exit_code,
-            snapshot.signal.unwrap_or(0),
-            run_attempt,
-            &reporting_node,
-            epilog_failed.then_some(&crate::agent_server::DrainRequest {
-                reason: "epilog script failed".into(),
-            }),
-        )
-        .await
+        signal,
+        epilog_failed,
+        capability,
+    };
+    if notify_agent_completion(&agent_socket, &notification).await
+        == Some(AgentNotificationResponse::Acknowledged)
     {
         store.acknowledge_completion(&PendingRuntimeCompletion {
             job_id,
             run_attempt,
             exit_code,
-            signal: snapshot.signal.unwrap_or(0),
+            signal,
         })?;
     }
     Ok(exit_code)
