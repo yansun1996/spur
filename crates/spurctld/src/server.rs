@@ -326,9 +326,11 @@ impl ControllerService {
                 );
                 // Signal 0 is a no-op on an unknown id, but SIGTERM/SIGKILLs a
                 // live process for the active-elsewhere case. Not epoch-gated.
+                // Unspecified: this path is deliberately not epoch-gated (see above).
                 crate::scheduler_loop::cancel_job_on_nodes(
                     &cluster,
                     job_id,
+                    0,
                     std::slice::from_ref(&node),
                     0,
                 )
@@ -1908,9 +1910,14 @@ impl SlurmController for ControllerService {
                         if !missing.is_empty() {
                             let cluster = self.cluster.clone();
                             let job_id = req.job_id;
+                            let run_attempt = job.run_attempt;
                             tokio::spawn(async move {
                                 crate::scheduler_loop::cancel_job_on_nodes(
-                                    &cluster, job_id, &missing, 15,
+                                    &cluster,
+                                    job_id,
+                                    run_attempt,
+                                    &missing,
+                                    15,
                                 )
                                 .await;
                             });

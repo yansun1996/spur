@@ -1485,14 +1485,16 @@ fn reconcile_orphaned_allocations(
 struct LaunchReservationGuard {
     allocation: Arc<Mutex<NodeAllocation>>,
     job_id: u32,
+    run_attempt: u32,
     armed: bool,
 }
 
 impl LaunchReservationGuard {
-    fn new(allocation: Arc<Mutex<NodeAllocation>>, job_id: u32) -> Self {
+    fn new(allocation: Arc<Mutex<NodeAllocation>>, job_id: u32, run_attempt: u32) -> Self {
         Self {
             allocation,
             job_id,
+            run_attempt,
             armed: true,
         }
     }
@@ -1508,12 +1510,15 @@ impl Drop for LaunchReservationGuard {
             return;
         }
         let job_id = self.job_id;
+        let run_attempt = self.run_attempt;
+        // Generation-checked: a redispatch may have already superseded this
+        // reservation, and releasing it here must not free the new one.
         if let Ok(mut alloc) = self.allocation.try_lock() {
-            alloc.release_job(job_id);
+            alloc.release_job_if(job_id, run_attempt);
         } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let allocation = self.allocation.clone();
             handle.spawn(async move {
-                allocation.lock().await.release_job(job_id);
+                allocation.lock().await.release_job_if(job_id, run_attempt);
             });
         }
     }
@@ -2355,7 +2360,8 @@ impl SlurmAgent for AgentService {
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
-        let mut reservation_guard = LaunchReservationGuard::new(self.allocation.clone(), job_id);
+        let mut reservation_guard =
+            LaunchReservationGuard::new(self.allocation.clone(), job_id, run_attempt);
 
         let injection = {
             let reg = self.device_registry.lock().await;
@@ -2765,10 +2771,17 @@ impl SlurmAgent for AgentService {
         // The signal paths only act on a running job; release a still-launching
         // reservation so a cancel-during-eviction doesn't strand it until the
         // TTL. Hold the running lock across the release (matching launch_job's
-        // commit order) so this can't free a job that just became running.
+        // commit order) so this can't free a job that just became running, and
+        // generation-check the release itself so a redispatch that already
+        // reserved a newer attempt survives a cancel for the old one.
         let jobs = self.running.lock().await;
         if !jobs.contains_key(&job_id) {
-            self.allocation.lock().await.release_job(job_id);
+            let mut alloc = self.allocation.lock().await;
+            if req.run_attempt == 0 {
+                alloc.release_job(job_id);
+            } else {
+                alloc.release_job_if(job_id, req.run_attempt);
+            }
         }
         drop(jobs);
 
@@ -2987,6 +3000,10 @@ impl SlurmAgent for AgentService {
                     ),
                     AllocError::DuplicateJob => Status::already_exists(format!(
                         "job {} already registered on this node",
+                        req.job_id
+                    )),
+                    AllocError::Superseded => Status::failed_precondition(format!(
+                        "job {} was superseded by a newer attempt on this node",
                         req.job_id
                     )),
                 })?;
@@ -4087,15 +4104,25 @@ impl AgentService {
             Err(AllocError::DuplicateJob) => {
                 // A launch is already in flight for this job id (reserved, not
                 // yet committed or released). This is a concurrent duplicate,
-                // not resource exhaustion. A stale reservation from a prior,
-                // already-torn-down run is superseded inside allocate_for_job
-                // and does not reach here.
+                // not resource exhaustion.
                 warn!(
                     job_id,
                     "rejecting duplicate launch: a launch is already in flight for this job"
                 );
                 return Err(Status::already_exists(format!(
                     "job {job_id} already has a launch in flight on this node"
+                )));
+            }
+            Err(AllocError::Superseded) => {
+                // A newer attempt already reserved/committed this job id; this
+                // is a late or duplicate LaunchJob for an older attempt.
+                warn!(
+                    job_id,
+                    run_attempt,
+                    "rejecting launch: superseded by a newer attempt already tracked on this node"
+                );
+                return Err(Status::failed_precondition(format!(
+                    "job {job_id} was superseded by a newer attempt on this node"
                 )));
             }
         };
@@ -7660,6 +7687,7 @@ mod tests {
         svc.cancel_job(Request::new(AgentCancelJobRequest {
             job_id: 7,
             signal: 9,
+            run_attempt: 1,
         }))
         .await
         .expect("cancel_job");
@@ -7668,6 +7696,39 @@ mod tests {
             svc.free_gpu_count().await,
             1,
             "cancel must release a launching (never-committed) reservation"
+        );
+    }
+
+    // A cancel for a superseded attempt must not release a redispatch's
+    // already-reserved, newer attempt.
+    #[tokio::test]
+    async fn cancel_spares_a_reused_job_ids_reservation() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(7, 1, 1, 0, &[0]).unwrap();
+            alloc.release_job(7);
+            alloc.allocate_for_job(7, 2, 1, 0, &[0]).unwrap();
+        }
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            signal: 9,
+            run_attempt: 1,
+        }))
+        .await
+        .expect("cancel_job");
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "a stale cancel must not release the current attempt's reservation"
         );
     }
 
@@ -7717,7 +7778,7 @@ mod tests {
                 .await
                 .allocate_for_job(9, 1, 1, 0, &[0])
                 .unwrap();
-            let guard = LaunchReservationGuard::new(svc.allocation.clone(), 9);
+            let guard = LaunchReservationGuard::new(svc.allocation.clone(), 9, 1);
             assert_eq!(svc.free_gpu_count().await, 0, "reserved under guard");
             drop(guard);
         }
@@ -7735,7 +7796,7 @@ mod tests {
                 .allocate_for_job(10, 1, 1, 0, &[0])
                 .unwrap();
             svc.allocation.lock().await.commit_job(10, 1);
-            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 10);
+            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 10, 1);
             guard.disarm();
             drop(guard);
         }
@@ -7743,6 +7804,45 @@ mod tests {
             svc.free_gpu_count().await,
             0,
             "a disarmed guard must leave the committed reservation intact"
+        );
+    }
+
+    // A guard whose reservation was superseded by a redispatch (e.g. a cancel
+    // raced the original launch) must not release the new attempt's own
+    // reservation when it drops still armed.
+    #[tokio::test]
+    async fn reservation_guard_spares_a_reused_job_ids_reservation_on_drop() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(11, 1, 1, 0, &[0])
+            .unwrap();
+        let guard = LaunchReservationGuard::new(svc.allocation.clone(), 11, 1);
+
+        // A cancel races the still-in-flight launch, releasing attempt 1's
+        // reservation; the controller redispatches attempt 2, which reserves
+        // and commits before attempt 1's guard is ever dropped.
+        svc.allocation.lock().await.release_job(11);
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(11, 2, 1, 0, &[0])
+            .unwrap();
+        svc.allocation.lock().await.commit_job(11, 2);
+
+        drop(guard);
+
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "attempt 1's stale guard must not release attempt 2's reservation"
         );
     }
 

@@ -22,6 +22,9 @@ pub enum AllocError {
     /// still mid-launch, not yet committed or released). A second concurrent
     /// launch would double-count resources, so it is rejected.
     DuplicateJob,
+    /// A newer run_attempt already owns this job id's reservation; this
+    /// (older or duplicate) attempt lost the race and must not proceed.
+    Superseded,
 }
 
 /// Per-node resource allocation state.
@@ -157,12 +160,14 @@ impl NodeAllocation {
         if self.launching.contains_key(&job_id) {
             return Err(AllocError::DuplicateJob);
         }
-        // A committed reservation still owned here means a prior run's teardown
-        // has not released yet (e.g. a preempted-then-requeued job re-dispatched
-        // under the same id before the agent reaped the killed process). The
-        // controller only re-issues LaunchJob after freeing the job, so this
-        // reservation is stale — supersede it rather than reject, releasing it
-        // first so CPU/memory stay symmetric and the owner entry is not orphaned.
+        // A committed owner from the same or an older attempt is stale (a prior
+        // run's teardown hasn't released yet) — supersede it. A NEWER attempt's
+        // owner already won this job id; a late reservation must not clobber it.
+        if let Some(existing) = self.owners.get(&job_id) {
+            if existing.run_attempt > run_attempt {
+                return Err(AllocError::Superseded);
+            }
+        }
         self.release_job(job_id);
 
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
@@ -222,8 +227,9 @@ impl NodeAllocation {
 
     /// Release a job's allocation by id, regardless of which attempt owns it.
     /// Idempotent: releasing an unknown or already-released job is a no-op
-    /// returning false. For callers that know the specific attempt they own,
-    /// prefer `commit_job`'s generation check before ever calling this.
+    /// returning false. Only for callers that genuinely don't have a specific
+    /// attempt to compare (reconcile, foreign-owner reclaim) — everyone else
+    /// should use `release_job_if`.
     pub fn release_job(&mut self, job_id: u32) -> bool {
         self.launching.remove(&job_id);
         let Some(owned) = self.owners.remove(&job_id) else {
@@ -231,6 +237,21 @@ impl NodeAllocation {
         };
         self.release(&owned.result);
         true
+    }
+
+    /// Release a job's allocation only if `run_attempt` is still the current
+    /// owner, so a stale caller can't free a different, newer attempt's
+    /// reservation that has since superseded the one it thinks it owns.
+    pub fn release_job_if(&mut self, job_id: u32, run_attempt: u32) -> bool {
+        if self
+            .owners
+            .get(&job_id)
+            .is_some_and(|owned| owned.run_attempt == run_attempt)
+        {
+            self.release_job(job_id)
+        } else {
+            false
+        }
     }
 
     /// Release owned allocations whose job is neither live nor launching within
@@ -600,6 +621,57 @@ mod tests {
             56,
             "the current attempt's resources must remain allocated"
         );
+    }
+
+    #[test]
+    fn test_allocate_for_job_rejects_a_stale_attempt_superseding_a_committed_newer_one() {
+        // Attempt 2 reserves and commits job 7. A late/duplicate LaunchJob for
+        // the older attempt 1 must not be allowed to supersede it — that would
+        // hand attempt 2's live, running resources to a stale relaunch.
+        let mut node = make_node(64, 256_000, 0, "");
+        node.allocate_for_job(7, 2, 8, 16_000, &[]).unwrap();
+        assert!(node.commit_job(7, 2));
+
+        assert_eq!(
+            node.allocate_for_job(7, 1, 8, 16_000, &[]),
+            Err(AllocError::Superseded)
+        );
+        assert_eq!(
+            node.free_cpus(),
+            56,
+            "the newer attempt's resources must remain allocated"
+        );
+    }
+
+    #[test]
+    fn test_allocate_for_job_supersedes_a_committed_same_or_older_attempt() {
+        // A same-attempt retry, or a genuinely newer attempt reserving after a
+        // stale committed owner, must still supersede as before.
+        let mut node = make_node(64, 256_000, 0, "");
+        node.allocate_for_job(7, 1, 8, 16_000, &[]).unwrap();
+        assert!(node.commit_job(7, 1));
+
+        assert!(node.allocate_for_job(7, 2, 8, 16_000, &[]).is_ok());
+        assert_eq!(node.free_cpus(), 56);
+    }
+
+    #[test]
+    fn test_release_job_if_spares_a_reused_job_ids_reservation() {
+        let mut node = make_node(64, 256_000, 0, "");
+        node.allocate_for_job(7, 1, 8, 16_000, &[]).unwrap();
+        node.release_job(7);
+        node.allocate_for_job(7, 2, 8, 16_000, &[]).unwrap();
+
+        assert!(
+            !node.release_job_if(7, 1),
+            "a stale attempt must not release a different, current attempt's reservation"
+        );
+        assert_eq!(node.free_cpus(), 56);
+        assert!(
+            node.release_job_if(7, 2),
+            "the current attempt can release its own"
+        );
+        assert_eq!(node.free_cpus(), 64);
     }
 
     #[test]

@@ -860,6 +860,10 @@ message LaunchJobResponse {
 message AgentCancelJobRequest {
   uint32 job_id = 1;
   int32 signal = 2;
+  // Epoch of the run being cancelled; 0 means unspecified (cancel whichever
+  // attempt is currently tracked). Guards a still-launching reservation
+  // release against a concurrent redispatch under the same job_id.
+  uint32 run_attempt = 3;
 }
 
 message AgentSuspendJobRequest {
