@@ -2350,7 +2350,7 @@ impl SlurmAgent for AgentService {
         };
 
         let (alloc_result, allocated_device_ids) = self
-            .allocate_local_resources(job_id, &spec, req.allocated.as_ref())
+            .allocate_local_resources(job_id, run_attempt, &spec, req.allocated.as_ref())
             .await?;
 
         // Release the reservation on any exit before commit, including a
@@ -2573,7 +2573,7 @@ impl SlurmAgent for AgentService {
                 // it is no longer exempt from reconcile. Take the running lock
                 // first so a job is never briefly absent from BOTH `running` and
                 // `launching` (which would let reconcile reclaim it).
-                let committed = self.allocation.lock().await.commit_job(job_id);
+                let committed = self.allocation.lock().await.commit_job(job_id, run_attempt);
                 reservation_guard.disarm();
 
                 // reconcile reclaimed the reservation mid-launch (launch exceeded
@@ -2974,7 +2974,13 @@ impl SlurmAgent for AgentService {
         {
             let mut alloc = self.allocation.lock().await;
             alloc
-                .allocate_for_job(req.job_id, cpus, memory_mb, &controller_gpu_ids)
+                .allocate_for_job(
+                    req.job_id,
+                    req.run_attempt,
+                    cpus,
+                    memory_mb,
+                    &controller_gpu_ids,
+                )
                 .map_err(|e| match e {
                     AllocError::GpusUnavailable => Status::resource_exhausted(
                         "controller-allocated GPUs unavailable on this node",
@@ -2984,7 +2990,7 @@ impl SlurmAgent for AgentService {
                         req.job_id
                     )),
                 })?;
-            let _ = alloc.commit_job(req.job_id);
+            let _ = alloc.commit_job(req.job_id, req.run_attempt);
         }
 
         info!(
@@ -3998,6 +4004,7 @@ impl AgentService {
     async fn allocate_local_resources(
         &self,
         job_id: u32,
+        run_attempt: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
     ) -> Result<(AllocationResult, Vec<u32>), Status> {
@@ -4030,6 +4037,7 @@ impl AgentService {
         };
         let result = match alloc.allocate_for_job(
             job_id,
+            run_attempt,
             cpus,
             spec.memory_per_node_mb,
             &controller_gpu_ids,
@@ -4056,6 +4064,7 @@ impl AgentService {
                 }
                 match alloc.allocate_for_job(
                     job_id,
+                    run_attempt,
                     cpus,
                     spec.memory_per_node_mb,
                     &controller_gpu_ids,
@@ -5116,9 +5125,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 128, &[])
+            .allocate_for_job(42, 1, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42));
+        assert!(allocation.lock().await.commit_job(42, 1));
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
@@ -5166,9 +5175,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 128, &[])
+            .allocate_for_job(42, 1, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42));
+        assert!(allocation.lock().await.commit_job(42, 1));
         let mut newer = TrackedJob::dummy(0);
         newer.run_attempt = 8;
         running.lock().await.insert(42, newer);
@@ -5219,9 +5228,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 128, &[])
+            .allocate_for_job(42, 1, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42));
+        assert!(allocation.lock().await.commit_job(42, 1));
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
@@ -5332,9 +5341,9 @@ mod tests {
         allocation
             .lock()
             .await
-            .allocate_for_job(42, 1, 128, &[])
+            .allocate_for_job(42, 1, 1, 128, &[])
             .expect("reserve allocation");
-        assert!(allocation.lock().await.commit_job(42));
+        assert!(allocation.lock().await.commit_job(42, 1));
         let mut tracked = TrackedJob::dummy(0);
         tracked.run_attempt = 7;
         running.lock().await.insert(42, tracked);
@@ -7176,10 +7185,10 @@ mod tests {
         // (simulating a teardown path that dropped the job without releasing).
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(1, 2, 0, &[0]).unwrap();
-            alloc.commit_job(1);
-            alloc.allocate_for_job(2, 2, 0, &[1]).unwrap();
-            alloc.commit_job(2);
+            alloc.allocate_for_job(1, 1, 2, 0, &[0]).unwrap();
+            alloc.commit_job(1, 1);
+            alloc.allocate_for_job(2, 1, 2, 0, &[1]).unwrap();
+            alloc.commit_job(2, 1);
         }
         assert_eq!(svc.free_gpu_count().await, 0);
 
@@ -7237,8 +7246,8 @@ mod tests {
         let job_id = 961;
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(job_id, 1, 0, &[0]).unwrap();
-            alloc.commit_job(job_id);
+            alloc.allocate_for_job(job_id, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(job_id, 1);
         }
         let child = tokio::process::Command::new("/bin/true")
             .process_group(0)
@@ -7284,8 +7293,8 @@ mod tests {
         // (its completion report was force-finished by the controller).
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(99, 1, 0, &[0]).unwrap();
-            alloc.commit_job(99);
+            alloc.allocate_for_job(99, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(99, 1);
         }
         assert_eq!(svc.free_gpu_count().await, 0);
 
@@ -7311,7 +7320,7 @@ mod tests {
         };
 
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&allocated))
+            .allocate_local_resources(100, 1, &spec, Some(&allocated))
             .await;
         assert!(
             res.is_ok(),
@@ -7334,8 +7343,8 @@ mod tests {
         svc.insert_test_job(99, TrackedJob::dummy(0)).await;
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(99, 1, 0, &[0]).unwrap();
-            alloc.commit_job(99);
+            alloc.allocate_for_job(99, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(99, 1);
         }
 
         let mut devices = std::collections::HashMap::new();
@@ -7360,7 +7369,7 @@ mod tests {
         };
 
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&allocated))
+            .allocate_local_resources(100, 1, &spec, Some(&allocated))
             .await;
         let err = res.expect_err("must reject: the conflicting GPU owner is still running");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -7380,7 +7389,7 @@ mod tests {
         // Prior job 99 owns GPU 0 and is still launching (never committed).
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(99, 1, 0, &[0]).unwrap();
+            alloc.allocate_for_job(99, 1, 1, 0, &[0]).unwrap();
         }
 
         let mut devices = std::collections::HashMap::new();
@@ -7405,7 +7414,7 @@ mod tests {
         };
 
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&allocated))
+            .allocate_local_resources(100, 1, &spec, Some(&allocated))
             .await;
         let err = res.expect_err("must reject: the conflicting GPU owner is still launching");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -7448,10 +7457,10 @@ mod tests {
 
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(98, 1, 0, &[0]).unwrap();
-            alloc.commit_job(98);
-            alloc.allocate_for_job(99, 1, 0, &[1]).unwrap();
-            alloc.commit_job(99);
+            alloc.allocate_for_job(98, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(98, 1);
+            alloc.allocate_for_job(99, 1, 1, 0, &[1]).unwrap();
+            alloc.commit_job(99, 1);
         }
         assert_eq!(svc.free_gpu_count().await, 0);
 
@@ -7461,7 +7470,7 @@ mod tests {
             ..Default::default()
         };
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
+            .allocate_local_resources(100, 1, &spec, Some(&gpu_alloc_request(&[0, 1])))
             .await;
         assert!(
             res.is_ok(),
@@ -7484,10 +7493,10 @@ mod tests {
         svc.insert_test_job(99, TrackedJob::dummy(0)).await;
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(98, 1, 0, &[0]).unwrap();
-            alloc.commit_job(98);
-            alloc.allocate_for_job(99, 1, 0, &[1]).unwrap();
-            alloc.commit_job(99);
+            alloc.allocate_for_job(98, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(98, 1);
+            alloc.allocate_for_job(99, 1, 1, 0, &[1]).unwrap();
+            alloc.commit_job(99, 1);
         }
 
         let spec = JobSpec {
@@ -7496,7 +7505,7 @@ mod tests {
             ..Default::default()
         };
         let res = svc
-            .allocate_local_resources(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
+            .allocate_local_resources(100, 1, &spec, Some(&gpu_alloc_request(&[0, 1])))
             .await;
         let err = res.expect_err("must reject: GPU 1's owner is still running");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -7640,7 +7649,7 @@ mod tests {
         // Reserve GPU 0 as a still-launching job (not committed, not in running).
         {
             let mut alloc = svc.allocation.lock().await;
-            alloc.allocate_for_job(7, 1, 0, &[0]).unwrap();
+            alloc.allocate_for_job(7, 1, 1, 0, &[0]).unwrap();
         }
         assert_eq!(
             svc.free_gpu_count().await,
@@ -7706,7 +7715,7 @@ mod tests {
             svc.allocation
                 .lock()
                 .await
-                .allocate_for_job(9, 1, 0, &[0])
+                .allocate_for_job(9, 1, 1, 0, &[0])
                 .unwrap();
             let guard = LaunchReservationGuard::new(svc.allocation.clone(), 9);
             assert_eq!(svc.free_gpu_count().await, 0, "reserved under guard");
@@ -7723,9 +7732,9 @@ mod tests {
             svc.allocation
                 .lock()
                 .await
-                .allocate_for_job(10, 1, 0, &[0])
+                .allocate_for_job(10, 1, 1, 0, &[0])
                 .unwrap();
-            svc.allocation.lock().await.commit_job(10);
+            svc.allocation.lock().await.commit_job(10, 1);
             let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 10);
             guard.disarm();
             drop(guard);
