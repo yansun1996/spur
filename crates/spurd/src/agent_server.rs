@@ -472,6 +472,9 @@ async fn release_runtime_tracking(
         }
     };
 
+    // Hold `running` across the allocation release too — matching the
+    // lock order commit_job uses — so a redispatch racing this can't have
+    // its brand-new allocation torn down by this stale, job_id-keyed release.
     let removed_tracked = {
         let mut jobs = running.lock().await;
         if jobs
@@ -479,14 +482,12 @@ async fn release_runtime_tracking(
             .is_some_and(|current| current.run_attempt == descriptor.run_attempt)
         {
             jobs.remove(&descriptor.job_id);
+            allocation.lock().await.release_job(descriptor.job_id);
             true
         } else {
             false
         }
     };
-    if removed_tracked {
-        allocation.lock().await.release_job(descriptor.job_id);
-    }
 
     if removed_runtime || removed_tracked {
         if let Err(error) = crate::runtime_session::record_resources_released(descriptor) {
@@ -1350,6 +1351,9 @@ impl AgentService {
                     }
                 }
 
+                // Stays under `jobs`: release_job is job_id-keyed with no generation tag,
+                // so dropping the lock first lets a redispatch's new attempt get torn down
+                // by this cleanup, and reconcile below would misclassify it as an orphan.
                 for c in &completed {
                     jobs.remove(&c.job_id);
                     crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
@@ -3948,6 +3952,9 @@ impl AgentService {
     /// attempt between the caller's peek and this call, and that entry must
     /// survive.
     async fn drop_tracked_job(&self, job_id: u32, run_attempt: u32) {
+        // Hold `running` across the allocation release too — matching the
+        // lock order commit_job uses — so a redispatch racing this can't have
+        // its brand-new allocation torn down by this stale, job_id-keyed release.
         let removed = {
             let mut jobs = self.running.lock().await;
             if jobs
@@ -3955,6 +3962,7 @@ impl AgentService {
                 .is_some_and(|current| current.run_attempt == run_attempt)
             {
                 jobs.remove(&job_id);
+                self.allocation.lock().await.release_job(job_id);
                 true
             } else {
                 false
@@ -3963,7 +3971,6 @@ impl AgentService {
         if !removed {
             return;
         }
-        self.allocation.lock().await.release_job(job_id);
         let stale_session = {
             let mut sessions = self.runtime_sessions.lock().await;
             if sessions
@@ -5130,6 +5137,55 @@ mod tests {
         assert!(!sessions.lock().await.contains_key(&42));
         assert_eq!(allocation.lock().await.allocated_memory_mb, 0);
         assert!(!store.session_dir(42, 7).exists());
+    }
+
+    #[tokio::test]
+    async fn release_runtime_tracking_spares_a_reused_job_ids_allocation() {
+        let stale = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                ..Default::default()
+            },
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        // A redispatch already retracked job 42 under a newer attempt with its
+        // own committed allocation before this stale (attempt 7) report lands.
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 1, 128, &[])
+            .expect("reserve allocation");
+        assert!(allocation.lock().await.commit_job(42));
+        let mut newer = TrackedJob::dummy(0);
+        newer.run_attempt = 8;
+        running.lock().await.insert(42, newer);
+
+        assert!(
+            !release_runtime_tracking(&running, &allocation, &sessions, &stale, "stale report")
+                .await
+        );
+
+        assert_eq!(
+            running.lock().await.get(&42).map(|job| job.run_attempt),
+            Some(8),
+            "a stale report must not evict the current attempt's tracking"
+        );
+        assert_eq!(
+            allocation.lock().await.allocated_memory_mb,
+            128,
+            "a stale report must not release the current attempt's allocation"
+        );
     }
 
     #[tokio::test]
@@ -7135,6 +7191,41 @@ mod tests {
             svc.free_gpu_count().await,
             1,
             "exactly the orphan's GPU must be reclaimed; the tracked job's is spared"
+        );
+    }
+
+    // A job removed from `running` this same tick must already be released
+    // before reconcile runs, or reconcile misclassifies every ordinary
+    // completion as an orphan and reports it as one.
+    #[tokio::test]
+    async fn a_just_completed_job_is_not_reclaimed_as_an_orphan() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 961;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(job_id, 1, 0, &[0]).unwrap();
+            alloc.commit_job(job_id);
+        }
+        // Mirror start_monitor's order for this tick: the job is already gone
+        // from `running` and its allocation already released before reconcile
+        // ever runs — matching release_job happening ahead of the backstop.
+        svc.allocation.lock().await.release_job(job_id);
+
+        let jobs = svc.running.lock().await;
+        let reclaimed = svc.allocation.lock().await.reconcile(
+            &jobs.keys().copied().collect(),
+            std::time::Instant::now(),
+            LAUNCHING_TTL,
+        );
+
+        assert!(
+            reclaimed.is_empty(),
+            "a job already released this tick must not also be reclaimed as an orphan"
         );
     }
 
