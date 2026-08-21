@@ -452,6 +452,14 @@ impl RunningJob {
             RunningJob::AllocationOnly => None,
         }
     }
+
+    pub fn cgroup_path(&self) -> Option<&Path> {
+        match self {
+            RunningJob::Managed { cgroup_path, .. } => cgroup_path.as_deref(),
+            RunningJob::Forked { cgroup_path, .. } => cgroup_path.as_deref(),
+            RunningJob::AllocationOnly => None,
+        }
+    }
 }
 
 /// Launch a job script on this node.
@@ -983,6 +991,12 @@ fn move_to_cgroup(cgroup_path: &Path, pid: u32) -> bool {
     } else {
         true
     }
+}
+
+/// Atomically SIGKILLs every process in the cgroup (cgroup-v2 `cgroup.kill`),
+/// reaching descendants that detached from the signaled process group.
+pub fn cgroup_kill(cgroup_path: &Path) -> std::io::Result<()> {
+    std::fs::write(cgroup_path.join("cgroup.kill"), b"1")
 }
 
 /// Whether the job's cgroup recorded an OOM kill (cgroup-v2 `memory.events`).

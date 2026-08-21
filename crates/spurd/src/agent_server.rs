@@ -156,6 +156,12 @@ async fn launch_runtime_session(
             anyhow::Error::from(error).context("wait for runtime session socket"),
         ));
     }
+    // Readiness confirmed the subprocess is up and has published its real
+    // pid/start-ticks; track those instead of the pid:0 placeholder so a
+    // later liveness check can tell this session apart from a dead one.
+    if let Ok(published) = store.load_descriptor(&session_dir) {
+        descriptor = published;
+    }
     Ok((
         executor::LaunchResult {
             job: executor::RunningJob::AllocationOnly,
@@ -611,7 +617,19 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                     None
                 };
                 if let Some((exit_code, signal)) = exit {
-                    newly_completed.push((*job_id, descriptor.run_attempt, exit_code, signal));
+                    // Mirror handle_completion_notification's ownership check: only
+                    // report if we're still the tracked owner, so a completion push
+                    // racing this poll can't both report the same exit.
+                    let still_owned = runtime_sessions
+                        .lock()
+                        .await
+                        .get(job_id)
+                        .is_some_and(|current| current == descriptor);
+                    if still_owned {
+                        newly_completed.push((*job_id, descriptor.run_attempt, exit_code, signal));
+                    } else {
+                        released.push(*job_id);
+                    }
                 } else if !tracked {
                     released.push(*job_id);
                 }
@@ -671,6 +689,96 @@ pub(crate) fn monitor_recovered_runtime_sessions(
             }
         }
     });
+}
+
+/// A RuntimeSession that crashes before pushing completion has no other
+/// record; re-check tracked pid/start-ticks periodically to catch that.
+const RUNTIME_LIVENESS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+pub(crate) fn monitor_runtime_session_liveness(
+    running: RunningJobs,
+    allocation: Arc<Mutex<NodeAllocation>>,
+    runtime_sessions: Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
+    store: crate::runtime_session::RuntimeSessionStore,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(RUNTIME_LIVENESS_CHECK_INTERVAL);
+        loop {
+            interval.tick().await;
+            let tracked: Vec<_> = runtime_sessions.lock().await.values().cloned().collect();
+            for descriptor in tracked {
+                if descriptor.pid == 0 {
+                    continue;
+                }
+                match crate::runtime_session::session_liveness(&descriptor) {
+                    Ok(crate::runtime_session::SessionLiveness::Live) => {}
+                    Ok(crate::runtime_session::SessionLiveness::Stale) => {
+                        fence_dead_runtime_session(
+                            &running,
+                            &allocation,
+                            &runtime_sessions,
+                            &store,
+                            descriptor,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
+                            "failed to check runtime session liveness");
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn fence_dead_runtime_session(
+    running: &RunningJobs,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    runtime_sessions: &Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
+    store: &crate::runtime_session::RuntimeSessionStore,
+    descriptor: crate::runtime_session::RuntimeSessionDescriptor,
+) {
+    // Re-check under lock: a completion push racing this liveness check may
+    // have already resolved the session between the snapshot and now.
+    let still_tracked = runtime_sessions
+        .lock()
+        .await
+        .get(&descriptor.job_id)
+        .is_some_and(|current| current == &descriptor);
+    if !still_tracked {
+        return;
+    }
+    warn!(
+        job_id = descriptor.job_id,
+        run_attempt = descriptor.run_attempt,
+        "runtime session process is gone without reporting completion; fencing"
+    );
+    let obligations = store.obligations(descriptor.job_id, descriptor.run_attempt);
+    let already_recorded = matches!(
+        store.observed_exit(descriptor.job_id, descriptor.run_attempt),
+        Ok(Some(_))
+    );
+    if !already_recorded {
+        if let Err(error) =
+            obligations.append(&crate::runtime_session::RuntimeObligation::ExitObserved {
+                exit_code: 0,
+                signal: nix::sys::signal::Signal::SIGKILL as i32,
+            })
+        {
+            warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
+                "failed to record synthetic exit for a dead runtime session");
+            return;
+        }
+    }
+    release_runtime_tracking(
+        running,
+        allocation,
+        runtime_sessions,
+        &descriptor,
+        "runtime session crash",
+    )
+    .await;
 }
 
 /// Accept runtime-session completion pushes for the daemon's life; spurd,
@@ -1142,6 +1250,15 @@ impl AgentService {
             descriptors.to_vec(),
             crate::runtime_session::RuntimeSessionStore::new(&self.runtime_state_dir),
             self.reporter.controller_addr.clone(),
+        );
+    }
+
+    pub(crate) fn monitor_runtime_session_liveness(&self) {
+        monitor_runtime_session_liveness(
+            self.running.clone(),
+            self.allocation.clone(),
+            self.runtime_sessions.clone(),
+            crate::runtime_session::RuntimeSessionStore::new(&self.runtime_state_dir),
         );
     }
 
@@ -3276,17 +3393,7 @@ impl SlurmAgent for AgentService {
                     environment: env,
                     uid: req.uid,
                     gid: req.gid,
-                    memlock: match self.memlock {
-                        spur_core::config::MemlockLimit::Unlimited => {
-                            crate::runtime_session::RuntimeMemlock::Unlimited
-                        }
-                        spur_core::config::MemlockLimit::Inherit => {
-                            crate::runtime_session::RuntimeMemlock::Inherit
-                        }
-                        spur_core::config::MemlockLimit::Bytes(value) => {
-                            crate::runtime_session::RuntimeMemlock::Bytes(value)
-                        }
-                    },
+                    memlock: self.memlock.into(),
                     pmix,
                     task_epilog: self.hooks.task_epilog.as_ref().map(|script| {
                         crate::runtime_session::RuntimeTaskEpilogSpec {
@@ -3569,17 +3676,7 @@ impl SlurmAgent for AgentService {
                     environment: std::collections::HashMap::new(),
                     uid: entry.uid,
                     gid: entry.gid,
-                    memlock: match self.memlock {
-                        spur_core::config::MemlockLimit::Unlimited => {
-                            crate::runtime_session::RuntimeMemlock::Unlimited
-                        }
-                        spur_core::config::MemlockLimit::Inherit => {
-                            crate::runtime_session::RuntimeMemlock::Inherit
-                        }
-                        spur_core::config::MemlockLimit::Bytes(value) => {
-                            crate::runtime_session::RuntimeMemlock::Bytes(value)
-                        }
-                    },
+                    memlock: self.memlock.into(),
                     winsize,
                 },
             )
@@ -4988,6 +5085,82 @@ mod tests {
         assert!(!store.session_dir(42, 7).exists());
     }
 
+    #[tokio::test]
+    async fn liveness_watchdog_fences_a_runtime_session_whose_process_is_gone() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::runtime_session::RuntimeSessionStore::new(state.path());
+        let pid = std::process::id();
+        let mut descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            pid,
+            crate::runtime_session::process_start_ticks(pid).expect("start ticks") + 1,
+            store.session_dir(42, 7).join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "test-capability".into();
+        store.publish(&descriptor).expect("publish descriptor");
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 2,
+                memory_mb: 1024,
+                ..Default::default()
+            },
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 1, 128, &[])
+            .expect("reserve allocation");
+        assert!(allocation.lock().await.commit_job(42));
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 7;
+        running.lock().await.insert(42, tracked);
+        sessions.lock().await.insert(42, descriptor.clone());
+
+        fence_dead_runtime_session(&running, &allocation, &sessions, &store, descriptor).await;
+
+        assert!(!running.lock().await.contains_key(&42));
+        assert!(!sessions.lock().await.contains_key(&42));
+        assert_eq!(
+            store.observed_exit(42, 7).expect("read exit"),
+            Some((0, nix::sys::signal::Signal::SIGKILL as i32))
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_watchdog_skips_a_session_someone_else_already_resolved() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::runtime_session::RuntimeSessionStore::new(state.path());
+        let pid = std::process::id();
+        let mut descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            pid,
+            crate::runtime_session::process_start_ticks(pid).expect("start ticks") + 1,
+            store.session_dir(42, 7).join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = "test-capability".into();
+        store.publish(&descriptor).expect("publish descriptor");
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        // Nothing tracked under job_id 42: a completion push already won the race.
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+
+        fence_dead_runtime_session(&running, &allocation, &sessions, &store, descriptor).await;
+
+        assert_eq!(store.observed_exit(42, 7).expect("read exit"), None);
+    }
+
     async fn completion_listener_fixture(
         controller_addr: &str,
     ) -> (
@@ -5159,6 +5332,67 @@ mod tests {
             "a rejected notification must not release tracking for the real session"
         );
         assert!(sessions.lock().await.contains_key(&42));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completion_notification_from_a_superseded_attempt_does_not_release_the_current_one() {
+        let (context, running, sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        // A redispatch bumped this job to run_attempt 8 after the fixture's
+        // run_attempt-7 session was tracked; the old attempt's own (valid,
+        // but now-stale) capability must not be able to touch the new one.
+        let current = sessions
+            .lock()
+            .await
+            .get(&42)
+            .cloned()
+            .expect("fixture session");
+        let mut newer = current.clone();
+        newer.run_attempt = 8;
+        newer.capability = "newer-capability".into();
+        sessions.lock().await.insert(42, newer.clone());
+
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::runtime_session::AgentNotification::RuntimeSessionCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            exit_code: 0,
+            signal: 0,
+            epilog_failed: false,
+            capability: current.capability.clone(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        crate::runtime_session::read_line_bounded(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        let response: crate::runtime_session::AgentNotificationResponse =
+            serde_json::from_str(&line).expect("decode response");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handle notification");
+
+        assert_eq!(
+            response,
+            crate::runtime_session::AgentNotificationResponse::Acknowledged,
+            "a stale attempt's own report is harmless to acknowledge"
+        );
+        assert!(
+            running.lock().await.contains_key(&42),
+            "the current attempt's tracking must survive a superseded attempt's report"
+        );
+        assert_eq!(sessions.lock().await.get(&42), Some(&newer));
     }
 
     #[tokio::test(start_paused = true)]

@@ -111,6 +111,15 @@ struct Args {
     log_level: String,
 }
 
+/// True when retrying a runtime-recovery report can never help, e.g. a
+/// `failed_precondition` from a controller with no jwt_key configured.
+fn is_permanent_recovery_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<tonic::Status>())
+        .any(|status| status.code() == tonic::Code::FailedPrecondition)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if std::env::args_os()
@@ -433,6 +442,7 @@ async fn main() -> anyhow::Result<()> {
         agent_service.completion_listener_context(),
     ));
     agent_service.monitor_recovered_runtime_sessions(&recovered_runtime_sessions);
+    agent_service.monitor_runtime_session_liveness();
     let runtime_recovery_cleanup = agent_service.runtime_recovery_cleanup();
 
     // the RPC-driven k0s component owner is idle until the controller sends
@@ -537,6 +547,17 @@ async fn main() -> anyhow::Result<()> {
                             }
                             break;
                         }
+                        Err(error) if is_permanent_recovery_error(&error) => {
+                            warn!(
+                                job_id = descriptor.job_id,
+                                run_attempt = descriptor.run_attempt,
+                                %error,
+                                "runtime recovery report permanently rejected by the controller \
+                                 (this node likely has no auth.jwt_key/jwt_key_file configured); \
+                                 giving up on this session"
+                            );
+                            break;
+                        }
                         Err(error) => {
                             warn!(
                                 job_id = descriptor.job_id,
@@ -577,6 +598,17 @@ async fn main() -> anyhow::Result<()> {
                                 "controller fenced stale runtime session"
                             );
                         }
+                        break;
+                    }
+                    Err(error) if is_permanent_recovery_error(&error) => {
+                        warn!(
+                            job_id = descriptor.job_id,
+                            run_attempt = descriptor.run_attempt,
+                            %error,
+                            "stale runtime recovery report permanently rejected by the controller \
+                             (this node likely has no auth.jwt_key/jwt_key_file configured); \
+                             giving up on this session"
+                        );
                         break;
                     }
                     Err(error) => {
@@ -678,5 +710,19 @@ mod tests {
     #[test]
     fn parse_label_just_equals() {
         assert!(parse_label("=").is_err());
+    }
+
+    #[test]
+    fn permanent_recovery_error_detects_failed_precondition() {
+        let error = anyhow::Error::new(tonic::Status::failed_precondition("no jwt_key configured"))
+            .context("runtime recovery report failed");
+        assert!(is_permanent_recovery_error(&error));
+    }
+
+    #[test]
+    fn permanent_recovery_error_ignores_transient_failures() {
+        let error = anyhow::Error::new(tonic::Status::unavailable("connection refused"))
+            .context("runtime recovery report failed");
+        assert!(!is_permanent_recovery_error(&error));
     }
 }

@@ -75,6 +75,26 @@ pub enum RuntimeMemlock {
     Bytes(u64),
 }
 
+impl From<spur_core::config::MemlockLimit> for RuntimeMemlock {
+    fn from(limit: spur_core::config::MemlockLimit) -> Self {
+        match limit {
+            spur_core::config::MemlockLimit::Unlimited => RuntimeMemlock::Unlimited,
+            spur_core::config::MemlockLimit::Inherit => RuntimeMemlock::Inherit,
+            spur_core::config::MemlockLimit::Bytes(value) => RuntimeMemlock::Bytes(value),
+        }
+    }
+}
+
+impl From<RuntimeMemlock> for spur_core::config::MemlockLimit {
+    fn from(limit: RuntimeMemlock) -> Self {
+        match limit {
+            RuntimeMemlock::Unlimited => spur_core::config::MemlockLimit::Unlimited,
+            RuntimeMemlock::Inherit => spur_core::config::MemlockLimit::Inherit,
+            RuntimeMemlock::Bytes(value) => spur_core::config::MemlockLimit::Bytes(value),
+        }
+    }
+}
+
 impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
     type Error = String;
 
@@ -99,11 +119,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
             gid: config.gid,
             partition: config.partition.clone(),
             nodelist: config.nodelist.clone(),
-            memlock: match config.memlock {
-                spur_core::config::MemlockLimit::Unlimited => RuntimeMemlock::Unlimited,
-                spur_core::config::MemlockLimit::Inherit => RuntimeMemlock::Inherit,
-                spur_core::config::MemlockLimit::Bytes(value) => RuntimeMemlock::Bytes(value),
-            },
+            memlock: config.memlock.into(),
             container: config.container.clone(),
             host_device_plan: config.host_device_plan.clone(),
             container_rootfs_mode: None,
@@ -148,11 +164,7 @@ impl RuntimeLaunchSpec {
             partition: self.partition,
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,
-            memlock: match self.memlock {
-                RuntimeMemlock::Unlimited => spur_core::config::MemlockLimit::Unlimited,
-                RuntimeMemlock::Inherit => spur_core::config::MemlockLimit::Inherit,
-                RuntimeMemlock::Bytes(value) => spur_core::config::MemlockLimit::Bytes(value),
-            },
+            memlock: self.memlock.into(),
             io_mode: crate::executor::LaunchIo::File,
             pmix_multi_task: self.pmix_multi_task,
         }
@@ -635,6 +647,15 @@ impl RuntimeSession {
         {
             let job = self.job.lock().await;
             job.kill_signal(signal).map_err(io::Error::other)?;
+            if signal == nix::sys::signal::Signal::SIGKILL {
+                if let Some(cgroup_path) = job.cgroup_path() {
+                    // Belt-and-suspenders: reaches descendants that detached
+                    // from the signaled process group (e.g. via setsid).
+                    if let Err(error) = crate::executor::cgroup_kill(cgroup_path) {
+                        tracing::warn!(%error, path = %cgroup_path.display(), "cgroup.kill failed");
+                    }
+                }
+            }
         }
         let steps = self.steps.lock().await;
         for step in steps.active.values() {
@@ -777,11 +798,7 @@ impl RuntimeSession {
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(step.uid, step.gid);
         unsafe {
             command.pre_exec(move || {
-                crate::executor::apply_memlock(match memlock {
-                    RuntimeMemlock::Unlimited => spur_core::config::MemlockLimit::Unlimited,
-                    RuntimeMemlock::Inherit => spur_core::config::MemlockLimit::Inherit,
-                    RuntimeMemlock::Bytes(value) => spur_core::config::MemlockLimit::Bytes(value),
-                });
+                crate::executor::apply_memlock(memlock.into());
                 if let Some(ref priv_drop) = priv_drop {
                     priv_drop
                         .apply()
@@ -958,11 +975,7 @@ impl RuntimeSession {
         unsafe {
             command.pre_exec(move || {
                 crate::pty::pty_pre_exec(slave_fd, master_fd)?;
-                crate::executor::apply_memlock(match memlock {
-                    RuntimeMemlock::Unlimited => spur_core::config::MemlockLimit::Unlimited,
-                    RuntimeMemlock::Inherit => spur_core::config::MemlockLimit::Inherit,
-                    RuntimeMemlock::Bytes(value) => spur_core::config::MemlockLimit::Bytes(value),
-                });
+                crate::executor::apply_memlock(memlock.into());
                 if let Some(ref priv_drop) = priv_drop {
                     priv_drop
                         .apply()
@@ -2450,7 +2463,10 @@ impl RuntimeSessionStore {
             }))
     }
 
-    fn load_descriptor(&self, session_dir: &Path) -> io::Result<RuntimeSessionDescriptor> {
+    pub(crate) fn load_descriptor(
+        &self,
+        session_dir: &Path,
+    ) -> io::Result<RuntimeSessionDescriptor> {
         let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
         let contents = fs::read(&descriptor_path)?;
         let descriptor: RuntimeSessionDescriptor =
@@ -2877,6 +2893,41 @@ mod tests {
         let output = wait_for_pty_exit(&session).await;
         assert!(output.exit_code.is_some());
         assert!(!session.snapshot().await.active);
+    }
+
+    #[tokio::test]
+    async fn sigkill_also_kills_the_job_cgroup() {
+        let cgroup = tempfile::tempdir().expect("tempdir");
+        std::fs::write(cgroup.path().join("cgroup.kill"), b"").expect("seed cgroup.kill");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.arg("-c").arg("trap '' TERM; while :; do :; done");
+        command.process_group(0);
+        let child = command.spawn().expect("spawn managed job");
+        let job = RunningJob::Managed {
+            child,
+            cgroup_path: Some(cgroup.path().to_path_buf()),
+        };
+        let session = RuntimeSession::new(job, 83, 1);
+
+        session
+            .signal(nix::sys::signal::Signal::SIGTERM as i32)
+            .await
+            .expect("send SIGTERM");
+        assert_eq!(
+            std::fs::read(cgroup.path().join("cgroup.kill")).expect("read cgroup.kill"),
+            b"",
+            "SIGTERM must not trigger cgroup.kill"
+        );
+
+        session
+            .signal(nix::sys::signal::Signal::SIGKILL as i32)
+            .await
+            .expect("send SIGKILL");
+        assert_eq!(
+            std::fs::read(cgroup.path().join("cgroup.kill")).expect("read cgroup.kill"),
+            b"1",
+            "SIGKILL must escalate through cgroup.kill"
+        );
     }
 
     #[tokio::test]
