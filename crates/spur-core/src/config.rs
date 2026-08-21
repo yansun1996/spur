@@ -740,6 +740,12 @@ impl AuthConfig {
         }
 
         if let Some(value) = &self.jwt_key {
+            if value.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "auth.jwt_key".into(),
+                    value: "must not be blank".into(),
+                });
+            }
             return Ok(Some(value.clone()));
         }
 
@@ -757,11 +763,18 @@ impl AuthConfig {
         }
 
         let key = std::fs::read_to_string(path)?;
-        Ok(Some(key.trim_end_matches(['\r', '\n']).to_owned()))
+        let key = key.trim_end_matches(['\r', '\n']).to_owned();
+        if key.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "auth.jwt_key_file".into(),
+                value: "contains a blank signing key".into(),
+            });
+        }
+        Ok(Some(key))
     }
 
     pub fn has_jwt_key(&self) -> bool {
-        self.jwt_key.is_some() || self.jwt_key_file.is_some()
+        self.resolved_jwt_key().ok().flatten().is_some()
     }
 }
 
@@ -1527,8 +1540,9 @@ impl SlurmConfig {
         }
         // Without a key, `required` would fall back to a well-known signing constant —
         // forgeable, so strictly worse than the default. Refuse to start instead.
+        let resolved_jwt_key = self.auth.resolved_jwt_key()?;
         if self.auth.mode == AuthMode::Required
-            && self.auth.jwt_key.as_deref().unwrap_or("").is_empty()
+            && resolved_jwt_key.as_deref().unwrap_or("").is_empty()
         {
             return Err(ConfigError::InvalidValue {
                 field: "auth.jwt_key".into(),
@@ -1953,6 +1967,39 @@ mod tests {
             config.auth.resolved_jwt_key().unwrap().as_deref(),
             key_file.path().to_str()
         );
+    }
+
+    #[test]
+    fn auth_config_rejects_a_blank_inline_jwt_key() {
+        let error = SlurmConfig::load_from_str(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key = \" \"\n",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("auth.jwt_key"));
+        assert!(!AuthConfig {
+            jwt_key: Some(" \n".into()),
+            ..Default::default()
+        }
+        .has_jwt_key());
+    }
+
+    #[test]
+    fn auth_config_rejects_a_blank_jwt_key_file() {
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(key_file).unwrap();
+        let error = SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"test\"\n[auth]\nplugin = \"jwt\"\njwt_key_file = {:?}\n",
+            key_file.path()
+        ))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("auth.jwt_key_file"));
+        assert!(!AuthConfig {
+            jwt_key_file: Some(key_file.path().display().to_string()),
+            ..Default::default()
+        }
+        .has_jwt_key());
     }
 
     #[test]

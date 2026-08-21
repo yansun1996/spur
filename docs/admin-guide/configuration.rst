@@ -484,13 +484,14 @@ Authentication plugin for client requests.
      - Restart
      - Literal signing key for credentials and node admission tokens. Deliberately
        not reloadable: swapping it live would immediately invalidate every
-       outstanding node token.
+       outstanding node token. Must not be blank.
    * - ``jwt_key_file``
      - string
      - none
      - Restart
      - Path to a regular file containing the signing key. Mutually exclusive with
-       ``jwt_key``. A trailing line ending is ignored.
+       ``jwt_key``. A trailing line ending is ignored; the remaining key must not
+       be blank.
    * - ``allow_root_jobs``
      - bool
      - ``false``
@@ -513,7 +514,8 @@ Authentication plugin for client requests.
    key cannot prove that a recovery report came from its named node. Set the same
    secret on every controller and agent before enabling RuntimeSession. Store a
    production secret with ``jwt_key_file`` pointing to a root-readable regular
-   file; a trailing newline in that file is ignored.
+   file; a trailing newline in that file is ignored. Blank inline values and blank
+   key files are rejected and do not enable node identity.
 
 ``[[partitions]]``
 ------------------

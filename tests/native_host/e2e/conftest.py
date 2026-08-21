@@ -210,7 +210,9 @@ def runtime_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
     """RuntimeSession-gated cluster for restart and fencing E2E coverage."""
     spur_cluster = SpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     try:
-        spur_cluster.deploy(
+        spur_cluster.provision()
+        spur_cluster.root_agent_preflight()
+        spur_cluster.start(
             config_overrides=_runtime_config_overrides(cluster_config_overrides),
             agent_as_root=True,
             agent_env={
@@ -218,7 +220,7 @@ def runtime_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
                 "SPUR_RUNTIME_STATE_DIR": spur_cluster.remote_dir,
             },
         )
-    except Exception:
+    except BaseException:
         spur_cluster.teardown()
         raise
     yield spur_cluster
@@ -232,7 +234,9 @@ def runtime_ha_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
         pytest.skip(f"Runtime HA tests require at least 3 nodes (got {len(ssh_nodes)})")
     c = HaSpurCluster(ssh_nodes, make_remote_dir(), remote_bin_dir)
     try:
-        c.deploy(
+        c.provision()
+        c.root_agent_preflight()
+        c.start(
             config_overrides=_runtime_config_overrides(cluster_config_overrides),
             agent_as_root=True,
             agent_env={
@@ -240,7 +244,7 @@ def runtime_ha_cluster(ssh_nodes, remote_bin_dir, cluster_config_overrides):
                 "SPUR_RUNTIME_STATE_DIR": c.remote_dir,
             },
         )
-    except Exception:
+    except BaseException:
         c.teardown()
         raise
     yield c

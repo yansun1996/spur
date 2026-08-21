@@ -549,14 +549,32 @@ impl RuntimeSession {
     }
 
     pub async fn poll_completion(&self) -> io::Result<()> {
-        let completed = self.job.lock().await.try_wait().map_err(io::Error::other)?;
-        let Some((exit_code, signal)) = completed else {
-            return Ok(());
+        let (allocation_only, completed) = {
+            let mut job = self.job.lock().await;
+            let allocation_only = job.is_allocation_only();
+            let completed = job.try_wait().map_err(io::Error::other)?;
+            (allocation_only, completed)
         };
-        let mut snapshot = self.snapshot.lock().await;
-        snapshot.active = false;
-        snapshot.exit_code = Some(exit_code);
-        snapshot.signal = Some(signal);
+        if let Some((exit_code, signal)) = completed {
+            let mut snapshot = self.snapshot.lock().await;
+            snapshot.active = false;
+            snapshot.exit_code = Some(exit_code);
+            snapshot.signal = Some(signal);
+            return Ok(());
+        }
+        if !allocation_only || !self.teardown_started.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let steps_finished = self.steps.lock().await.active.is_empty();
+        let pty_finished = match self.pty.lock().await.clone() {
+            Some(pty) => pty.buffer.lock().await.exit_code.is_some(),
+            None => true,
+        };
+        if steps_finished && pty_finished {
+            let mut snapshot = self.snapshot.lock().await;
+            snapshot.active = false;
+            snapshot.signal = Some(nix::sys::signal::Signal::SIGTERM as i32);
+        }
         Ok(())
     }
 
@@ -567,11 +585,10 @@ impl RuntimeSession {
                 format!("invalid signal: {error}"),
             )
         })?;
-        let allocation_only = {
+        {
             let job = self.job.lock().await;
             job.kill_signal(signal).map_err(io::Error::other)?;
-            job.is_allocation_only()
-        };
+        }
         let steps = self.steps.lock().await;
         for step in steps.active.values() {
             signal_process_group(step.pid, signal);
@@ -585,8 +602,6 @@ impl RuntimeSession {
                 signal as i32,
             )
             .map_err(io::Error::other)?;
-        } else if allocation_only {
-            self.snapshot.lock().await.active = false;
         }
         Ok(())
     }
@@ -595,10 +610,26 @@ impl RuntimeSession {
         let launch_gate = self.launch_gate.lock().await;
         self.teardown_started.store(true, Ordering::Release);
         drop(launch_gate);
-        self.snapshot.lock().await.active = false;
+        {
+            let job = self.job.lock().await;
+            if let Err(error) = job.kill_signal(nix::sys::signal::Signal::SIGTERM) {
+                tracing::warn!(%error, "failed to terminate runtime batch process during teardown");
+            }
+        }
         let steps = self.steps.lock().await;
         for step in steps.active.values() {
             signal_process_group(step.pid, nix::sys::signal::Signal::SIGTERM);
+        }
+        drop(steps);
+        let pty = self.pty.lock().await.clone();
+        if let Some(pty) = pty {
+            if let Err(error) = crate::pty::signal_foreground(
+                pty.master.get_ref().as_raw_fd(),
+                pty.child_pid,
+                nix::sys::signal::Signal::SIGTERM as i32,
+            ) {
+                tracing::warn!(%error, "failed to terminate runtime PTY during teardown");
+            }
         }
     }
 
@@ -1351,6 +1382,22 @@ pub async fn signal_allocation(
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "runtime signal response was invalid",
+        )),
+    }
+}
+
+pub async fn shutdown_allocation(
+    descriptor: &RuntimeSessionDescriptor,
+    spurd_instance_id: String,
+) -> io::Result<()> {
+    match runtime_request(descriptor, spurd_instance_id, RuntimeRequest::Shutdown).await? {
+        RuntimeResponse::Acknowledged => Ok(()),
+        RuntimeResponse::Rejected { message } => {
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime shutdown response was invalid",
         )),
     }
 }
@@ -2724,6 +2771,25 @@ mod tests {
         assert!(!session.snapshot().await.active);
     }
 
+    #[tokio::test]
+    async fn allocation_only_signals_preserve_session_liveness() {
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 82, 1);
+        for signal in [
+            nix::sys::signal::Signal::SIGSTOP,
+            nix::sys::signal::Signal::SIGCONT,
+            nix::sys::signal::Signal::SIGTERM,
+        ] {
+            session
+                .signal(signal as i32)
+                .await
+                .expect("signal allocation-only runtime session");
+            assert!(
+                session.snapshot().await.active,
+                "{signal:?} must not end session"
+            );
+        }
+    }
+
     #[test]
     fn discovers_only_live_identity_matched_sessions() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3376,7 +3442,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_loop_acknowledges_allocation_signal() {
+    async fn allocation_signals_do_not_end_the_runtime_session() {
         let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
         let session = Arc::new(RuntimeSession::new(RunningJob::AllocationOnly, 42, 3));
         let server_session = session.clone();
@@ -3388,7 +3454,7 @@ mod tests {
                 format!(
                     "{}\n",
                     serde_json::to_string(&RuntimeRequest::SignalAllocation {
-                        signal: nix::sys::signal::Signal::SIGTERM as i32,
+                        signal: nix::sys::signal::Signal::SIGSTOP as i32,
                     })
                     .expect("encode signal request")
                 )
@@ -3408,6 +3474,71 @@ mod tests {
             RuntimeResponse::Acknowledged
         );
         server.await.expect("server task").expect("serve control");
+        assert!(session.snapshot().await.active);
+    }
+
+    #[tokio::test]
+    async fn shutdown_ends_an_allocation_runtime_session() {
+        let (server_stream, client_stream) = UnixStream::pair().expect("socket pair");
+        let session = Arc::new(RuntimeSession::new(RunningJob::AllocationOnly, 42, 3));
+        let server_session = session.clone();
+        let server =
+            tokio::spawn(async move { serve_control(server_stream, &server_session).await });
+        let (reader, mut writer) = client_stream.into_split();
+        writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::to_string(&RuntimeRequest::Shutdown).expect("encode shutdown")
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write shutdown request");
+        drop(writer);
+        let mut reader = BufReader::new(reader);
+        let mut response = String::new();
+        reader
+            .read_line(&mut response)
+            .await
+            .expect("read response");
+        assert_eq!(
+            serde_json::from_str::<RuntimeResponse>(&response).expect("decode response"),
+            RuntimeResponse::Acknowledged
+        );
+        server.await.expect("server task").expect("serve control");
+        session
+            .poll_completion()
+            .await
+            .expect("poll teardown completion");
+        assert!(!session.snapshot().await.active);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_a_runtime_pty_to_exit() {
+        let session = RuntimeSession::new(RunningJob::AllocationOnly, 83, 1);
+        session
+            .launch_pty(pty_spec(&[
+                "/bin/sh",
+                "-c",
+                "trap '' TERM; while :; do :; done",
+            ]))
+            .await
+            .expect("launch runtime PTY");
+
+        session.begin_teardown().await;
+        session.poll_completion().await.expect("poll teardown");
+        assert!(session.snapshot().await.active);
+
+        session
+            .signal(nix::sys::signal::Signal::SIGKILL as i32)
+            .await
+            .expect("kill runtime PTY");
+        let _ = wait_for_pty_exit(&session).await;
+        session
+            .poll_completion()
+            .await
+            .expect("poll PTY completion");
         assert!(!session.snapshot().await.active);
     }
 

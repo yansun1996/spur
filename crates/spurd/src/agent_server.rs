@@ -3747,17 +3747,13 @@ impl AgentService {
     async fn graceful_cancel(&self, job_id: u32) {
         let runtime = self.runtime_sessions.lock().await.get(&job_id).cloned();
         if let Some(descriptor) = runtime {
-            match crate::runtime_session::signal_allocation(
+            match crate::runtime_session::shutdown_allocation(
                 &descriptor,
                 uuid::Uuid::new_v4().to_string(),
-                nix::sys::signal::Signal::SIGTERM as i32,
             )
             .await
             {
-                Ok(()) => {
-                    self.schedule_runtime_sigkill(descriptor);
-                    return;
-                }
+                Ok(()) => return,
                 Err(error) => {
                     warn!(job_id, %error, "runtime termination request failed");
                     return;
@@ -3798,33 +3794,6 @@ impl AgentService {
                 info!(job_id, "grace period expired, sending SIGKILL");
                 let _ = tracked.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                 // Job stays in `running` and monitor loop reaps it and does full cleanup.
-            }
-        });
-    }
-
-    fn schedule_runtime_sigkill(
-        &self,
-        descriptor: crate::runtime_session::RuntimeSessionDescriptor,
-    ) {
-        let runtime_sessions = self.runtime_sessions.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            let current = runtime_sessions
-                .lock()
-                .await
-                .get(&descriptor.job_id)
-                .is_some_and(|current| current == &descriptor);
-            if !current {
-                return;
-            }
-            if let Err(error) = crate::runtime_session::signal_allocation(
-                &descriptor,
-                uuid::Uuid::new_v4().to_string(),
-                nix::sys::signal::Signal::SIGKILL as i32,
-            )
-            .await
-            {
-                warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error, "runtime SIGKILL escalation failed");
             }
         });
     }

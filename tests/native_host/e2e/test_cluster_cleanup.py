@@ -64,3 +64,72 @@ def test_runtime_mpi_preflight_skip_cleans_up_before_deploy(monkeypatch):
 
     assert cluster.teardown_called
     assert not cluster.deploy_called
+
+
+class _RuntimeFixtureCluster:
+    def __init__(self, skip_preflight=False):
+        self.remote_dir = "/tmp/runtime-fixture"
+        self.skip_preflight = skip_preflight
+        self.events = []
+
+    def provision(self):
+        self.events.append("provision")
+
+    def root_agent_preflight(self):
+        self.events.append("preflight")
+        if self.skip_preflight:
+            pytest.skip("rootful agent is unavailable")
+
+    def start(self, **_kwargs):
+        self.events.append("start")
+
+    def teardown(self):
+        self.events.append("teardown")
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "cluster_name", "node_count"),
+    [
+        ("runtime_cluster", "SpurCluster", 1),
+        ("runtime_ha_cluster", "HaSpurCluster", 3),
+    ],
+)
+def test_runtime_fixtures_preflight_before_start(
+    monkeypatch, fixture_name, cluster_name, node_count
+):
+    cluster = _RuntimeFixtureCluster()
+    monkeypatch.setattr(conftest, cluster_name, lambda *_args: cluster)
+    monkeypatch.setattr(conftest, "make_remote_dir", lambda: cluster.remote_dir)
+
+    fixture = getattr(conftest, fixture_name).__wrapped__(
+        [object()] * node_count, "/tmp/bin", {}
+    )
+    assert next(fixture) is cluster
+    assert cluster.events == ["provision", "preflight", "start"]
+
+    with pytest.raises(StopIteration):
+        next(fixture)
+    assert cluster.events == ["provision", "preflight", "start", "teardown"]
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "cluster_name", "node_count"),
+    [
+        ("runtime_cluster", "SpurCluster", 1),
+        ("runtime_ha_cluster", "HaSpurCluster", 3),
+    ],
+)
+def test_runtime_fixture_preflight_skip_cleans_up(
+    monkeypatch, fixture_name, cluster_name, node_count
+):
+    cluster = _RuntimeFixtureCluster(skip_preflight=True)
+    monkeypatch.setattr(conftest, cluster_name, lambda *_args: cluster)
+    monkeypatch.setattr(conftest, "make_remote_dir", lambda: cluster.remote_dir)
+
+    fixture = getattr(conftest, fixture_name).__wrapped__(
+        [object()] * node_count, "/tmp/bin", {}
+    )
+    with pytest.raises(pytest.skip.Exception):
+        next(fixture)
+
+    assert cluster.events == ["provision", "preflight", "teardown"]

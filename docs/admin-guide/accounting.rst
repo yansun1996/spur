@@ -991,8 +991,9 @@ identity:
 
 ``jwt_key`` is a literal signing secret. To read the secret from a regular file,
 set ``jwt_key_file`` instead; the two settings are mutually exclusive. A trailing
-line ending in a key file is ignored. Keep production key files readable only by
-the daemon account. Only ``none`` and ``jwt`` are supported.
+line ending in a key file is ignored, but either form must still contain a
+non-blank secret. Keep production key files readable only by the daemon account.
+Only ``none`` and ``jwt`` are supported.
 
 Admission tokens for node join
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
