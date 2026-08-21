@@ -682,7 +682,7 @@ impl ControllerService {
                 missing.push(node_name.clone());
                 continue;
             };
-            let endpoint = match node_comm_socket(&node, node_name) {
+            let endpoint = match node_comm_http_url(&node, node_name) {
                 Ok(endpoint) => endpoint,
                 Err(_) => {
                     missing.push(node_name.clone());
@@ -690,6 +690,7 @@ impl ControllerService {
                 }
             };
             let node_name = node_name.clone();
+            let probed_node = node_name.clone();
             let handle = set.spawn(async move {
                 match crate::agent_client::connect(endpoint).await {
                     Ok(mut client) => client
@@ -699,8 +700,14 @@ impl ControllerService {
                         })
                         .await
                         .map(|response| response.into_inner().active)
-                        .unwrap_or(false),
-                    Err(_) => false,
+                        .unwrap_or_else(|error| {
+                            warn!(job_id, run_attempt, node = %probed_node, %error, "runtime recovery probe RPC failed");
+                            false
+                        }),
+                    Err(error) => {
+                        warn!(job_id, run_attempt, node = %probed_node, %error, "runtime recovery probe failed to connect to agent");
+                        false
+                    }
                 }
             });
             handle_to_node.insert(handle.id(), node_name);
@@ -5898,6 +5905,202 @@ mod tests {
         job_id
     }
 
+    /// Minimal live SlurmAgent that only implements `probe_runtime_session`,
+    /// answering with a fixed `active` value — enough to prove
+    /// `probe_runtime_recovery` reaches a real node over a real connection
+    /// instead of asserting on the RPC's internals.
+    struct ProbeAgent {
+        active: bool,
+    }
+
+    #[tonic::async_trait]
+    impl spur_proto::proto::slurm_agent_server::SlurmAgent for ProbeAgent {
+        type StreamJobOutputStream =
+            tonic::codegen::BoxStream<spur_proto::proto::StreamJobOutputChunk>;
+        type InteractiveSessionStream =
+            tonic::codegen::BoxStream<spur_proto::proto::InteractiveOutput>;
+
+        async fn launch_job(
+            &self,
+            _request: tonic::Request<spur_proto::proto::LaunchJobRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::LaunchJobResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn prepare_pmix(
+            &self,
+            _request: tonic::Request<spur_proto::proto::PreparePmixRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::PreparePmixResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn release_pmix(
+            &self,
+            _request: tonic::Request<spur_proto::proto::ReleasePmixRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::ReleasePmixResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn cancel_job(
+            &self,
+            _request: tonic::Request<spur_proto::proto::AgentCancelJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            Ok(tonic::Response::new(()))
+        }
+
+        async fn suspend_job(
+            &self,
+            _request: tonic::Request<spur_proto::proto::AgentSuspendJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn get_node_resources(
+            &self,
+            _request: tonic::Request<()>,
+        ) -> Result<tonic::Response<spur_proto::proto::NodeResourcesResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn probe_runtime_session(
+            &self,
+            _request: tonic::Request<spur_proto::proto::RuntimeSessionProbeRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::RuntimeSessionProbeResponse>, tonic::Status>
+        {
+            Ok(tonic::Response::new(
+                spur_proto::proto::RuntimeSessionProbeResponse {
+                    active: self.active,
+                },
+            ))
+        }
+
+        async fn exec_in_job(
+            &self,
+            _request: tonic::Request<spur_proto::proto::ExecInJobRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::ExecInJobResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn run_command(
+            &self,
+            _request: tonic::Request<spur_proto::proto::RunCommandRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::RunCommandResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn cancel_step(
+            &self,
+            _request: tonic::Request<spur_proto::proto::CancelStepRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            Ok(tonic::Response::new(()))
+        }
+
+        async fn register_job_allocation(
+            &self,
+            _request: tonic::Request<spur_proto::proto::RegisterJobAllocationRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::RegisterJobAllocationResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn stream_job_output(
+            &self,
+            _request: tonic::Request<spur_proto::proto::StreamJobOutputRequest>,
+        ) -> Result<tonic::Response<Self::StreamJobOutputStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn interactive_session(
+            &self,
+            _request: tonic::Request<tonic::Streaming<spur_proto::proto::InteractiveInput>>,
+        ) -> Result<tonic::Response<Self::InteractiveSessionStream>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn start_cluster_component(
+            &self,
+            _request: tonic::Request<spur_proto::proto::StartClusterComponentRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::StartClusterComponentResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn stop_cluster_component(
+            &self,
+            _request: tonic::Request<spur_proto::proto::StopClusterComponentRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::StopClusterComponentResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn get_cluster_component_status(
+            &self,
+            _request: tonic::Request<spur_proto::proto::GetClusterComponentStatusRequest>,
+        ) -> Result<
+            tonic::Response<spur_proto::proto::GetClusterComponentStatusResponse>,
+            tonic::Status,
+        > {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn create_k0s_join_token(
+            &self,
+            _request: tonic::Request<spur_proto::proto::CreateK0sJoinTokenRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::CreateK0sJoinTokenResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn drain_k8s_node(
+            &self,
+            _request: tonic::Request<spur_proto::proto::DrainK8sNodeRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::DrainK8sNodeResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn delete_k8s_node(
+            &self,
+            _request: tonic::Request<spur_proto::proto::DeleteK8sNodeRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::DeleteK8sNodeResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn get_kubeconfig(
+            &self,
+            _request: tonic::Request<spur_proto::proto::GetKubeconfigRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::GetKubeconfigResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+
+        async fn apply_mesh(
+            &self,
+            _request: tonic::Request<spur_proto::proto::MeshMembership>,
+        ) -> Result<tonic::Response<spur_proto::proto::ApplyMeshResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("not used in tests"))
+        }
+    }
+
+    /// Spawn a real `ProbeAgent` gRPC server on an OS-assigned localhost port.
+    async fn spawn_probe_agent(active: bool) -> std::net::SocketAddr {
+        let incoming =
+            tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = incoming.local_addr().unwrap();
+        let agent = ProbeAgent { active };
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        addr
+    }
+
     fn runtime_recovery_request(
         svc: &ControllerService,
         hostname: &str,
@@ -6061,6 +6264,116 @@ mod tests {
         assert!(response.message.contains("missing 1 of 1 participants"));
         let job = svc.cluster.get_job(job_id).expect("running job");
         assert_eq!(job.state, JobState::Running);
+    }
+
+    /// A node that restarts and reports recovery must not drag down a
+    /// second, untouched node that stayed alive the whole time: with both
+    /// nodes reachable and reporting `active`, the cohort must retain the
+    /// job immediately rather than defer or fence it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_recovery_report_retains_a_cohort_with_a_live_untouched_peer() {
+        use spur_core::resource::{ResourceAllocations, ResourceSet};
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+
+        let restarted_addr = spawn_probe_agent(true).await;
+        svc.cluster
+            .register_node(
+                "n1".into(),
+                "n1".into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                restarted_addr.port(),
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+            )
+            .expect("point n1 at its live probe agent");
+
+        let untouched_addr = spawn_probe_agent(true).await;
+        svc.cluster
+            .register_node(
+                "n2".into(),
+                "n2".into(),
+                ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                untouched_addr.port(),
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+            )
+            .expect("register the untouched peer");
+        for name in ["n1", "n2"] {
+            for _ in 0..200 {
+                if svc.cluster.get_node(name).is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
+        let spec = spur_core::job::JobSpec {
+            name: "two-node".into(),
+            user: "alice".into(),
+            num_nodes: 2,
+            num_tasks: 2,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        };
+        let job_id = svc.cluster.submit_job(spec).unwrap().job_id;
+        let res = ResourceAllocations::with_scalar(1, 1000);
+        let per_node: std::collections::HashMap<_, _> = [
+            ("n1".to_string(), res.clone()),
+            ("n2".to_string(), res.clone()),
+        ]
+        .into_iter()
+        .collect();
+        svc.cluster
+            .start_job(job_id, vec!["n1".into(), "n2".into()], res, per_node)
+            .expect("start two-node job");
+        for _ in 0..200 {
+            if svc.cluster.get_job(job_id).map(|j| j.state) == Some(JobState::Running) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        let response = svc
+            .report_runtime_session_recovery(Request::new(runtime_recovery_request(
+                &svc,
+                "n1",
+                job_id,
+                run_attempt,
+                false,
+            )))
+            .await
+            .expect("recovery report with a fully live cohort")
+            .into_inner();
+        assert!(response.retained);
+        assert!(!response.fenced);
+        assert!(response.message.is_empty());
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("running job").state,
+            JobState::Running
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
