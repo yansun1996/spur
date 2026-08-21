@@ -561,8 +561,7 @@ async fn main() -> anyhow::Result<()> {
                                 run_attempt = descriptor.run_attempt,
                                 %error,
                                 "runtime recovery report permanently rejected by the controller \
-                                 (this node likely has no auth.jwt_key/jwt_key_file configured); \
-                                 giving up on this session"
+                                 (missing jwt_key or an invalid node identity); giving up on this session"
                             );
                             break;
                         }
@@ -614,8 +613,7 @@ async fn main() -> anyhow::Result<()> {
                             run_attempt = descriptor.run_attempt,
                             %error,
                             "stale runtime recovery report permanently rejected by the controller \
-                             (this node likely has no auth.jwt_key/jwt_key_file configured); \
-                             giving up on this session"
+                             (missing jwt_key or an invalid node identity); giving up on this session"
                         );
                         break;
                     }

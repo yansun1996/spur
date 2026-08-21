@@ -2069,7 +2069,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
     if let Some(cgroup) = session.take_cgroup().await {
-        crate::executor::cleanup_cgroup(&cgroup);
+        crate::executor::cleanup_cgroup(&cgroup).await;
     }
     if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
         crate::container::cleanup_rootfs(job_id, rootfs_mode);

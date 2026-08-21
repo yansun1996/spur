@@ -1012,7 +1012,7 @@ pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
 }
 
 /// Kill any leftover processes in the job's cgroup and remove the directory.
-pub fn cleanup_cgroup(cgroup_path: &Path) {
+pub async fn cleanup_cgroup(cgroup_path: &Path) {
     if cgroup_kill(cgroup_path).is_err() {
         // No cgroup.kill (e.g. cgroup v1): fall back to a manual per-pid sweep.
         if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
@@ -1031,7 +1031,7 @@ pub fn cleanup_cgroup(cgroup_path: &Path) {
         match std::fs::remove_dir(cgroup_path) {
             Ok(()) => return,
             Err(_) if attempt < REMOVE_ATTEMPTS => {
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             Err(e) => warn!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup"),
         }
@@ -1727,6 +1727,29 @@ fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cleanup_cgroup_retries_past_a_transient_removal_failure() {
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        // A directory (not a plain file) at the cgroup.kill path makes the
+        // write fail, so cleanup_cgroup falls back to the per-pid sweep and
+        // this blocker is the only thing standing in remove_dir's way.
+        let blocker = cgroup.path().join("cgroup.kill");
+        std::fs::create_dir(&blocker).expect("seed blocker directory");
+
+        let blocker_removed = blocker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            std::fs::remove_dir(&blocker_removed).expect("clear blocker");
+        });
+
+        cleanup_cgroup(cgroup.path()).await;
+
+        assert!(
+            !cgroup.path().exists(),
+            "cleanup_cgroup must retry past a transient removal failure"
+        );
+    }
 
     #[test]
     fn decode_wait_status_splits_exit_and_signal() {

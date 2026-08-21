@@ -619,15 +619,9 @@ pub(crate) fn monitor_recovered_runtime_sessions(
                     None
                 };
                 if let Some((exit_code, signal)) = exit {
-                    // Mirror handle_completion_notification's ownership check: only
-                    // report if we're still the tracked owner, so a completion push
-                    // racing this poll can't both report the same exit.
-                    let still_owned = runtime_sessions
-                        .lock()
-                        .await
-                        .get(job_id)
-                        .is_some_and(|current| current == descriptor);
-                    if still_owned {
+                    // Claim before reporting: a completion push or the crash
+                    // watchdog racing this poll must not both report the exit.
+                    if claim_runtime_session(&runtime_sessions, descriptor).await {
                         newly_completed.push((*job_id, descriptor.run_attempt, exit_code, signal));
                     } else {
                         released.push(*job_id);
@@ -794,7 +788,7 @@ async fn fence_dead_runtime_session(
     .await;
     // The crashed process was the cgroup's only owner; nothing else reaps it.
     if !descriptor.cgroup_path.as_os_str().is_empty() {
-        crate::executor::cleanup_cgroup(&descriptor.cgroup_path);
+        crate::executor::cleanup_cgroup(&descriptor.cgroup_path).await;
     }
 }
 
@@ -894,7 +888,7 @@ async fn handle_completion_notification(
         Some(descriptor)
             if !claim_runtime_session(&context.runtime_sessions, &descriptor).await =>
         {
-            // The liveness watchdog already claimed and fenced this session.
+            // Already claimed elsewhere (the watchdog, or a concurrent duplicate push).
             crate::runtime_session::AgentNotificationResponse::Acknowledged
         }
         Some(descriptor) => {
@@ -1361,7 +1355,7 @@ impl AgentService {
                     crate::container::cleanup_rootfs(c.job_id, &c.rootfs_mode);
                     crate::executor::cleanup_job_spool(c.job_id);
                     if let Some(ref cgroup) = c.cgroup {
-                        crate::executor::cleanup_cgroup(cgroup);
+                        crate::executor::cleanup_cgroup(cgroup).await;
                     }
                     allocation.lock().await.release_job(c.job_id);
                     cleanup_completed_job_mpi(c.job_id, &c.mpi, &mpi_host).await;
@@ -2608,7 +2602,7 @@ impl SlurmAgent for AgentService {
                             crate::executor::cleanup_job_spool(job_id);
                         }
                         if let Some(ref cg) = cgroup {
-                            crate::executor::cleanup_cgroup(cg);
+                            crate::executor::cleanup_cgroup(cg).await;
                         }
                     });
                     return Ok(Response::new(LaunchJobResponse {
@@ -3949,17 +3943,45 @@ impl SlurmAgent for AgentService {
 }
 
 impl AgentService {
-    async fn drop_tracked_job(&self, job_id: u32) {
-        if self.running.lock().await.remove(&job_id).is_some() {
-            self.allocation.lock().await.release_job(job_id);
-            if let Some(descriptor) = self.runtime_sessions.lock().await.remove(&job_id) {
-                if let Err(error) = crate::runtime_session::record_resources_released(&descriptor) {
-                    warn!(job_id, %error, "failed to record runtime resource release");
-                }
+    /// Drops the tracked entry for `job_id` only if it's still `run_attempt` —
+    /// a concurrent redispatch can retrack the same job_id under a newer
+    /// attempt between the caller's peek and this call, and that entry must
+    /// survive.
+    async fn drop_tracked_job(&self, job_id: u32, run_attempt: u32) {
+        let removed = {
+            let mut jobs = self.running.lock().await;
+            if jobs
+                .get(&job_id)
+                .is_some_and(|current| current.run_attempt == run_attempt)
+            {
+                jobs.remove(&job_id);
+                true
+            } else {
+                false
             }
-            if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
-                warn!(job_id, error = %e, "PMIx stop failed on job drop");
+        };
+        if !removed {
+            return;
+        }
+        self.allocation.lock().await.release_job(job_id);
+        let stale_session = {
+            let mut sessions = self.runtime_sessions.lock().await;
+            if sessions
+                .get(&job_id)
+                .is_some_and(|current| current.run_attempt == run_attempt)
+            {
+                sessions.remove(&job_id)
+            } else {
+                None
             }
+        };
+        if let Some(descriptor) = stale_session {
+            if let Err(error) = crate::runtime_session::record_resources_released(&descriptor) {
+                warn!(job_id, %error, "failed to record runtime resource release");
+            }
+        }
+        if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+            warn!(job_id, error = %e, "PMIx stop failed on job drop");
         }
     }
 
@@ -4098,13 +4120,14 @@ impl AgentService {
                 }
             }
         }
-        let is_allocation_only = {
+        let allocation_only_attempt = {
             let jobs = self.running.lock().await;
             jobs.get(&job_id)
-                .is_some_and(|tracked| tracked.job.is_allocation_only())
+                .filter(|tracked| tracked.job.is_allocation_only())
+                .map(|tracked| tracked.run_attempt)
         };
-        if is_allocation_only {
-            self.drop_tracked_job(job_id).await;
+        if let Some(run_attempt) = allocation_only_attempt {
+            self.drop_tracked_job(job_id, run_attempt).await;
             return;
         }
 
@@ -4182,13 +4205,14 @@ impl AgentService {
                 }
             }
         }
-        let is_allocation_only = {
+        let allocation_only_attempt = {
             let jobs = self.running.lock().await;
             jobs.get(&job_id)
-                .is_some_and(|tracked| tracked.job.is_allocation_only())
+                .filter(|tracked| tracked.job.is_allocation_only())
+                .map(|tracked| tracked.run_attempt)
         };
-        if is_allocation_only {
-            self.drop_tracked_job(job_id).await;
+        if let Some(run_attempt) = allocation_only_attempt {
+            self.drop_tracked_job(job_id, run_attempt).await;
             return;
         }
 
@@ -5373,6 +5397,71 @@ mod tests {
             store.observed_exit(42, 7).expect("read exit"),
             None,
             "the watchdog must not write a synthetic exit once the push already claimed the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_push_arriving_after_the_watchdog_already_fenced_it_just_acks() {
+        let (context, running, sessions) = completion_listener_fixture("http://127.0.0.1:1").await;
+        let descriptor = sessions
+            .lock()
+            .await
+            .get(&42)
+            .cloned()
+            .expect("fixture session");
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::runtime_session::RuntimeSessionStore::new(state.path());
+        store.publish(&descriptor).expect("publish descriptor");
+
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        fence_dead_runtime_session(&running, &allocation, &sessions, &store, descriptor).await;
+        assert!(!sessions.lock().await.contains_key(&42));
+
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::runtime_session::AgentNotification::RuntimeSessionCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            exit_code: 0,
+            signal: 0,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        // If this reached report_completion it would block for seconds retrying
+        // against the unreachable controller; a fast reply proves it did not.
+        let read = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            crate::runtime_session::read_line_bounded(&mut reader, &mut line),
+        )
+        .await
+        .expect("push must not retry against the controller once fenced")
+        .expect("read response");
+        let _ = read;
+        let response: crate::runtime_session::AgentNotificationResponse =
+            serde_json::from_str(&line).expect("decode response");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handle notification");
+
+        assert_eq!(
+            response,
+            crate::runtime_session::AgentNotificationResponse::Acknowledged
         );
     }
 
@@ -7809,6 +7898,56 @@ mod tests {
             );
         }
         svc.running.lock().await.remove(&job_id);
+    }
+
+    // A stale-epoch drop (peeked before a concurrent redispatch retracked the
+    // same job_id under a newer attempt) must not evict the new tracking.
+    #[tokio::test]
+    async fn drop_tracked_job_skips_a_reused_job_id() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        fn allocation_only_job(run_attempt: u32) -> TrackedJob {
+            TrackedJob {
+                job: executor::RunningJob::AllocationOnly,
+                rootfs_mode: crate::container::RootfsMode::Extracted,
+                stdout_path: "/dev/null".into(),
+                stderr_path: "/dev/null".into(),
+                has_pid_namespace: false,
+                has_user_namespace: false,
+                has_mount_namespace: false,
+                _pty_master: None,
+                work_dir: "/tmp".into(),
+                uid: 0,
+                gid: 0,
+                user: "testuser".into(),
+                partition: String::new(),
+                gpu_devices: Vec::new(),
+                cpus: 1,
+                memory_mb: 0,
+                nodelist: String::new(),
+                mpi: String::new(),
+                run_attempt,
+            }
+        }
+        let job_id = 903;
+        svc.insert_test_job(job_id, allocation_only_job(1)).await;
+        svc.insert_test_job(job_id, allocation_only_job(2)).await;
+
+        svc.drop_tracked_job(job_id, 1).await;
+
+        assert_eq!(
+            svc.running
+                .lock()
+                .await
+                .get(&job_id)
+                .map(|job| job.run_attempt),
+            Some(2),
+            "a stale-epoch drop must not evict a newer, already-retracked job"
+        );
     }
 
     fn proc_state(pid: i32) -> char {
