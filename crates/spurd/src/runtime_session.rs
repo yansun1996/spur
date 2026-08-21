@@ -2052,6 +2052,12 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             }
         }
     };
+    if let Some(cgroup_path) = job.cgroup_path() {
+        descriptor.cgroup_path = cgroup_path.to_path_buf();
+        if let Err(error) = store.publish(&descriptor) {
+            tracing::warn!(job_id, %error, "failed to republish runtime descriptor with cgroup path");
+        }
+    }
     let session = Arc::new(RuntimeSession::with_environment_and_pmix(
         job,
         job_id,

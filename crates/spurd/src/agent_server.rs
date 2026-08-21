@@ -779,6 +779,10 @@ async fn fence_dead_runtime_session(
         "runtime session crash",
     )
     .await;
+    // The crashed process was the cgroup's only owner; nothing else reaps it.
+    if !descriptor.cgroup_path.as_os_str().is_empty() {
+        crate::executor::cleanup_cgroup(&descriptor.cgroup_path);
+    }
 }
 
 /// Accept runtime-session completion pushes for the daemon's life; spurd,
@@ -5159,6 +5163,39 @@ mod tests {
         fence_dead_runtime_session(&running, &allocation, &sessions, &store, descriptor).await;
 
         assert_eq!(store.observed_exit(42, 7).expect("read exit"), None);
+    }
+
+    #[tokio::test]
+    async fn liveness_watchdog_cleans_up_the_orphaned_cgroup() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::runtime_session::RuntimeSessionStore::new(state.path());
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let pid = std::process::id();
+        let mut descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            pid,
+            crate::runtime_session::process_start_ticks(pid).expect("start ticks") + 1,
+            store.session_dir(42, 7).join("runtime.sock"),
+            cgroup.path().to_path_buf(),
+        );
+        descriptor.capability = "test-capability".into();
+        store.publish(&descriptor).expect("publish descriptor");
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions.lock().await.insert(42, descriptor.clone());
+
+        fence_dead_runtime_session(&running, &allocation, &sessions, &store, descriptor).await;
+
+        assert!(
+            !cgroup.path().exists(),
+            "an orphaned cgroup left by a crashed session must be cleaned up"
+        );
     }
 
     async fn completion_listener_fixture(
