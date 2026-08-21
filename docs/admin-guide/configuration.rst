@@ -500,11 +500,14 @@ Authentication plugin for client requests.
 
 .. warning::
 
-   ``[auth] plugin`` is inert. Setting it to ``"jwt"`` does **not** authenticate
-   RPCs — the controller accepts requests from anyone who can reach its gRPC port,
-   and ``spurctld`` warns about this at startup whenever it binds a non-loopback
-   address. Restrict access to the controller port at the network layer. See
-   :doc:`accounting` for how identity maps to accounts and admin rights.
+   ``[auth] mode`` controls how strictly RPCs are authenticated; leaving it at
+   ``"disabled"`` means the controller accepts requests from anyone who can
+   reach its gRPC port, and ``spurctld`` warns about this at startup whenever
+   it binds a non-loopback address. Set ``mode = "required"`` (with ``plugin =
+   "jwt"`` and a ``jwt_key``/``jwt_key_file``) to enforce authentication, and
+   still restrict access to the controller port at the network layer as
+   defense in depth. See :doc:`accounting` for how identity maps to accounts
+   and admin rights.
 
 .. note::
 
