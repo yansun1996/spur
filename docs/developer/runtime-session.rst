@@ -51,9 +51,11 @@ Failure contracts
   requeue its attempt. Process adoption is not a recovery mechanism.
 * A recovered agent reports ``(job, attempt)`` to the controller. The
   controller probes every node in the durable allocation for that exact live
-  RuntimeSession. A missing, stale, or inactive participant fences the whole
-  attempt, cancels its old allocation, and requeues it; a subset must never
-  silently continue as a healthy allocation.
+  RuntimeSession. If a peer hasn't reported yet, the cohort is retained and the
+  reporter is told to retry, up to a short grace period; a peer still missing,
+  stale, or inactive once that grace period elapses fences the whole attempt,
+  cancels its old allocation, and requeues it. A subset must never silently
+  continue as a healthy allocation.
 * A client disconnect does not transfer execution ownership to the client.
   Output attachment is resumable only while the runtime's bounded live buffer
   retains the requested offset.

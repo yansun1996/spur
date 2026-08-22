@@ -275,6 +275,11 @@ pub(crate) fn resolve_startup_jwt_key(
 impl ControllerService {
     async fn runtime_recovery_cohort_expired(&self, job_id: u32, run_attempt: u32) -> bool {
         let mut incomplete = self.incomplete_runtime_recoveries.lock().await;
+        // A cohort whose reporter stops retrying is never cleared by the normal
+        // path; sweep entries stuck well past the grace period so this map
+        // can't grow without bound.
+        incomplete
+            .retain(|_, first_seen| first_seen.elapsed() < RUNTIME_RECOVERY_COHORT_GRACE * 10);
         let first_seen = incomplete
             .entry((job_id, run_attempt))
             .or_insert_with(std::time::Instant::now);
@@ -6380,6 +6385,29 @@ mod tests {
         assert_eq!(
             svc.cluster.get_job(job_id).expect("running job").state,
             JobState::Running
+        );
+    }
+
+    // A cohort whose reporter stops retrying is never cleared by the normal
+    // report-and-clear path; the bookkeeping map must self-prune instead of
+    // growing forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_recovery_cohort_map_prunes_entries_abandoned_by_their_reporter() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service(&dir).await;
+        svc.incomplete_runtime_recoveries.lock().await.insert(
+            (1, 1),
+            std::time::Instant::now() - RUNTIME_RECOVERY_COHORT_GRACE * 10,
+        );
+
+        svc.runtime_recovery_cohort_expired(2, 1).await;
+
+        assert!(
+            !svc.incomplete_runtime_recoveries
+                .lock()
+                .await
+                .contains_key(&(1, 1)),
+            "an abandoned cohort entry must be swept once it's far past its grace period"
         );
     }
 

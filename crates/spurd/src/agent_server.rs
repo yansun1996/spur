@@ -1049,8 +1049,14 @@ struct ActiveStepGuard {
 
 impl Drop for ActiveStepGuard {
     fn drop(&mut self) {
+        let key = self.key;
         if let Ok(mut steps) = self.steps.try_lock() {
-            steps.remove(&self.key);
+            steps.remove(&key);
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let steps = self.steps.clone();
+            handle.spawn(async move {
+                steps.lock().await.remove(&key);
+            });
         }
     }
 }
@@ -2914,6 +2920,36 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
+        if let Some(descriptor) = self.runtime_sessions.lock().await.get(&req.job_id).cloned() {
+            // Synthetic ids live in the upper half of u32 space so they can never
+            // collide with a real srun step number, which starts at 0.
+            let step_id = (uuid::Uuid::new_v4().as_u128() as u32) | 0x8000_0000;
+            let result = crate::runtime_session::launch_step(
+                &descriptor,
+                uuid::Uuid::new_v4().to_string(),
+                crate::runtime_session::RuntimeStepLaunchSpec {
+                    step_id,
+                    program: req.command[0].clone(),
+                    args: req.command[1..].to_vec(),
+                    work_dir: entry.work_dir.clone(),
+                    environment: std::collections::HashMap::new(),
+                    uid: entry.uid,
+                    gid: entry.gid,
+                    memlock: self.memlock.into(),
+                    pmix: None,
+                    task_epilog: None,
+                },
+            )
+            .await
+            .map_err(|error| Status::unavailable(format!("runtime exec failed: {error}")))?;
+            return Ok(Response::new(ExecInJobResponse {
+                success: result.exit_code == 0,
+                exit_code: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+            }));
+        }
+
         let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
 
         let plan = build_launch_plan(&entry, priv_drop.as_ref(), &req.command);
@@ -2974,11 +3010,11 @@ impl SlurmAgent for AgentService {
         let cpus = allocated.map(|a| a.cpus).unwrap_or(req.cpus).max(1);
         let memory_mb = allocated.map(|a| a.memory_mb).unwrap_or(req.memory_mb);
 
-        // Hold the running lock across the duplicate check, reserve+commit, and
-        // insert (running → allocation, as in commit) so the job is never
-        // committed-but-absent-from-running, which the reclaim reads as stale.
-        let mut jobs = self.running.lock().await;
-        if jobs.contains_key(&req.job_id) {
+        // Cheap check only; not held across the slow runtime-session launch
+        // below (which can take up to several seconds). The reservation is
+        // generation-guarded via `reservation_guard`, and the final commit
+        // below re-checks for a same-job_id race that landed in the meantime.
+        if self.running.lock().await.contains_key(&req.job_id) {
             return Err(Status::already_exists(format!(
                 "job {} already registered on this node",
                 req.job_id
@@ -3009,6 +3045,8 @@ impl SlurmAgent for AgentService {
                 })?;
             let _ = alloc.commit_job(req.job_id, req.run_attempt);
         }
+        let mut reservation_guard =
+            LaunchReservationGuard::new(self.allocation.clone(), req.job_id, req.run_attempt);
 
         info!(
             job_id = req.job_id,
@@ -3051,16 +3089,14 @@ impl SlurmAgent for AgentService {
                 io_mode: executor::LaunchIo::File,
                 pmix_multi_task: false,
             };
-            if let Err(error) =
-                fence_displaced_runtime_session(&self.runtime_sessions, req.job_id, req.run_attempt)
-                    .await
-            {
-                self.allocation.lock().await.release_job(req.job_id);
-                return Err(Status::unavailable(format!(
-                    "failed to fence displaced runtime session before allocation launch: {error}"
-                )));
-            }
-            match launch_runtime_session(
+            fence_displaced_runtime_session(&self.runtime_sessions, req.job_id, req.run_attempt)
+                .await
+                .map_err(|error| {
+                    Status::unavailable(format!(
+                        "failed to fence displaced runtime session before allocation launch: {error}"
+                    ))
+                })?;
+            let (_, descriptor) = launch_runtime_session(
                 &config,
                 req.run_attempt,
                 &self.reporter.controller_addr,
@@ -3075,20 +3111,54 @@ impl SlurmAgent for AgentService {
                 },
             )
             .await
-            .map(|(_, descriptor)| descriptor)
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "failed to start allocation runtime session: {error}"
+                ))
+            })?;
+
+            // Claim the slot before committing anything else, mirroring
+            // LaunchJob: a concurrent registration for a strictly newer
+            // attempt may have already tracked its own session while we were
+            // setting this one up.
+            if let Err(descriptor) =
+                claim_runtime_session_slot(&self.runtime_sessions, descriptor).await
             {
-                Ok(descriptor) => Some(descriptor),
-                Err(error) => {
-                    self.allocation.lock().await.release_job(req.job_id);
-                    return Err(Status::unavailable(format!(
-                        "failed to start allocation runtime session: {error}"
-                    )));
+                warn!(
+                    job_id = req.job_id,
+                    run_attempt = req.run_attempt,
+                    "runtime session superseded by a newer attempt before it could be tracked; aborting"
+                );
+                if let Err(error) =
+                    stop_runtime_session_unit(descriptor.job_id, descriptor.run_attempt).await
+                {
+                    warn!(job_id = req.job_id, %error, "failed to stop superseded runtime session");
                 }
+                cleanup_runtime_session_files(&descriptor);
+                return Err(Status::failed_precondition(format!(
+                    "job {} was superseded by a newer attempt on this node",
+                    req.job_id
+                )));
             }
+            true
         } else {
-            None
+            false
         };
 
+        let mut jobs = self.running.lock().await;
+        if jobs.contains_key(&req.job_id) {
+            drop(jobs);
+            if runtime_descriptor {
+                self.runtime_sessions.lock().await.remove(&req.job_id);
+                if let Err(error) = stop_runtime_session_unit(req.job_id, req.run_attempt).await {
+                    warn!(job_id = req.job_id, %error, "failed to stop redundant runtime session");
+                }
+            }
+            return Err(Status::already_exists(format!(
+                "job {} already registered on this node",
+                req.job_id
+            )));
+        }
         jobs.insert(
             req.job_id,
             TrackedJob {
@@ -3113,13 +3183,8 @@ impl SlurmAgent for AgentService {
                 run_attempt: req.run_attempt,
             },
         );
+        reservation_guard.disarm();
         drop(jobs);
-        if let Some(descriptor) = runtime_descriptor {
-            self.runtime_sessions
-                .lock()
-                .await
-                .insert(req.job_id, descriptor);
-        }
 
         Ok(Response::new(RegisterJobAllocationResponse {}))
     }
@@ -6342,6 +6407,43 @@ mod tests {
         assert_ne!(code, Some(tonic::Code::PermissionDenied));
     }
 
+    #[tokio::test]
+    async fn exec_in_job_routes_through_a_tracked_runtime_session() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.insert_test_job(902, TrackedJob::dummy(std::process::id()))
+            .await;
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            902,
+            1,
+            0,
+            0,
+            state.path().join("missing-runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        svc.runtime_sessions.lock().await.insert(902, descriptor);
+
+        // No runtime session server is listening, so a fix that actually routes
+        // through it must fail with Unavailable rather than silently falling
+        // back to running the command as a bare host process, which would
+        // succeed since job 902's dummy process is real.
+        let err = svc
+            .exec_in_job(Request::new(ExecInJobRequest {
+                job_id: 902,
+                command: vec!["echo".into(), "hello".into()],
+                user: "testuser".into(),
+            }))
+            .await
+            .expect_err("exec must route through the tracked runtime session, not the host path");
+
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+    }
+
     fn user_identity(name: &str) -> spur_core::auth::Identity {
         spur_core::auth::Identity {
             user: name.into(),
@@ -7758,6 +7860,37 @@ mod tests {
         assert!(
             svc.mpi_host.has_active_pmix(99),
             "batch completion must release one ref, not force-stop an active step namespace"
+        );
+    }
+
+    // A guard dropped while another task holds the steps lock must still
+    // release, via the spawned-task fallback, once the lock frees up.
+    #[tokio::test]
+    async fn active_step_guard_releases_via_spawn_when_lock_is_contended() {
+        let steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let key = (77, 1);
+        steps.lock().await.insert(key, ActiveStep::default());
+
+        let held = steps.lock().await;
+        drop(ActiveStepGuard {
+            steps: steps.clone(),
+            key,
+        });
+        drop(held);
+
+        let removed = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if !steps.lock().await.contains_key(&key) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            removed.is_ok(),
+            "guard should release the step entry once the lock frees up"
         );
     }
 

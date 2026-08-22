@@ -985,18 +985,32 @@ impl RuntimeSession {
             });
         }
         let mut child = command.spawn()?;
-        let child_pid = child
-            .id()
-            .ok_or_else(|| io::Error::other("runtime PTY has no pid"))?
-            as i32;
+        let child_pid = match child.id() {
+            Some(pid) => pid as i32,
+            None => {
+                let _ = child.start_kill();
+                return Err(io::Error::other("runtime PTY has no pid"));
+            }
+        };
         drop(slave);
-        nix::fcntl::fcntl(
+        // A failure past this point leaves an untracked orphan unless we kill
+        // it ourselves — nothing else has a handle on `child` yet.
+        if let Err(error) = nix::fcntl::fcntl(
             &master,
             nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-        )
-        .map_err(io::Error::other)?;
+        ) {
+            let _ = child.start_kill();
+            return Err(io::Error::other(error));
+        }
+        let master = match AsyncFd::new(master) {
+            Ok(master) => master,
+            Err(error) => {
+                let _ = child.start_kill();
+                return Err(error);
+            }
+        };
         let pty = Arc::new(RuntimePty {
-            master: Arc::new(AsyncFd::new(master)?),
+            master: Arc::new(master),
             child_pid,
             buffer: Mutex::new(RuntimePtyBuffer {
                 start_offset: 0,
