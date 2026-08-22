@@ -1238,6 +1238,29 @@ mod suspend_wal_tests {
     }
 
     #[test]
+    fn job_suspend_op_round_trips_with_provenance() {
+        let op = WalOperation::JobSuspend {
+            job_id: 7,
+            at: chrono::Utc::now(),
+            preempted_by: Some(11),
+            preempt_qos: Some("burst".into()),
+        };
+        let json = serde_json::to_string(&op).unwrap();
+        let back: WalOperation = serde_json::from_str(&json).unwrap();
+        match back {
+            WalOperation::JobSuspend {
+                preempted_by,
+                preempt_qos,
+                ..
+            } => {
+                assert_eq!(preempted_by, Some(11));
+                assert_eq!(preempt_qos.as_deref(), Some("burst"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn job_time_limit_signaled_op_round_trips() {
         let at = chrono::Utc::now();
         let op = WalOperation::JobTimeLimitSignaled { job_id: 13, at };

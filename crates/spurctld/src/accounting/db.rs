@@ -194,6 +194,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS one_default_account_per_user
 -- Administrative action / audit log. Records who ran reservation admin commands
 -- (create/update/delete) and their outcome. Entity-agnostic so other admin ops
 -- can reuse it later. `details` is a JSON string (sqlx has no json feature).
+CREATE TABLE IF NOT EXISTS txn (
+    id           BIGSERIAL PRIMARY KEY,
+    ts           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    actor        TEXT NOT NULL DEFAULT '',
+    actor_uid    BIGINT,
+    verified     BOOLEAN NOT NULL DEFAULT FALSE,
+    source       TEXT NOT NULL DEFAULT 'api',
+    action       TEXT NOT NULL,
+    entity_type  TEXT NOT NULL,
+    entity_name  TEXT NOT NULL DEFAULT '',
+    outcome      TEXT NOT NULL DEFAULT 'success',
+    details      TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_txn_ts ON txn(ts);
+CREATE INDEX IF NOT EXISTS idx_txn_actor ON txn(actor);
+CREATE INDEX IF NOT EXISTS idx_txn_entity ON txn(entity_type, entity_name);
 "#;
 
 /// What accounting persists when a job starts. Named fields rather than positional

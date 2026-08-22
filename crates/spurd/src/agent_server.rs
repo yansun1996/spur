@@ -1286,6 +1286,14 @@ impl AgentService {
         );
     }
 
+    /// A handle to the tracked-RuntimeSession map — the only jobs that survive
+    /// this process exiting.
+    pub(crate) fn runtime_sessions_handle(
+        &self,
+    ) -> Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>> {
+        self.runtime_sessions.clone()
+    }
+
     pub(crate) fn runtime_recovery_cleanup(&self) -> RuntimeRecoveryCleanup {
         RuntimeRecoveryCleanup {
             running: self.running.clone(),

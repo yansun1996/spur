@@ -452,6 +452,7 @@ async fn main() -> anyhow::Result<()> {
     agent_service.monitor_recovered_runtime_sessions(&recovered_runtime_sessions);
     agent_service.monitor_runtime_session_liveness();
     let runtime_recovery_cleanup = agent_service.runtime_recovery_cleanup();
+    let runtime_sessions_handle = agent_service.runtime_sessions_handle();
 
     // the RPC-driven k0s component owner is idle until the controller sends
     // StartClusterComponent; k0s then runs under its OWN systemd unit — never as a spurd job/child —
@@ -636,7 +637,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         result = server_task => { result??; }
         _ = sigterm.recv() => {
-            if !running_jobs.lock().await.is_empty() {
+            if !runtime_sessions_handle.lock().await.is_empty() {
                 info!("received SIGTERM with held runtime sessions; preserving controller registration");
                 return Ok(());
             }
