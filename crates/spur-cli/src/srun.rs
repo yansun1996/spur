@@ -877,13 +877,13 @@ async fn run_standalone_srun(
             &user,
         )
         .await;
-        let _ = client
-            .cancel_job(CancelJobRequest {
-                job_id,
-                signal: 0,
-                user: user.clone(),
-            })
-            .await;
+        // Report the real outcome instead of always cancelling: a restart-
+        // delayed real completion report must not lose to a redundant cancel.
+        let exit_code = match &result {
+            Ok(code) => *code,
+            Err(_) => 1,
+        };
+        release_srun_allocation(&mut client, job_id, &user, exit_code).await;
         std::process::exit(result?);
     }
 

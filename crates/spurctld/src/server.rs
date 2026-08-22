@@ -1900,33 +1900,36 @@ impl SlurmController for ControllerService {
             Some(Ok(NodeCompleteResult::AllDone { .. })) => Ok(Response::new(())),
             Some(Ok(NodeCompleteResult::Completing)) => {
                 if let Some(job) = self.cluster.get_job(req.job_id) {
-                    if job
-                        .spec
-                        .script
-                        .as_deref()
-                        .is_some_and(batch_script_uses_step_launch)
+                    let remaining: Vec<String> = job
+                        .allocated_nodes
+                        .iter()
+                        .filter(|node| !job.node_completions.contains_key(*node))
+                        .cloned()
+                        .collect();
+                    if !remaining.is_empty()
+                        && (pmix_peer_failure_requires_group_cancel(
+                            job.spec.mpi.as_deref(),
+                            req.exit_code,
+                            req.signal,
+                        ) || job
+                            .spec
+                            .script
+                            .as_deref()
+                            .is_some_and(batch_script_uses_step_launch))
                     {
-                        let missing: Vec<String> = job
-                            .allocated_nodes
-                            .iter()
-                            .filter(|node| !job.node_completions.contains_key(*node))
-                            .cloned()
-                            .collect();
-                        if !missing.is_empty() {
-                            let cluster = self.cluster.clone();
-                            let job_id = req.job_id;
-                            let run_attempt = job.run_attempt;
-                            tokio::spawn(async move {
-                                crate::scheduler_loop::cancel_job_on_nodes(
-                                    &cluster,
-                                    job_id,
-                                    run_attempt,
-                                    &missing,
-                                    15,
-                                )
-                                .await;
-                            });
-                        }
+                        let cluster = self.cluster.clone();
+                        let job_id = req.job_id;
+                        let run_attempt = job.run_attempt;
+                        tokio::spawn(async move {
+                            crate::scheduler_loop::cancel_job_on_nodes(
+                                &cluster,
+                                job_id,
+                                run_attempt,
+                                &remaining,
+                                15,
+                            )
+                            .await;
+                        });
                     }
                 }
                 Ok(Response::new(()))
@@ -4195,6 +4198,14 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
     }
 }
 
+/// MPI ranks are one interdependent group: a peer that dies or fails leaves
+/// the survivors blocked in collective calls forever, so an abnormal exit
+/// from any PMIx participant must cancel the whole job rather than let the
+/// rest limp on to their own completion.
+fn pmix_peer_failure_requires_group_cancel(mpi: Option<&str>, exit_code: i32, signal: i32) -> bool {
+    mpi == Some(MPI_PMIX) && (exit_code != 0 || signal != 0)
+}
+
 /// Human-readable summary of a job's GPU request for display.
 fn requested_gpus_detail(spec: &spur_core::job::JobSpec) -> String {
     let ty = |t: Option<&str>| t.map(|t| format!("{t}:")).unwrap_or_default();
@@ -4495,6 +4506,27 @@ fn validate_completion_report_state_for_rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pmix_peer_failure_requires_group_cancel_only_for_abnormal_pmix_exits() {
+        assert!(pmix_peer_failure_requires_group_cancel(
+            Some(MPI_PMIX),
+            1,
+            0
+        ));
+        assert!(pmix_peer_failure_requires_group_cancel(
+            Some(MPI_PMIX),
+            0,
+            9
+        ));
+        assert!(!pmix_peer_failure_requires_group_cancel(
+            Some(MPI_PMIX),
+            0,
+            0
+        ));
+        assert!(!pmix_peer_failure_requires_group_cancel(None, 1, 0));
+        assert!(!pmix_peer_failure_requires_group_cancel(Some("none"), 1, 9));
+    }
 
     #[test]
     fn runtime_step_retries_only_transport_failures() {

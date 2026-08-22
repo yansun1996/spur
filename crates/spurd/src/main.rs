@@ -111,6 +111,15 @@ struct Args {
     log_level: String,
 }
 
+/// Parses a runtime session directory's `<job_id>.<run_attempt>` basename.
+/// Used to fence a session whose descriptor failed to parse — the job/attempt
+/// identity survives in the directory name even when its contents don't.
+fn parse_session_dir_name(path: &std::path::Path) -> Option<(u32, u32)> {
+    let name = path.file_name()?.to_str()?;
+    let (job_id, run_attempt) = name.split_once('.')?;
+    Some((job_id.parse().ok()?, run_attempt.parse().ok()?))
+}
+
 /// True when retrying a runtime-recovery report can never help: the
 /// controller has no jwt_key configured, or this node's own identity/token
 /// is invalid — none of which a retry loop can fix on its own.
@@ -207,11 +216,31 @@ async fn main() -> anyhow::Result<()> {
     });
     let runtime_sessions = runtime_session::RuntimeSessionStore::new(&runtime_state_dir);
     let discovered_sessions = runtime_sessions.discover_live()?;
+    // A corrupted descriptor still names its (job_id, run_attempt) in the
+    // directory it lives in — fence it the same way as a stale session
+    // instead of silently forgetting the job forever.
+    let mut unparseable_rejected = Vec::new();
+    let mut corrupted_runtime_sessions = Vec::new();
     for (path, reason) in discovered_sessions.rejected {
+        match parse_session_dir_name(&path) {
+            Some((job_id, run_attempt)) => corrupted_runtime_sessions.push((job_id, run_attempt)),
+            None => unparseable_rejected.push((path, reason)),
+        }
+    }
+    for (path, reason) in unparseable_rejected {
         warn!(path = %path.display(), %reason, "ignoring unusable runtime session descriptor");
     }
     let recovered_runtime_sessions = discovered_sessions.live;
     let stale_runtime_sessions = discovered_sessions.stale;
+    // A stale session's supervisor is confirmed dead, but that alone doesn't
+    // kill its cgroup: if only the supervisor was killed (not the whole
+    // process tree), the job's own process survives as an unsupervised
+    // orphan. Reap it locally instead of leaving it running indefinitely.
+    for descriptor in &stale_runtime_sessions {
+        if !descriptor.cgroup_path.as_os_str().is_empty() {
+            crate::executor::cleanup_cgroup(&descriptor.cgroup_path).await;
+        }
+    }
     if !recovered_runtime_sessions.is_empty() {
         warn!(
             sessions = recovered_runtime_sessions.len(),
@@ -581,27 +610,27 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    for descriptor in stale_runtime_sessions.into_iter().filter(|descriptor| {
-        !reconciled_runtime_completions.contains(&(descriptor.job_id, descriptor.run_attempt))
-            && !unacknowledged_runtime_completions
-                .contains(&(descriptor.job_id, descriptor.run_attempt))
-    }) {
+    let unreportable_sessions = stale_runtime_sessions
+        .iter()
+        .map(|descriptor| (descriptor.job_id, descriptor.run_attempt))
+        .chain(corrupted_runtime_sessions)
+        .filter(|id| {
+            !reconciled_runtime_completions.contains(id)
+                && !unacknowledged_runtime_completions.contains(id)
+        });
+    for (job_id, run_attempt) in unreportable_sessions {
         let recovery_reporter = reporter.clone();
         tokio::spawn(async move {
             loop {
                 match recovery_reporter
-                    .report_runtime_session_recovery(
-                        descriptor.job_id,
-                        descriptor.run_attempt,
-                        true,
-                    )
+                    .report_runtime_session_recovery(job_id, run_attempt, true)
                     .await
                 {
                     Ok(response) => {
                         if response.fenced {
                             warn!(
-                                job_id = descriptor.job_id,
-                                run_attempt = descriptor.run_attempt,
+                                job_id,
+                                run_attempt,
                                 message = %response.message,
                                 "controller fenced stale runtime session"
                             );
@@ -610,8 +639,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(error) if is_permanent_recovery_error(&error) => {
                         warn!(
-                            job_id = descriptor.job_id,
-                            run_attempt = descriptor.run_attempt,
+                            job_id,
+                            run_attempt,
                             ?error,
                             "stale runtime recovery report permanently rejected by the controller; \
                              giving up on this session"
@@ -620,8 +649,8 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(error) => {
                         warn!(
-                            job_id = descriptor.job_id,
-                            run_attempt = descriptor.run_attempt,
+                            job_id,
+                            run_attempt,
                             %error,
                             "stale runtime recovery report failed; retrying"
                         );
@@ -717,6 +746,22 @@ mod tests {
     #[test]
     fn parse_label_just_equals() {
         assert!(parse_label("=").is_err());
+    }
+
+    #[test]
+    fn parse_session_dir_name_extracts_job_id_and_run_attempt() {
+        assert_eq!(
+            parse_session_dir_name(std::path::Path::new("/var/spool/spur/runtime/36.1")),
+            Some((36, 1))
+        );
+        assert_eq!(
+            parse_session_dir_name(std::path::Path::new("not-a-session-dir")),
+            None
+        );
+        assert_eq!(
+            parse_session_dir_name(std::path::Path::new("/var/spool/spur/runtime")),
+            None
+        );
     }
 
     #[test]
