@@ -127,7 +127,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for RuntimeLaunchSpec {
             plugstack_path: String::new(),
             controller_addr: String::new(),
             reporting_node: String::new(),
-            run_attempt: 0,
+            run_attempt: config.run_attempt,
             capability: String::new(),
             allocation_only: false,
             pmix_config: None,
@@ -141,6 +141,7 @@ impl RuntimeLaunchSpec {
     pub fn into_launch_config(self) -> crate::executor::JobLaunchConfig {
         crate::executor::JobLaunchConfig {
             job_id: self.job_id,
+            run_attempt: self.run_attempt,
             script: self.script,
             work_dir: self.work_dir,
             name: self.name,

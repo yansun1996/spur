@@ -2464,6 +2464,7 @@ impl SlurmAgent for AgentService {
 
         let launch_cfg = executor::JobLaunchConfig {
             job_id,
+            run_attempt,
             script: launch_script,
             work_dir: work_dir.clone(),
             name: spec.name.clone(),
@@ -3070,6 +3071,7 @@ impl SlurmAgent for AgentService {
         let runtime_descriptor = if runtime_enabled {
             let config = executor::JobLaunchConfig {
                 job_id: req.job_id,
+                run_attempt: req.run_attempt,
                 script: String::new(),
                 work_dir: req.work_dir.clone(),
                 name: String::new(),

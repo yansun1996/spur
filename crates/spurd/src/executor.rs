@@ -136,6 +136,7 @@ pub enum LaunchIo {
 
 pub struct JobLaunchConfig {
     pub job_id: JobId,
+    pub run_attempt: u32,
     pub script: String,
     pub work_dir: String,
     /// Needed to expand `%x`/`%u`/`%N`/`%a`/`%A` in output paths as the controller does.
@@ -500,6 +501,7 @@ async fn spawn_job_process(
 ) -> Result<LaunchResult, LaunchError> {
     let JobLaunchConfig {
         job_id,
+        run_attempt,
         ref script,
         ref work_dir,
         ref environment,
@@ -519,7 +521,7 @@ async fn spawn_job_process(
     info!(job_id, work_dir, "launching job");
 
     // Set up cgroup for isolation
-    let cgroup_path = setup_cgroup(job_id, cpus, memory_mb, cpu_ids)?;
+    let cgroup_path = setup_cgroup(job_id, run_attempt, cpus, memory_mb, cpu_ids)?;
 
     // Ensure work_dir exists on this node (the submitted path may only exist on the submitting
     // node). If creation fails (e.g. path is under another user's home), fall back to /tmp so
@@ -889,14 +891,27 @@ async fn spawn_job_process(
 }
 
 /// Set up a cgroups v2 hierarchy for a job.
+// Keyed by attempt, not just job_id: a redispatch must never land in a
+// still-occupied cgroup left by a not-yet-reaped prior attempt.
+fn cgroup_path_for(cgroup_root: &Path, job_id: JobId, run_attempt: u32) -> PathBuf {
+    cgroup_root.join(format!("job_{}_{}", job_id, run_attempt))
+}
+
+/// Reconstructs a job's cgroup path from its identity alone — usable even
+/// when the session descriptor that would normally carry it is unreadable.
+pub(crate) fn expected_cgroup_path(job_id: JobId, run_attempt: u32) -> PathBuf {
+    cgroup_path_for(Path::new(CGROUP_ROOT), job_id, run_attempt)
+}
+
 fn setup_cgroup(
     job_id: JobId,
+    run_attempt: u32,
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
 ) -> anyhow::Result<Option<PathBuf>> {
     let cgroup_root = PathBuf::from(CGROUP_ROOT);
-    let cgroup_path = cgroup_root.join(format!("job_{}", job_id));
+    let cgroup_path = cgroup_path_for(&cgroup_root, job_id, run_attempt);
 
     // Delegate controllers to children: in cgroup-v2 a child only gets
     // memory.*/cpu.*/pids.* files if the parent lists them in subtree_control;
@@ -1444,7 +1459,13 @@ async fn launch_container_job(
     job_io: JobIo,
 ) -> anyhow::Result<(RunningJob, Option<OwnedFd>)> {
     let job_id = cfg.job_id;
-    let cgroup_path = setup_cgroup(job_id, cfg.cpus, cfg.memory_mb, &cfg.cpu_ids)?;
+    let cgroup_path = setup_cgroup(
+        job_id,
+        cfg.run_attempt,
+        cfg.cpus,
+        cfg.memory_mb,
+        &cfg.cpu_ids,
+    )?;
 
     // Sync pipe: child writes status, parent reads.
     // Convert OwnedFd to raw fds for manual lifecycle management across fork.
@@ -1727,6 +1748,17 @@ fn wrap_with_burst_buffer(script: &str, bb: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cgroup_path_is_scoped_to_the_attempt_not_just_the_job() {
+        let root = Path::new("/sys/fs/cgroup/spur");
+        let first = cgroup_path_for(root, 4, 1);
+        let second = cgroup_path_for(root, 4, 2);
+        assert_ne!(
+            first, second,
+            "a redispatch must never share a cgroup with a not-yet-reaped prior attempt"
+        );
+    }
 
     #[tokio::test]
     async fn cleanup_cgroup_retries_past_a_transient_removal_failure() {
@@ -2195,6 +2227,7 @@ mod tests {
     fn launch_cfg_for_paths(job_id: JobId, name: &str, user: &str, node: &str) -> JobLaunchConfig {
         JobLaunchConfig {
             job_id,
+            run_attempt: 1,
             script: String::new(),
             work_dir: String::new(),
             name: name.to_string(),

@@ -241,6 +241,15 @@ async fn main() -> anyhow::Result<()> {
             crate::executor::cleanup_cgroup(&descriptor.cgroup_path).await;
         }
     }
+    // A corrupted descriptor has no cgroup_path to read, but the path is
+    // reconstructable from identity alone — reap it the same way.
+    for &(job_id, run_attempt) in &corrupted_runtime_sessions {
+        crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
+            job_id,
+            run_attempt,
+        ))
+        .await;
+    }
     if !recovered_runtime_sessions.is_empty() {
         warn!(
             sessions = recovered_runtime_sessions.len(),
