@@ -11674,7 +11674,12 @@ mod tests {
 
         let job_id = run_job_on(&cm, "preempt-suspend", "worker1");
         let outcome = cm
-            .preempt_job_with_provenance(job_id, PreemptMode::Suspend, Some(42), Some("highprio".into()))
+            .preempt_job_with_provenance(
+                job_id,
+                PreemptMode::Suspend,
+                Some(42),
+                Some("highprio".into()),
+            )
             .unwrap();
         assert_eq!(outcome, PreemptOutcome::Suspended);
         settle(&cm, job_id, JobState::Suspended);
@@ -11696,7 +11701,9 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "preempt-off", "worker1");
-        assert!(cm.preempt_job_with_provenance(job_id, PreemptMode::Off, Some(99), None).is_err());
+        assert!(cm
+            .preempt_job_with_provenance(job_id, PreemptMode::Off, Some(99), None)
+            .is_err());
         // Job keeps running; nothing was preempted.
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
     }
@@ -11895,8 +11902,13 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "prov-clear", "worker1");
-        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(77), Some("burst".into()))
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            job_id,
+            PreemptMode::Requeue,
+            Some(77),
+            Some("burst".into()),
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         let after_preempt = cm.get_job(job_id).unwrap();

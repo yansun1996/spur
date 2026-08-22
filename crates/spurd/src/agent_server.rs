@@ -6589,6 +6589,7 @@ mod tests {
         let mut req = Request::new(AgentCancelJobRequest {
             job_id: 48,
             signal: 9,
+            run_attempt: 0,
         });
         req.extensions_mut().insert(user_identity("attacker"));
         let err = svc
