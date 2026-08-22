@@ -619,6 +619,8 @@ impl SlurmAgent for VirtualAgent {
         &self,
         _request: Request<RuntimeSessionProbeRequest>,
     ) -> Result<Response<RuntimeSessionProbeResponse>, Status> {
+        // k8s-backed jobs run as pods, never under a native RuntimeSession, so
+        // they never enter the native recovery/fencing path that calls this.
         Ok(Response::new(RuntimeSessionProbeResponse { active: false }))
     }
 

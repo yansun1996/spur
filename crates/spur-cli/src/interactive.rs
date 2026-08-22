@@ -253,7 +253,10 @@ pub async fn drive_interactive_session(
                             None => {}
                         }
                     }
-                    Ok(None) | Err(_) if runtime_session => {
+                    // A local stdin close ends the request stream, which the
+                    // server sees as `Ok(None)` too — only `Err` here is an
+                    // actual disconnect worth reconnecting for.
+                    Err(_) if runtime_session => {
                         match reconnect_runtime_session(
                             agent,
                             spec.job_id,
