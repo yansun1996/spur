@@ -730,10 +730,13 @@ async fn spawn_job_process(
     // Launch the process
     let piped_mpi_stdio = cfg.pmix_multi_task && cfg.io_mode == LaunchIo::File;
     let mut cmd = Command::new(&launch_cmd);
-    cmd.args(&launch_args).current_dir(work_dir).envs(&env);
-    if !cfg.pmix_multi_task {
-        cmd.process_group(0);
-    }
+    // Always its own process group (run_command does the same for pmix step
+    // launches) so signal()/kill_signal's group-kill reaches the whole job
+    // regardless of PMIx — only namespace isolation is pmix-conditional above.
+    cmd.args(&launch_args)
+        .current_dir(work_dir)
+        .envs(&env)
+        .process_group(0);
     if piped_mpi_stdio {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
