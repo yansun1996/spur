@@ -229,9 +229,12 @@ async fn fence_displaced_runtime_session(
     let displaced_attempt = displaced_runtime_attempt(&displaced, run_attempt)?;
     let stop_result = stop_runtime_session_unit(displaced.job_id, displaced_attempt).await;
     if !runtime_teardown_confirmed(&displaced.cgroup_path, &stop_result).await {
-        return stop_result.and(Err(std::io::Error::other(
-            "could not confirm the displaced runtime session's cgroup is empty",
-        )));
+        return match stop_result {
+            Err(error) => Err(error),
+            Ok(()) => Err(std::io::Error::other(
+                "could not confirm the displaced runtime session's cgroup is empty",
+            )),
+        };
     }
     // Only remove the entry we just fenced: a concurrent claim (a newer
     // attempt racing this one) may have already replaced it while the stop
@@ -805,8 +808,7 @@ async fn fence_dead_runtime_session(
     }
     // The crashed supervisor was the cgroup's only owner, so its job process
     // can outlive it as an orphan — reap it before releasing this node's ledger.
-    // Unlike the other fencing sites, there's no unit left to retry stopping,
-    // so an unconfirmed cgroup still proceeds rather than wedging forever.
+    // No unit is left to retry stopping, so an unconfirmed cgroup still proceeds.
     if !descriptor.cgroup_path.as_os_str().is_empty()
         && !crate::executor::cleanup_cgroup(&descriptor.cgroup_path).await
     {

@@ -228,16 +228,30 @@ pub async fn drive_interactive_session(
                     last_error = Some(status);
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
-                Err(status) => return Err(anyhow::anyhow!(status.message().to_string())),
+                Err(status) => {
+                    return Err(anyhow::anyhow!(
+                        "runtime session reconnect failed: {}",
+                        status.message()
+                    ))
+                }
             }
         }
-        let message = last_error
+        let detail = last_error
             .map(|status| status.message().to_string())
-            .unwrap_or_else(|| "runtime session reconnect failed".into());
-        Err(anyhow::anyhow!(message))
+            .unwrap_or_else(|| "no attempt succeeded".into());
+        Err(anyhow::anyhow!(
+            "runtime session reconnect failed: {detail}"
+        ))
     }
 
-    let exit_code: i32 = loop {
+    // A real remote exit code is trustworthy on its own; a lost session is
+    // not — carry them separately so a lost session can't masquerade as Ok(1).
+    enum SessionOutcome {
+        Exited(i32),
+        Lost(anyhow::Error),
+    }
+
+    let outcome = loop {
         tokio::select! {
             msg = out_stream.message() => {
                 match msg {
@@ -248,7 +262,7 @@ pub async fn drive_interactive_session(
                                 stdout.flush().await?;
                             }
                             Some(interactive_output::Msg::ExitStatus(code)) => {
-                                break code;
+                                break SessionOutcome::Exited(code);
                             }
                             None => {}
                         }
@@ -271,17 +285,13 @@ pub async fn drive_interactive_session(
                                 out_stream = handle.out_stream;
                                 runtime_session = handle.runtime_session;
                             }
-                            Err(error) => {
-                                eprintln!("\r\nruntime session reconnect failed: {error}");
-                                break 1;
-                            }
+                            Err(error) => break SessionOutcome::Lost(error),
                         }
                     }
-                    Ok(None) => break 1,
-                    Err(e) => {
-                        eprintln!("\r\nstream error: {e}");
-                        break 1;
-                    }
+                    Ok(None) => break SessionOutcome::Lost(anyhow::anyhow!(
+                        "interactive session ended without reporting an exit status"
+                    )),
+                    Err(e) => break SessionOutcome::Lost(anyhow::anyhow!("stream error: {e}")),
                 }
             }
 
@@ -321,7 +331,10 @@ pub async fn drive_interactive_session(
     drop(_raw_guard);
     let _ = std::panic::take_hook(); // remove our raw-mode panic hook
 
-    Ok(exit_code)
+    match outcome {
+        SessionOutcome::Exited(code) => Ok(code),
+        SessionOutcome::Lost(error) => Err(error),
+    }
 }
 
 /// Run a full interactive PTY session over the InteractiveSession RPC.

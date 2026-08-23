@@ -95,6 +95,36 @@ class TestRuntimeSessionRecovery:
         finally:
             channel.close()
 
+    def test_interactive_pty_lost_session_does_not_fabricate_completion(self, runtime_cluster):
+        """A session that started and then exhausts its reconnect budget
+        must not let the CLI report a fabricated exit code — the command
+        may still be alive under its RuntimeSession, and only its real
+        completion may resolve the job."""
+        cluster = runtime_cluster
+        node = cluster.node_names[0]
+        channel = cluster.interactive_srun(
+            ["--pty", "-N", "1", "-w", node, "bash", "-c", "printf READY; sleep 8"],
+            width=80,
+            height=24,
+        )
+        try:
+            output = _read_until(channel, "Pending job allocation")
+            match = re.search(r"Pending job allocation (\d+)", output)
+            assert match, f"could not find job id in srun output: {output}"
+            job_id = int(match.group(1))
+            output += _read_until(channel, "READY")
+            cluster.stop_agents()
+            output += _read_until(channel, "reconnect failed", timeout=15)
+            cluster.start_agents()
+            _wait_agents_registered(cluster)
+            state = wait_job(cluster, job_id, timeout=30)
+            assert state in ("CD", "GONE"), (
+                f"the real completion must resolve the job, not a fabricated one: "
+                f"{state}\n{cluster.debug_job(job_id)}"
+            )
+        finally:
+            channel.close()
+
     def test_interactive_pty_never_started_finalizes_immediately(self, runtime_cluster):
         """A pty attach that fails before the interactive step ever reaches
         its RuntimeSession has nothing to race a later completion report
