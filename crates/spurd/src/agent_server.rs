@@ -4640,9 +4640,13 @@ impl AgentService {
         let instance_id = uuid::Uuid::new_v4().to_string();
         let mut offset = 0;
         let mut poll = tokio::time::interval(tokio::time::Duration::from_millis(25));
+        // The RuntimeSession outlives any one attach, so a closed local input
+        // (ordinary stdin EOF, not a failure) must not end the bridge — keep
+        // polling for the real exit instead of dropping the response stream.
+        let mut input_closed = false;
         loop {
             tokio::select! {
-                item = inbound.next() => match item {
+                item = inbound.next(), if !input_closed => match item {
                     Some(Ok(input)) => {
                         let result = match input.msg {
                             Some(interactive_input::Msg::Stdin(data)) => {
@@ -4674,7 +4678,7 @@ impl AgentService {
                         let _ = tx.send(Err(error)).await;
                         return;
                     }
-                    None => return,
+                    None => input_closed = true,
                 },
                 _ = poll.tick() => {
                     match crate::runtime_session::read_pty(&descriptor, instance_id.clone(), offset).await {

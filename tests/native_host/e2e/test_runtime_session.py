@@ -96,10 +96,8 @@ class TestRuntimeSessionRecovery:
             channel.close()
 
     def test_interactive_pty_lost_session_does_not_fabricate_completion(self, runtime_cluster):
-        """A session that started and then exhausts its reconnect budget
-        must not let the CLI report a fabricated exit code — the command
-        may still be alive under its RuntimeSession, and only its real
-        completion may resolve the job."""
+        """Exhausting the reconnect budget must not let the CLI fabricate an
+        exit code for a command that may still be alive under its RuntimeSession."""
         cluster = runtime_cluster
         node = cluster.node_names[0]
         channel = cluster.interactive_srun(
@@ -124,6 +122,17 @@ class TestRuntimeSessionRecovery:
             )
         finally:
             channel.close()
+
+    def test_interactive_pty_stdin_eof_reports_the_real_exit_code(self, runtime_cluster):
+        """Ordinary stdin EOF (redirected/piped input) is not a lost session —
+        the RuntimeSession keeps running and must still deliver its real exit."""
+        cluster = runtime_cluster
+        node = cluster.node_names[0]
+        code, output = cluster.srun_with_closed_stdin(
+            ["--pty", "-N", "1", "-w", node, "sleep", "2"]
+        )
+        assert code == 0, f"a closed stdin must not be reported as a lost session: {output}"
+        assert "lost" not in output.lower() and "ended without reporting" not in output, output
 
     def test_interactive_pty_never_started_finalizes_immediately(self, runtime_cluster):
         """A pty attach that fails before the interactive step ever reaches

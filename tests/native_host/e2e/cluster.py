@@ -428,6 +428,19 @@ class SpurCluster:
         code = stdout.channel.recv_exit_status()
         return code, stdout.read().decode() + stderr.read().decode()
 
+    def srun_with_closed_stdin(self, args: list[str]) -> tuple[int, str]:
+        """Run srun with stdin closed immediately (ordinary EOF, not a failure)."""
+        cmd_parts = [
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(self.controller_addr)}",
+            f"PATH={shlex.quote(self.bin_dir)}:$PATH",
+            shlex.quote(f"{self.bin_dir}/srun"),
+        ]
+        cmd_parts.extend(shlex.quote(a) for a in args)
+        stdin, stdout, stderr = self.nodes[0].client.exec_command(" ".join(cmd_parts))
+        stdin.close()
+        code = stdout.channel.recv_exit_status()
+        return code, stdout.read().decode() + stderr.read().decode()
+
     def srun_in_allocation(self, job_id: int, args: list[str]) -> tuple[int, str]:
         """Run srun inside an existing allocation (step mode, as after salloc)."""
         cmd_parts = [
