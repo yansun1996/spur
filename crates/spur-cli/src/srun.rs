@@ -791,6 +791,13 @@ async fn release_srun_allocation(
         })
         .await
     {
+        // A real completion report (e.g. from a restart-delayed RuntimeSession
+        // push) can already have finalized the job by the time we get here —
+        // that's the race this call is meant to lose gracefully, not a
+        // failure needing a redundant cancel.
+        if e.code() == tonic::Code::FailedPrecondition && e.message().contains("already") {
+            return;
+        }
         eprintln!(
             "srun: warning: failed to release allocation for job {}: {}",
             job_id, e
@@ -877,14 +884,24 @@ async fn run_standalone_srun(
             &user,
         )
         .await;
-        // Report the real outcome instead of always cancelling: a restart-
-        // delayed real completion report must not lose to a redundant cancel.
-        let exit_code = match &result {
-            Ok(code) => *code,
-            Err(_) => 1,
-        };
-        release_srun_allocation(&mut client, job_id, &user, exit_code).await;
-        std::process::exit(result?);
+        match result {
+            // Report the real outcome instead of always cancelling: a
+            // restart-delayed real completion report must not lose to a
+            // redundant cancel.
+            Ok(exit_code) => {
+                release_srun_allocation(&mut client, job_id, &user, exit_code).await;
+                std::process::exit(exit_code);
+            }
+            // We lost contact with our own session, not necessarily with the
+            // job: forcing a "failed" completion here could finalize a job
+            // that's still running (or already succeeded) under its
+            // RuntimeSession, racing out its real, correct report. Leave the
+            // allocation for that report to resolve instead of guessing.
+            Err(error) => {
+                eprintln!("srun: {error}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let job = client

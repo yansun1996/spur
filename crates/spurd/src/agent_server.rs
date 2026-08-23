@@ -213,7 +213,16 @@ async fn fence_displaced_runtime_session(
         return Ok(());
     };
     let displaced_attempt = displaced_runtime_attempt(&displaced, run_attempt)?;
-    stop_runtime_session_unit(displaced.job_id, displaced_attempt).await?;
+    let stop_result = stop_runtime_session_unit(displaced.job_id, displaced_attempt).await;
+    // A bare unit stop only signals the supervisor, which by design ignores a
+    // raw SIGTERM for its job's cgroup — confirm the cgroup is actually
+    // empty before letting the new attempt launch, or it can land in the
+    // same cgroup as a still-alive orphan and double-book its resources.
+    let cgroup_confirmed_dead = !displaced.cgroup_path.as_os_str().is_empty()
+        && crate::executor::cleanup_cgroup(&displaced.cgroup_path).await;
+    if stop_result.is_err() && !cgroup_confirmed_dead {
+        return stop_result;
+    }
     // Only remove the entry we just fenced: a concurrent claim (a newer
     // attempt racing this one) may have already replaced it while the stop
     // was in flight, and that entry must not be dropped.
@@ -793,6 +802,16 @@ async fn fence_dead_runtime_session(
                 "failed to record synthetic exit for a dead runtime session");
         }
     }
+    // The crashed supervisor was the cgroup's only owner, so its job process
+    // can outlive it as an orphan — reap it before releasing this node's
+    // resource ledger, or a new job could be handed the same CPU/GPU ids
+    // while the orphan is still physically using them.
+    if !descriptor.cgroup_path.as_os_str().is_empty()
+        && !crate::executor::cleanup_cgroup(&descriptor.cgroup_path).await
+    {
+        warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt,
+            "could not confirm the crashed runtime session's cgroup is empty; releasing tracking anyway");
+    }
     release_runtime_tracking(
         running,
         allocation,
@@ -801,10 +820,6 @@ async fn fence_dead_runtime_session(
         "runtime session crash",
     )
     .await;
-    // The crashed process was the cgroup's only owner; nothing else reaps it.
-    if !descriptor.cgroup_path.as_os_str().is_empty() {
-        crate::executor::cleanup_cgroup(&descriptor.cgroup_path).await;
-    }
 }
 
 /// Accept runtime-session completion pushes for the daemon's life; spurd,
@@ -2590,6 +2605,21 @@ impl SlurmAgent for AgentService {
                         {
                             warn!(job_id, run_attempt, %error, "failed to stop superseded runtime session");
                         }
+                        // This session never entered `runtime_sessions`, so
+                        // the crash watchdog will never see it either — reap
+                        // its cgroup here or it leaks silently. The cgroup
+                        // path is deterministic from job identity alone, so
+                        // this works even if the descriptor reload above
+                        // failed and left it unpopulated.
+                        let cgroup_path = if descriptor.cgroup_path.as_os_str().is_empty() {
+                            executor::expected_cgroup_path(
+                                descriptor.job_id,
+                                descriptor.run_attempt,
+                            )
+                        } else {
+                            descriptor.cgroup_path.clone()
+                        };
+                        crate::executor::cleanup_cgroup(&cgroup_path).await;
                         cleanup_runtime_session_files(&descriptor);
                         let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                         tokio::spawn(reap_killed_job(result.job));
@@ -5049,6 +5079,47 @@ mod tests {
         assert_eq!(sessions.lock().await.get(&42), Some(&same));
     }
 
+    // A bare unit stop only signals the supervisor, which by design ignores
+    // a raw SIGTERM for its job's cgroup — the displaced attempt's cgroup
+    // must be reaped directly before a new attempt is allowed to launch on
+    // top of it, or the two can end up sharing (or racing over) resources.
+    #[tokio::test]
+    async fn fence_displaced_runtime_session_reaps_its_cgroup() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let blocker = cgroup.path().join("cgroup.kill");
+        std::fs::create_dir(&blocker).expect("seed cgroup.kill blocker");
+        let blocker_removed = blocker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            std::fs::remove_dir(&blocker_removed).expect("clear blocker");
+        });
+        let displaced = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            1,
+            0,
+            0,
+            std::path::PathBuf::from("/nonexistent/runtime.sock"),
+            cgroup.path().to_path_buf(),
+        );
+        sessions.lock().await.insert(42, displaced.clone());
+
+        // No real "spur-runtime-42.1" unit exists in the test environment,
+        // so the unit-stop attempt itself fails — this must not be fatal as
+        // long as the cgroup kill independently confirms the job is gone.
+        let result = fence_displaced_runtime_session(&sessions, 42, 2).await;
+
+        assert!(
+            result.is_ok(),
+            "cgroup confirmation must be enough even when the unit stop fails: {result:?}"
+        );
+        assert!(
+            !cgroup.path().exists(),
+            "the displaced attempt's cgroup must be reaped, not left for the new attempt to share"
+        );
+        assert!(!sessions.lock().await.contains_key(&42));
+    }
+
     #[test]
     fn runtime_sigkill_escalation_requires_the_exact_session_attempt() {
         let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
@@ -5485,6 +5556,10 @@ mod tests {
             b"1",
             "an orphaned cgroup left by a crashed session must be cleaned up"
         );
+        // Cgroup reaping happens before tracking is released (not after), so
+        // a new attempt can never be handed this node's resources while the
+        // old orphan might still be occupying them.
+        assert!(!sessions.lock().await.contains_key(&42));
     }
 
     async fn completion_listener_fixture(
