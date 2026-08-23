@@ -3,6 +3,7 @@
 
 """RuntimeSession E2E coverage for restart and failure contracts."""
 
+import re
 import time
 
 from cluster import job_state, parse_job_id, wait_job, wait_job_state
@@ -93,6 +94,35 @@ class TestRuntimeSessionRecovery:
             assert "SIGNALLED" in output
         finally:
             channel.close()
+
+    def test_interactive_pty_never_started_finalizes_immediately(self, runtime_cluster):
+        """A pty attach that fails before the interactive step ever reaches
+        its RuntimeSession has nothing to race a later completion report
+        against — it must release the allocation right away, not leave it
+        for a reaper that (by default) never runs."""
+        cluster = runtime_cluster
+        node = cluster.node_names[0]
+        channel = cluster.interactive_srun(
+            ["--pty", "-N", "1", "-w", node, "sleep", "120"],
+            width=80,
+            height=24,
+        )
+        try:
+            output = _read_until(channel, "Pending job allocation")
+            match = re.search(r"Pending job allocation (\d+)", output)
+            assert match, f"could not find job id in srun output: {output}"
+            job_id = int(match.group(1))
+            cluster.stop_agents()
+            output += _read_until(channel, "cannot connect to agent", timeout=30)
+            state = wait_job(cluster, job_id, timeout=30)
+            assert state in ("F", "CA", "GONE"), (
+                f"a never-started pty attach must finalize promptly, not hang: "
+                f"{state}\n{cluster.debug_job(job_id)}"
+            )
+        finally:
+            channel.close()
+            cluster.start_agents()
+            _wait_agents_registered(cluster)
 
     def test_runtime_task_epilog_runs_once_per_logical_step(self, runtime_unstarted_cluster):
         cluster = runtime_unstarted_cluster
@@ -230,10 +260,9 @@ class TestRuntimeSessionRecovery:
             wait_job_state(cluster, job_id, "R", timeout=60)
             descriptors = _wait_descriptors(cluster, job_id, expected=ranks)
             node_index, descriptor = descriptors[0]
-            # A hard kill of the supervisor process itself (not `systemctl
-            # stop`, which only sends SIGTERM and lets the unit's own grace
-            # period apply) — this is the actual failure this test targets:
-            # the supervisor is gone outright, not asked to shut down.
+            # A hard kill (not `systemctl stop`, which only sends SIGTERM and
+            # lets the unit's own grace period apply) — the supervisor is gone
+            # outright, not asked to shut down.
             cluster.nodes[node_index].exec(
                 f"{cluster._sudo_prefix()}kill -9 {descriptor['pid']}"
             )
@@ -402,12 +431,9 @@ class TestRuntimeSessionRecovery:
             )
             output = cluster.read_output_on_any_node(marker_path)
             lines = output.splitlines()
-            # A second START is expected and harmless: the old attempt
-            # legitimately wrote its own START before being killed, and the
-            # new attempt writes its own after redispatch. What must never
-            # happen is the old attempt ALSO reaching END — that would mean
-            # it survived as an orphan and ran concurrently with (or instead
-            # of) the new attempt for the full 30s sleep.
+            # A second START is expected and harmless (the old attempt wrote
+            # its own before being killed); a second END would mean it
+            # survived as an orphan and ran concurrently with the new attempt.
             assert lines.count("END") == 1, (
                 f"at most one attempt may ever run to completion; a second END "
                 f"means an orphan survived and ran concurrently: "
@@ -437,12 +463,11 @@ class TestRuntimeSessionRecovery:
             )
             cluster.restart_agent(node_index)
             _wait_agents_registered(cluster)
-            # wait_job's only failure mode is raising TimeoutError, so simply
-            # reaching this line already proves the job didn't hang forever;
-            # the assertion documents which resolutions are legitimate rather
-            # than re-deriving that guarantee.
+            # Reaching this line already proves the job didn't hang forever
+            # (wait_job's only failure mode is raising TimeoutError); the
+            # assertion just documents which resolutions are legitimate.
             state = wait_job(cluster, job_id, timeout=90)
-            assert state in ("PD", "R", "CD", "F", "CA", "TO", "GONE"), (
+            assert state in ("CD", "F", "CA", "TO", "GONE"), (
                 f"job must not be left permanently stuck after a corrupted descriptor: "
                 f"{state}\n{cluster.debug_job(job_id)}"
             )

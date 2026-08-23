@@ -224,7 +224,10 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
         let user = crate::interactive::current_user()?;
         let exit_code =
             run_interactive_pty(&args.controller, job_id, args.command.clone(), node, &user)
-                .await?;
+                .await
+                .map_err(|e| match e {
+                    PtySessionError::NeverStarted(e) | PtySessionError::Lost(e) => e,
+                })?;
         std::process::exit(exit_code);
     }
 
@@ -791,10 +794,8 @@ async fn release_srun_allocation(
         })
         .await
     {
-        // A real completion report (e.g. from a restart-delayed RuntimeSession
-        // push) can already have finalized the job by the time we get here —
-        // that's the race this call is meant to lose gracefully, not a
-        // failure needing a redundant cancel.
+        // A real completion report can already have finalized the job by the
+        // time we get here — lose that race gracefully, not a redundant cancel.
         if e.code() == tonic::Code::FailedPrecondition && e.message().contains("already") {
             return;
         }
@@ -892,12 +893,18 @@ async fn run_standalone_srun(
                 release_srun_allocation(&mut client, job_id, &user, exit_code).await;
                 std::process::exit(exit_code);
             }
-            // We lost contact with our own session, not necessarily with the
-            // job: forcing a "failed" completion here could finalize a job
-            // that's still running (or already succeeded) under its
-            // RuntimeSession, racing out its real, correct report. Leave the
-            // allocation for that report to resolve instead of guessing.
-            Err(error) => {
+            // The interactive command never actually started (step creation
+            // or connect failed) — nothing is racing us, so release now or
+            // the allocation is stuck forever.
+            Err(PtySessionError::NeverStarted(error)) => {
+                eprintln!("srun: {error}");
+                release_srun_allocation(&mut client, job_id, &user, 1).await;
+                std::process::exit(1);
+            }
+            // The command was already running under its RuntimeSession when
+            // we lost our own attach — leave its real report to resolve this
+            // instead of racing it with a fabricated one.
+            Err(PtySessionError::Lost(error)) => {
                 eprintln!("srun: {error}");
                 std::process::exit(1);
             }
@@ -1213,6 +1220,14 @@ fn warn_unsupported_cpu_bind(environment: &HashMap<String, String>) {
     }
 }
 
+/// Whether the interactive command ever actually started running on the
+/// agent. Only once it has can a real completion report be racing us —
+/// before that, nothing else will ever resolve the allocation.
+enum PtySessionError {
+    NeverStarted(anyhow::Error),
+    Lost(anyhow::Error),
+}
+
 /// Create an interactive PTY step on a running job and attach to it.
 ///
 /// Retries transient failures (job not yet visible on agent after controller
@@ -1223,10 +1238,11 @@ async fn run_interactive_pty(
     command: Vec<String>,
     node: String,
     user: &str,
-) -> Result<i32> {
+) -> Result<i32, PtySessionError> {
     let channel = crate::authclient::connect(controller)
         .await
-        .context("cannot connect to controller")?;
+        .context("cannot connect to controller")
+        .map_err(PtySessionError::NeverStarted)?;
     let mut ctrl = SlurmControllerClient::new(channel);
 
     let winsize = crate::interactive::get_terminal_size();
@@ -1262,25 +1278,27 @@ async fn run_interactive_pty(
                     continue;
                 }
                 Err(status) => {
-                    return Err(anyhow::anyhow!(
+                    return Err(PtySessionError::NeverStarted(anyhow::anyhow!(
                         "CreateJobStep failed: {}",
                         status.message()
-                    ))
+                    )))
                 }
             };
 
             if step_resp.node_addr.is_empty() {
-                anyhow::bail!(
+                return Err(PtySessionError::NeverStarted(anyhow::anyhow!(
                     "controller did not return a node address for job {}",
                     job_id
-                );
+                )));
             }
             let pair = (step_resp.step_id, format!("http://{}", step_resp.node_addr));
             cached_step = Some(pair.clone());
             pair
         };
 
-        let mut agent = crate::interactive::connect_agent(&node_addr).await?;
+        let mut agent = crate::interactive::connect_agent(&node_addr)
+            .await
+            .map_err(PtySessionError::NeverStarted)?;
 
         match crate::interactive::open_interactive_session(
             &mut agent,
@@ -1306,22 +1324,25 @@ async fn run_interactive_pty(
                         user: user.to_string(),
                     },
                 )
-                .await;
+                .await
+                .map_err(PtySessionError::Lost);
             }
             Err(status) if is_retryable_status(&status) && attempt < 4 => {
                 last_err = Some(anyhow::anyhow!("InteractiveSession: {}", status.message()));
                 continue;
             }
             Err(status) => {
-                return Err(anyhow::anyhow!(
+                return Err(PtySessionError::NeverStarted(anyhow::anyhow!(
                     "InteractiveSession RPC failed: {}",
                     status.message()
-                ));
+                )));
             }
         }
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("interactive session failed after retries")))
+    Err(PtySessionError::NeverStarted(last_err.unwrap_or_else(
+        || anyhow::anyhow!("interactive session failed after retries"),
+    )))
 }
 
 fn is_retryable_status(status: &tonic::Status) -> bool {

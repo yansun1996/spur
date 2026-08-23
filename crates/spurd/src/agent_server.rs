@@ -203,6 +203,20 @@ async fn stop_runtime_session_unit(job_id: u32, run_attempt: u32) -> std::io::Re
     )))
 }
 
+/// Whether a torn-down runtime session is confirmed dead. A cgroup path, if
+/// recorded, is authoritative — a successful unit stop only signals the
+/// supervisor, which by design ignores a raw SIGTERM for its job's cgroup.
+async fn runtime_teardown_confirmed(
+    cgroup_path: &std::path::Path,
+    stop_result: &std::io::Result<()>,
+) -> bool {
+    if cgroup_path.as_os_str().is_empty() {
+        stop_result.is_ok()
+    } else {
+        crate::executor::cleanup_cgroup(cgroup_path).await
+    }
+}
+
 async fn fence_displaced_runtime_session(
     runtime_sessions: &Arc<Mutex<HashMap<u32, crate::runtime_session::RuntimeSessionDescriptor>>>,
     job_id: u32,
@@ -214,14 +228,10 @@ async fn fence_displaced_runtime_session(
     };
     let displaced_attempt = displaced_runtime_attempt(&displaced, run_attempt)?;
     let stop_result = stop_runtime_session_unit(displaced.job_id, displaced_attempt).await;
-    // A bare unit stop only signals the supervisor, which by design ignores a
-    // raw SIGTERM for its job's cgroup — confirm the cgroup is actually
-    // empty before letting the new attempt launch, or it can land in the
-    // same cgroup as a still-alive orphan and double-book its resources.
-    let cgroup_confirmed_dead = !displaced.cgroup_path.as_os_str().is_empty()
-        && crate::executor::cleanup_cgroup(&displaced.cgroup_path).await;
-    if stop_result.is_err() && !cgroup_confirmed_dead {
-        return stop_result;
+    if !runtime_teardown_confirmed(&displaced.cgroup_path, &stop_result).await {
+        return stop_result.and(Err(std::io::Error::other(
+            "could not confirm the displaced runtime session's cgroup is empty",
+        )));
     }
     // Only remove the entry we just fenced: a concurrent claim (a newer
     // attempt racing this one) may have already replaced it while the stop
@@ -441,16 +451,7 @@ impl RuntimeRecoveryCleanup {
                 "failed to stop controller-rejected runtime session"
             );
         }
-        // Stopping the unit only signals the supervisor process, which by
-        // design does not tear down its job on a bare SIGTERM (only via the
-        // local control protocol) — kill the cgroup directly too, or a still
-        // live job survives as an orphan racing the next attempt's launch.
-        // Its own confirmation (cgroup verified empty) is a stronger signal
-        // than the unit stop succeeding, which only means systemd accepted
-        // the request, not that the job's process is actually gone.
-        let cgroup_confirmed_dead = !descriptor.cgroup_path.as_os_str().is_empty()
-            && crate::executor::cleanup_cgroup(&descriptor.cgroup_path).await;
-        if stop_result.is_err() && !cgroup_confirmed_dead {
+        if !runtime_teardown_confirmed(&descriptor.cgroup_path, &stop_result).await {
             // Can't confirm the old attempt is actually gone — releasing
             // tracking now would let a new attempt double-book resources
             // it's still using.
@@ -803,9 +804,9 @@ async fn fence_dead_runtime_session(
         }
     }
     // The crashed supervisor was the cgroup's only owner, so its job process
-    // can outlive it as an orphan — reap it before releasing this node's
-    // resource ledger, or a new job could be handed the same CPU/GPU ids
-    // while the orphan is still physically using them.
+    // can outlive it as an orphan — reap it before releasing this node's ledger.
+    // Unlike the other fencing sites, there's no unit left to retry stopping,
+    // so an unconfirmed cgroup still proceeds rather than wedging forever.
     if !descriptor.cgroup_path.as_os_str().is_empty()
         && !crate::executor::cleanup_cgroup(&descriptor.cgroup_path).await
     {
@@ -2605,12 +2606,8 @@ impl SlurmAgent for AgentService {
                         {
                             warn!(job_id, run_attempt, %error, "failed to stop superseded runtime session");
                         }
-                        // This session never entered `runtime_sessions`, so
-                        // the crash watchdog will never see it either — reap
-                        // its cgroup here or it leaks silently. The cgroup
-                        // path is deterministic from job identity alone, so
-                        // this works even if the descriptor reload above
-                        // failed and left it unpopulated.
+                        // This session never entered `runtime_sessions`, so the
+                        // crash watchdog will never see it either — reap it here.
                         let cgroup_path = if descriptor.cgroup_path.as_os_str().is_empty() {
                             executor::expected_cgroup_path(
                                 descriptor.job_id,
@@ -2619,7 +2616,10 @@ impl SlurmAgent for AgentService {
                         } else {
                             descriptor.cgroup_path.clone()
                         };
-                        crate::executor::cleanup_cgroup(&cgroup_path).await;
+                        if !crate::executor::cleanup_cgroup(&cgroup_path).await {
+                            warn!(job_id, run_attempt,
+                                "could not confirm the superseded runtime session's cgroup is empty");
+                        }
                         cleanup_runtime_session_files(&descriptor);
                         let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                         tokio::spawn(reap_killed_job(result.job));
@@ -5079,10 +5079,8 @@ mod tests {
         assert_eq!(sessions.lock().await.get(&42), Some(&same));
     }
 
-    // A bare unit stop only signals the supervisor, which by design ignores
-    // a raw SIGTERM for its job's cgroup — the displaced attempt's cgroup
-    // must be reaped directly before a new attempt is allowed to launch on
-    // top of it, or the two can end up sharing (or racing over) resources.
+    // A bare unit stop doesn't kill the job's cgroup — the displaced attempt's
+    // cgroup must be reaped directly before a new attempt can launch on top of it.
     #[tokio::test]
     async fn fence_displaced_runtime_session_reaps_its_cgroup() {
         let sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -5104,9 +5102,8 @@ mod tests {
         );
         sessions.lock().await.insert(42, displaced.clone());
 
-        // No real "spur-runtime-42.1" unit exists in the test environment,
-        // so the unit-stop attempt itself fails — this must not be fatal as
-        // long as the cgroup kill independently confirms the job is gone.
+        // No real "spur-runtime-42.1" unit exists, so the stop attempt itself
+        // fails — cgroup confirmation alone must still be enough to proceed.
         let result = fence_displaced_runtime_session(&sessions, 42, 2).await;
 
         assert!(
@@ -5118,6 +5115,36 @@ mod tests {
             "the displaced attempt's cgroup must be reaped, not left for the new attempt to share"
         );
         assert!(!sessions.lock().await.contains_key(&42));
+    }
+
+    // A successful unit stop must NOT substitute for cgroup confirmation: the
+    // supervisor exiting says nothing about whether its job's cgroup is empty.
+    #[tokio::test]
+    async fn runtime_teardown_confirmed_requires_the_cgroup_even_when_stop_succeeded() {
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        std::fs::create_dir(cgroup.path().join("cgroup.kill"))
+            .expect("seed a permanent cgroup.kill blocker");
+
+        let confirmed = runtime_teardown_confirmed(cgroup.path(), &Ok(())).await;
+
+        assert!(
+            !confirmed,
+            "a successful unit stop must not override an unconfirmed cgroup"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_teardown_confirmed_trusts_stop_result_when_there_is_no_cgroup() {
+        let empty_path = std::path::PathBuf::new();
+
+        assert!(runtime_teardown_confirmed(&empty_path, &Ok(())).await);
+        assert!(
+            !runtime_teardown_confirmed(
+                &empty_path,
+                &Err(std::io::Error::other("systemctl stop failed"))
+            )
+            .await
+        );
     }
 
     #[test]
