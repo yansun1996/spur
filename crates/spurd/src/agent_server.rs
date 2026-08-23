@@ -424,13 +424,27 @@ impl RuntimeRecoveryCleanup {
         descriptor: &crate::runtime_session::RuntimeSessionDescriptor,
         stop_result: std::io::Result<()>,
     ) {
-        if let Err(error) = stop_result {
+        if let Err(error) = &stop_result {
             warn!(
                 job_id = descriptor.job_id,
                 run_attempt = descriptor.run_attempt,
                 %error,
                 "failed to stop controller-rejected runtime session"
             );
+        }
+        // Stopping the unit only signals the supervisor process, which by
+        // design does not tear down its job on a bare SIGTERM (only via the
+        // local control protocol) — kill the cgroup directly too, or a still
+        // live job survives as an orphan racing the next attempt's launch.
+        // Its own confirmation (cgroup verified empty) is a stronger signal
+        // than the unit stop succeeding, which only means systemd accepted
+        // the request, not that the job's process is actually gone.
+        let cgroup_confirmed_dead = !descriptor.cgroup_path.as_os_str().is_empty()
+            && crate::executor::cleanup_cgroup(&descriptor.cgroup_path).await;
+        if stop_result.is_err() && !cgroup_confirmed_dead {
+            // Can't confirm the old attempt is actually gone — releasing
+            // tracking now would let a new attempt double-book resources
+            // it's still using.
             return;
         }
         self.release_tracking(descriptor).await;
@@ -5182,6 +5196,65 @@ mod tests {
             running.lock().await.get(&42).map(|job| job.run_attempt),
             Some(7)
         );
+    }
+
+    // A bare `systemctl stop` only signals the supervisor, which by design
+    // ignores a raw SIGTERM for its job's cgroup — so the unit stop failing
+    // must not be the only signal consulted. If the cgroup kill itself
+    // confirms the job is gone, tracking must still be released.
+    #[tokio::test]
+    async fn rejected_recovery_releases_tracking_when_the_cgroup_confirms_the_job_is_gone() {
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let cleanup = RuntimeRecoveryCleanup {
+            running: running.clone(),
+            allocation,
+            runtime_sessions: sessions.clone(),
+        };
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        // A plain tempdir can't model real cgroupfs, where writing to the
+        // kernel-provided "cgroup.kill" never leaves a stray directory
+        // entry. A directory at that path makes the write fail cleanly
+        // instead (no file created), and removing it shortly after — same
+        // technique as cleanup_cgroup_retries_past_a_transient_removal_failure
+        // — lets the directory end up genuinely empty once retried.
+        let blocker = cgroup.path().join("cgroup.kill");
+        std::fs::create_dir(&blocker).expect("seed cgroup.kill blocker");
+        let blocker_removed = blocker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            std::fs::remove_dir(&blocker_removed).expect("clear blocker");
+        });
+        let descriptor = crate::runtime_session::RuntimeSessionDescriptor::new(
+            42,
+            7,
+            0,
+            0,
+            state.path().join("runtime.sock"),
+            cgroup.path().to_path_buf(),
+        );
+        sessions.lock().await.insert(42, descriptor.clone());
+        let mut tracked = TrackedJob::dummy(0);
+        tracked.run_attempt = 7;
+        running.lock().await.insert(42, tracked);
+
+        cleanup
+            .finish_rejection(
+                &descriptor,
+                Err(std::io::Error::other("unit remains active")),
+            )
+            .await;
+
+        assert!(
+            !sessions.lock().await.contains_key(&42),
+            "an empty, confirmed-dead cgroup must release tracking even if the unit stop failed"
+        );
+        assert!(!running.lock().await.contains_key(&42));
     }
 
     #[tokio::test]

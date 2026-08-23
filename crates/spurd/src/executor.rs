@@ -1027,7 +1027,10 @@ pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
 }
 
 /// Kill any leftover processes in the job's cgroup and remove the directory.
-pub async fn cleanup_cgroup(cgroup_path: &Path) {
+/// Returns whether the cgroup was confirmed empty and removed — callers that
+/// need to know the job's process is actually gone (not just signaled)
+/// should gate on this rather than assuming the kill took effect.
+pub async fn cleanup_cgroup(cgroup_path: &Path) -> bool {
     if cgroup_kill(cgroup_path).is_err() {
         // No cgroup.kill (e.g. cgroup v1): fall back to a manual per-pid sweep.
         if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
@@ -1044,13 +1047,14 @@ pub async fn cleanup_cgroup(cgroup_path: &Path) {
     const REMOVE_ATTEMPTS: u32 = 5;
     for attempt in 1..=REMOVE_ATTEMPTS {
         match std::fs::remove_dir(cgroup_path) {
-            Ok(()) => return,
+            Ok(()) => return true,
             Err(_) if attempt < REMOVE_ATTEMPTS => {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             Err(e) => warn!(error = %e, path = %cgroup_path.display(), "failed to remove cgroup"),
         }
     }
+    false
 }
 
 /// Recursively signal a process and all its descendants (children first).
