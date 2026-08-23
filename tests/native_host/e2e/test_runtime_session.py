@@ -209,6 +209,47 @@ class TestRuntimeSessionRecovery:
         finally:
             cluster.scancel(str(job_id))
 
+    def test_pmix_batch_fails_closed_when_one_participant_dies(self, runtime_mpi_cluster):
+        """PMIx ranks are one interdependent group: a peer that dies leaves
+        the rest blocked in collective calls. Killing one participant's
+        RuntimeSession must cancel the whole job, not let the other ranks
+        run to their own unrelated completion."""
+        cluster = runtime_mpi_cluster
+        ranks = min(2, len(cluster.nodes))
+        marker_path = f"{cluster.remote_dir}/pmix-group-fail-markers.log"
+        script = cluster.write_file(
+            "runtime-pmix-group-fail.sh",
+            "#!/bin/bash\n#SBATCH --mpi=pmix\n"
+            f"echo START >> '{marker_path}'\nsleep 60\necho END >> '{marker_path}'\n",
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "runtime-pmix-group-fail", "-N", str(ranks), "-n", str(ranks), script])
+        )
+        assert job_id is not None, "PMIx batch submission failed"
+        try:
+            wait_job_state(cluster, job_id, "R", timeout=60)
+            descriptors = _wait_descriptors(cluster, job_id, expected=ranks)
+            node_index, descriptor = descriptors[0]
+            # A hard kill of the supervisor process itself (not `systemctl
+            # stop`, which only sends SIGTERM and lets the unit's own grace
+            # period apply) — this is the actual failure this test targets:
+            # the supervisor is gone outright, not asked to shut down.
+            cluster.nodes[node_index].exec(
+                f"{cluster._sudo_prefix()}kill -9 {descriptor['pid']}"
+            )
+            state = wait_job(cluster, job_id, timeout=90)
+            assert state not in ("CD",), (
+                f"a job with a dead PMIx participant must not complete normally: "
+                f"{state}\n{cluster.debug_job(job_id)}"
+            )
+            output = cluster.read_output_all_nodes(marker_path)
+            assert output.count("END") < ranks, (
+                f"the surviving rank(s) must be cancelled, not run to their own "
+                f"completion while their peer is dead: {output}"
+            )
+        finally:
+            cluster.scancel(str(job_id))
+
     def test_container_job_completes(self, runtime_cluster, tmp_path):
         cluster = runtime_cluster
         cluster.container_preflight()
@@ -328,5 +369,78 @@ class TestRuntimeSessionRecovery:
             )
             assert code != 0, "step unexpectedly succeeded after its runtime session was stopped"
             _wait_pending(cluster, job_id)
+        finally:
+            cluster.scancel(str(job_id))
+
+    def test_dual_death_does_not_duplicate_execution(self, runtime_cluster):
+        """spurd and its RuntimeSession child dying together must not let a
+        redispatched attempt run concurrently with the not-yet-reaped old
+        one: the cgroup they'd share would let one attempt's teardown kill
+        the other's live work, and their output would interleave."""
+        cluster = runtime_cluster
+        marker_path = f"{cluster.remote_dir}/dual-death-markers.log"
+        node = cluster.node_names[0]
+        script = cluster.write_file(
+            "dual-death.sh",
+            f"#!/bin/bash\necho START >> '{marker_path}'\nsleep 30\necho END >> '{marker_path}'\n",
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "dual-death", "-N", "1", "-w", node, script])
+        )
+        assert job_id is not None, "batch submission failed"
+        try:
+            wait_job_state(cluster, job_id, "R", timeout=60)
+            _wait_descriptors(cluster, job_id, expected=1)
+            # restart_agent's broad process match takes down spurd AND its
+            # RuntimeSession child together, matching the "both die at once"
+            # failure this test targets.
+            cluster.restart_agent(0)
+            _wait_agents_registered(cluster)
+            state = wait_job(cluster, job_id, timeout=90)
+            assert state in ("CD", "GONE"), (
+                f"job did not resolve after dual death: {state}\n{cluster.debug_job(job_id)}"
+            )
+            output = cluster.read_output_on_any_node(marker_path)
+            lines = output.splitlines()
+            # A second START is expected and harmless: the old attempt
+            # legitimately wrote its own START before being killed, and the
+            # new attempt writes its own after redispatch. What must never
+            # happen is the old attempt ALSO reaching END — that would mean
+            # it survived as an orphan and ran concurrently with (or instead
+            # of) the new attempt for the full 30s sleep.
+            assert lines.count("END") == 1, (
+                f"at most one attempt may ever run to completion; a second END "
+                f"means an orphan survived and ran concurrently: "
+                f"{lines}\n{cluster.debug_job(job_id)}"
+            )
+        finally:
+            cluster.scancel(str(job_id))
+
+    def test_corrupted_descriptor_requeues_instead_of_hanging(self, runtime_cluster):
+        """A RuntimeSession descriptor that fails to parse still names its
+        (job_id, run_attempt) in the directory it lives in — the job must be
+        fenced and requeued, not silently forgotten and left RUNNING forever
+        once its (unsupervised) process eventually exits on its own."""
+        cluster = runtime_cluster
+        script = cluster.write_file("corrupt-descriptor.sh", "#!/bin/bash\nsleep 60\n")
+        job_id = parse_job_id(cluster.sbatch(["-J", "corrupt-descriptor", "-N", "1", script]))
+        assert job_id is not None, "batch submission failed"
+        try:
+            wait_job_state(cluster, job_id, "R", timeout=60)
+            node_index, descriptor = _wait_descriptors(cluster, job_id, expected=1)[0]
+            run_attempt = descriptor["run_attempt"]
+            descriptor_path = (
+                f"{cluster.remote_dir}/runtime/{job_id}.{run_attempt}/descriptor.json"
+            )
+            cluster.nodes[node_index].exec(
+                f"{cluster._sudo_prefix()}sh -c \"echo garbage > '{descriptor_path}'\""
+            )
+            cluster.restart_agent(node_index)
+            _wait_agents_registered(cluster)
+            state = wait_job(cluster, job_id, timeout=90)
+            assert state in ("PD", "R", "CD", "GONE"), (
+                f"job must not be left permanently stuck after a corrupted descriptor: "
+                f"{state}\n{cluster.debug_job(job_id)}"
+            )
         finally:
             cluster.scancel(str(job_id))
