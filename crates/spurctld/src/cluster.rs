@@ -1810,18 +1810,26 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Preempt a running job per its partition's PreemptMode, without
+    /// recording a triggering job (e.g. controller-initiated fencing rather
+    /// than scheduler priority preemption). See `preempt_job_with_provenance`.
+    pub fn preempt_job(&self, job_id: JobId, mode: PreemptMode) -> anyhow::Result<PreemptOutcome> {
+        self.preempt_job_with_provenance(job_id, mode, None, None)
+    }
+
     /// Preempt a running job per its partition's PreemptMode. Does the
     /// controller-side state change; the caller dispatches the signal named by
     /// the returned `PreemptOutcome`. `Off` is rejected.
     ///
     /// `preempted_by` is the job that triggered the preemption (recorded for
-    /// provenance). `preempt_qos` is the authorizing QOS name when
-    /// `preempt_type = QosPriority`; `None` for plain priority-based preemption.
-    pub fn preempt_job(
+    /// provenance), or `None` when there isn't one. `preempt_qos` is the
+    /// authorizing QOS name when `preempt_type = QosPriority`; `None` for
+    /// plain priority-based preemption.
+    pub fn preempt_job_with_provenance(
         &self,
         job_id: JobId,
         mode: PreemptMode,
-        preempted_by: JobId,
+        preempted_by: Option<JobId>,
         preempt_qos: Option<String>,
     ) -> anyhow::Result<PreemptOutcome> {
         {
@@ -1844,7 +1852,7 @@ impl ClusterManager {
                 let resp = self.propose(WalOperation::JobSuspend {
                     job_id,
                     at: chrono::Utc::now(),
-                    preempted_by: Some(preempted_by),
+                    preempted_by,
                     preempt_qos: preempt_qos.clone(),
                 })?;
                 self.run_all_finalized_side_effects(&resp);
@@ -1854,7 +1862,7 @@ impl ClusterManager {
             PreemptMode::Cancel => {
                 let resp = self.propose(WalOperation::JobPreemptCancel {
                     job_id,
-                    preempted_by: Some(preempted_by),
+                    preempted_by,
                     preempt_qos,
                 })?;
                 self.run_all_finalized_side_effects(&resp);
@@ -1885,7 +1893,7 @@ impl ClusterManager {
                 let resp = self.propose(WalOperation::JobPreemptRequeue {
                     job_id,
                     begin_time,
-                    preempted_by: Some(preempted_by),
+                    preempted_by,
                     preempt_qos,
                 })?;
                 self.run_all_finalized_side_effects(&resp);
@@ -12827,7 +12835,7 @@ mod tests {
         assert_eq!(cm.node_metrics().alloc_cpus, 2);
 
         let outcome = cm
-            .preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            .preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
             .unwrap();
         assert_eq!(outcome, PreemptOutcome::Killed);
         settle(&cm, job_id, JobState::Pending);
@@ -12884,7 +12892,7 @@ mod tests {
         .unwrap();
         settle(&cm, job_id, JobState::Running);
 
-        cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
             .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
@@ -12904,7 +12912,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "hold-reason", "worker1");
-        cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
             .unwrap();
         settle(&cm, job_id, JobState::Pending);
         assert_eq!(
@@ -12929,7 +12937,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "hold-expiry", "worker1");
-        cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
             .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
@@ -13395,7 +13403,7 @@ mod tests {
 
         let job_id = run_job_on(&cm, "preempt-cancel", "worker1");
         let outcome = cm
-            .preempt_job(job_id, PreemptMode::Cancel, 99, None)
+            .preempt_job_with_provenance(job_id, PreemptMode::Cancel, Some(99), None)
             .unwrap();
         assert_eq!(outcome, PreemptOutcome::Killed);
         settle(&cm, job_id, JobState::Cancelled);
@@ -13646,7 +13654,12 @@ mod tests {
 
         let job_id = run_job_on(&cm, "preempt-suspend", "worker1");
         let outcome = cm
-            .preempt_job(job_id, PreemptMode::Suspend, 42, Some("highprio".into()))
+            .preempt_job_with_provenance(
+                job_id,
+                PreemptMode::Suspend,
+                Some(42),
+                Some("highprio".into()),
+            )
             .unwrap();
         assert_eq!(outcome, PreemptOutcome::Suspended);
         settle(&cm, job_id, JobState::Suspended);
@@ -13668,7 +13681,9 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "preempt-off", "worker1");
-        assert!(cm.preempt_job(job_id, PreemptMode::Off, 99, None).is_err());
+        assert!(cm
+            .preempt_job_with_provenance(job_id, PreemptMode::Off, Some(99), None)
+            .is_err());
         // Job keeps running; nothing was preempted.
         assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Running);
     }
@@ -13680,7 +13695,7 @@ mod tests {
 
         let job_id = submit_and_wait(&cm, basic_spec("still-pending"));
         assert!(cm
-            .preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            .preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
             .is_err());
     }
 
@@ -13867,8 +13882,13 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let job_id = run_job_on(&cm, "prov-clear", "worker1");
-        cm.preempt_job(job_id, PreemptMode::Requeue, 77, Some("burst".into()))
-            .unwrap();
+        cm.preempt_job_with_provenance(
+            job_id,
+            PreemptMode::Requeue,
+            Some(77),
+            Some("burst".into()),
+        )
+        .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
         let after_preempt = cm.get_job(job_id).unwrap();
@@ -16007,7 +16027,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         let parent_id = run_job_on(&cm, "parent", "worker1");
-        cm.preempt_job(parent_id, PreemptMode::Cancel, 99, None)
+        cm.preempt_job_with_provenance(parent_id, PreemptMode::Cancel, Some(99), None)
             .unwrap();
         settle(&cm, parent_id, JobState::Cancelled);
 
@@ -16671,7 +16691,7 @@ mod tests {
 
         let job_id = run_job_on(&cm, "chronic-preempt", "worker1");
         for _ in 0..(max + 3) {
-            cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
                 .unwrap();
             settle(&cm, job_id, JobState::Pending);
             {
@@ -16689,7 +16709,7 @@ mod tests {
             .unwrap();
             settle(&cm, job_id, JobState::Running);
         }
-        cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+        cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
             .unwrap();
         settle(&cm, job_id, JobState::Pending);
 
@@ -16732,7 +16752,7 @@ mod tests {
             )
             .unwrap();
             settle(&cm, job_id, JobState::Running);
-            cm.preempt_job(job_id, PreemptMode::Requeue, 99, None)
+            cm.preempt_job_with_provenance(job_id, PreemptMode::Requeue, Some(99), None)
                 .unwrap();
             settle(&cm, job_id, JobState::Pending);
             {
