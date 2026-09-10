@@ -1498,11 +1498,7 @@ pub(crate) struct StepOutputFiles {
 /// roots [`open_step_output_files`] (via [`create_job_spool_dir`]) chooses
 /// between. A reader that did not open the file cannot see which root the writer
 /// picked, so it checks both. Kept in sync with `open_step_output_files`' names.
-pub(crate) fn step_output_path_candidates(
-    job_id: JobId,
-    step_id: u32,
-    stderr: bool,
-) -> Vec<PathBuf> {
+pub fn step_output_path_candidates(job_id: JobId, step_id: u32, stderr: bool) -> Vec<PathBuf> {
     let name = format!("step{step_id}.{}", if stderr { "err" } else { "out" });
     [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")]
         .into_iter()
@@ -1923,6 +1919,16 @@ pub(crate) fn write_job_scratch(
 pub fn cleanup_job_spool(job_id: JobId) {
     for base in [PathBuf::from(SPOOL_ROOT), std::env::temp_dir().join("spur")] {
         let _ = std::fs::remove_dir_all(base.join(format!("job{}", job_id)));
+    }
+}
+
+/// Remove just one step's output, for a supervisor that does not own the job's
+/// spool — its siblings are still writing to theirs.
+pub fn cleanup_step_spool(job_id: JobId, step_id: u32) {
+    for stderr in [false, true] {
+        for path in step_output_path_candidates(job_id, step_id, stderr) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -2490,6 +2496,23 @@ mod cgroup_files_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purging_one_step_leaves_its_siblings_output() {
+        let root = std::env::temp_dir().join("spur");
+        let job_dir = root.join("job771");
+        std::fs::create_dir_all(&job_dir).expect("job spool");
+        let mine = job_dir.join("step0.out");
+        let sibling = job_dir.join("step1.out");
+        std::fs::write(&mine, "mine").expect("mine");
+        std::fs::write(&sibling, "sibling").expect("sibling");
+
+        cleanup_step_spool(771, 0);
+
+        assert!(!mine.exists(), "the step's own output is purged");
+        assert!(sibling.exists(), "a live sibling's output must survive");
+        let _ = std::fs::remove_dir_all(&job_dir);
+    }
 
     #[test]
     fn reaping_a_job_clears_its_step_leaves_first() {

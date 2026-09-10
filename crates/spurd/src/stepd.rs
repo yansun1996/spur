@@ -1222,6 +1222,16 @@ async fn serve_supervisor_connection(
     }
 }
 
+/// A step's rootfs is kept out of the job's namespace so it can never resolve to
+/// (and later delete) a batch job's live rootfs.
+fn rootfs_base(job_id: u32, step_id: spur_core::step::StepId) -> String {
+    if spur_core::step::is_user_step(step_id) {
+        crate::container::step_rootfs_base(job_id, step_id)
+    } else {
+        crate::container::job_rootfs_base(job_id)
+    }
+}
+
 pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if args.len() != 4 {
         anyhow::bail!("usage: spurstepd <state-dir> <job-id> <attempt> <launch-spec>");
@@ -1298,7 +1308,11 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
                 tracing::warn!(%write_error, path = %failure_path.display(),
                     "failed to record stepd failure");
             }
-            crate::executor::cleanup_job_spool(job_id);
+            if spur_core::step::is_user_step(step_id) {
+                crate::executor::cleanup_step_spool(job_id, step_id);
+            } else {
+                crate::executor::cleanup_job_spool(job_id);
+            }
             return Err(error);
         }
     }
@@ -1309,12 +1323,13 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             Ok(result) => (result.job, result.cgroup_path),
             Err(error) => {
                 if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
-                    crate::container::cleanup_rootfs(
-                        &crate::container::job_rootfs_base(job_id),
-                        rootfs_mode,
-                    );
+                    crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
                 }
-                crate::executor::cleanup_job_spool(job_id);
+                if spur_core::step::is_user_step(step_id) {
+                    crate::executor::cleanup_step_spool(job_id, step_id);
+                } else {
+                    crate::executor::cleanup_job_spool(job_id);
+                }
                 return Err(anyhow::anyhow!(error.to_string()));
             }
         }
@@ -1349,12 +1364,13 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             }
         }
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
-            crate::container::cleanup_rootfs(
-                &crate::container::job_rootfs_base(job_id),
-                rootfs_mode,
-            );
+            crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
-        crate::executor::cleanup_job_spool(job_id);
+        if spur_core::step::is_user_step(step_id) {
+            crate::executor::cleanup_step_spool(job_id, step_id);
+        } else {
+            crate::executor::cleanup_job_spool(job_id);
+        }
     };
     if let Err(error) = result {
         teardown(cgroup).await;
