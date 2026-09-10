@@ -21,4 +21,5 @@ pub mod privdrop;
 pub mod pty;
 pub mod reporter;
 pub mod seccomp;
+pub mod step_completion;
 pub mod stepd;

@@ -805,6 +805,7 @@ pub struct StepdRecoveryCleanup {
 #[derive(Clone)]
 pub struct CompletionListenerContext {
     running: RunningJobs,
+    step_completions: crate::step_completion::StepCompletions,
     allocation: Arc<Mutex<NodeAllocation>>,
     stepds: Arc<Mutex<StepdMap>>,
     stepds_store: crate::stepd::StepdStore,
@@ -1333,6 +1334,16 @@ async fn handle_completion_notification(
                 "runtime completion",
             )
             .await;
+            // A user step's exit ends the RPC that launched it, not the job, so
+            // the controller report above was a no-op and this is the delivery.
+            context
+                .step_completions
+                .complete(
+                    job_id,
+                    step_id,
+                    crate::step_completion::StepOutcome { exit_code, signal },
+                )
+                .await;
             if reported {
                 crate::stepd::AgentNotificationResponse::Acknowledged
             } else {
@@ -2261,6 +2272,8 @@ pub struct AgentService {
     k0s: Arc<crate::cluster::K0sAgent>,
     /// In-flight srun steps keyed by `(job_id, step_id)`.
     active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
+    /// Where a supervised step's launching RPC parks for its exit status.
+    step_completions: crate::step_completion::StepCompletions,
     /// Serializes setup against teardown for a job id, which a re-dispatch reuses.
     lifecycle: crate::job_lifecycle::JobLifecycle,
     stepds: Arc<Mutex<StepdMap>>,
@@ -2390,6 +2403,7 @@ impl AgentService {
             device_registry,
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
+            step_completions: crate::step_completion::StepCompletions::new(),
             lifecycle: crate::job_lifecycle::JobLifecycle::default(),
             stepds: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -2481,6 +2495,7 @@ impl AgentService {
     pub fn completion_listener_context(&self) -> CompletionListenerContext {
         CompletionListenerContext {
             running: self.running.clone(),
+            step_completions: self.step_completions.clone(),
             allocation: self.allocation.clone(),
             stepds: self.stepds.clone(),
             stepds_store: crate::stepd::StepdStore::new(&self.stepd_state_dir),
@@ -8140,15 +8155,18 @@ mod tests {
             .contains_key(&(42, spur_core::step::STEP_BATCH)));
     }
 
-    async fn completion_listener_fixture(
+    async fn completion_listener_fixture_for_step(
         controller_addr: &str,
+        step_id: spur_core::step::StepId,
     ) -> (
         CompletionListenerContext,
         RunningJobs,
         Arc<Mutex<StepdMap>>,
         tempfile::TempDir,
+        crate::step_completion::StepCompletions,
     ) {
         let running = new_running_jobs();
+        let completions = crate::step_completion::StepCompletions::new();
         let allocation = Arc::new(Mutex::new(NodeAllocation::new(
             "test-node".into(),
             &ResourceSet {
@@ -8161,7 +8179,7 @@ mod tests {
         let mut descriptor = crate::stepd::StepdDescriptor::new(
             42,
             7,
-            spur_core::step::STEP_BATCH,
+            step_id,
             0,
             0,
             std::path::PathBuf::from("/tmp/runtime.sock"),
@@ -8184,12 +8202,75 @@ mod tests {
         let state_dir = tempfile::tempdir().expect("state dir");
         let context = CompletionListenerContext {
             running: running.clone(),
+            step_completions: completions.clone(),
             allocation,
             stepds: sessions.clone(),
             stepds_store: crate::stepd::StepdStore::new(state_dir.path()),
             controller_addr: controller_addr.into(),
             hostname: "test-node".into(),
         };
+        (context, running, sessions, state_dir, completions)
+    }
+
+    #[tokio::test]
+    async fn a_user_steps_completion_wakes_the_rpc_that_launched_it() {
+        const STEP: spur_core::step::StepId = 3;
+        let (context, _running, _sessions, _state_dir, completions) =
+            completion_listener_fixture_for_step("http://127.0.0.1:1", STEP).await;
+        let mut waiter = completions.register(42, STEP).await;
+        let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
+        let handler =
+            tokio::spawn(
+                async move { handle_completion_notification(server_stream, &context).await },
+            );
+        let (reader, mut writer) = client_stream.into_split();
+        let notification = crate::stepd::AgentNotification::StepdCompleted {
+            job_id: 42,
+            run_attempt: 7,
+            step_id: STEP,
+            exit_code: 9,
+            signal: 0,
+            epilog_failed: false,
+            capability: "test-capability".into(),
+        };
+        writer
+            .write_all(&serde_json::to_vec(&notification).expect("encode notification"))
+            .await
+            .expect("write notification");
+        writer.write_all(b"\n").await.expect("write newline");
+        drop(writer);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut line = String::new();
+        crate::stepd::read_line_bounded(&mut reader, &mut line)
+            .await
+            .expect("read response");
+        handler
+            .await
+            .expect("handler task")
+            .expect("handle notification");
+
+        // try_recv, not await: the handler has already returned, so a woken
+        // waiter is ready now and an unwoken one fails instead of hanging.
+        assert_eq!(
+            waiter.try_recv().expect("the launching RPC must be woken"),
+            crate::step_completion::StepOutcome {
+                exit_code: 9,
+                signal: 0,
+            }
+        );
+    }
+
+    async fn completion_listener_fixture(
+        controller_addr: &str,
+    ) -> (
+        CompletionListenerContext,
+        RunningJobs,
+        Arc<Mutex<StepdMap>>,
+        tempfile::TempDir,
+    ) {
+        let (context, running, sessions, state_dir, _) =
+            completion_listener_fixture_for_step(controller_addr, spur_core::step::STEP_BATCH)
+                .await;
         (context, running, sessions, state_dir)
     }
 
