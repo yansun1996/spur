@@ -4888,6 +4888,7 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
         planned_start: None,
         reason_uid: node.reason_uid,
         reason_time: node.reason_time.map(datetime_to_proto),
+        agent_port: u32::from(node.port),
     }
 }
 
