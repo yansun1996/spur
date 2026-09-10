@@ -7402,8 +7402,10 @@ mod tests {
     #[tokio::test]
     async fn runtime_teardown_confirmed_requires_the_cgroup_even_when_stop_succeeded() {
         let cgroup = tempfile::tempdir().expect("cgroup directory");
-        std::fs::create_dir(cgroup.path().join("cgroup.kill"))
-            .expect("seed a permanent cgroup.kill blocker");
+        // A leftover file fails rmdir the way a busy cgroup does. It must not be a
+        // directory: reaping clears child cgroups, so a dir would be removed.
+        std::fs::write(cgroup.path().join("cgroup.procs"), "not-a-pid\n")
+            .expect("seed a permanent removal blocker");
 
         let mut descriptor = crate::stepd::StepdDescriptor::new(
             42,

@@ -1401,6 +1401,16 @@ fn classify_cgroup_claim_failure(
 
 /// Kill any leftover processes in the job's cgroup and remove the directory.
 pub fn cleanup_cgroup(cgroup_path: &Path) {
+    // Steps live in leaves under the job, and rmdir only works bottom-up, so
+    // reaping a job has to clear its steps first.
+    if let Ok(entries) = std::fs::read_dir(cgroup_path) {
+        for child in entries.flatten() {
+            if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+                cleanup_cgroup(&child.path());
+            }
+        }
+    }
+
     // Kill any remaining processes
     if let Ok(pids) = std::fs::read_to_string(cgroup_path.join("cgroup.procs")) {
         for pid_str in pids.lines() {
@@ -2480,6 +2490,21 @@ mod cgroup_files_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reaping_a_job_clears_its_step_leaves_first() {
+        // rmdir is bottom-up, so a job whose steps still have directories was
+        // previously left behind entirely.
+        let dir = tempfile::tempdir().expect("cgroup root");
+        let job = dir.path().join("job_9_1");
+        let step = job.join("step_0");
+        std::fs::create_dir_all(&step).expect("step leaf");
+
+        cleanup_cgroup(&job);
+
+        assert!(!step.exists(), "the step leaf must be removed");
+        assert!(!job.exists(), "the job node must be removed once empty");
+    }
 
     #[test]
     fn a_steps_cgroup_is_a_leaf_under_its_job() {

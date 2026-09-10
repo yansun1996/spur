@@ -1340,6 +1340,13 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let teardown = |cgroup: Option<PathBuf>| async move {
         if let Some(cgroup) = cgroup.as_ref() {
             crate::executor::cleanup_cgroup(cgroup);
+            // The job node outlives its steps' leaves; the step that owns the
+            // job's lifetime takes it with it, once its siblings are gone.
+            if !spur_core::step::is_user_step(step_id) {
+                if let Some(job_cgroup) = cgroup.parent() {
+                    crate::executor::cleanup_cgroup(job_cgroup);
+                }
+            }
         }
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(
