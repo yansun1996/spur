@@ -1101,6 +1101,10 @@ pub(crate) fn monitor_recovered_stepds(
 
 /// A Stepd that crashes before pushing completion has no other
 /// record; re-check tracked pid/start-ticks periodically to catch that.
+/// Caps a controller-facing supervisor probe so a launch in progress cannot
+/// hold the RPC open.
+const STEPD_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 const RUNTIME_LIVENESS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub(crate) fn monitor_stepd_liveness(
@@ -4244,10 +4248,17 @@ impl SlurmAgent for AgentService {
         let Some(descriptor) = descriptor else {
             return Ok(Response::new(StepdProbeResponse { active: false }));
         };
-        let active = crate::stepd::query_state(&descriptor, uuid::Uuid::new_v4().to_string())
-            .await
-            .map(|state| state.active)
-            .unwrap_or(false);
+        // Bounded: between releasing the launch gate and serving control the
+        // supervisor accepts nothing, so an unbounded read would wedge this RPC.
+        let active = tokio::time::timeout(
+            STEPD_PROBE_TIMEOUT,
+            crate::stepd::query_state(&descriptor, uuid::Uuid::new_v4().to_string()),
+        )
+        .await
+        .ok()
+        .and_then(|state| state.ok())
+        .map(|state| state.active)
+        .unwrap_or(false);
         Ok(Response::new(StepdProbeResponse { active }))
     }
 
