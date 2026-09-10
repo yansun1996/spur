@@ -140,6 +140,8 @@ pub enum LaunchIo {
 pub struct JobLaunchConfig {
     pub job_id: JobId,
     pub run_attempt: u32,
+    /// Step whose processes this launch owns; its cgroup is a child of the job's.
+    pub step_id: spur_core::step::StepId,
     pub script: String,
     pub work_dir: String,
     /// Needed to expand `%x`/`%u`/`%N`/`%a`/`%A` in output paths as the controller does.
@@ -508,9 +510,12 @@ async fn spawn_job_process(
     // Set up cgroup for isolation
     let device_paths = allocated_device_paths(cfg.host_device_plan.as_ref());
     let cgroup_path = CgroupGuard(setup_cgroup(
-        job_id,
+        CgroupScope {
+            job_id,
+            run_attempt,
+            step_id: cfg.step_id,
+        },
         &cfg.cgroup,
-        run_attempt,
         cpus,
         memory_mb,
         cpu_ids,
@@ -955,21 +960,45 @@ fn cgroup_path_for(cgroup_root: &Path, job_id: JobId, run_attempt: u32) -> PathB
     cgroup_root.join(format!("job_{}_{}", job_id, run_attempt))
 }
 
+/// A step's leaf under its job. cgroup v2 forbids processes in a node that has
+/// children with controllers enabled, so limits live on the job and every
+/// step's processes live one level down — the shape Slurm uses.
+fn step_cgroup_path_for(
+    cgroup_root: &Path,
+    job_id: JobId,
+    run_attempt: u32,
+    step_id: spur_core::step::StepId,
+) -> PathBuf {
+    cgroup_path_for(cgroup_root, job_id, run_attempt).join(format!("step_{}", step_id))
+}
+
 /// Reconstructs a job's cgroup path from its identity alone — usable even
 /// when the session descriptor that would normally carry it is unreadable.
 pub fn expected_cgroup_path(job_id: JobId, run_attempt: u32) -> PathBuf {
     cgroup_path_for(Path::new(CGROUP_ROOT), job_id, run_attempt)
 }
 
+/// Which step's cgroup a launch is preparing.
+#[derive(Clone, Copy)]
+pub(crate) struct CgroupScope {
+    pub job_id: JobId,
+    pub run_attempt: u32,
+    pub step_id: spur_core::step::StepId,
+}
+
 pub(crate) fn setup_cgroup(
-    job_id: JobId,
+    scope: CgroupScope,
     cgroup: &CgroupConfig,
-    run_attempt: u32,
     cpus: u32,
     memory_mb: u64,
     cpu_ids: &[u32],
     device_paths: &[String],
 ) -> anyhow::Result<Option<PathBuf>> {
+    let CgroupScope {
+        job_id,
+        run_attempt,
+        step_id,
+    } = scope;
     let Some(mut limits) = cgroup.limits_for(cpus, memory_mb, cpu_ids) else {
         debug!(job_id, "cgroup enforcement disabled by config");
         return Ok(None);
@@ -1007,7 +1036,15 @@ pub(crate) fn setup_cgroup(
             degrade(&format!("controller {ctrl} not delegated"));
         }
     }
-    if let Err(e) = claim_cgroup_dir(&cgroup_path) {
+    // Claiming reaps whatever is in the directory, so only the step that owns the
+    // job's lifetime may claim it — a numbered step would kill its siblings.
+    let owns_job_cgroup = !spur_core::step::is_user_step(step_id);
+    let claim = if owns_job_cgroup {
+        claim_cgroup_dir(&cgroup_path)
+    } else {
+        std::fs::create_dir_all(&cgroup_path)
+    };
+    if let Err(e) = claim {
         match classify_cgroup_claim_failure(
             &e,
             nix::unistd::geteuid().is_root(),
@@ -1097,7 +1134,23 @@ pub(crate) fn setup_cgroup(
         "cgroup created"
     );
 
-    Ok(Some(cgroup_path))
+    // cgroup v2 refuses processes in a node whose children have controllers, so
+    // the job node carries the limits and each step gets a leaf of its own.
+    let job_subtree = cgroup_path.join("cgroup.subtree_control");
+    for ctrl in ["+memory", "+cpu", "+pids", "+cpuset"] {
+        if let Err(e) = std::fs::write(&job_subtree, ctrl) {
+            debug!(job_id, controller = ctrl, error = %e, "job cgroup controller not delegated to steps");
+        }
+    }
+    let step_path = step_cgroup_path_for(&cgroup_root, job_id, run_attempt, step_id);
+    if let Err(e) = std::fs::create_dir_all(&step_path) {
+        if cgroup.required {
+            anyhow::bail!("[cgroup] required but the step cgroup is unavailable: {e}");
+        }
+        warn!(job_id, step_id, error = %e, "step cgroup unavailable; falling back to the job cgroup");
+        return Ok(Some(cgroup_path));
+    }
+    Ok(Some(step_path))
 }
 
 /// Parse a cgroup cpu list (`"0-3"`, `"0-1,4"`, `""`) into core ids.
@@ -2429,6 +2482,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_steps_cgroup_is_a_leaf_under_its_job() {
+        let root = Path::new("/sys/fs/cgroup/spur");
+        let job = cgroup_path_for(root, 4, 1);
+        let batch = step_cgroup_path_for(root, 4, 1, spur_core::step::STEP_BATCH);
+        let user = step_cgroup_path_for(root, 4, 1, 0);
+
+        // Limits live on the job; every step's processes sit one level down, so
+        // two steps never share a directory.
+        assert_eq!(batch.parent(), Some(job.as_path()));
+        assert_eq!(user.parent(), Some(job.as_path()));
+        assert_ne!(batch, user);
+        // Reaping the job still reaches every step.
+        assert!(user.starts_with(&job));
+    }
+
+    #[test]
     fn cgroup_path_is_scoped_to_the_attempt_not_just_the_job() {
         let root = Path::new("/sys/fs/cgroup/spur");
         let first = cgroup_path_for(root, 4, 1);
@@ -3042,6 +3111,7 @@ mod tests {
 
     fn launch_cfg_for_paths(job_id: JobId, name: &str, user: &str, node: &str) -> JobLaunchConfig {
         JobLaunchConfig {
+            step_id: spur_core::step::STEP_BATCH,
             job_id,
             run_attempt: 1,
             script: String::new(),

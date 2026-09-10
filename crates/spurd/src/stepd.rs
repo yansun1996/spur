@@ -144,6 +144,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
 impl StepdLaunchSpec {
     pub fn into_launch_config(self) -> crate::executor::JobLaunchConfig {
         crate::executor::JobLaunchConfig {
+            step_id: self.step_id,
             job_id: self.job_id,
             run_attempt: self.run_attempt,
             cgroup: self.cgroup,

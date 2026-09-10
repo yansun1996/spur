@@ -3847,6 +3847,7 @@ impl SlurmAgent for AgentService {
         };
 
         let launch_cfg = executor::JobLaunchConfig {
+            step_id: launch_step,
             job_id,
             run_attempt,
             script: launch_script,
@@ -4460,9 +4461,12 @@ impl SlurmAgent for AgentService {
         // This allocation launches nothing, so its cgroup has to be created
         // here or the first step arriving has none to join.
         let setup = executor::setup_cgroup(
-            req.job_id,
+            executor::CgroupScope {
+                job_id: req.job_id,
+                run_attempt: req.run_attempt,
+                step_id: spur_core::step::STEP_EXTERN,
+            },
             &self.cgroup,
-            req.run_attempt,
             cpus,
             memory_mb,
             &alloc_result.cpu_ids,
@@ -4501,6 +4505,7 @@ impl SlurmAgent for AgentService {
             let config = executor::JobLaunchConfig {
                 job_id: req.job_id,
                 run_attempt: req.run_attempt,
+                step_id: spur_core::step::STEP_EXTERN,
                 script: String::new(),
                 work_dir: req.work_dir.clone(),
                 name: String::new(),
