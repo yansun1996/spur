@@ -307,7 +307,10 @@ async fn main() -> anyhow::Result<()> {
     // Start gRPC server
     let addr: std::net::SocketAddr = listen_addr.parse()?;
     // The controller presents this key as its credential to agents (spurd authenticates callers).
-    crate::agent_client::set_signing_key(config.auth.jwt_key.clone().unwrap_or_default());
+    // Resolved, not raw: a jwt_key_file cluster would otherwise sign with an empty key while the
+    // agents verify with the real one.
+    let jwt_key = server::resolve_startup_jwt_key(&config)?;
+    crate::agent_client::set_signing_key(jwt_key.clone());
     crate::agent_client::set_channel_tuning(&config.controller);
 
     // State the authentication posture explicitly at startup: it determines whether the listening
@@ -339,7 +342,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     info!(%addr, "gRPC server listening");
-    let jwt_key = server::resolve_startup_jwt_key(&config)?;
     server::serve(
         addr,
         cluster,
