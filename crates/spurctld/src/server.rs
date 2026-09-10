@@ -2005,7 +2005,8 @@ impl SlurmController for ControllerService {
         // Non-empty `reporting_node` means a per-node completion report. The final
         // job outcome is still derived from aggregated exit codes in
         // `Job::derived_completion`.
-        let completion_result = if !req.reporting_node.is_empty() {
+        let completion_result = if !req.reporting_node.is_empty() && reports_whole_job(req.step_id)
+        {
             validate_completion_report_state_for_rpc(state, req.exit_code)?;
             Some(self.cluster.node_complete(
                 req.job_id,
@@ -2575,7 +2576,7 @@ impl SlurmController for ControllerService {
 
         // Owning the job is not licence to address any step id: reserved ids
         // belong to the batch, extern, and interactive steps.
-        if req.step_id >= spur_core::step::STEP_RESERVED_MIN {
+        if !spur_core::step::is_user_step(req.step_id) {
             return Err(Status::invalid_argument(format!(
                 "step {} is reserved and cannot be completed by a client",
                 req.step_id
@@ -5170,6 +5171,12 @@ fn node_complete_to_status(err: NodeCompleteError) -> Status {
     Status::new(code, message)
 }
 
+/// A numbered step's supervisor speaks only for that step; finalizing the job on
+/// it would end the allocation while its siblings still run.
+fn reports_whole_job(step_id: Option<spur_core::step::StepId>) -> bool {
+    step_id.is_none_or(|id| !spur_core::step::is_user_step(id))
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_completion_report_state_for_rpc(
     state: spur_core::job::JobState,
@@ -5181,6 +5188,19 @@ fn validate_completion_report_state_for_rpc(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_a_non_user_step_reports_for_the_whole_job() {
+        use spur_core::step::{STEP_BATCH, STEP_EXTERN, STEP_INTERACTIVE};
+
+        // A legacy agent sends no step and still speaks for the job.
+        assert!(reports_whole_job(None));
+        assert!(reports_whole_job(Some(STEP_BATCH)));
+        assert!(reports_whole_job(Some(STEP_EXTERN)));
+        assert!(reports_whole_job(Some(STEP_INTERACTIVE)));
+        assert!(!reports_whole_job(Some(0)));
+        assert!(!reports_whole_job(Some(7)));
+    }
     use super::*;
     use chrono::Duration;
     use spur_core::job::{JobState, NodeCompleteError};

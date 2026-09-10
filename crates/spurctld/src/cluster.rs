@@ -32,7 +32,7 @@ use spur_core::qos::{
 };
 use spur_core::reservation::{self, normalize_node_list, running_jobs_overlap_start, Reservation};
 use spur_core::resource::{ResourceAllocations, ResourceSet};
-use spur_core::step::{JobStep, StepState, STEP_BATCH, STEP_RESERVED_MIN};
+use spur_core::step::{JobStep, StepState, STEP_BATCH};
 use spur_core::wal::WalOperation;
 use spur_metrics::job::JobMetricsSnapshot;
 use spur_metrics::node::NodeMetricsSnapshot;
@@ -6279,7 +6279,7 @@ impl ClusterManager {
                     // step is excluded — it carries the job's own exit, not a step
                     // result). Maintained live so `scontrol show job` reflects it
                     // mid-run, matching Slurm.
-                    if *step_id < STEP_RESERVED_MIN {
+                    if spur_core::step::is_user_step(*step_id) {
                         if let Some(job) = jobs.get_mut(job_id) {
                             job.derived_exit_code = job.derived_exit_code.max(*exit_code);
                         }

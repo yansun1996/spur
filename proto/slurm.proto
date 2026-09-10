@@ -1503,6 +1503,9 @@ message ReportJobStatusRequest {
   // Echoed from LaunchJobRequest.run_attempt; controller drops this report if
   // older than the job's current epoch. 0 = unset (legacy), check off.
   uint32 run_attempt = 9;
+  // Step whose supervisor is reporting. Absent from a legacy agent, and from a
+  // report that speaks for the whole node rather than one step.
+  optional uint32 step_id = 10;
 }
 
 // ============================================================

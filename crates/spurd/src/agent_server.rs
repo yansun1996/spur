@@ -1068,14 +1068,17 @@ pub(crate) fn monitor_recovered_stepds(
             for completion in completed.values() {
                 if report_completion(
                     &controller_addr,
-                    completion.job_id,
-                    completion.exit_code,
-                    completion.signal,
-                    completion.run_attempt,
-                    &hostname,
-                    completion.epilog_failed.then_some(&DrainRequest {
-                        reason: "epilog script failed".into(),
-                    }),
+                    CompletionReport {
+                        job_id: completion.job_id,
+                        exit_code: completion.exit_code,
+                        signal: completion.signal,
+                        run_attempt: completion.run_attempt,
+                        reporting_node: &hostname,
+                        drain: completion.epilog_failed.then_some(&DrainRequest {
+                            reason: "epilog script failed".into(),
+                        }),
+                        step_id: Some(completion.step_id),
+                    },
                 )
                 .await
                 {
@@ -1309,14 +1312,17 @@ async fn handle_completion_notification(
         Some(descriptor) => {
             let reported = report_completion(
                 &context.controller_addr,
-                job_id,
-                exit_code,
-                signal,
-                run_attempt,
-                &context.hostname,
-                epilog_failed.then_some(&DrainRequest {
-                    reason: "epilog script failed".into(),
-                }),
+                CompletionReport {
+                    job_id,
+                    exit_code,
+                    signal,
+                    run_attempt,
+                    reporting_node: &context.hostname,
+                    drain: epilog_failed.then_some(&DrainRequest {
+                        reason: "epilog script failed".into(),
+                    }),
+                    step_id: Some(step_id),
+                },
             )
             .await;
             release_stepd_tracking(
@@ -1366,14 +1372,17 @@ pub async fn replay_unacknowledged_stepd_completions(
     for completion in store.discover_unacknowledged_completions()? {
         if report_completion(
             controller_addr,
-            completion.job_id,
-            completion.exit_code,
-            completion.signal,
-            completion.run_attempt,
-            reporting_node,
-            completion.epilog_failed.then_some(&DrainRequest {
-                reason: "epilog script failed".into(),
-            }),
+            CompletionReport {
+                job_id: completion.job_id,
+                exit_code: completion.exit_code,
+                signal: completion.signal,
+                run_attempt: completion.run_attempt,
+                reporting_node,
+                drain: completion.epilog_failed.then_some(&DrainRequest {
+                    reason: "epilog script failed".into(),
+                }),
+                step_id: Some(completion.step_id),
+            },
         )
         .await
         {
@@ -2618,12 +2627,16 @@ impl AgentService {
                     });
                     report_completion(
                         &controller_addr,
-                        c.job_id,
-                        c.exit_code,
-                        c.signal,
-                        c.run_attempt,
-                        &local_hostname,
-                        drain.as_ref(),
+                        CompletionReport {
+                            job_id: c.job_id,
+                            exit_code: c.exit_code,
+                            signal: c.signal,
+                            run_attempt: c.run_attempt,
+                            reporting_node: &local_hostname,
+                            drain: drain.as_ref(),
+                            // Unsupervised path: the report speaks for the job.
+                            step_id: None,
+                        },
                     )
                     .await;
                 }
@@ -3210,15 +3223,28 @@ fn inject_script_args(script: &str, args: &[String]) -> Result<String, Status> {
     Ok(format!("{set_line}\n{script}"))
 }
 
-pub(crate) async fn report_completion(
-    controller_addr: &str,
-    job_id: u32,
-    exit_code: i32,
-    signal: i32,
-    run_attempt: u32,
-    reporting_node: &str,
-    drain: Option<&DrainRequest>,
-) -> bool {
+/// One node's account of a finished run. `step_id` is `None` when the report
+/// speaks for the job rather than a single step.
+pub(crate) struct CompletionReport<'a> {
+    pub job_id: u32,
+    pub exit_code: i32,
+    pub signal: i32,
+    pub run_attempt: u32,
+    pub reporting_node: &'a str,
+    pub drain: Option<&'a DrainRequest>,
+    pub step_id: Option<spur_core::step::StepId>,
+}
+
+pub(crate) async fn report_completion(controller_addr: &str, report: CompletionReport<'_>) -> bool {
+    let CompletionReport {
+        job_id,
+        exit_code,
+        signal,
+        run_attempt,
+        reporting_node,
+        drain,
+        step_id,
+    } = report;
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
     // state<->exit_code agreement. The controller rederives the true Failed /
@@ -3238,6 +3264,7 @@ pub(crate) async fn report_completion(
                 ControllerRpcError::Connect(e)
             })?;
         let req = ReportJobStatusRequest {
+            step_id,
             job_id,
             state,
             exit_code,
