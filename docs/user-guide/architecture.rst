@@ -1,7 +1,7 @@
 Architecture
 ============
 
-Spur runs as three binaries: a controller daemon (``spurctld``), a node agent
+Spur runs as four binaries: a controller daemon (``spurctld``), a node agent
 (``spurd``), and a command-line client (``spur``). This page describes what each
 component does, which ports they use, and the core scheduling concepts.
 
@@ -43,7 +43,7 @@ full command map.
 
    Unlike Slurm, Spur has **no** separate accounting or REST daemons — there is
    no ``slurmdbd`` and no ``slurmrestd``. The controller (``spurctld``) handles
-   accounting and the REST API itself. The entire distribution is three binaries:
+   accounting and the REST API itself. The entire distribution is four binaries:
    ``spurctld``, ``spurd``, and ``spur``.
 
 Ports

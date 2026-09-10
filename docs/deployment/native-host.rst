@@ -22,21 +22,22 @@ to ``~/.local/bin`` (no sudo required):
    curl -fsSL https://raw.githubusercontent.com/ROCm/spur/main/install.sh | bash
    export PATH="$HOME/.local/bin:$PATH"
 
-This installs the three binaries — ``spur``, ``spurctld``, and ``spurd`` — and makes the
+This installs the four binaries — ``spur``, ``spurctld``, ``spurd``, and the per-job
+supervisor ``spurstepd`` — and makes the
 CLI reachable under its Slurm-compatible names (``sbatch``, ``squeue``, ``sinfo``, …).
 
 For ``--mpi=pmix``, use a **nightly** tarball (includes ``spur_mpi_pmix.so``);
 see :ref:`mpi-pmix-install`.
 
 To build from source instead, install the Rust toolchain and ``protobuf-compiler``, then
-build the three binaries:
+build the binaries:
 
 .. code-block:: bash
 
    git clone https://github.com/ROCm/spur.git && cd spur
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && source "$HOME/.cargo/env"
    sudo apt install -y protobuf-compiler build-essential
-   cargo build --release -p spur-cli -p spurctld -p spurd
+   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
 
 The binaries land in ``target/release/``. For a fuller build walkthrough see
 :doc:`/developer/building`.

@@ -130,13 +130,13 @@ For a multi-node cluster, the Ansible toolkit is the recommended upgrade path. T
 playbooks are supported; both reuse the same install, config, and health-check roles as
 ``deploy.yml``, so their behavior stays consistent.
 
-Rebuild all three binaries from the same source tree together — they share a Raft
+Rebuild all binaries from the same source tree together — they share a Raft
 write-ahead-log schema, and mixing binaries from different builds can leave a controller
 unable to parse a log written by a differently-versioned peer:
 
 .. code-block:: bash
 
-   cargo build --release -p spur-cli -p spurctld -p spurd
+   cargo build --release -p spur-cli -p spurctld -p spurd -p spur-stepd
 
 Binaries roll out by content, not version string: Ansible compares checksums, so an
 unchanged re-run is a near no-op.
@@ -228,7 +228,7 @@ Safe Upgrade Order
 
 Follow this order for any cluster upgrade:
 
-1. **Rebuild all three binaries together** from the same source tree — they share a Raft
+1. **Rebuild all binaries together** from the same source tree — they share a Raft
    WAL schema and must stay version-matched.
 2. **Upgrade controllers before agents.** Both playbooks do this automatically, one
    controller at a time to preserve quorum.

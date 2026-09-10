@@ -163,7 +163,7 @@ mkdir -p "${INSTALL_DIR}"
 EXTRACTED=$(find "${TMPDIR}" -maxdepth 1 -type d -name 'spur-*' | head -1)
 [ -n "${EXTRACTED}" ] || err "Could not find extracted directory"
 cp -f "${EXTRACTED}"/bin/* "${INSTALL_DIR}/"
-chmod +x "${INSTALL_DIR}/spur" "${INSTALL_DIR}/spurctld" "${INSTALL_DIR}/spurd"
+for _bin in ${BINARIES}; do chmod +x "${INSTALL_DIR}/${_bin}"; done
 
 PLUGIN_DIR="$(dirname "${INSTALL_DIR}")/lib/spur"
 if [ -f "${EXTRACTED}/lib/spur/spur_mpi_pmix.so" ]; then
