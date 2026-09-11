@@ -1344,8 +1344,9 @@ message StreamJobOutputRequest {
   uint32 job_id = 1;
   string stream = 2;  // "stdout" or "stderr"
   string user = 3;    // Requesting user; verified identity must own the job; the controller/admin credential overrides
-  uint32 step_id = 4; // 0 = the batch job's own output; >0 = tail that step's per-step spool file
+  uint32 step_id = 4; // Legacy: 0 means the job's own output, so it cannot name step 0
   uint64 start_offset = 5; // Resume a reconnecting reader without repeating what it already printed
+  optional uint32 step = 6; // Names a step even when that step is 0; absent means the job's own output
 }
 
 message StreamJobOutputChunk {

@@ -1246,6 +1246,7 @@ async fn stream_step_output_live(
     let req = |stream: &str| StreamJobOutputRequest {
         job_id,
         step_id,
+        step: Some(step_id),
         start_offset: 0,
         stream: stream.to_string(),
         user: user.to_string(),

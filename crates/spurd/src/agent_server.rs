@@ -1882,6 +1882,12 @@ async fn step_cancel_requested(
 /// spool files (so `stream_job_output` can tail them live), register its pid for
 /// cancellation, and wait. Returns `Ok(None)` if the step was cancelled before
 /// it could run. Shared by the nsenter (Case 1) and plain-host (Case 3) paths.
+/// `step` names a step even when it is 0; `step_id` cannot, because 0 has always
+/// meant the job's own output there.
+fn requested_step_of(req: &spur_proto::proto::StreamJobOutputRequest) -> Option<u32> {
+    req.step.or((req.step_id != 0).then_some(req.step_id))
+}
+
 /// A step that builds its own container keeps the agent in its exec path, so it
 /// cannot be handed to a supervisor. Entering a parent job's namespaces can.
 fn step_can_be_supervised(container_image: &str) -> bool {
@@ -5670,10 +5676,10 @@ impl SlurmAgent for AgentService {
         // finish when the step leaves active_steps (rather than the batch file,
         // which ends only when the whole allocation does). This is what lets an
         // srun step stream live and terminate at step exit (#781).
-        if req.step_id != 0 {
+        if let Some(requested_step) = requested_step_of(&req) {
             let active_steps = self.active_steps.clone();
             let want_stderr = req.stream == "stderr";
-            let step_id = req.step_id;
+            let step_id = requested_step;
             let start_offset = req.start_offset;
             let step_key = (job_id, step_id);
             let (tx, rx) = tokio::sync::mpsc::channel(32);
@@ -9846,6 +9852,7 @@ mod tests {
         let mut stream = svc
             .stream_job_output(Request::new(StreamJobOutputRequest {
                 start_offset: 0,
+                step: None,
                 job_id,
                 step_id,
                 stream: "stdout".into(),
@@ -9890,6 +9897,38 @@ mod tests {
         assert_eq!(rest, b"part2\n");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_named_step_zero_is_not_the_jobs_own_output() {
+        // step_id cannot express step 0: there, 0 has always meant the job.
+        let named = spur_proto::proto::StreamJobOutputRequest {
+            job_id: 1,
+            step_id: 0,
+            step: Some(0),
+            ..Default::default()
+        };
+        let legacy = spur_proto::proto::StreamJobOutputRequest {
+            job_id: 1,
+            step_id: 0,
+            step: None,
+            ..Default::default()
+        };
+
+        assert_eq!(requested_step_of(&named), Some(0));
+        assert_eq!(requested_step_of(&legacy), None);
+    }
+
+    #[test]
+    fn a_legacy_client_still_names_its_step() {
+        let legacy = spur_proto::proto::StreamJobOutputRequest {
+            job_id: 1,
+            step_id: 4,
+            step: None,
+            ..Default::default()
+        };
+
+        assert_eq!(requested_step_of(&legacy), Some(4));
     }
 
     #[tokio::test]
