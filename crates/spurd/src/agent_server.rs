@@ -1109,6 +1109,9 @@ pub(crate) fn monitor_recovered_stepds(
 /// hold the RPC open.
 const STEPD_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+const WORKLOAD_PID_POLLS: u32 = 40;
+const WORKLOAD_PID_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
 const RUNTIME_LIVENESS_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub(crate) fn monitor_stepd_liveness(
@@ -1879,6 +1882,46 @@ async fn step_cancel_requested(
 /// spool files (so `stream_job_output` can tail them live), register its pid for
 /// cancellation, and wait. Returns `Ok(None)` if the step was cancelled before
 /// it could run. Shared by the nsenter (Case 1) and plain-host (Case 3) paths.
+/// Joining a parent's namespaces or building its own container both keep the
+/// agent in the step's exec path, so neither can be handed to a supervisor.
+fn step_runs_plainly(job_entry: &crate::job_entry::JobEntry, container_image: &str) -> bool {
+    let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
+    !joins_parent_namespaces && container_image.is_empty()
+}
+
+/// wait(2) encoding, so a caller comparing against a directly-reaped step's
+/// status sees the same shape.
+fn step_exit_status(outcome: crate::step_completion::StepOutcome) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    if outcome.signal != 0 {
+        std::process::ExitStatus::from_raw(outcome.signal)
+    } else {
+        std::process::ExitStatus::from_raw(outcome.exit_code << 8)
+    }
+}
+
+/// The supervisor forks the workload after the gate opens, so its pid is not
+/// available the instant `start_job` returns.
+async fn supervised_step_workload_pid(descriptor: &crate::stepd::StepdDescriptor) -> Option<u32> {
+    for _ in 0..WORKLOAD_PID_POLLS {
+        match crate::stepd::query_state(descriptor, uuid::Uuid::new_v4().to_string()).await {
+            Ok(snapshot) if snapshot.job_pid > 0 => return Some(snapshot.job_pid as u32),
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    job_id = descriptor.job_id,
+                    step_id = descriptor.step_id,
+                    %error,
+                    "could not read the supervised step's workload pid"
+                );
+                return None;
+            }
+        }
+        tokio::time::sleep(WORKLOAD_PID_POLL_INTERVAL).await;
+    }
+    None
+}
+
 async fn run_tokio_step_to_spool(
     mut cmd: tokio::process::Command,
     step_files: crate::executor::StepOutputFiles,
@@ -2482,6 +2525,116 @@ impl AgentService {
             }
         }
         None
+    }
+
+    /// Run a numbered step under its own supervisor. The job already holds its
+    /// allocation and tracking, so none of LaunchJob's bookkeeping repeats here.
+    async fn run_supervised_step_to_spool(
+        &self,
+        cfg: &executor::JobLaunchConfig,
+        step_files: crate::executor::StepOutputFiles,
+        step_key: (u32, u32),
+    ) -> Result<Option<std::process::ExitStatus>, Status> {
+        let (job_id, step_id) = step_key;
+        // The supervisor opens the spool files itself from the launch spec;
+        // holding our own copies would pin the fds for the life of the step.
+        drop(step_files);
+
+        fence_displaced_stepd(&self.stepds, job_id, step_id, cfg.run_attempt)
+            .await
+            .map_err(|error| {
+                Status::internal(format!(
+                    "could not fence a displaced step supervisor: {error}"
+                ))
+            })?;
+
+        // Registered before the spawn: a step that outruns this RPC would
+        // otherwise deliver its exit status to nobody.
+        let waiter = self.step_completions.register(job_id, step_id).await;
+
+        let launched = launch_stepd(
+            cfg,
+            cfg.run_attempt,
+            &self.reporter.controller_addr,
+            &self.reporter.hostname,
+            &self.stepd_state_dir,
+            StepdLaunchOptions {
+                step_id,
+                allocation_only: false,
+                container_rootfs_mode: None,
+                hooks: (*self.hooks).clone(),
+                plugstack_path: self.plugstack_path.clone(),
+            },
+        )
+        .await;
+        let descriptor = match launched {
+            Ok((_, descriptor)) => descriptor,
+            Err(error) => {
+                self.step_completions.deregister(job_id, step_id).await;
+                return Err(Status::internal(format!(
+                    "step supervisor failed to start: {error}"
+                )));
+            }
+        };
+
+        if let Err(descriptor) = claim_stepd_slot(&self.stepds, descriptor.clone()).await {
+            self.step_completions.deregister(job_id, step_id).await;
+            if let Err(error) = stop_stepd_process(&descriptor).await {
+                warn!(job_id, step_id, %error, "failed to stop a superseded step supervisor");
+            }
+            cleanup_stepd_files(&descriptor);
+            return Err(Status::aborted(
+                "step supervisor superseded before it could be tracked",
+            ));
+        }
+
+        if let Err(error) =
+            crate::stepd::start_job(&descriptor, uuid::Uuid::new_v4().to_string()).await
+        {
+            // The gate is still shut, so the workload never ran.
+            self.step_completions.deregister(job_id, step_id).await;
+            if let Err(stop_error) = stop_stepd_process(&descriptor).await {
+                warn!(job_id, step_id, %stop_error, "failed to stop an unreleased step supervisor");
+            }
+            release_stepd_tracking(
+                &self.running,
+                &self.allocation,
+                &self.stepds,
+                &descriptor,
+                "supervised step could not be released",
+            )
+            .await;
+            return Err(Status::internal(format!(
+                "failed to release the supervised step: {error}"
+            )));
+        }
+
+        // Record the workload's pid, not the supervisor's, so the existing
+        // cancel path signals the step's own tree and leaves its reporter alive.
+        if let Some(pid) = supervised_step_workload_pid(&descriptor).await {
+            let cancel_now = {
+                let mut steps = self.active_steps.lock().await;
+                match steps.get_mut(&step_key) {
+                    Some(step) => {
+                        step.pid = Some(pid);
+                        step.cancel_requested
+                    }
+                    None => false,
+                }
+            };
+            if cancel_now {
+                signal_step_tree(pid, nix::sys::signal::Signal::SIGTERM as i32);
+            }
+        }
+
+        match waiter.await {
+            Ok(outcome) => Ok(Some(step_exit_status(outcome))),
+            // The supervisor died without reporting; its cgroup and session are
+            // reaped by the crash watchdog, so only the status is lost here.
+            Err(_) => Err(Status::internal(
+                "step supervisor exited without reporting a status",
+            )),
+        }
     }
 
     pub fn stepd_recovery_cleanup(&self) -> StepdRecoveryCleanup {
@@ -5033,6 +5186,67 @@ impl SlurmAgent for AgentService {
             }
         }
 
+        // Built before the dispatch chain so the arms stay a plain match on
+        // where the step runs, not on whether it is supervised.
+        let supervise_step = step_runs_plainly(
+            &job_entry,
+            req.container.as_ref().map_or("", |c| c.image.as_str()),
+        );
+        #[cfg(test)]
+        let supervise_step = supervise_step && !self.force_legacy_launch;
+        let mut supervised_step_cfg = if supervise_step {
+            let run_attempt = self
+                .running
+                .lock()
+                .await
+                .get(&job_id)
+                .map(|tracked| tracked.run_attempt)
+                .unwrap_or_default();
+            let command: Vec<String> = std::iter::once(program.clone())
+                .chain(program_args.iter().cloned())
+                .collect();
+            Some(executor::JobLaunchConfig {
+                step_id,
+                job_id,
+                run_attempt,
+                script: build_one_shot_command_script(&command)?,
+                work_dir: work_dir.clone(),
+                name: format!("{job_id}.{step_id}"),
+                user: env
+                    .get("USER")
+                    .or_else(|| env.get("LOGNAME"))
+                    .cloned()
+                    .unwrap_or_default(),
+                node: self.reporter.hostname.clone(),
+                array_job_id: None,
+                array_task_id: None,
+                environment: env.clone(),
+                // The spool files already exist, so the supervisor must not
+                // truncate them when it opens them again.
+                open_mode: Some("append".into()),
+                stdout_path: stdout_path.clone(),
+                stderr_path: stderr_path.clone(),
+                stdin_path: String::new(),
+                cpus,
+                memory_mb,
+                gpu_devices: gpu_devices.clone(),
+                cpu_ids: Vec::new(),
+                uid: req.uid,
+                gid: req.gid,
+                container: None,
+                prolog_script: None,
+                partition: partition.clone(),
+                nodelist: nodelist.clone(),
+                host_device_plan: None,
+                memlock,
+                cgroup: self.cgroup.clone(),
+                io_mode: executor::LaunchIo::File,
+                pmix_multi_task: false,
+            })
+        } else {
+            None
+        };
+
         // Three dispatch paths, each wiring the step's stdio to the spool files
         // above. `None` means the step was cancelled before it ran.
         let maybe_status: Option<std::process::ExitStatus> = if job_entry.has_namespaces()
@@ -5265,6 +5479,11 @@ impl SlurmAgent for AgentService {
                 rootfs_guard.pid = Some(child_pid);
             }
             maybe_status
+        } else if let Some(step_cfg) = supervised_step_cfg.take() {
+            // Case 3a: no container and supervision is on — the step gets its
+            // own spurstepd, so it outlives a restart of this agent.
+            self.run_supervised_step_to_spool(&step_cfg, step_files, step_key)
+                .await?
         } else {
             // Case 3: no container — plain host process. Route through the same
             // launch plan as the other arms so the child joins the job cgroup.
@@ -8210,6 +8429,73 @@ mod tests {
             hostname: "test-node".into(),
         };
         (context, running, sessions, state_dir, completions)
+    }
+
+    fn plain_job_entry() -> crate::job_entry::JobEntry {
+        crate::job_entry::JobEntry {
+            pid: 0,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            uid: 1000,
+            gid: 1000,
+            work_dir: "/tmp".into(),
+            cgroup_path: None,
+        }
+    }
+
+    #[test]
+    fn a_plain_host_step_is_supervisable() {
+        assert!(step_runs_plainly(&plain_job_entry(), ""));
+    }
+
+    #[test]
+    fn a_step_joining_its_parents_namespaces_is_not_supervisable() {
+        let mut entry = plain_job_entry();
+        entry.has_pid_namespace = true;
+        entry.pid = 4242;
+
+        assert!(!step_runs_plainly(&entry, ""));
+    }
+
+    #[test]
+    fn a_namespaced_parent_with_no_live_pid_leaves_the_step_supervisable() {
+        let mut entry = plain_job_entry();
+        entry.has_pid_namespace = true;
+
+        assert!(step_runs_plainly(&entry, ""));
+    }
+
+    #[test]
+    fn a_step_building_its_own_container_is_not_supervisable() {
+        assert!(!step_runs_plainly(&plain_job_entry(), "docker://alpine"));
+    }
+
+    #[test]
+    fn an_exit_code_survives_the_wait_encoding() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = step_exit_status(crate::step_completion::StepOutcome {
+            exit_code: 7,
+            signal: 0,
+        });
+
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(status.signal(), None);
+    }
+
+    #[test]
+    fn a_signalled_step_reports_its_signal_not_an_exit_code() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = step_exit_status(crate::step_completion::StepOutcome {
+            exit_code: 0,
+            signal: nix::sys::signal::Signal::SIGTERM as i32,
+        });
+
+        assert_eq!(
+            status.signal(),
+            Some(nix::sys::signal::Signal::SIGTERM as i32)
+        );
+        assert_eq!(status.code(), None);
     }
 
     #[tokio::test]
