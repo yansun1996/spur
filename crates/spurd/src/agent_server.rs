@@ -4525,7 +4525,8 @@ impl SlurmAgent for AgentService {
         let job_id = req.job_id;
 
         if req.signal > 0 {
-            self.send_explicit_signal(job_id, req.signal).await;
+            self.send_explicit_signal(job_id, req.run_attempt, req.signal)
+                .await;
         } else {
             self.graceful_cancel(job_id).await;
         }
@@ -6662,8 +6663,35 @@ impl AgentService {
         (count, gpu_type)
     }
 
+    /// Whether this node is running the named epoch of a job. Zero names no
+    /// epoch in particular and matches whatever is here.
+    async fn runs_attempt(&self, job_id: u32, run_attempt: u32) -> bool {
+        if run_attempt == 0 {
+            return true;
+        }
+        if stepds_for_job(&*self.stepds.lock().await, job_id)
+            .iter()
+            .any(|descriptor| descriptor.run_attempt == run_attempt)
+        {
+            return true;
+        }
+        let jobs = self.running.lock().await;
+        jobs.get(&job_id)
+            .is_some_and(|tracked| tracked.run_attempt == run_attempt)
+    }
+
     /// Send a user-specified signal to a running job.
-    async fn send_explicit_signal(&self, job_id: u32, signal: i32) {
+    async fn send_explicit_signal(&self, job_id: u32, run_attempt: u32, signal: i32) {
+        // A signal naming an epoch this node no longer runs belongs to a
+        // superseded run, and the processes here are the redispatch that
+        // replaced it. Killing them is worse than dropping the signal.
+        if !self.runs_attempt(job_id, run_attempt).await {
+            warn!(
+                job_id,
+                run_attempt, signal, "dropping a signal for a superseded run"
+            );
+            return;
+        }
         // A signal reaches every step the job holds; one failing must not
         // silently spare its siblings.
         let runtimes = stepds_for_job(&*self.stepds.lock().await, job_id);
@@ -13143,7 +13171,38 @@ mod tests {
             "process should run after SIGCONT, got {state}"
         );
 
-        svc.send_explicit_signal(job_id, 9).await; // cleanup
+        svc.send_explicit_signal(job_id, 0, 9).await; // cleanup
+    }
+
+    #[tokio::test]
+    async fn a_signal_for_a_superseded_run_spares_the_redispatch() {
+        // The same job id runs again on this node after a requeue. A delayed
+        // kill for the run it replaced must not land on the new one.
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.start_monitor("http://127.0.0.1:1".into());
+
+        let job_id = 903;
+        let mut redispatch = TrackedJob::dummy(0);
+        redispatch.run_attempt = 2;
+        svc.insert_test_job(job_id, redispatch).await;
+
+        svc.send_explicit_signal(job_id, 1, 9).await;
+
+        assert!(
+            !wait_job_reaped(&svc, job_id, 2_000).await,
+            "a kill aimed at the run this one replaced must not reap it"
+        );
+
+        svc.send_explicit_signal(job_id, 2, 9).await;
+        assert!(
+            wait_job_reaped(&svc, job_id, 5_000).await,
+            "naming the running epoch must still kill it"
+        );
     }
 
     #[tokio::test]
@@ -13159,7 +13218,7 @@ mod tests {
         let job_id = 902;
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
 
-        svc.send_explicit_signal(job_id, 9).await; // SIGKILL
+        svc.send_explicit_signal(job_id, 0, 9).await; // SIGKILL
 
         assert!(
             wait_job_reaped(&svc, job_id, 5_000).await,
@@ -13188,7 +13247,7 @@ mod tests {
         tracked.cgroup_path = Some(cgroup.clone());
         svc.insert_test_job(job_id, tracked).await;
 
-        svc.send_explicit_signal(job_id, 9).await; // SIGKILL
+        svc.send_explicit_signal(job_id, 0, 9).await; // SIGKILL
 
         assert!(
             wait_job_reaped(&svc, job_id, 5_000).await,
@@ -13390,7 +13449,7 @@ mod tests {
         recover_stepds(&svc.running, vec![descriptor.clone()]).await;
         svc.adopt_stepds(&[descriptor]).await;
 
-        svc.send_explicit_signal(902, nix::sys::signal::Signal::SIGTERM as i32)
+        svc.send_explicit_signal(902, 0, nix::sys::signal::Signal::SIGTERM as i32)
             .await;
         svc.graceful_cancel(902).await;
 
