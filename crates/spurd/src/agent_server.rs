@@ -3642,11 +3642,8 @@ impl SlurmAgent for AgentService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
-        // A pty's terminal is the agent's to own. Direct-launch PMIx is here
-        // because its ranks cannot reach the server once supervised, not yet why.
-        let is_direct_pmix_batch =
-            spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script);
-        let stepd_enabled = !is_direct_pmix_batch && !spec.pty;
+        // A pty launch stays on the legacy path: its terminal is the agent's to own.
+        let stepd_enabled = !spec.pty;
         #[cfg(test)]
         let stepd_enabled = stepd_enabled && !self.force_legacy_launch;
 
@@ -3908,7 +3905,7 @@ impl SlurmAgent for AgentService {
         let mut pmix_guard = None;
         let mut pmix_plan: Option<PmixLaunchPlan> = None;
         let mut pmix_per_local_rank_env: Option<Vec<HashMap<String, String>>> = None;
-        if spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script) && !stepd_enabled {
+        if spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script) {
             let proto = req.pmix_plan.as_ref().ok_or_else(|| {
                 Status::failed_precondition("missing PMIx launch plan for --mpi=pmix job")
             })?;
@@ -3928,39 +3925,38 @@ impl SlurmAgent for AgentService {
         // out when `task_fanout` is set (standalone `srun` routed through the batch
         // path) or when `--mpi=pmix` is set so a direct batch launch spawns one
         // MPI rank per local task without requiring an inner `srun`.
-        let launch_script = if stepd_enabled && pmix_multi_task {
-            launch_script
-        } else if use_multi_task_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script) {
-            // Write the user script to disk first so the wrapper can reference it
-            let user_script_path = format!("{}/.spur_user_{}.sh", work_dir, job_id);
-            std::fs::write(&user_script_path, &launch_script)
-                .map_err(|e| Status::internal(format!("failed to write user script: {}", e)))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &user_script_path,
-                    std::fs::Permissions::from_mode(0o755),
-                );
-            }
+        let launch_script =
+            if use_multi_task_launch(tasks_per_node, req.task_fanout, &spec.mpi, &spec.script) {
+                // Write the user script to disk first so the wrapper can reference it
+                let user_script_path = format!("{}/.spur_user_{}.sh", work_dir, job_id);
+                std::fs::write(&user_script_path, &launch_script)
+                    .map_err(|e| Status::internal(format!("failed to write user script: {}", e)))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &user_script_path,
+                        std::fs::Permissions::from_mode(0o755),
+                    );
+                }
 
-            if spec.mpi == MPI_PMIX {
-                warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
-                build_multi_task_pmix_wrapper(
-                    &user_script_path,
-                    tasks_per_node,
-                    pmix_per_local_rank_env.as_ref().ok_or_else(|| {
-                        Status::internal("missing PMIx per-rank env for multi-task launch")
-                    })?,
-                    Some(&spec.environment),
-                )
-                .map_err(Status::failed_precondition)?
+                if spec.mpi == MPI_PMIX {
+                    warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
+                    build_multi_task_pmix_wrapper(
+                        &user_script_path,
+                        tasks_per_node,
+                        pmix_per_local_rank_env.as_ref().ok_or_else(|| {
+                            Status::internal("missing PMIx per-rank env for multi-task launch")
+                        })?,
+                        Some(&spec.environment),
+                    )
+                    .map_err(Status::failed_precondition)?
+                } else {
+                    build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
+                }
             } else {
-                build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
-            }
-        } else {
-            launch_script
-        };
+                launch_script
+            };
 
         let (cpus, memory_mb) =
             resolve_cgroup_budget(req.allocated.as_ref(), &spec, tasks_per_node);
