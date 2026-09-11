@@ -1366,9 +1366,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
-        if spur_core::step::is_user_step(step_id) {
-            crate::executor::cleanup_step_spool(job_id, step_id);
-        } else {
+        // A user step's spool outlives teardown: this runs before the agent is
+        // notified, and the agent still has to read the step's output back.
+        if !spur_core::step::is_user_step(step_id) {
             crate::executor::cleanup_job_spool(job_id);
         }
     };
