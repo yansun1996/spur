@@ -178,6 +178,10 @@ pub struct JobLaunchConfig {
     /// The launch command enters a running job's namespaces itself, so wrapping
     /// it in a fresh one here would land the work in the wrong place.
     pub joins_parent_namespaces: bool,
+    /// Holds a companion node's slice of an allocation and runs no user code.
+    /// Isolating it would make it PID 1 of a namespace, where the kernel drops
+    /// unhandled signals and nothing can then tear it down.
+    pub allocation_holder: bool,
 }
 
 pub struct LaunchResult {
@@ -690,8 +694,7 @@ async fn spawn_job_process(
     // Batch `--mpi=pmix` multi-rank wrappers must stay in the host mount/PID
     // namespace so Open MPI's PMIx client can reach spurd's embedded server
     // (same as standalone `srun` via `run_command`, which never uses unshare).
-    let use_namespaces =
-        nix::unistd::geteuid().is_root() && !cfg.pmix_multi_task && !cfg.joins_parent_namespaces;
+    let use_namespaces = would_use_namespaces(cfg, nix::unistd::geteuid().is_root());
     let (launch_cmd, launch_args) = if use_namespaces {
         let wrapper_path = spool_dir.join(namespace_wrapper_name(cfg.step_id));
         let visible_devices = cfg
@@ -1936,6 +1939,13 @@ pub fn cleanup_step_spool(job_id: JobId, step_id: u32) {
     }
 }
 
+/// Whether a launch wraps the job in fresh namespaces. A PMIx rank needs the
+/// host's, a step entering a parent's brings its own, and a holder must stay
+/// signalable.
+fn would_use_namespaces(cfg: &JobLaunchConfig, is_root: bool) -> bool {
+    is_root && !cfg.pmix_multi_task && !cfg.joins_parent_namespaces && !cfg.allocation_holder
+}
+
 pub(crate) fn launch_script_name(step_id: spur_core::step::StepId) -> String {
     match spur_core::step::is_user_step(step_id) {
         true => format!("spur_step{step_id}.sh"),
@@ -3095,6 +3105,22 @@ mod tests {
     }
 
     #[test]
+    fn an_allocation_holder_is_not_isolated() {
+        // PID 1 of a namespace has unhandled signals dropped by the kernel, so a
+        // holder isolated that way can never be torn down.
+        let cfg = holder_cfg(true);
+        assert!(!would_use_namespaces(&cfg, true));
+
+        let normal = holder_cfg(false);
+        assert!(would_use_namespaces(&normal, true));
+    }
+
+    #[test]
+    fn an_unprivileged_launch_is_never_isolated() {
+        assert!(!would_use_namespaces(&holder_cfg(false), false));
+    }
+
+    #[test]
     fn a_step_does_not_reuse_the_jobs_script_path() {
         // A step overwriting the job's script corrupts it under a running bash.
         assert_ne!(
@@ -3206,9 +3232,17 @@ mod tests {
         assert!(received.is_empty());
     }
 
+    fn holder_cfg(allocation_holder: bool) -> JobLaunchConfig {
+        JobLaunchConfig {
+            allocation_holder,
+            ..launch_cfg_for_paths(1, "n", "u", "node")
+        }
+    }
+
     fn launch_cfg_for_paths(job_id: JobId, name: &str, user: &str, node: &str) -> JobLaunchConfig {
         JobLaunchConfig {
             joins_parent_namespaces: false,
+            allocation_holder: false,
             step_id: spur_core::step::STEP_BATCH,
             job_id,
             run_attempt: 1,

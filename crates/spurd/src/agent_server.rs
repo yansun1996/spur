@@ -3743,12 +3743,13 @@ impl SlurmAgent for AgentService {
         // collision-prone shared anchor for relative output paths.
         let work_dir = spec.work_dir.clone();
 
-        let script =
-            if batch_script_uses_step_launch(&spec.script) && task_offset > 0 && !req.task_fanout {
-                batch_companion_hold_script().to_string()
-            } else {
-                build_job_script(&spec.script, &spec.argv, &spec.script_args)?
-            };
+        let allocation_holder =
+            batch_script_uses_step_launch(&spec.script) && task_offset > 0 && !req.task_fanout;
+        let script = if allocation_holder {
+            batch_companion_hold_script().to_string()
+        } else {
+            build_job_script(&spec.script, &spec.argv, &spec.script_args)?
+        };
 
         // Compute tasks_per_node for both single- and multi-node jobs
         let tasks_per_node = if spec.tasks_per_node > 0 {
@@ -4104,6 +4105,7 @@ impl SlurmAgent for AgentService {
             environment: env,
             pmix_multi_task,
             joins_parent_namespaces: false,
+            allocation_holder,
             stdout_path: spec.stdout_path.clone(),
             stderr_path: spec.stderr_path.clone(),
             stdin_path: spec.stdin_path.clone(),
@@ -4753,6 +4755,7 @@ impl SlurmAgent for AgentService {
                 run_attempt: req.run_attempt,
                 step_id: spur_core::step::STEP_EXTERN,
                 joins_parent_namespaces: false,
+                allocation_holder: false,
                 script: String::new(),
                 work_dir: req.work_dir.clone(),
                 name: String::new(),
@@ -5289,6 +5292,7 @@ impl SlurmAgent for AgentService {
                 run_attempt,
                 script: supervised_step_script(&job_entry, req.uid, req.gid, &command)?,
                 joins_parent_namespaces,
+                allocation_holder: false,
                 work_dir: work_dir.clone(),
                 name: format!("{job_id}.{step_id}"),
                 user: env

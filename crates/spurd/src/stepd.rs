@@ -70,6 +70,8 @@ pub struct StepdLaunchSpec {
     pub pmix_multi_task: bool,
     #[serde(default)]
     pub joins_parent_namespaces: bool,
+    #[serde(default)]
+    pub allocation_holder: bool,
     /// What the launch unshares. The supervisor cannot derive this — it is the
     /// agent's decision — and an adopted job needs it to place exec and attach.
     #[serde(default)]
@@ -148,6 +150,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             allocation_only: false,
             pmix_multi_task: config.pmix_multi_task,
             joins_parent_namespaces: config.joins_parent_namespaces,
+            allocation_holder: config.allocation_holder,
             has_pid_namespace: false,
             has_user_namespace: false,
             has_mount_namespace: false,
@@ -189,6 +192,7 @@ impl StepdLaunchSpec {
             io_mode: crate::executor::LaunchIo::File,
             pmix_multi_task: self.pmix_multi_task,
             joins_parent_namespaces: self.joins_parent_namespaces,
+            allocation_holder: self.allocation_holder,
         }
     }
 }
@@ -1975,6 +1979,7 @@ mod tests {
     fn launch_spec() -> StepdLaunchSpec {
         StepdLaunchSpec {
             joins_parent_namespaces: false,
+            allocation_holder: false,
             has_pid_namespace: false,
             has_user_namespace: false,
             has_mount_namespace: false,
