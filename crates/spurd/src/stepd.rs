@@ -209,6 +209,11 @@ const CUSTODY_DEPOSIT: u8 = b'D';
 const CUSTODY_RECLAIM: u8 = b'R';
 const CUSTODY_FOUND: u8 = b'O';
 const CUSTODY_ABSENT: u8 = b'N';
+/// Claim any terminal this job has left orphaned. After an agent restart every
+/// entry is orphaned by definition, which is exactly the recovery case.
+const CUSTODY_RECLAIM_ANY: u8 = b'A';
+/// The terminal closed; stop holding it or the master leaks for the job's life.
+const CUSTODY_RELEASE: u8 = b'X';
 
 fn custody_payload(opcode: u8, session_id: u32) -> [u8; 5] {
     let mut payload = [0u8; 5];
@@ -282,6 +287,41 @@ pub async fn deposit_pty_master(
         &[master.as_raw_fd()],
     )
     .map_err(|error| io::Error::other(format!("deposit pty master: {error}")))
+}
+
+/// Claim a terminal the job has left orphaned, returning its shell id with the
+/// descriptor so the caller can release it later. Custody is retained, so the
+/// terminal still outlives the agent that just picked it up.
+pub async fn reclaim_orphaned_pty(
+    session_dir: &std::path::Path,
+) -> io::Result<Option<(u32, std::os::fd::OwnedFd)>> {
+    use std::os::fd::AsRawFd;
+    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    let raw = stream.as_raw_fd();
+    send_custody(raw, &custody_payload(CUSTODY_RECLAIM_ANY, 0), &[])
+        .map_err(|error| io::Error::other(format!("request orphaned pty: {error}")))?;
+    let (payload, fds) = recv_custody(raw)
+        .map_err(|error| io::Error::other(format!("reclaim orphaned pty: {error}")))?;
+    match parse_custody_payload(&payload) {
+        Some((CUSTODY_FOUND, session_id)) => Ok(fds.into_iter().next().map(|fd| (session_id, fd))),
+        _ => Ok(None),
+    }
+}
+
+/// Stop holding a terminal that has closed.
+pub async fn release_pty_master(session_dir: &std::path::Path, session_id: u32) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    send_custody(
+        stream.as_raw_fd(),
+        &custody_payload(CUSTODY_RELEASE, session_id),
+        &[],
+    )
+    .map_err(|error| io::Error::other(format!("release pty master: {error}")))
 }
 
 /// Reclaim one shell's master, so a replacement agent resumes that terminal
@@ -1161,6 +1201,19 @@ async fn serve_pty_custody(listener: UnixListener) {
                     }
                     None => tracing::warn!(session_id, "pty custody deposit carried no descriptor"),
                 },
+                CUSTODY_RECLAIM_ANY => {
+                    let claimed = custody.iter().next().map(|(id, fd)| (*id, fd.as_raw_fd()));
+                    let (reply, id, fds) = match claimed {
+                        Some((id, raw_fd)) => (CUSTODY_FOUND, id, vec![raw_fd]),
+                        None => (CUSTODY_ABSENT, 0, Vec::new()),
+                    };
+                    if let Err(error) = send_custody(raw, &custody_payload(reply, id), &fds) {
+                        tracing::warn!(%error, "failed to hand back an orphaned pty");
+                    }
+                }
+                CUSTODY_RELEASE => {
+                    custody.remove(&session_id);
+                }
                 CUSTODY_RECLAIM => {
                     let (reply, fds) = match custody.get(&session_id) {
                         Some(master) => (CUSTODY_FOUND, vec![master.as_raw_fd()]),
@@ -2075,6 +2128,23 @@ mod pty_custody_tests {
         // occupied, so a second terminal on one job deadlocked both ends.
         assert_ne!(CUSTODY_DEPOSIT, CUSTODY_RECLAIM);
         assert_ne!(CUSTODY_RECLAIM, CUSTODY_FOUND);
+    }
+
+    #[test]
+    fn every_custody_opcode_is_distinct() {
+        use super::{CUSTODY_ABSENT, CUSTODY_RECLAIM_ANY, CUSTODY_RELEASE};
+        let all = [
+            CUSTODY_DEPOSIT,
+            CUSTODY_RECLAIM,
+            CUSTODY_RECLAIM_ANY,
+            CUSTODY_RELEASE,
+            CUSTODY_FOUND,
+            CUSTODY_ABSENT,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for opcode in all {
+            assert!(seen.insert(opcode), "duplicate custody opcode {opcode}");
+        }
     }
 
     #[test]
