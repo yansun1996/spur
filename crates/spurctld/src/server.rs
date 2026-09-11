@@ -240,12 +240,11 @@ async fn reawait_step(
                 user: user.to_string(),
             })
             .await;
-        match awaited {
-            Ok(response) => return Ok(response.into_inner()),
-            // The agent is back and does not have the step: it is genuinely
-            // gone, so waiting longer cannot recover it.
-            Err(status) if status.code() == tonic::Code::NotFound => return Err(status),
-            Err(_) => continue,
+        // Not-found is retried like the rest: an agent that has just come back
+        // has not finished adopting its sessions, so it answers that for a step
+        // it is about to own again.
+        if let Ok(response) = awaited {
+            return Ok(response.into_inner());
         }
     }
     Err(Status::unavailable(
@@ -5271,12 +5270,20 @@ mod tests {
     #[test]
     fn a_step_that_genuinely_failed_is_not_re_attached_to() {
         assert!(!is_agent_connection_loss(&Status::internal("step blew up")));
-        assert!(!is_agent_connection_loss(&Status::not_found(
-            "no such step"
-        )));
         assert!(!is_agent_connection_loss(&Status::permission_denied(
             "nope"
         )));
+    }
+
+    #[test]
+    fn a_re_attach_outlasts_the_agents_adoption_window() {
+        // An agent that has just restarted answers not-found for a step it is
+        // about to own again, so the budget has to cover that window.
+        assert!(
+            STEP_REAWAIT_BACKOFF.saturating_mul(STEP_REAWAIT_ATTEMPTS)
+                >= std::time::Duration::from_secs(30),
+            "re-attach gives up before a restarting agent finishes adopting"
+        );
     }
 
     #[test]
