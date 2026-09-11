@@ -206,6 +206,12 @@ impl LeaderProxy {
 /// `serve` into `ControllerService::jwt_key`; deliberately not re-read on
 /// `reconfigure` (see the field doc). Falls back to a shared default so
 /// key-less dev clusters interoperate.
+/// The credential the controller presents to agents. Unlike the admission key
+/// this has no fallback: an unset key must present nothing, not a guessable one.
+pub(crate) fn agent_signing_key(config: &spur_core::config::SlurmConfig) -> anyhow::Result<String> {
+    Ok(config.auth.resolved_jwt_key()?.unwrap_or_default())
+}
+
 pub(crate) fn resolve_startup_jwt_key(
     config: &spur_core::config::SlurmConfig,
 ) -> anyhow::Result<String> {
@@ -5188,6 +5194,40 @@ fn validate_completion_report_state_for_rpc(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_unset_key_presents_no_credential_to_agents() {
+        let config = spur_core::config::SlurmConfig::load_from_str("cluster_name = \"t\"\n")
+            .expect("config with no auth key");
+
+        assert_eq!(
+            agent_signing_key(&config).expect("resolve"),
+            "",
+            "a keyless controller must present nothing; signing with the admission fallback \
+             makes every keyless agent reject dispatch"
+        );
+    }
+
+    #[test]
+    fn an_unset_key_still_falls_back_for_admission() {
+        let config = spur_core::config::SlurmConfig::load_from_str("cluster_name = \"t\"\n")
+            .expect("config with no auth key");
+
+        assert_eq!(
+            resolve_startup_jwt_key(&config).expect("resolve"),
+            "spur-default-key"
+        );
+    }
+
+    #[test]
+    fn a_configured_key_is_presented_to_agents() {
+        let config = spur_core::config::SlurmConfig::load_from_str(
+            "cluster_name = \"t\"\n[auth]\nplugin = \"none\"\njwt_key = \"a-real-key\"\n",
+        )
+        .expect("config with a key");
+
+        assert_eq!(agent_signing_key(&config).expect("resolve"), "a-real-key");
+    }
 
     #[test]
     fn only_a_non_user_step_reports_for_the_whole_job() {
