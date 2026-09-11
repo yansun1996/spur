@@ -1574,7 +1574,7 @@ pub(crate) fn open_step_output_files(
 }
 
 /// Send file descriptors to a peer over a Unix socket via SCM_RIGHTS.
-fn send_fds(sock: RawFd, fds: &[RawFd]) -> nix::Result<()> {
+pub(crate) fn send_fds(sock: RawFd, fds: &[RawFd]) -> nix::Result<()> {
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
     let iov = [std::io::IoSlice::new(b"F")];
     let cmsgs = [ControlMessage::ScmRights(fds)];
@@ -1584,7 +1584,7 @@ fn send_fds(sock: RawFd, fds: &[RawFd]) -> nix::Result<()> {
 
 /// Receive file descriptors sent via SCM_RIGHTS. Returns an empty vec if the
 /// peer closed without sending (e.g. the helper failed before passing fds).
-fn recv_fds(sock: RawFd) -> nix::Result<Vec<OwnedFd>> {
+pub(crate) fn recv_fds(sock: RawFd) -> nix::Result<Vec<OwnedFd>> {
     use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
     let mut buf = [0u8; 8];
     let mut iov = [std::io::IoSliceMut::new(&mut buf)];

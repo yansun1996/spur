@@ -198,6 +198,37 @@ impl StepdLaunchSpec {
 }
 
 const DESCRIPTOR_FILE: &str = "descriptor.json";
+/// Custody socket for an interactive session's pty master. Separate from the
+/// control socket because ancillary data cannot cross a buffered reader.
+pub const PTY_CUSTODY_SOCKET_NAME: &str = "ptyfd.sock";
+
+/// Ask the supervisor to hold a dup of the pty master, so the terminal does not
+/// hang up when the agent that created it goes away.
+pub async fn deposit_pty_master(
+    session_dir: &std::path::Path,
+    master: std::os::fd::BorrowedFd<'_>,
+) -> io::Result<()> {
+    use std::os::fd::{AsRawFd, RawFd};
+    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    crate::executor::send_fds(stream.as_raw_fd(), &[master.as_raw_fd() as RawFd])
+        .map_err(|error| io::Error::other(format!("deposit pty master: {error}")))
+}
+
+/// Reclaim the pty master a previous agent deposited, so a replacement can
+/// resume bridging the same terminal.
+pub async fn reclaim_pty_master(
+    session_dir: &std::path::Path,
+) -> io::Result<Option<std::os::fd::OwnedFd>> {
+    use std::os::fd::AsRawFd;
+    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    let fds = crate::executor::recv_fds(stream.as_raw_fd())
+        .map_err(|error| io::Error::other(format!("reclaim pty master: {error}")))?;
+    Ok(fds.into_iter().next())
+}
 const OBLIGATION_FILE: &str = "obligations.jsonl";
 const FAILURE_FILE: &str = "failure.txt";
 const FORMAT_VERSION: u32 = 1;
@@ -1022,6 +1053,40 @@ async fn try_notify_agent(
     serde_json::from_str(&line).map_err(io::Error::other)
 }
 
+/// Holds one interactive session's pty master. The first caller deposits it;
+/// later callers (a replacement agent) get a copy while custody is retained, so
+/// the terminal outlives however many agents come and go.
+async fn serve_pty_custody(listener: UnixListener) {
+    use std::os::fd::AsRawFd;
+    let held: std::sync::Arc<Mutex<Option<std::os::fd::OwnedFd>>> =
+        std::sync::Arc::new(Mutex::new(None));
+    while let Ok((stream, _)) = listener.accept().await {
+        let held = held.clone();
+        tokio::spawn(async move {
+            let Ok(stream) = stream.into_std() else {
+                return;
+            };
+            if stream.set_nonblocking(false).is_err() {
+                return;
+            }
+            let mut custody = held.lock().await;
+            match custody.as_ref() {
+                Some(master) => {
+                    if let Err(error) =
+                        crate::executor::send_fds(stream.as_raw_fd(), &[master.as_raw_fd()])
+                    {
+                        tracing::warn!(%error, "failed to hand back the pty master");
+                    }
+                }
+                None => match crate::executor::recv_fds(stream.as_raw_fd()) {
+                    Ok(fds) => *custody = fds.into_iter().next(),
+                    Err(error) => tracing::warn!(%error, "failed to take custody of a pty master"),
+                },
+            }
+        });
+    }
+}
+
 pub async fn serve_control(stream: UnixStream, session: &Stepd) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     loop {
@@ -1308,6 +1373,17 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.has_mount_namespace = launch_spec.has_mount_namespace;
     store.publish(&descriptor)?;
     let listener = UnixListener::bind(&socket_path)?;
+    // Custody of an interactive session's pty master outlives the agent that
+    // created it, so the terminal survives a restart and can be picked back up.
+    let custody_path = session_dir.join(PTY_CUSTODY_SOCKET_NAME);
+    let _ = std::fs::remove_file(&custody_path);
+    if let Ok(custody) = UnixListener::bind(&custody_path) {
+        let _ = std::fs::set_permissions(
+            &custody_path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+        );
+        tokio::spawn(serve_pty_custody(custody));
+    }
     let runtime_environment = launch_spec.environment.clone();
     let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     let hooks = launch_spec.hooks.clone();

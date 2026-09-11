@@ -6049,6 +6049,22 @@ impl SlurmAgent for AgentService {
             self.cgroup.required,
         )?;
 
+        // Deposited with the supervisor, which outlives this agent: without a
+        // second holder the master closes when the agent does and the terminal
+        // hangs up under the user.
+        if let Some(descriptor) = stepds_for_job(&*self.stepds.lock().await, init.job_id).first() {
+            if let Some(session_dir) = descriptor.socket_path.parent() {
+                if let Err(error) = crate::stepd::deposit_pty_master(
+                    session_dir,
+                    std::os::fd::AsFd::as_fd(&master_fd),
+                )
+                .await
+                {
+                    warn!(job_id = init.job_id, %error, "pty master custody failed");
+                }
+            }
+        }
+
         info!(
             job_id = init.job_id,
             child_pid,
