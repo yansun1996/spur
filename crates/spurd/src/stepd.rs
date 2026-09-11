@@ -1603,9 +1603,13 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     ));
     session.adopt_cgroup(launched_cgroup).await;
     let capability = descriptor.capability.clone();
+    // An allocation's supervisor never launches, so it holds no cgroup of its
+    // own — but the agent made one and recorded it, and it still has to go.
+    let recorded_cgroup =
+        (!descriptor.cgroup_path.as_os_str().is_empty()).then(|| descriptor.cgroup_path.clone());
     let result = run_supervisor(listener, descriptor, session.clone()).await;
     let _ = std::fs::remove_file(socket_path);
-    let cgroup = session.take_cgroup().await;
+    let cgroup = session.take_cgroup().await.or(recorded_cgroup);
     let teardown = |cgroup: Option<PathBuf>| async move {
         if let Some(cgroup) = cgroup.as_ref() {
             crate::executor::cleanup_cgroup(cgroup);
