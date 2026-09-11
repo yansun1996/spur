@@ -68,6 +68,8 @@ pub struct StepdLaunchSpec {
     // executor.rs); persisted so a restarted supervisor launches identically.
     #[serde(default)]
     pub pmix_multi_task: bool,
+    #[serde(default)]
+    pub joins_parent_namespaces: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +139,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             capability: String::new(),
             allocation_only: false,
             pmix_multi_task: config.pmix_multi_task,
+            joins_parent_namespaces: config.joins_parent_namespaces,
         })
     }
 }
@@ -174,6 +177,7 @@ impl StepdLaunchSpec {
             memlock: self.memlock.into(),
             io_mode: crate::executor::LaunchIo::File,
             pmix_multi_task: self.pmix_multi_task,
+            joins_parent_namespaces: self.joins_parent_namespaces,
         }
     }
 }
@@ -1857,6 +1861,50 @@ pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLi
 }
 
 #[cfg(test)]
+mod launch_spec_compat {
+    use super::StepdLaunchSpec;
+
+    /// Captured from a build that predates every optional field below. A
+    /// supervisor re-reads its launch.json after the agent restarts, so a field
+    /// added without a default would strand running work rather than fail loudly.
+    /// Never regenerate this: its value is that it stays at the old shape.
+    const FROZEN_LAUNCH_JSON: &str = r##"{
+        "job_id": 42,
+        "script": "#!/bin/bash\necho hi\n",
+        "work_dir": "/tmp",
+        "name": "demo",
+        "user": "someone",
+        "node": "node-1",
+        "environment": {"SPUR_JOB_ID": "42"},
+        "stdout_path": "/tmp/out",
+        "stderr_path": "/tmp/err",
+        "stdin_path": "",
+        "cpus": 2,
+        "memory_mb": 1024,
+        "cpu_ids": [0, 1],
+        "open_mode": null,
+        "uid": 1000,
+        "gid": 1000,
+        "partition": "batch",
+        "nodelist": "node-1",
+        "memlock": "Unlimited"
+    }"##;
+
+    #[test]
+    fn a_launch_spec_from_an_older_build_still_loads() {
+        let spec: StepdLaunchSpec =
+            serde_json::from_str(FROZEN_LAUNCH_JSON).expect("an older launch.json must still load");
+
+        assert_eq!(spec.job_id, 42);
+        assert_eq!(spec.step_id, spur_core::step::default_step_id());
+        assert!(!spec.joins_parent_namespaces);
+        assert!(!spec.allocation_only);
+        assert!(!spec.pmix_multi_task);
+        assert_eq!(spec.run_attempt, 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1891,6 +1939,7 @@ mod tests {
 
     fn launch_spec() -> StepdLaunchSpec {
         StepdLaunchSpec {
+            joins_parent_namespaces: false,
             job_id: 42,
             step_id: spur_core::step::STEP_BATCH,
             cgroup: Default::default(),

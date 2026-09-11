@@ -1882,11 +1882,31 @@ async fn step_cancel_requested(
 /// spool files (so `stream_job_output` can tail them live), register its pid for
 /// cancellation, and wait. Returns `Ok(None)` if the step was cancelled before
 /// it could run. Shared by the nsenter (Case 1) and plain-host (Case 3) paths.
-/// Joining a parent's namespaces or building its own container both keep the
-/// agent in the step's exec path, so neither can be handed to a supervisor.
-fn step_runs_plainly(job_entry: &crate::job_entry::JobEntry, container_image: &str) -> bool {
-    let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
-    !joins_parent_namespaces && container_image.is_empty()
+/// A step that builds its own container keeps the agent in its exec path, so it
+/// cannot be handed to a supervisor. Entering a parent job's namespaces can.
+fn step_can_be_supervised(container_image: &str) -> bool {
+    container_image.is_empty()
+}
+
+/// The script a supervised step runs. A step joining a running job enters its
+/// namespaces from inside the script, so the supervisor itself stays outside
+/// them and survives independently of the job it is running work for.
+fn supervised_step_script(
+    job_entry: &crate::job_entry::JobEntry,
+    uid: u32,
+    gid: u32,
+    command: &[String],
+) -> Result<String, Status> {
+    if !(job_entry.has_namespaces() && job_entry.pid > 0) {
+        return build_one_shot_command_script(command);
+    }
+    let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(uid, gid);
+    let plan = build_launch_plan(job_entry, priv_drop.as_ref(), command);
+    let entering = shlex::try_join(
+        std::iter::once(plan.program.as_str()).chain(plan.args.iter().map(String::as_str)),
+    )
+    .map_err(|e| Status::invalid_argument(format!("step command is not shell-safe: {e}")))?;
+    Ok(format!("#!/bin/bash\nexec {entering}\n"))
 }
 
 /// The same shape RunCommand would have returned, output included: a user
@@ -4053,6 +4073,7 @@ impl SlurmAgent for AgentService {
             array_task_id: (array_job_id != 0).then_some(array_task_id),
             environment: env,
             pmix_multi_task,
+            joins_parent_namespaces: false,
             stdout_path: spec.stdout_path.clone(),
             stderr_path: spec.stderr_path.clone(),
             stdin_path: spec.stdin_path.clone(),
@@ -4700,6 +4721,7 @@ impl SlurmAgent for AgentService {
                 job_id: req.job_id,
                 run_attempt: req.run_attempt,
                 step_id: spur_core::step::STEP_EXTERN,
+                joins_parent_namespaces: false,
                 script: String::new(),
                 work_dir: req.work_dir.clone(),
                 name: String::new(),
@@ -5214,10 +5236,9 @@ impl SlurmAgent for AgentService {
 
         // Built before the dispatch chain so the arms stay a plain match on
         // where the step runs, not on whether it is supervised.
-        let supervise_step = step_runs_plainly(
-            &job_entry,
-            req.container.as_ref().map_or("", |c| c.image.as_str()),
-        );
+        let supervise_step =
+            step_can_be_supervised(req.container.as_ref().map_or("", |c| c.image.as_str()));
+        let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
         #[cfg(test)]
         let supervise_step = supervise_step && !self.force_legacy_launch;
         let mut supervised_step_cfg = if supervise_step {
@@ -5235,7 +5256,8 @@ impl SlurmAgent for AgentService {
                 step_id,
                 job_id,
                 run_attempt,
-                script: build_one_shot_command_script(&command)?,
+                script: supervised_step_script(&job_entry, req.uid, req.gid, &command)?,
+                joins_parent_namespaces,
                 work_dir: work_dir.clone(),
                 name: format!("{job_id}.{step_id}"),
                 user: env
@@ -8518,29 +8540,50 @@ mod tests {
 
     #[test]
     fn a_plain_host_step_is_supervisable() {
-        assert!(step_runs_plainly(&plain_job_entry(), ""));
-    }
-
-    #[test]
-    fn a_step_joining_its_parents_namespaces_is_not_supervisable() {
-        let mut entry = plain_job_entry();
-        entry.has_pid_namespace = true;
-        entry.pid = 4242;
-
-        assert!(!step_runs_plainly(&entry, ""));
-    }
-
-    #[test]
-    fn a_namespaced_parent_with_no_live_pid_leaves_the_step_supervisable() {
-        let mut entry = plain_job_entry();
-        entry.has_pid_namespace = true;
-
-        assert!(step_runs_plainly(&entry, ""));
+        assert!(step_can_be_supervised(""));
     }
 
     #[test]
     fn a_step_building_its_own_container_is_not_supervisable() {
-        assert!(!step_runs_plainly(&plain_job_entry(), "docker://alpine"));
+        assert!(!step_can_be_supervised("docker://alpine"));
+    }
+
+    #[test]
+    fn a_plain_steps_script_runs_the_command_directly() {
+        let script = supervised_step_script(&plain_job_entry(), 1000, 1000, &["true".to_string()])
+            .expect("script");
+
+        assert!(
+            !script.contains("nsenter"),
+            "nothing to enter without a namespaced parent:\n{script}"
+        );
+    }
+
+    #[test]
+    fn a_namespaced_steps_script_enters_the_parent_from_inside() {
+        let mut entry = plain_job_entry();
+        entry.has_pid_namespace = true;
+        entry.has_mount_namespace = true;
+        entry.pid = 4242;
+
+        let script =
+            supervised_step_script(&entry, 1000, 1000, &["true".to_string()]).expect("script");
+
+        // Inside the script, so the supervisor itself stays out of the job's
+        // namespaces and outlives it.
+        assert!(script.contains("nsenter"), "{script}");
+        assert!(script.contains("4242"), "{script}");
+    }
+
+    #[test]
+    fn a_namespaced_parent_with_no_live_pid_runs_the_command_directly() {
+        let mut entry = plain_job_entry();
+        entry.has_pid_namespace = true;
+
+        let script =
+            supervised_step_script(&entry, 1000, 1000, &["true".to_string()]).expect("script");
+
+        assert!(!script.contains("nsenter"), "{script}");
     }
 
     #[test]

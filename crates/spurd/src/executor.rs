@@ -175,6 +175,9 @@ pub struct JobLaunchConfig {
     pub io_mode: LaunchIo,
     /// Direct multi-rank PMIx launch via a wrapper script (batch `--mpi=pmix`).
     pub pmix_multi_task: bool,
+    /// The launch command enters a running job's namespaces itself, so wrapping
+    /// it in a fresh one here would land the work in the wrong place.
+    pub joins_parent_namespaces: bool,
 }
 
 pub struct LaunchResult {
@@ -538,7 +541,9 @@ async fn spawn_job_process(
     // Script + wrapper live in the node-local spool dir, not work_dir (see
     // SPOOL_ROOT), so root-side writes survive NFS root_squash work_dirs.
     let spool_dir = create_job_spool_dir(job_id, uid, gid)?;
-    let script_path = spool_dir.join("spur_job.sh");
+    // Per step: a job's own script and each of its steps' share this directory,
+    // and rewriting one under a running bash corrupts it mid-execution.
+    let script_path = spool_dir.join(launch_script_name(cfg.step_id));
     write_job_scratch(&script_path, script, uid, gid)
         .context("failed to write job script")
         .map_err(|e| classify_spool_error(&spool_dir, e))?;
@@ -685,9 +690,10 @@ async fn spawn_job_process(
     // Batch `--mpi=pmix` multi-rank wrappers must stay in the host mount/PID
     // namespace so Open MPI's PMIx client can reach spurd's embedded server
     // (same as standalone `srun` via `run_command`, which never uses unshare).
-    let use_namespaces = nix::unistd::geteuid().is_root() && !cfg.pmix_multi_task;
+    let use_namespaces =
+        nix::unistd::geteuid().is_root() && !cfg.pmix_multi_task && !cfg.joins_parent_namespaces;
     let (launch_cmd, launch_args) = if use_namespaces {
-        let wrapper_path = spool_dir.join("spur_ns.sh");
+        let wrapper_path = spool_dir.join(namespace_wrapper_name(cfg.step_id));
         let visible_devices = cfg
             .host_device_plan
             .as_ref()
@@ -1932,6 +1938,20 @@ pub fn cleanup_step_spool(job_id: JobId, step_id: u32) {
     }
 }
 
+pub(crate) fn launch_script_name(step_id: spur_core::step::StepId) -> String {
+    match spur_core::step::is_user_step(step_id) {
+        true => format!("spur_step{step_id}.sh"),
+        false => "spur_job.sh".to_string(),
+    }
+}
+
+pub(crate) fn namespace_wrapper_name(step_id: spur_core::step::StepId) -> String {
+    match spur_core::step::is_user_step(step_id) {
+        true => format!("spur_ns_step{step_id}.sh"),
+        false => "spur_ns.sh".to_string(),
+    }
+}
+
 /// Resolve output path patterns (%j → job_id, etc.)
 /// Resolve a pattern against the *effective* work_dir (may be the `/tmp`
 /// fallback) via the shared resolver, so agent and controller paths match.
@@ -3077,6 +3097,37 @@ mod tests {
     }
 
     #[test]
+    fn a_step_does_not_reuse_the_jobs_script_path() {
+        // A step overwriting the job's script corrupts it under a running bash.
+        assert_ne!(
+            launch_script_name(0),
+            launch_script_name(spur_core::step::STEP_BATCH)
+        );
+        assert_ne!(
+            namespace_wrapper_name(0),
+            namespace_wrapper_name(spur_core::step::STEP_BATCH)
+        );
+    }
+
+    #[test]
+    fn two_steps_of_one_job_get_different_scripts() {
+        assert_ne!(launch_script_name(0), launch_script_name(1));
+        assert_ne!(namespace_wrapper_name(0), namespace_wrapper_name(1));
+    }
+
+    #[test]
+    fn a_jobs_own_steps_keep_the_original_script_names() {
+        for owning in [
+            spur_core::step::STEP_BATCH,
+            spur_core::step::STEP_EXTERN,
+            spur_core::step::STEP_INTERACTIVE,
+        ] {
+            assert_eq!(launch_script_name(owning), "spur_job.sh");
+            assert_eq!(namespace_wrapper_name(owning), "spur_ns.sh");
+        }
+    }
+
+    #[test]
     fn job_spool_dir_round_trips_create_and_cleanup() {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
@@ -3159,6 +3210,7 @@ mod tests {
 
     fn launch_cfg_for_paths(job_id: JobId, name: &str, user: &str, node: &str) -> JobLaunchConfig {
         JobLaunchConfig {
+            joins_parent_namespaces: false,
             step_id: spur_core::step::STEP_BATCH,
             job_id,
             run_attempt: 1,
