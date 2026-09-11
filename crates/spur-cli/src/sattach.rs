@@ -149,19 +149,16 @@ async fn stream_output_only(
     Ok(())
 }
 
-/// Interactive attach via InteractiveSession RPC. Returns the remote exit code.
-/// The agent's own port, since a cluster may run it anywhere. Falling back to
-/// the default keeps a node that predates the field reachable.
 fn agent_port_for(nodes: &[spur_proto::proto::NodeInfo], node: &str) -> u32 {
-    const DEFAULT_AGENT_PORT: u32 = 6818;
-    nodes
-        .iter()
-        .find(|info| info.name == node)
-        .map(|info| info.agent_port)
-        .filter(|port| *port > 0)
-        .unwrap_or(DEFAULT_AGENT_PORT)
+    crate::interactive::agent_port_or_default(
+        nodes
+            .iter()
+            .find(|info| info.name == node)
+            .map_or(0, |info| info.agent_port),
+    )
 }
 
+/// Interactive attach via InteractiveSession RPC. Returns the remote exit code.
 async fn interactive_attach(
     agent: &mut SlurmAgentClient<crate::authclient::AuthChannel>,
     job_id: u32,
