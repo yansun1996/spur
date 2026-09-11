@@ -765,6 +765,12 @@ pub struct StepdDescriptor {
     pub has_mount_namespace: bool,
     #[serde(default)]
     pub resources: StepdJobResources,
+    /// The workload itself, not the supervisor. Without a cgroup to watch
+    /// empty, this identity is the only proof that fencing actually killed it.
+    #[serde(default)]
+    pub workload_pid: u32,
+    #[serde(default)]
+    pub workload_start_ticks: u64,
 }
 
 impl StepdDescriptor {
@@ -796,6 +802,8 @@ impl StepdDescriptor {
             has_user_namespace: false,
             has_mount_namespace: false,
             resources: StepdJobResources::default(),
+            workload_pid: 0,
+            workload_start_ticks: 0,
         }
     }
 }
@@ -1622,10 +1630,17 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             }
         }
     };
+    let workload_pid = job.pid().unwrap_or(0);
+    if workload_pid > 0 {
+        descriptor.workload_pid = workload_pid;
+        descriptor.workload_start_ticks = process_start_ticks(workload_pid).unwrap_or(0);
+    }
     if let Some(cgroup_path) = launched_cgroup.as_deref() {
         descriptor.cgroup_path = cgroup_path.to_path_buf();
+    }
+    if workload_pid > 0 || launched_cgroup.is_some() {
         if let Err(error) = store.publish(&descriptor) {
-            tracing::warn!(job_id, %error, "failed to republish runtime descriptor with cgroup path");
+            tracing::warn!(job_id, %error, "failed to republish the runtime descriptor");
         }
     }
     let session = Arc::new(Stepd::with_environment(
@@ -2138,6 +2153,24 @@ pub(crate) fn process_start_ticks(pid: u32) -> io::Result<u64> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process start time"))?
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Whether the recorded process is still the one that was recorded and still
+/// holding resources. A pid the kernel has since handed to someone else reads
+/// as gone, and so does a zombie: it has already released everything and only
+/// waits to be reaped.
+pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, fields)) = stat.rsplit_once(") ") else {
+        return false;
+    };
+    let mut fields = fields.split_ascii_whitespace();
+    if fields.next() == Some("Z") {
+        return false;
+    }
+    matches!(fields.nth(18).and_then(|t| t.parse::<u64>().ok()), Some(ticks) if ticks == start_ticks)
 }
 
 pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {

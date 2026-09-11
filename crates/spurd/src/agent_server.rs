@@ -327,14 +327,47 @@ async fn runtime_teardown_confirmed(
 ) -> bool {
     // A derived path is still worth reaping — the supervisor may have created
     // the cgroup before dying — but its absence proves nothing, since it may
-    // never have existed, so confirmation falls back to the stop.
+    // never have existed, so the workload itself has to answer for its death.
     if descriptor.cgroup_path.as_os_str().is_empty() {
         runtime_cgroup_reaped(&effective_cgroup_path(descriptor));
-        return stop_result.is_ok();
+        return stop_result.is_ok() && workload_confirmed_gone(descriptor).await;
     }
     // The retrying rmdir only succeeds once the cgroup is empty, so its
     // absence is what confirms the job's processes are actually gone.
     runtime_cgroup_reaped(&descriptor.cgroup_path)
+}
+
+/// With no cgroup to watch empty, killing the supervisor says nothing about the
+/// workload it left behind — it is a separate process the signal never reached.
+/// Escalate to the recorded workload and answer for that instead.
+async fn workload_confirmed_gone(descriptor: &crate::stepd::StepdDescriptor) -> bool {
+    // Allocations hold no workload, and a descriptor written before this was
+    // recorded cannot be improved on here.
+    if descriptor.workload_pid == 0 {
+        return true;
+    }
+    let alive =
+        || crate::stepd::process_is_live(descriptor.workload_pid, descriptor.workload_start_ticks);
+    if !alive() {
+        return true;
+    }
+    crate::executor::kill_process_tree(
+        descriptor.workload_pid as i32,
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    for _ in 0..WORKLOAD_DEATH_POLLS {
+        if !alive() {
+            return true;
+        }
+        tokio::time::sleep(WORKLOAD_DEATH_POLL_INTERVAL).await;
+    }
+    warn!(
+        job_id = descriptor.job_id,
+        step_id = descriptor.step_id,
+        pid = descriptor.workload_pid,
+        "workload outlived its supervisor and did not die on SIGKILL"
+    );
+    false
 }
 
 /// Reap a supervisor's cgroup and report whether it is confirmed gone.
@@ -1143,6 +1176,8 @@ pub(crate) fn monitor_recovered_stepds(
 const STEPD_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 const REPARENTED_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+const WORKLOAD_DEATH_POLLS: u32 = 20;
+const WORKLOAD_DEATH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const WORKLOAD_PID_POLLS: u32 = 40;
 const WORKLOAD_PID_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
@@ -7675,6 +7710,67 @@ mod tests {
             "must fail fast via the exec-error pipe, not the full readiness timeout"
         );
         assert!(error.to_string().contains("failed to exec"));
+    }
+
+    fn descriptor_for_workload(pid: u32) -> crate::stepd::StepdDescriptor {
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            91,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/unused.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.workload_pid = pid;
+        descriptor.workload_start_ticks =
+            crate::stepd::process_start_ticks(pid).unwrap_or_default();
+        descriptor
+    }
+
+    #[tokio::test]
+    async fn fencing_without_a_cgroup_kills_a_workload_that_outlived_its_supervisor() {
+        // Stopping the supervisor says nothing about the workload: it is a
+        // separate process, and the signal never reached it.
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in workload");
+        let descriptor = descriptor_for_workload(child.id());
+
+        let confirmed = runtime_teardown_confirmed(&descriptor, &Ok(())).await;
+
+        assert!(confirmed, "teardown must confirm once the workload is gone");
+        assert!(
+            !crate::stepd::process_is_live(
+                descriptor.workload_pid,
+                descriptor.workload_start_ticks
+            ),
+            "the workload must actually be dead, not merely reported so"
+        );
+        let _ = child.wait();
+    }
+
+    #[tokio::test]
+    async fn fencing_without_a_cgroup_accepts_a_supervisor_that_held_no_workload() {
+        // An allocation runs nothing of its own, and a descriptor written
+        // before the workload identity existed cannot be improved on here.
+        let descriptor = descriptor_for_workload(0);
+
+        assert!(runtime_teardown_confirmed(&descriptor, &Ok(())).await);
+    }
+
+    #[tokio::test]
+    async fn fencing_without_a_cgroup_does_not_kill_a_recycled_pid() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived process");
+        let mut descriptor = descriptor_for_workload(child.id());
+        let _ = child.wait();
+        // Whoever holds this pid next is not our workload.
+        descriptor.workload_start_ticks = descriptor.workload_start_ticks.wrapping_add(1);
+
+        assert!(runtime_teardown_confirmed(&descriptor, &Ok(())).await);
     }
 
     #[tokio::test]
