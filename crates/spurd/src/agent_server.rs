@@ -4372,35 +4372,10 @@ impl SlurmAgent for AgentService {
                     },
                 );
                 drop(jobs);
-                // Released only now: the workload must not start before this
-                // node's own bookkeeping is complete, or a step launched from
-                // the script can outrun the job's start.
-                if let Some(descriptor) = runtime_descriptor.as_ref() {
-                    if let Err(error) =
-                        crate::stepd::start_job(descriptor, uuid::Uuid::new_v4().to_string()).await
-                    {
-                        // The gate is still shut, so nothing ran: fail the launch
-                        // rather than leave the controller holding a job whose
-                        // workload never starts.
-                        warn!(job_id, run_attempt, %error, "failed to release the supervised job");
-                        let _ = stop_stepd_process(descriptor).await;
-                        release_stepd_tracking(
-                            &self.running,
-                            &self.allocation,
-                            &self.stepds,
-                            descriptor,
-                            "supervised job could not be released",
-                        )
-                        .await;
-                        return Ok(Response::new(LaunchJobResponse {
-                            success: false,
-                            error: format!("failed to release the supervised job: {error}"),
-                            stdout_path: String::new(),
-                            stderr_path: String::new(),
-                            failure_kind: LaunchFailureKind::LaunchFailureUnspecified as i32,
-                        }));
-                    }
-                }
+                // The gate stays shut until the controller has committed the
+                // job Running and calls StartJob: a step launched from the
+                // script's first line would otherwise ask about a job the
+                // cluster still reports as Pending.
                 // Already claimed into `stepds` above, before the
                 // allocation/running commit; completion arrives by push
                 // notification, not by polling.
@@ -4490,6 +4465,55 @@ impl SlurmAgent for AgentService {
             warn!(job_id, error = %err, "PMIx prepare release failed");
         }
         Ok(Response::new(ReleasePmixResponse {}))
+    }
+
+    async fn start_job(
+        &self,
+        request: Request<spur_proto::proto::AgentStartJobRequest>,
+    ) -> Result<Response<()>, Status> {
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        let job_id = req.job_id;
+
+        // Only the job's own supervisor waits at a gate; a numbered step is
+        // released by the agent as it launches, since its job already runs.
+        let gated: Vec<crate::stepd::StepdDescriptor> =
+            stepds_for_job(&*self.stepds.lock().await, job_id)
+                .into_iter()
+                .filter(|descriptor| !spur_core::step::is_user_step(descriptor.step_id))
+                .filter(|descriptor| {
+                    req.run_attempt == 0 || descriptor.run_attempt == req.run_attempt
+                })
+                .collect();
+        if gated.is_empty() {
+            return Err(Status::not_found(format!(
+                "job {job_id} has no supervisor waiting to start on this node"
+            )));
+        }
+
+        for descriptor in &gated {
+            if let Err(error) =
+                crate::stepd::start_job(descriptor, uuid::Uuid::new_v4().to_string()).await
+            {
+                // Nothing ran, so tear the supervisor down rather than leave
+                // the controller holding a job whose workload never starts.
+                warn!(job_id, run_attempt = req.run_attempt, %error,
+                    "failed to release the supervised job");
+                let _ = stop_stepd_process(descriptor).await;
+                release_stepd_tracking(
+                    &self.running,
+                    &self.allocation,
+                    &self.stepds,
+                    descriptor,
+                    "supervised job could not be released",
+                )
+                .await;
+                return Err(Status::internal(format!(
+                    "failed to release the supervised job: {error}"
+                )));
+            }
+        }
+        Ok(Response::new(()))
     }
 
     async fn cancel_job(
@@ -10650,6 +10674,97 @@ mod tests {
 
     /// End-to-end: a verified *user* identity in the request extensions cannot cancel a job through
     /// the agent — the controller-only gate refuses it before any signal is sent.
+    #[tokio::test]
+    async fn start_job_rejects_a_non_controller_caller() {
+        // Releasing the gate is what lets a job's workload run; a user token
+        // reaching it directly would bypass the controller's commit entirely.
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        let mut req = Request::new(spur_proto::proto::AgentStartJobRequest {
+            job_id: 48,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(user_identity("attacker"));
+        let err = svc
+            .start_job(req)
+            .await
+            .expect_err("a user token must not release a gated job");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    async fn svc_holding(descriptor: crate::stepd::StepdDescriptor) -> AgentService {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.stepds
+            .lock()
+            .await
+            .insert((descriptor.job_id, descriptor.step_id), descriptor);
+        svc
+    }
+
+    fn gated_descriptor(
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> crate::stepd::StepdDescriptor {
+        crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            step_id,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/unused.sock"),
+            std::path::PathBuf::new(),
+        )
+    }
+
+    fn controller_start(
+        job_id: u32,
+        run_attempt: u32,
+    ) -> Request<spur_proto::proto::AgentStartJobRequest> {
+        let mut req = Request::new(spur_proto::proto::AgentStartJobRequest {
+            job_id,
+            run_attempt,
+        });
+        req.extensions_mut().insert(controller_identity());
+        req
+    }
+
+    #[tokio::test]
+    async fn start_job_does_not_release_a_superseded_run() {
+        // A late release for an earlier epoch would start a workload the
+        // controller has already redispatched under a new one.
+        let svc = svc_holding(gated_descriptor(49, 2, spur_core::step::STEP_BATCH)).await;
+
+        let err = svc
+            .start_job(controller_start(49, 1))
+            .await
+            .expect_err("an older epoch owns no supervisor here");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn start_job_ignores_a_jobs_numbered_steps() {
+        // Only the job's own supervisor waits at a gate; a numbered step is
+        // released as the agent launches it.
+        let svc = svc_holding(gated_descriptor(50, 1, 0)).await;
+
+        let err = svc
+            .start_job(controller_start(50, 1))
+            .await
+            .expect_err("a numbered step is not a gated job");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
     #[tokio::test]
     async fn cancel_job_rejects_a_non_controller_caller() {
         let svc = AgentService::new(

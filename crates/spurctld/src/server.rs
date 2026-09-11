@@ -6539,6 +6539,13 @@ mod tests {
         ) -> Result<Response<spur_proto::proto::LaunchJobResponse>, Status> {
             Err(Status::unimplemented("not used in tests"))
         }
+        async fn start_job(
+            &self,
+            _request: tonic::Request<spur_proto::proto::AgentStartJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            Ok(tonic::Response::new(()))
+        }
+
         async fn await_step(
             &self,
             _request: Request<spur_proto::proto::AwaitStepRequest>,
