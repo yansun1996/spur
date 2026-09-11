@@ -4476,6 +4476,7 @@ impl SlurmAgent for AgentService {
         // generation-check the release itself so a redispatch that already
         // reserved a newer attempt survives a cancel for the old one.
         let jobs = self.running.lock().await;
+        let tracked_attempt = jobs.get(&job_id).map(|tracked| tracked.run_attempt);
         if !jobs.contains_key(&job_id) {
             let mut alloc = self.allocation.lock().await;
             if req.run_attempt == 0 {
@@ -4488,11 +4489,24 @@ impl SlurmAgent for AgentService {
 
         // An allocation ends here rather than through the completion teardown,
         // so this is where its cgroup node has to go: the steps inside only
-        // ever remove their own leaf.
-        crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
-            job_id,
-            req.run_attempt,
-        ));
+        // ever remove their own leaf. A cancel need not name an attempt, and
+        // the zero it carries then names a path no job ever used, so fall back
+        // to the attempt this node is running.
+        let supervised_attempt = match (req.run_attempt, tracked_attempt) {
+            (0, None) => stepds_for_job(&*self.stepds.lock().await, job_id)
+                .first()
+                .map(|descriptor| descriptor.run_attempt),
+            _ => None,
+        };
+        let doomed_attempt = match req.run_attempt {
+            0 => tracked_attempt.or(supervised_attempt),
+            named => Some(named),
+        };
+        if let Some(attempt) = doomed_attempt {
+            crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
+                job_id, attempt,
+            ));
+        }
 
         if let Err(err) = self.mpi_host.release_prepared_pmix(job_id) {
             warn!(job_id, error = %err, "PMIx prepare release on cancel failed");

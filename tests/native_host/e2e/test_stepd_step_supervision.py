@@ -1,7 +1,10 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""A numbered step gets its own supervisor, and outlives the agent that made it."""
+"""A numbered step gets its own supervisor, and a job reclaims what it made."""
+
+import shlex
+import time
 
 from cluster import parse_job_id, wait_job, wait_job_state
 
@@ -50,3 +53,87 @@ class TestNumberedStepSupervision:
 
         cluster.scancel(str(job_id))
         wait_job(cluster, job_id, timeout=120)
+
+
+def _job_cgroups(cluster, job_id: int, node_index: int = 0) -> list[str]:
+    """This job's cgroups only. `/sys/fs/cgroup/spur` outlives any one cluster
+    and job ids restart at 1, so an earlier run's leftovers are not ours."""
+    node = cluster.nodes[node_index]
+    listing = node.exec_allow_fail(
+        f"ls -d /sys/fs/cgroup/spur/job_{job_id}_* 2>/dev/null || true"
+    )
+    return listing.split()
+
+
+def _clear_stale_cgroups(cluster, node_index: int = 0) -> None:
+    """`/sys/fs/cgroup/spur` is global while job ids restart at 1 per cluster,
+    so an earlier run's leftovers are indistinguishable from this job's."""
+    cluster.nodes[node_index].exec_allow_fail(
+        "sudo rmdir /sys/fs/cgroup/spur/job_*/step_* /sys/fs/cgroup/spur/job_* "
+        "2>/dev/null || true"
+    )
+
+
+class TestSupervisedJobReclaim:
+    # cgroup_cluster, not cluster: an unprivileged agent creates no cgroups, so
+    # these would compare two empty sets and pass whatever the code did.
+    def test_a_finished_job_leaves_no_cgroup(self, cgroup_cluster):
+        cluster = cgroup_cluster
+        _clear_stale_cgroups(cluster)
+        node = cluster.node_names[0]
+        script = cluster.write_file(
+            "reclaim.sh", "#!/bin/bash\nsleep 10\n", all_nodes=True
+        )
+        job_id = parse_job_id(cluster.sbatch(["-J", "reclaim", "-w", node, script]))
+        assert job_id is not None
+        wait_job_state(cluster, job_id, "R")
+
+        during = _job_cgroups(cluster, job_id)
+        assert during, "a rootful agent must place the job in a cgroup"
+
+        assert wait_job(cluster, job_id, timeout=120) == "CD"
+        # Teardown runs after the job reaches a terminal state, so poll for it.
+        deadline = time.time() + 60
+        remaining = _job_cgroups(cluster, job_id)
+        while remaining and time.time() < deadline:
+            time.sleep(2)
+            remaining = _job_cgroups(cluster, job_id)
+        assert remaining == [], f"job {job_id} left cgroups behind: {remaining}"
+
+    def test_an_allocation_leaves_no_cgroup(self, cgroup_cluster):
+        # An allocation never reaches the completion teardown — it holds no
+        # process to exit — so its cgroup was reclaimed by nothing.
+        cluster = cgroup_cluster
+        _clear_stale_cgroups(cluster)
+        node = cluster.node_names[0]
+        srun = " ".join(
+            [
+                f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)}",
+                "nohup",
+                shlex.quote(f"{cluster.bin_dir}/srun"),
+                "-J", "alloc-reclaim", "-w", node, "-n", "1", "sleep", "10",
+                ">/dev/null", "2>&1", "&", "echo", "$!",
+            ]
+        )
+        assert cluster.nodes[0].exec(srun).strip().isdigit()
+
+        # Identified while it still holds the allocation: a look-up afterwards
+        # finds nothing to wait on.
+        job_ids = []
+        deadline = time.time() + 60
+        while time.time() < deadline and not job_ids:
+            job_ids = cluster.running_job_ids_by_name("alloc-reclaim")
+            if not job_ids:
+                time.sleep(1)
+        assert job_ids, f"allocation never ran:\n{cluster.squeue_all()}"
+
+        during = _job_cgroups(cluster, job_ids[0])
+        assert during, "a rootful agent must place the allocation in a cgroup"
+
+        wait_job(cluster, job_ids[0], timeout=120)
+        deadline = time.time() + 60
+        remaining = _job_cgroups(cluster, job_ids[0])
+        while remaining and time.time() < deadline:
+            time.sleep(2)
+            remaining = _job_cgroups(cluster, job_ids[0])
+        assert remaining == [], f"the allocation left cgroups behind: {remaining}"
