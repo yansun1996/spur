@@ -1889,6 +1889,18 @@ fn step_runs_plainly(job_entry: &crate::job_entry::JobEntry, container_image: &s
     !joins_parent_namespaces && container_image.is_empty()
 }
 
+/// No output is replayed: a reconnecting caller tails the spool itself, from
+/// the offset it already reached.
+fn awaited_step_response(exit_code: i32, signal: i32) -> RunCommandResponse {
+    RunCommandResponse {
+        exit_code: spur_core::process::shell_exit_code(&step_exit_status(
+            crate::step_completion::StepOutcome { exit_code, signal },
+        )),
+        stdout: String::new(),
+        stderr: String::new(),
+    }
+}
+
 /// wait(2) encoding, so a caller comparing against a directly-reaped step's
 /// status sees the same shape.
 fn step_exit_status(outcome: crate::step_completion::StepOutcome) -> std::process::ExitStatus {
@@ -5564,6 +5576,47 @@ impl SlurmAgent for AgentService {
         }))
     }
 
+    async fn await_step(
+        &self,
+        request: Request<AwaitStepRequest>,
+    ) -> Result<Response<RunCommandResponse>, Status> {
+        let identity = Self::verified_identity(&request).cloned();
+        let req = request.into_inner();
+        self.check_job_access(req.job_id, identity.as_ref(), &req.user, "await a step of")
+            .await?;
+
+        let descriptor = self
+            .stepds
+            .lock()
+            .await
+            .get(&(req.job_id, req.step_id))
+            .cloned()
+            .ok_or_else(|| Status::not_found("this node is not running that step"))?;
+
+        // A supervisor that finished while nobody was listening recorded its exit
+        // durably; the rendezvous is in memory and does not survive a restart.
+        let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+        if let Ok(Some((exit_code, signal))) = durable_runtime_exit(&store, &descriptor) {
+            return Ok(Response::new(awaited_step_response(exit_code, signal)));
+        }
+
+        let waiter = self
+            .step_completions
+            .reregister(req.job_id, req.step_id)
+            .await
+            .ok_or_else(|| Status::already_exists("that step already has a caller awaiting it"))?;
+
+        match waiter.await {
+            Ok(outcome) => Ok(Response::new(awaited_step_response(
+                outcome.exit_code,
+                outcome.signal,
+            ))),
+            Err(_) => Err(Status::internal(
+                "the step's supervisor exited without reporting a status",
+            )),
+        }
+    }
+
     async fn stream_job_output(
         &self,
         request: Request<StreamJobOutputRequest>,
@@ -5583,6 +5636,7 @@ impl SlurmAgent for AgentService {
             let active_steps = self.active_steps.clone();
             let want_stderr = req.stream == "stderr";
             let step_id = req.step_id;
+            let start_offset = req.start_offset;
             let step_key = (job_id, step_id);
             let (tx, rx) = tokio::sync::mpsc::channel(32);
             tokio::spawn(async move {
@@ -5648,7 +5702,9 @@ impl SlurmAgent for AgentService {
                 // Tail incrementally: seek to the last offset and read only the
                 // newly appended bytes each poll, instead of re-reading the whole
                 // file (which is O(n^2) for high-volume steps).
-                let mut offset: u64 = 0;
+                // Resume where a reconnecting reader left off rather than
+                // repeating output it has already printed.
+                let mut offset: u64 = start_offset;
                 loop {
                     if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
                         let mut buf = Vec::new();
@@ -9730,6 +9786,7 @@ mod tests {
 
         let mut stream = svc
             .stream_job_output(Request::new(StreamJobOutputRequest {
+                start_offset: 0,
                 job_id,
                 step_id,
                 stream: "stdout".into(),
@@ -9774,6 +9831,102 @@ mod tests {
         assert_eq!(rest, b"part2\n");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn await_step_rejects_non_owner() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.insert_test_job(44, TrackedJob::dummy(std::process::id()))
+            .await;
+
+        let err = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 0,
+                user: "intruder".into(),
+            }))
+            .await
+            .expect_err("a non-owner must not await another user's step");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn await_step_reports_a_step_this_node_does_not_run() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        // The job runs here; only the step is unknown, so the lookup under test
+        // is reached rather than the job-access check in front of it.
+        svc.insert_test_job(44, TrackedJob::dummy(std::process::id()))
+            .await;
+
+        let err = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+            }))
+            .await
+            .expect_err("an unknown step must not park the caller forever");
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn await_step_returns_an_exit_recorded_while_nobody_was_listening() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.path().to_path_buf());
+        svc.insert_test_job(44, TrackedJob::dummy(std::process::id()))
+            .await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            44,
+            1,
+            3,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.socket_path = store.session_dir(44, 1, 3).join("runtime.sock");
+        store.publish(&descriptor).expect("publish descriptor");
+        store
+            .obligations(44, 1, 3)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 5,
+                signal: 0,
+            })
+            .expect("record the step's exit");
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+
+        let response = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+            }))
+            .await
+            .expect("a recorded exit must be returned, not parked on");
+
+        assert_eq!(response.into_inner().exit_code, 5);
     }
 
     #[tokio::test]

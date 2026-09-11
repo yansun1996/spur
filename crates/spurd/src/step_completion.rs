@@ -49,6 +49,25 @@ impl StepCompletions {
         sender.send(outcome).is_ok()
     }
 
+    /// Take over a step whose waiter is gone, for a client reconnecting after it
+    /// lost the call that launched it. Refuses while a waiter is still parked.
+    pub async fn reregister(
+        &self,
+        job_id: JobId,
+        step_id: StepId,
+    ) -> Option<oneshot::Receiver<StepOutcome>> {
+        let mut waiters = self.waiters.lock().await;
+        if waiters
+            .get(&(job_id, step_id))
+            .is_some_and(|parked| !parked.is_closed())
+        {
+            return None;
+        }
+        let (sender, receiver) = oneshot::channel();
+        waiters.insert((job_id, step_id), sender);
+        Some(receiver)
+    }
+
     pub async fn deregister(&self, job_id: JobId, step_id: StepId) {
         self.waiters.lock().await.remove(&(job_id, step_id));
     }
@@ -130,5 +149,40 @@ mod tests {
             "a dropped receiver must not read as a delivered outcome"
         );
         assert_eq!(completions.parked().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_reconnecting_client_takes_over_an_abandoned_slot() {
+        let completions = StepCompletions::new();
+        drop(completions.register(42, 0).await);
+
+        let mut resumed = completions
+            .reregister(42, 0)
+            .await
+            .expect("an abandoned slot is available");
+
+        assert!(completions.complete(42, 0, OUTCOME).await);
+        assert_eq!(resumed.try_recv().expect("outcome delivered"), OUTCOME);
+    }
+
+    #[tokio::test]
+    async fn reregistering_never_displaces_a_live_waiter() {
+        let completions = StepCompletions::new();
+        let mut original = completions.register(42, 0).await;
+
+        assert!(
+            completions.reregister(42, 0).await.is_none(),
+            "a parked waiter must keep its slot"
+        );
+
+        assert!(completions.complete(42, 0, OUTCOME).await);
+        assert_eq!(original.try_recv().expect("outcome delivered"), OUTCOME);
+    }
+
+    #[tokio::test]
+    async fn a_step_nobody_ever_awaited_can_be_registered_by_a_reconnect() {
+        let completions = StepCompletions::new();
+
+        assert!(completions.reregister(42, 0).await.is_some());
     }
 }

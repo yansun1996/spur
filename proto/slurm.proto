@@ -489,6 +489,9 @@ service SlurmAgent {
   rpc CancelStep(CancelStepRequest) returns (google.protobuf.Empty);
   // Record an allocation on this node without launching a batch process.
   rpc RegisterJobAllocation(RegisterJobAllocationRequest) returns (RegisterJobAllocationResponse);
+  // Re-park on a step this agent is already running, after a client lost its
+  // RunCommand call (e.g. the agent restarted under a supervised step).
+  rpc AwaitStep(AwaitStepRequest) returns (RunCommandResponse);
   rpc StreamJobOutput(StreamJobOutputRequest) returns (stream StreamJobOutputChunk);
   // PTY-backed interactive session (srun --pty, sattach, srun --overlap --pty)
   rpc InteractiveSession(stream InteractiveInput) returns (stream InteractiveOutput);
@@ -1331,11 +1334,18 @@ message CancelStepRequest {
   int32 signal = 3;  // 0 = SIGTERM, 9 = SIGKILL, etc.
 }
 
+message AwaitStepRequest {
+  uint32 job_id = 1;
+  uint32 step_id = 2;
+  string user = 3;
+}
+
 message StreamJobOutputRequest {
   uint32 job_id = 1;
   string stream = 2;  // "stdout" or "stderr"
   string user = 3;    // Requesting user; verified identity must own the job; the controller/admin credential overrides
   uint32 step_id = 4; // 0 = the batch job's own output; >0 = tail that step's per-step spool file
+  uint64 start_offset = 5; // Resume a reconnecting reader without repeating what it already printed
 }
 
 message StreamJobOutputChunk {
