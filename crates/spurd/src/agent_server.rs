@@ -1889,8 +1889,8 @@ fn step_runs_plainly(job_entry: &crate::job_entry::JobEntry, container_image: &s
     !joins_parent_namespaces && container_image.is_empty()
 }
 
-/// No output is replayed: a reconnecting caller tails the spool itself, from
-/// the offset it already reached.
+/// Status only. The step's spool is purged by its own teardown, so output that
+/// arrived while nobody was listening is not recoverable here.
 fn awaited_step_response(exit_code: i32, signal: i32) -> RunCommandResponse {
     RunCommandResponse {
         exit_code: spur_core::process::shell_exit_code(&step_exit_status(
