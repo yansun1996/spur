@@ -1198,10 +1198,12 @@ async fn serve_pty_custody(listener: UnixListener) {
                 CUSTODY_DEPOSIT => match fds.into_iter().next() {
                     Some(master) => {
                         custody.insert(session_id, master);
+                        tracing::debug!(session_id, held = custody.len(), "pty custody: deposited");
                     }
                     None => tracing::warn!(session_id, "pty custody deposit carried no descriptor"),
                 },
                 CUSTODY_RECLAIM_ANY => {
+                    tracing::debug!(held = custody.len(), "pty custody: reclaim-any");
                     let claimed = custody.iter().next().map(|(id, fd)| (*id, fd.as_raw_fd()));
                     let (reply, id, fds) = match claimed {
                         Some((id, raw_fd)) => (CUSTODY_FOUND, id, vec![raw_fd]),
