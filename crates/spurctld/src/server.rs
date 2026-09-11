@@ -206,6 +206,53 @@ impl LeaderProxy {
 /// `serve` into `ControllerService::jwt_key`; deliberately not re-read on
 /// `reconfigure` (see the field doc). Falls back to a shared default so
 /// key-less dev clusters interoperate.
+const STEP_REAWAIT_ATTEMPTS: u32 = 30;
+const STEP_REAWAIT_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// tonic surfaces a dropped connection as Unknown/"transport error" rather than
+/// Unavailable, so both count as losing the agent rather than losing the step.
+fn is_agent_connection_loss(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::Unknown
+    )
+}
+
+/// A supervised step outlives the agent that launched it, so a lost call is not
+/// a lost step: reconnect and re-park instead of failing work still running.
+async fn reawait_step(
+    agent_addr: &str,
+    job_id: u32,
+    step_id: u32,
+    user: &str,
+) -> Result<spur_proto::RunCommandResponse, Status> {
+    for attempt in 0..STEP_REAWAIT_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(STEP_REAWAIT_BACKOFF).await;
+        }
+        let Ok(mut agent) = crate::agent_client::connect(agent_addr.to_string()).await else {
+            continue;
+        };
+        let awaited = agent
+            .await_step(spur_proto::AwaitStepRequest {
+                job_id,
+                step_id,
+                user: user.to_string(),
+            })
+            .await;
+        match awaited {
+            Ok(response) => return Ok(response.into_inner()),
+            // The agent is back and does not have the step: it is genuinely
+            // gone, so waiting longer cannot recover it.
+            Err(status) if status.code() == tonic::Code::NotFound => return Err(status),
+            Err(_) => continue,
+        }
+    }
+    Err(Status::unavailable(
+        "lost contact with the step's agent and could not re-attach",
+    ))
+}
+
 /// The credential the controller presents to agents. Unlike the admission key
 /// this has no fallback: an unset key must present nothing, not a guessable one.
 pub(crate) fn agent_signing_key(config: &spur_core::config::SlurmConfig) -> anyhow::Result<String> {
@@ -3383,6 +3430,7 @@ impl SlurmController for ControllerService {
             let step_mpi = mpi.clone();
             let container = step_container.clone();
             let step_nodelist = step_nodelist.clone();
+            let step_user = job.spec.user.clone();
             set.spawn(async move {
                 let mut agent = crate::agent_client::connect(agent_addr.clone())
                     .await
@@ -3392,7 +3440,7 @@ impl SlurmController for ControllerService {
                     .max_decoding_message_size(spur_proto::MAX_GRPC_MESSAGE_SIZE)
                     .max_encoding_message_size(spur_proto::MAX_GRPC_REQUEST_SIZE);
 
-                let agent_resp = agent
+                let launched = agent
                     .run_command(RunCommandRequest {
                         command: command.clone(),
                         uid,
@@ -3411,11 +3459,27 @@ impl SlurmController for ControllerService {
                         container,
                         nodelist: step_nodelist.clone(),
                     })
-                    .await
-                    .map_err(|e| {
-                        Status::internal(format!("run_command on {} failed: {}", node_name, e))
-                    })?
-                    .into_inner();
+                    .await;
+
+                let agent_resp = match launched {
+                    Ok(response) => response.into_inner(),
+                    Err(error) if is_agent_connection_loss(&error) => {
+                        warn!(
+                            job_id,
+                            step_id,
+                            node = %node_name,
+                            %error,
+                            "lost the step's agent mid-run; re-attaching"
+                        );
+                        reawait_step(&agent_addr, job_id, step_id, &step_user).await?
+                    }
+                    Err(error) => {
+                        return Err(Status::internal(format!(
+                            "run_command on {} failed: {}",
+                            node_name, error
+                        )))
+                    }
+                };
 
                 Ok::<_, Status>((node_name, agent_resp))
             });
@@ -5196,6 +5260,26 @@ fn validate_completion_report_state_for_rpc(
 mod tests {
 
     #[test]
+    fn a_dropped_agent_connection_is_worth_re_attaching_to() {
+        // tonic reports a dropped connection as Unknown, not Unavailable.
+        assert!(is_agent_connection_loss(&Status::unknown(
+            "transport error"
+        )));
+        assert!(is_agent_connection_loss(&Status::unavailable("no route")));
+    }
+
+    #[test]
+    fn a_step_that_genuinely_failed_is_not_re_attached_to() {
+        assert!(!is_agent_connection_loss(&Status::internal("step blew up")));
+        assert!(!is_agent_connection_loss(&Status::not_found(
+            "no such step"
+        )));
+        assert!(!is_agent_connection_loss(&Status::permission_denied(
+            "nope"
+        )));
+    }
+
+    #[test]
     fn an_unset_key_presents_no_credential_to_agents() {
         let config = spur_core::config::SlurmConfig::load_from_str("cluster_name = \"t\"\n")
             .expect("config with no auth key");
@@ -6446,6 +6530,12 @@ mod tests {
             &self,
             _request: Request<spur_proto::proto::LaunchJobRequest>,
         ) -> Result<Response<spur_proto::proto::LaunchJobResponse>, Status> {
+            Err(Status::unimplemented("not used in tests"))
+        }
+        async fn await_step(
+            &self,
+            _request: Request<spur_proto::proto::AwaitStepRequest>,
+        ) -> Result<Response<spur_proto::proto::RunCommandResponse>, Status> {
             Err(Status::unimplemented("not used in tests"))
         }
         async fn prepare_pmix(

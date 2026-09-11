@@ -148,6 +148,17 @@ impl SlurmAgent for VirtualAgent {
     type InteractiveSessionStream =
         tokio_stream::wrappers::ReceiverStream<Result<InteractiveOutput, Status>>;
 
+    /// Steps here run as pods the kubelet owns, so there is no supervisor
+    /// session for a lost caller to re-park on.
+    async fn await_step(
+        &self,
+        _request: Request<spur_proto::proto::AwaitStepRequest>,
+    ) -> Result<Response<spur_proto::proto::RunCommandResponse>, Status> {
+        Err(Status::unimplemented(
+            "a virtual agent does not supervise steps",
+        ))
+    }
+
     async fn launch_job(
         &self,
         request: Request<LaunchJobRequest>,

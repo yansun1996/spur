@@ -3124,6 +3124,14 @@ mod tests {
             type InteractiveSessionStream =
                 tonic::codegen::BoxStream<spur_proto::proto::InteractiveOutput>;
 
+            async fn await_step(
+                &self,
+                _request: tonic::Request<spur_proto::proto::AwaitStepRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::RunCommandResponse>, tonic::Status>
+            {
+                Err(tonic::Status::unimplemented("not used in tests"))
+            }
+
             async fn launch_job(
                 &self,
                 request: tonic::Request<spur_proto::proto::LaunchJobRequest>,
