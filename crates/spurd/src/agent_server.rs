@@ -1889,16 +1889,30 @@ fn step_runs_plainly(job_entry: &crate::job_entry::JobEntry, container_image: &s
     !joins_parent_namespaces && container_image.is_empty()
 }
 
-/// Status only. The step's spool is purged by its own teardown, so output that
-/// arrived while nobody was listening is not recoverable here.
-fn awaited_step_response(exit_code: i32, signal: i32) -> RunCommandResponse {
+/// The same shape RunCommand would have returned, output included: a user
+/// step's spool outlives its teardown precisely so this read-back can happen.
+async fn awaited_step_response(
+    job_id: u32,
+    step_id: u32,
+    exit_code: i32,
+    signal: i32,
+) -> RunCommandResponse {
     RunCommandResponse {
         exit_code: spur_core::process::shell_exit_code(&step_exit_status(
             crate::step_completion::StepOutcome { exit_code, signal },
         )),
-        stdout: String::new(),
-        stderr: String::new(),
+        stdout: read_back_step_output(job_id, step_id, false).await,
+        stderr: read_back_step_output(job_id, step_id, true).await,
     }
+}
+
+async fn read_back_step_output(job_id: u32, step_id: u32, stderr: bool) -> String {
+    for path in crate::executor::step_output_path_candidates(job_id, step_id, stderr) {
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
+    }
+    String::new()
 }
 
 /// wait(2) encoding, so a caller comparing against a directly-reaped step's
@@ -5597,7 +5611,9 @@ impl SlurmAgent for AgentService {
         // durably; the rendezvous is in memory and does not survive a restart.
         let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
         if let Ok(Some((exit_code, signal))) = durable_runtime_exit(&store, &descriptor) {
-            return Ok(Response::new(awaited_step_response(exit_code, signal)));
+            return Ok(Response::new(
+                awaited_step_response(req.job_id, req.step_id, exit_code, signal).await,
+            ));
         }
 
         let waiter = self
@@ -5607,10 +5623,10 @@ impl SlurmAgent for AgentService {
             .ok_or_else(|| Status::already_exists("that step already has a caller awaiting it"))?;
 
         match waiter.await {
-            Ok(outcome) => Ok(Response::new(awaited_step_response(
-                outcome.exit_code,
-                outcome.signal,
-            ))),
+            Ok(outcome) => Ok(Response::new(
+                awaited_step_response(req.job_id, req.step_id, outcome.exit_code, outcome.signal)
+                    .await,
+            )),
             Err(_) => Err(Status::internal(
                 "the step's supervisor exited without reporting a status",
             )),
