@@ -3642,8 +3642,8 @@ impl SlurmAgent for AgentService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
-        // Opt-in until steps, exec and attach are served by the supervisor.
-        // Direct-launch PMIx and pty launches stay on the legacy path either way.
+        // A pty's terminal is the agent's to own. Direct-launch PMIx is here
+        // because its ranks cannot reach the server once supervised, not yet why.
         let is_direct_pmix_batch =
             spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script);
         let stepd_enabled = !is_direct_pmix_batch && !spec.pty;
