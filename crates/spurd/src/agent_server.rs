@@ -5301,11 +5301,17 @@ impl SlurmAgent for AgentService {
             None
         };
 
-        // Three dispatch paths, each wiring the step's stdio to the spool files
-        // above. `None` means the step was cancelled before it ran.
-        let maybe_status: Option<std::process::ExitStatus> = if job_entry.has_namespaces()
-            && job_entry.pid > 0
+        // Dispatch paths, each wiring the step's stdio to the spool files above.
+        // `None` means the step was cancelled before it ran.
+        let maybe_status: Option<std::process::ExitStatus> = if let Some(step_cfg) =
+            supervised_step_cfg.take()
         {
+            // Supervised: the step gets its own spurstepd and outlives a restart
+            // of this agent. Its script enters the parent's namespaces, if any,
+            // so the supervisor itself stays outside them.
+            self.run_supervised_step_to_spool(&step_cfg, step_files, step_key)
+                .await?
+        } else if job_entry.has_namespaces() && job_entry.pid > 0 {
             // Case 1: parent job is containerized — enter its namespaces via nsenter
             // (srun inside sbatch/salloc --container-image).
             //
@@ -5533,11 +5539,6 @@ impl SlurmAgent for AgentService {
                 rootfs_guard.pid = Some(child_pid);
             }
             maybe_status
-        } else if let Some(step_cfg) = supervised_step_cfg.take() {
-            // Case 3a: no container and supervision is on — the step gets its
-            // own spurstepd, so it outlives a restart of this agent.
-            self.run_supervised_step_to_spool(&step_cfg, step_files, step_key)
-                .await?
         } else {
             // Case 3: no container — plain host process. Route through the same
             // launch plan as the other arms so the child joins the job cgroup.

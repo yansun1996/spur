@@ -795,11 +795,9 @@ async fn spawn_job_process(
     // Must set supplementary groups (video, render) so the process can
     // access GPU device nodes.
     //
-    // Issue #128: when use_namespaces is true, the wrapper handles the priv
-    // drop *after* unshare runs (via setpriv). Dropping priv here would cause
-    // unshare(2) to fail with EPERM since the unprivileged user lacks
-    // CAP_SYS_ADMIN.
-    if !use_namespaces {
+    // Both namespace shapes drop privilege themselves via setpriv, after the
+    // unshare or nsenter that needs CAP_SYS_ADMIN; dropping here fails those.
+    if !use_namespaces && !cfg.joins_parent_namespaces {
         if let Some(pd) = crate::privdrop::PrivDrop::resolve_if_needed(uid, gid) {
             unsafe {
                 cmd.pre_exec(move || {
