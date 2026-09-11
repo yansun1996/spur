@@ -115,10 +115,16 @@ The two daemons are configured with command-line flags. The most common are belo
 
 .. note::
 
-   Every job runs under a per-job supervisor, so batch, container and
-   allocation jobs keep running across an ``spurd`` restart or upgrade. Direct
-   ``--mpi=pmix`` batch jobs (no inner ``srun``) are the one exception: they
-   still launch unsupervised and do **not** survive a restart.
+   Work runs under a supervisor — one per job, plus one per numbered ``srun``
+   step — so batch, container, allocation and MPI jobs and the steps inside
+   them keep running across an ``spurd`` restart or upgrade. A step's exit
+   status is reported over the reconnect, so a job whose agent restarted
+   mid-step still completes with the right exit code.
+
+   Two launches are still unsupervised and do **not** survive a restart: a step
+   given its own ``--container-image``, and an ``srun --pty`` that allocates its
+   own job. A terminal opened *inside* an existing allocation is supervised —
+   see :doc:`../user-guide/interactive`.
 
    Setting ``[auth] jwt_key`` (or ``jwt_key_file``) to the same value on the
    controller and every agent lets the controller verify a supervisor an agent

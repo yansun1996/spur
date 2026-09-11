@@ -254,6 +254,15 @@ Follow this order for any cluster upgrade:
    supported recovery from a bad upgrade is to roll forward, not to reinstall the
    previous version over a log the new one has already written.
 
+.. note::
+
+   Restarting ``spurd`` does not kill the work on that node: jobs, ``srun``
+   steps and held allocations run under supervisors that outlive the agent, and
+   the restarted agent re-adopts them. Draining first is still the recommended
+   order — it keeps new work off a node mid-swap — but it is no longer what
+   protects running jobs from the restart itself. See :doc:`native-host` for
+   the two launches that remain unsupervised.
+
 Behavior Changes Between Releases
 ---------------------------------
 

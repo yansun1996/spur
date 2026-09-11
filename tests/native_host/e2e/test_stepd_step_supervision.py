@@ -29,30 +29,93 @@ def _step_ids(sessions: list[str], job_id: int) -> set[int]:
     return ids
 
 
+def _supervisor_pids(cluster, node_index: int = 0) -> set[str]:
+    node = cluster.nodes[node_index]
+    return set(node.exec_allow_fail("pgrep -x spurstepd || true").split())
+
+
+def _wait_for_numbered_step(cluster, job_id: int, timeout: int = 90) -> set[int]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        numbered = {
+            step
+            for step in _step_ids(_sessions(cluster), job_id)
+            if step < RESERVED_STEP_MIN
+        }
+        if numbered:
+            return numbered
+        time.sleep(2)
+    return set()
+
+
 class TestNumberedStepSupervision:
     def test_a_numbered_step_gets_its_own_supervisor(self, cluster):
-        # The step's supervisor is what lets it outlive the agent; before this
-        # the step ran as the agent's child and only the job had one.
+        # The step's own supervisor is what lets it outlive the agent; before
+        # this a step ran as the agent's child and only the job had one.
         node = cluster.node_names[0]
         script = cluster.write_file(
             "step-sup.sh",
-            "#!/bin/bash\nsleep 30\n",
+            "#!/bin/bash\nsrun sleep 30\n",
             all_nodes=True,
         )
-        job_id = parse_job_id(
-            cluster.sbatch(["-J", "step-sup", "-w", node, script])
-        )
+        job_id = parse_job_id(cluster.sbatch(["-J", "step-sup", "-w", node, script]))
         assert job_id is not None
         wait_job_state(cluster, job_id, "R")
 
-        owning = _step_ids(_sessions(cluster), job_id)
-        assert owning, f"job {job_id} has no session"
-        assert all(step >= RESERVED_STEP_MIN for step in owning), (
-            f"a batch job's own step is reserved, got {owning}"
+        numbered = _wait_for_numbered_step(cluster, job_id)
+        assert numbered, (
+            f"job {job_id} never got a supervisor for its numbered step; "
+            f"sessions were {_sessions(cluster)}"
+        )
+        assert _step_ids(_sessions(cluster), job_id) - numbered, (
+            "the batch step keeps its own supervisor beside the numbered one"
         )
 
         cluster.scancel(str(job_id))
         wait_job(cluster, job_id, timeout=120)
+
+    def test_a_numbered_step_survives_an_agent_restart(self, cluster):
+        # The point of supervising steps: restarting the agent to upgrade it
+        # must not kill the step, and its exit status must still arrive.
+        node = cluster.node_names[0]
+        out_path = f"{cluster.remote_dir}/step-survive.out"
+        script = cluster.write_file(
+            "step-survive.sh",
+            "#!/bin/bash\nsrun bash -c 'sleep 40; echo STEP-FINISHED'\n"
+            "echo \"step-rc=$?\"\n",
+            all_nodes=True,
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(
+                ["-J", "step-survive", "-w", node, "-o", out_path, script]
+            )
+        )
+        assert job_id is not None
+        wait_job_state(cluster, job_id, "R")
+        assert _wait_for_numbered_step(cluster, job_id), (
+            f"the step never got a supervisor; sessions: {_sessions(cluster)}"
+        )
+        # Identity, not count: a supervisor killed with the agent and respawned
+        # afterwards would satisfy any "still one running" check.
+        before = _supervisor_pids(cluster)
+
+        cluster.restart_agent(0)
+
+        assert before <= _supervisor_pids(cluster), (
+            "the step's supervisor must outlive the agent that spawned it: "
+            f"{sorted(before)} before, {sorted(_supervisor_pids(cluster))} after"
+        )
+
+        assert wait_job(cluster, job_id, timeout=180) == "CD"
+        content = cluster.read_output_on_any_node(out_path)
+        assert "STEP-FINISHED" in content, (
+            f"the step did not run to completion:\n{content}"
+        )
+        # The agent reconnects to a step it no longer parented, so the status
+        # has to come back over that reconnect rather than from a child wait.
+        assert "step-rc=0" in content, (
+            f"the step's exit status was lost across the restart:\n{content}"
+        )
 
 
 def _job_cgroups(cluster, job_id: int, node_index: int = 0) -> list[str]:
