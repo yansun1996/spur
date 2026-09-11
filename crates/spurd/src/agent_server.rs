@@ -1121,6 +1121,7 @@ pub(crate) fn monitor_recovered_stepds(
 /// hold the RPC open.
 const STEPD_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+const REPARENTED_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 const WORKLOAD_PID_POLLS: u32 = 40;
 const WORKLOAD_PID_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
@@ -1916,6 +1917,16 @@ struct LaunchNamespaces {
     mount: bool,
 }
 
+/// A resumed terminal's shell was reparented to init when its old agent died,
+/// so there is no child handle to wait on; watch the pid instead.
+async fn wait_for_reparented_exit(pid: i32) -> i32 {
+    let path = std::path::PathBuf::from(format!("/proc/{pid}"));
+    while path.exists() {
+        tokio::time::sleep(REPARENTED_EXIT_POLL).await;
+    }
+    0
+}
+
 /// A step that builds its own container keeps the agent in its exec path, so it
 /// cannot be handed to a supervisor. Entering a parent job's namespaces can.
 fn step_can_be_supervised(container_image: &str) -> bool {
@@ -2397,6 +2408,9 @@ pub struct AgentService {
     active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     /// Where a supervised step's launching RPC parks for its exit status.
     step_completions: crate::step_completion::StepCompletions,
+    /// Jobs this agent is currently bridging a terminal for. A job absent here
+    /// with a terminal in custody has been orphaned by a restart.
+    live_ptys: Arc<Mutex<std::collections::HashSet<u32>>>,
     /// Serializes setup against teardown for a job id, which a re-dispatch reuses.
     lifecycle: crate::job_lifecycle::JobLifecycle,
     stepds: Arc<Mutex<StepdMap>>,
@@ -2527,6 +2541,7 @@ impl AgentService {
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
             step_completions: crate::step_completion::StepCompletions::new(),
+            live_ptys: Arc::new(Mutex::new(std::collections::HashSet::new())),
             lifecycle: crate::job_lifecycle::JobLifecycle::default(),
             stepds: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
@@ -6039,63 +6054,100 @@ impl SlurmAgent for AgentService {
             );
         }
 
-        // Case 1 (nsenter, parent has namespaces) and Case 3 (host): the existing
-        // path spawns via a tokio Child.
-        let (master_fd, mut child, child_pid) = Self::spawn_pty_in_job(
-            &entry,
-            &argv,
-            init.job_id,
-            winsize.as_ref(),
-            self.cgroup.required,
-        )?;
-
-        // Deposited with the supervisor, which outlives this agent: without a
-        // second holder the master closes when the agent does and the terminal
-        // hangs up under the user.
-        // The job's own supervisor, not whichever happens to be first: a step's
-        // supervisor can exit while the terminal is still open.
-        let job_supervisor = stepds_for_job(&*self.stepds.lock().await, init.job_id)
+        // The supervisor that outlives this agent, so a terminal it is holding
+        // can be found again after a restart.
+        let custody_dir = stepds_for_job(&*self.stepds.lock().await, init.job_id)
             .into_iter()
-            .find(|descriptor| !spur_core::step::is_user_step(descriptor.step_id));
-        if let Some(session_dir) = job_supervisor
-            .as_ref()
-            .and_then(|descriptor| descriptor.socket_path.parent())
-        {
-            // Keyed by the shell's own pid: a job can hold several terminals.
-            if let Err(error) = crate::stepd::deposit_pty_master(
-                session_dir,
-                child_pid as u32,
-                std::os::fd::AsFd::as_fd(&master_fd),
-            )
-            .await
-            {
-                warn!(job_id = init.job_id, child_pid, %error, "pty master custody failed");
+            .find(|descriptor| !spur_core::step::is_user_step(descriptor.step_id))
+            .and_then(|descriptor| descriptor.socket_path.parent().map(|dir| dir.to_path_buf()));
+
+        // Resume rather than open a new one: a terminal held for a job this
+        // agent is not already bridging was orphaned when its agent went away,
+        // and its user wants it back.
+        let already_bridging = self.live_ptys.lock().await.contains(&init.job_id);
+        let reclaimed = match custody_dir.as_deref() {
+            Some(dir) if !already_bridging => match crate::stepd::reclaim_orphaned_pty(dir).await {
+                Ok(found) => found,
+                Err(error) => {
+                    warn!(job_id = init.job_id, %error, "could not look for an orphaned terminal");
+                    None
+                }
+            },
+            _ => {
+                if custody_dir.is_none() {
+                    warn!(
+                        job_id = init.job_id,
+                        "no supervisor to hold this terminal; it will not survive a restart"
+                    );
+                }
+                None
             }
-        }
-
-        info!(
-            job_id = init.job_id,
-            child_pid,
-            overlap = init.overlap,
-            "interactive session started"
-        );
-
-        let wait_exit = async move {
-            child
-                .wait()
-                .await
-                .ok()
-                .and_then(|s| s.code())
-                .unwrap_or(128)
         };
-        tokio::spawn(Self::run_pty_bridge(
-            master_fd,
-            wait_exit,
-            child_pid,
-            interactive,
-            inbound,
-            tx,
-        ));
+
+        type ExitFuture = std::pin::Pin<Box<dyn std::future::Future<Output = i32> + Send>>;
+        let (master_fd, wait_exit, child_pid): (std::os::fd::OwnedFd, ExitFuture, i32) =
+            match reclaimed {
+                Some((session_id, master)) => {
+                    let pid = session_id as i32;
+                    info!(job_id = init.job_id, pid, "resumed an orphaned terminal");
+                    (master, Box::pin(wait_for_reparented_exit(pid)), pid)
+                }
+                None => {
+                    let (master, mut child, pid) = Self::spawn_pty_in_job(
+                        &entry,
+                        &argv,
+                        init.job_id,
+                        winsize.as_ref(),
+                        self.cgroup.required,
+                    )?;
+                    // Deposited with the supervisor, which outlives this agent:
+                    // without a second holder the master closes when the agent
+                    // does and the terminal hangs up under the user.
+                    if let Some(dir) = custody_dir.as_deref() {
+                        if let Err(error) = crate::stepd::deposit_pty_master(
+                            dir,
+                            pid as u32,
+                            std::os::fd::AsFd::as_fd(&master),
+                        )
+                        .await
+                        {
+                            warn!(job_id = init.job_id, pid, %error, "pty master custody failed");
+                        }
+                    }
+                    info!(
+                        job_id = init.job_id,
+                        child_pid = pid,
+                        overlap = init.overlap,
+                        "interactive session started"
+                    );
+                    let exit = async move {
+                        child
+                            .wait()
+                            .await
+                            .ok()
+                            .and_then(|s| s.code())
+                            .unwrap_or(128)
+                    };
+                    (master, Box::pin(exit), pid)
+                }
+            };
+
+        self.live_ptys.lock().await.insert(init.job_id);
+        let live_ptys = self.live_ptys.clone();
+        let job_id = init.job_id;
+        let bridge =
+            Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx);
+        tokio::spawn(async move {
+            bridge.await;
+            live_ptys.lock().await.remove(&job_id);
+            // The terminal is gone; stop holding its descriptor or it leaks for
+            // as long as the job runs.
+            if let Some(dir) = custody_dir.as_deref() {
+                if let Err(error) = crate::stepd::release_pty_master(dir, child_pid as u32).await {
+                    warn!(job_id, child_pid, %error, "failed to release a closed terminal");
+                }
+            }
+        });
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
