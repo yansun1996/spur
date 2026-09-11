@@ -7797,7 +7797,9 @@ mod tests {
     #[tokio::test]
     async fn fence_displaced_stepd_reaps_its_cgroup() {
         let sessions = Arc::new(Mutex::new(HashMap::new()));
-        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        // Named as the real thing: cleanup refuses a path that is not ours.
+        let cgroup = TestCgroup::new(&cgroup_root);
         let blocker = cgroup.path().join("cgroup.kill");
         std::fs::create_dir(&blocker).expect("seed cgroup.kill blocker");
         let blocker_removed = blocker.clone();
@@ -7841,7 +7843,9 @@ mod tests {
     // supervisor exiting says nothing about whether its job's cgroup is empty.
     #[tokio::test]
     async fn runtime_teardown_confirmed_requires_the_cgroup_even_when_stop_succeeded() {
-        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        // Named as the real thing: cleanup refuses a path that is not ours.
+        let cgroup = TestCgroup::new(&cgroup_root);
         // A leftover file fails rmdir the way a busy cgroup does. It must not be a
         // directory: reaping clears child cgroups, so a dir would be removed.
         std::fs::write(cgroup.path().join("cgroup.procs"), "not-a-pid\n")
@@ -8089,7 +8093,9 @@ mod tests {
             stepds: sessions.clone(),
         };
         let state = tempfile::tempdir().expect("runtime state directory");
-        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        // Named as the real thing: cleanup refuses a path that is not ours.
+        let cgroup = TestCgroup::new(&cgroup_root);
         // A plain tempdir can't model real cgroupfs, where writing to the
         // kernel-provided "cgroup.kill" never leaves a stray directory
         // entry. A directory at that path makes the write fail cleanly
@@ -8538,7 +8544,9 @@ mod tests {
     async fn liveness_watchdog_cleans_up_the_orphaned_cgroup() {
         let state = tempfile::tempdir().expect("runtime state directory");
         let store = crate::stepd::StepdStore::new(state.path());
-        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        // Named as the real thing: cleanup refuses a path that is not ours.
+        let cgroup = TestCgroup::new(&cgroup_root);
         let pid = std::process::id();
         let mut descriptor = crate::stepd::StepdDescriptor::new(
             42,
@@ -8635,6 +8643,25 @@ mod tests {
             hostname: "test-node".into(),
         };
         (context, running, sessions, state_dir, completions)
+    }
+
+    /// A tempdir-backed cgroup with a realistic `job_<id>_<attempt>` name, so
+    /// reaping it exercises the same path a real one would.
+    struct TestCgroup {
+        _root: (),
+        path: std::path::PathBuf,
+    }
+
+    impl TestCgroup {
+        fn new(root: &tempfile::TempDir) -> Self {
+            let path = root.path().join("job_42_1");
+            std::fs::create_dir(&path).expect("job cgroup");
+            Self { _root: (), path }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
     }
 
     fn plain_job_entry() -> crate::job_entry::JobEntry {

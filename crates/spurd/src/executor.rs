@@ -1407,7 +1407,25 @@ fn classify_cgroup_claim_failure(
 }
 
 /// Kill any leftover processes in the job's cgroup and remove the directory.
+/// Every cgroup this agent creates is `job_<id>_<attempt>` or a `step_<id>` leaf
+/// beneath one. A path that is neither was derived wrongly — walking up from a
+/// job node reaches the shared root — and reaping it would destroy a directory
+/// that is not ours.
+fn is_own_cgroup(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("job_") || name.starts_with("step_"))
+}
+
 pub fn cleanup_cgroup(cgroup_path: &Path) {
+    if !is_own_cgroup(cgroup_path) {
+        warn!(
+            path = %cgroup_path.display(),
+            "refusing to reap a cgroup that is not a job or step of ours"
+        );
+        return;
+    }
+
     // Steps live in leaves under the job, and rmdir only works bottom-up, so
     // reaping a job has to clear its steps first.
     if let Ok(entries) = std::fs::read_dir(cgroup_path) {
@@ -2610,9 +2628,43 @@ mod tests {
         assert!(cgroup_signal(missing, Signal::SIGTERM).is_err());
     }
 
+    #[test]
+    fn a_job_or_step_cgroup_is_ours_to_reap() {
+        assert!(is_own_cgroup(Path::new("/sys/fs/cgroup/spur/job_7_1")));
+        assert!(is_own_cgroup(Path::new(
+            "/sys/fs/cgroup/spur/job_7_1/step_0"
+        )));
+    }
+
+    #[test]
+    fn the_shared_root_is_never_reapable() {
+        // Walking up from a job node lands here; reaping it would take out
+        // every other job on the node.
+        assert!(!is_own_cgroup(Path::new("/sys/fs/cgroup/spur")));
+        assert!(!is_own_cgroup(Path::new("/sys/fs/cgroup")));
+        assert!(!is_own_cgroup(Path::new("/")));
+    }
+
+    #[test]
+    fn a_path_we_did_not_name_is_not_reapable() {
+        assert!(!is_own_cgroup(Path::new("/sys/fs/cgroup/system.slice")));
+        assert!(!is_own_cgroup(Path::new("/tmp/.tmpAbC123")));
+    }
+
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
     #[tokio::test]
     async fn cleanup_cgroup_retries_past_a_transient_removal_failure() {
-        let cgroup = tempfile::tempdir().expect("cgroup directory");
+        let root = tempfile::tempdir().expect("cgroup root");
+        // Named as the real thing: cleanup refuses a path that is not ours.
+        let cgroup = root.path().join("job_7_1");
+        std::fs::create_dir(&cgroup).expect("job cgroup");
+        let cgroup = TestDir(cgroup);
         // A directory (not a plain file) at the cgroup.kill path makes the
         // write fail, so cleanup_cgroup falls back to the per-pid sweep and
         // this blocker is the only thing standing in remove_dir's way.
