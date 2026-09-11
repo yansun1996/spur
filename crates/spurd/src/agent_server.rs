@@ -216,6 +216,11 @@ async fn launch_stepd(
     descriptor.has_pid_namespace = namespaces.pid;
     descriptor.has_user_namespace = namespaces.user;
     descriptor.has_mount_namespace = namespaces.mount;
+    // Also on the spec: the supervisor republishes the descriptor from it, and
+    // would otherwise overwrite these with defaults it cannot derive.
+    launch_spec.has_pid_namespace = namespaces.pid;
+    launch_spec.has_user_namespace = namespaces.user;
+    launch_spec.has_mount_namespace = namespaces.mount;
     let launch_path = session_dir.join("launch.json");
     let launch_json = serde_json::to_vec(&launch_spec)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;

@@ -70,6 +70,14 @@ pub struct StepdLaunchSpec {
     pub pmix_multi_task: bool,
     #[serde(default)]
     pub joins_parent_namespaces: bool,
+    /// What the launch unshares. The supervisor cannot derive this — it is the
+    /// agent's decision — and an adopted job needs it to place exec and attach.
+    #[serde(default)]
+    pub has_pid_namespace: bool,
+    #[serde(default)]
+    pub has_user_namespace: bool,
+    #[serde(default)]
+    pub has_mount_namespace: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +148,9 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             allocation_only: false,
             pmix_multi_task: config.pmix_multi_task,
             joins_parent_namespaces: config.joins_parent_namespaces,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
         })
     }
 }
@@ -1288,6 +1299,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.uid = launch_spec.uid;
     descriptor.gid = launch_spec.gid;
     descriptor.work_dir = launch_spec.work_dir.clone();
+    descriptor.has_pid_namespace = launch_spec.has_pid_namespace;
+    descriptor.has_user_namespace = launch_spec.has_user_namespace;
+    descriptor.has_mount_namespace = launch_spec.has_mount_namespace;
     store.publish(&descriptor)?;
     let listener = UnixListener::bind(&socket_path)?;
     let runtime_environment = launch_spec.environment.clone();
@@ -1902,6 +1916,16 @@ mod launch_spec_compat {
     }"##;
 
     #[test]
+    fn an_older_launch_spec_reports_no_namespaces_rather_than_failing() {
+        let spec: StepdLaunchSpec =
+            serde_json::from_str(FROZEN_LAUNCH_JSON).expect("older launch.json");
+
+        assert!(!spec.has_pid_namespace);
+        assert!(!spec.has_user_namespace);
+        assert!(!spec.has_mount_namespace);
+    }
+
+    #[test]
     fn a_launch_spec_from_an_older_build_still_loads() {
         let spec: StepdLaunchSpec =
             serde_json::from_str(FROZEN_LAUNCH_JSON).expect("an older launch.json must still load");
@@ -1951,6 +1975,9 @@ mod tests {
     fn launch_spec() -> StepdLaunchSpec {
         StepdLaunchSpec {
             joins_parent_namespaces: false,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
             job_id: 42,
             step_id: spur_core::step::STEP_BATCH,
             cgroup: Default::default(),
