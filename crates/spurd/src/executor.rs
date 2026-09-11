@@ -2600,6 +2600,12 @@ mod tests {
             first, second,
             "a redispatch must never share a cgroup with a not-yet-reaped prior attempt"
         );
+        // Nor sit beneath it: reaping is recursive, so a stale attempt's cancel
+        // would take a live one with it.
+        assert!(
+            !second.starts_with(&first),
+            "{second:?} nested under {first:?}"
+        );
     }
 
     #[test]
@@ -2626,6 +2632,17 @@ mod tests {
     fn cgroup_signal_reports_the_read_failure_when_theres_no_cgroup() {
         let missing = std::path::Path::new("/nonexistent/spur-cgroup-signal-test");
         assert!(cgroup_signal(missing, Signal::SIGTERM).is_err());
+    }
+
+    #[test]
+    fn an_attemptless_cancel_names_no_live_cgroup() {
+        // run_attempt is zero on a legacy cancel; a real attempt starts at one,
+        // so the path it derives belongs to no running job.
+        let legacy = expected_cgroup_path(5, 0);
+
+        for attempt in 1..=4 {
+            assert_ne!(legacy, expected_cgroup_path(5, attempt));
+        }
     }
 
     #[test]
