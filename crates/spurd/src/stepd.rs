@@ -202,33 +202,109 @@ const DESCRIPTOR_FILE: &str = "descriptor.json";
 /// control socket because ancillary data cannot cross a buffered reader.
 pub const PTY_CUSTODY_SOCKET_NAME: &str = "ptyfd.sock";
 
-/// Ask the supervisor to hold a dup of the pty master, so the terminal does not
-/// hang up when the agent that created it goes away.
+/// Custody wire format: an opcode byte then the session id, little-endian. The
+/// identity rides in the message payload, not a preceding line, so no buffered
+/// reader can swallow bytes belonging to the descriptor beside it.
+const CUSTODY_DEPOSIT: u8 = b'D';
+const CUSTODY_RECLAIM: u8 = b'R';
+const CUSTODY_FOUND: u8 = b'O';
+const CUSTODY_ABSENT: u8 = b'N';
+
+fn custody_payload(opcode: u8, session_id: u32) -> [u8; 5] {
+    let mut payload = [0u8; 5];
+    payload[0] = opcode;
+    payload[1..].copy_from_slice(&session_id.to_le_bytes());
+    payload
+}
+
+fn parse_custody_payload(buf: &[u8]) -> Option<(u8, u32)> {
+    let id: [u8; 4] = buf.get(1..5)?.try_into().ok()?;
+    Some((*buf.first()?, u32::from_le_bytes(id)))
+}
+
+fn send_custody(
+    sock: std::os::fd::RawFd,
+    payload: &[u8],
+    fds: &[std::os::fd::RawFd],
+) -> nix::Result<()> {
+    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
+    let iov = [std::io::IoSlice::new(payload)];
+    match fds.is_empty() {
+        true => sendmsg::<()>(sock, &iov, &[], MsgFlags::empty(), None)?,
+        false => sendmsg::<()>(
+            sock,
+            &iov,
+            &[ControlMessage::ScmRights(fds)],
+            MsgFlags::empty(),
+            None,
+        )?,
+    };
+    Ok(())
+}
+
+fn recv_custody(sock: std::os::fd::RawFd) -> nix::Result<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
+    use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
+    use std::os::fd::FromRawFd;
+    let mut buf = [0u8; 8];
+    let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+    let mut cmsg = nix::cmsg_space!([std::os::fd::RawFd; 1]);
+    let (read, fds) = {
+        let msg = recvmsg::<()>(sock, &mut iov, Some(&mut cmsg), MsgFlags::empty())?;
+        let mut fds = Vec::new();
+        for cmsg in msg.cmsgs()? {
+            if let ControlMessageOwned::ScmRights(received) = cmsg {
+                for fd in received {
+                    fds.push(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+                }
+            }
+        }
+        (msg.bytes, fds)
+    };
+    let read = read.min(buf.len());
+    Ok((buf[..read].to_vec(), fds))
+}
+
+/// Ask the supervisor to hold a dup of one shell's pty master, so that terminal
+/// does not hang up when the agent that created it goes away. Keyed per shell:
+/// one job can have several terminals open at once.
 pub async fn deposit_pty_master(
     session_dir: &std::path::Path,
+    session_id: u32,
     master: std::os::fd::BorrowedFd<'_>,
 ) -> io::Result<()> {
-    use std::os::fd::{AsRawFd, RawFd};
+    use std::os::fd::AsRawFd;
     let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
     let stream = stream.into_std()?;
     stream.set_nonblocking(false)?;
-    crate::executor::send_fds(stream.as_raw_fd(), &[master.as_raw_fd() as RawFd])
-        .map_err(|error| io::Error::other(format!("deposit pty master: {error}")))
+    send_custody(
+        stream.as_raw_fd(),
+        &custody_payload(CUSTODY_DEPOSIT, session_id),
+        &[master.as_raw_fd()],
+    )
+    .map_err(|error| io::Error::other(format!("deposit pty master: {error}")))
 }
 
-/// Reclaim the pty master a previous agent deposited, so a replacement can
-/// resume bridging the same terminal.
+/// Reclaim one shell's master, so a replacement agent resumes that terminal
+/// rather than starting a new one.
 pub async fn reclaim_pty_master(
     session_dir: &std::path::Path,
+    session_id: u32,
 ) -> io::Result<Option<std::os::fd::OwnedFd>> {
     use std::os::fd::AsRawFd;
     let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
     let stream = stream.into_std()?;
     stream.set_nonblocking(false)?;
-    let fds = crate::executor::recv_fds(stream.as_raw_fd())
+    let raw = stream.as_raw_fd();
+    send_custody(raw, &custody_payload(CUSTODY_RECLAIM, session_id), &[])
+        .map_err(|error| io::Error::other(format!("request pty master: {error}")))?;
+    let (payload, fds) = recv_custody(raw)
         .map_err(|error| io::Error::other(format!("reclaim pty master: {error}")))?;
-    Ok(fds.into_iter().next())
+    match parse_custody_payload(&payload) {
+        Some((CUSTODY_FOUND, _)) => Ok(fds.into_iter().next()),
+        _ => Ok(None),
+    }
 }
+
 const OBLIGATION_FILE: &str = "obligations.jsonl";
 const FAILURE_FILE: &str = "failure.txt";
 const FORMAT_VERSION: u32 = 1;
@@ -1053,13 +1129,13 @@ async fn try_notify_agent(
     serde_json::from_str(&line).map_err(io::Error::other)
 }
 
-/// Holds one interactive session's pty master. The first caller deposits it;
-/// later callers (a replacement agent) get a copy while custody is retained, so
-/// the terminal outlives however many agents come and go.
+/// Holds each open terminal's pty master for this job. Keyed per shell, since a
+/// job can have several at once, and retained after a hand-back so the terminal
+/// still outlives however many agents come and go.
 async fn serve_pty_custody(listener: UnixListener) {
     use std::os::fd::AsRawFd;
-    let held: std::sync::Arc<Mutex<Option<std::os::fd::OwnedFd>>> =
-        std::sync::Arc::new(Mutex::new(None));
+    let held: std::sync::Arc<Mutex<HashMap<u32, std::os::fd::OwnedFd>>> =
+        std::sync::Arc::new(Mutex::new(HashMap::new()));
     while let Ok((stream, _)) = listener.accept().await {
         let held = held.clone();
         tokio::spawn(async move {
@@ -1069,19 +1145,33 @@ async fn serve_pty_custody(listener: UnixListener) {
             if stream.set_nonblocking(false).is_err() {
                 return;
             }
+            let raw = stream.as_raw_fd();
+            let Ok((payload, fds)) = recv_custody(raw) else {
+                return;
+            };
+            let Some((opcode, session_id)) = parse_custody_payload(&payload) else {
+                tracing::warn!("malformed pty custody request");
+                return;
+            };
             let mut custody = held.lock().await;
-            match custody.as_ref() {
-                Some(master) => {
-                    if let Err(error) =
-                        crate::executor::send_fds(stream.as_raw_fd(), &[master.as_raw_fd()])
+            match opcode {
+                CUSTODY_DEPOSIT => match fds.into_iter().next() {
+                    Some(master) => {
+                        custody.insert(session_id, master);
+                    }
+                    None => tracing::warn!(session_id, "pty custody deposit carried no descriptor"),
+                },
+                CUSTODY_RECLAIM => {
+                    let (reply, fds) = match custody.get(&session_id) {
+                        Some(master) => (CUSTODY_FOUND, vec![master.as_raw_fd()]),
+                        None => (CUSTODY_ABSENT, Vec::new()),
+                    };
+                    if let Err(error) = send_custody(raw, &custody_payload(reply, session_id), &fds)
                     {
-                        tracing::warn!(%error, "failed to hand back the pty master");
+                        tracing::warn!(session_id, %error, "failed to hand back a pty master");
                     }
                 }
-                None => match crate::executor::recv_fds(stream.as_raw_fd()) {
-                    Ok(fds) => *custody = fds.into_iter().next(),
-                    Err(error) => tracing::warn!(%error, "failed to take custody of a pty master"),
-                },
+                _ => tracing::warn!(session_id, opcode, "unknown pty custody opcode"),
             }
         });
     }
@@ -1962,6 +2052,36 @@ pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLi
         Ok(_) => Ok(StepdLiveness::Stale),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StepdLiveness::Stale),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod pty_custody_tests {
+    use super::{
+        custody_payload, parse_custody_payload, CUSTODY_DEPOSIT, CUSTODY_FOUND, CUSTODY_RECLAIM,
+    };
+
+    #[test]
+    fn a_custody_message_round_trips_its_shell_identity() {
+        for id in [0u32, 1, 4242, u32::MAX] {
+            let payload = custody_payload(CUSTODY_DEPOSIT, id);
+            assert_eq!(parse_custody_payload(&payload), Some((CUSTODY_DEPOSIT, id)));
+        }
+    }
+
+    #[test]
+    fn opcodes_stay_distinct_so_a_deposit_is_never_read_as_a_reclaim() {
+        // The first version inferred the operation from whether a slot was
+        // occupied, so a second terminal on one job deadlocked both ends.
+        assert_ne!(CUSTODY_DEPOSIT, CUSTODY_RECLAIM);
+        assert_ne!(CUSTODY_RECLAIM, CUSTODY_FOUND);
+    }
+
+    #[test]
+    fn a_truncated_custody_message_is_rejected() {
+        assert_eq!(parse_custody_payload(&[]), None);
+        assert_eq!(parse_custody_payload(&[CUSTODY_DEPOSIT]), None);
+        assert_eq!(parse_custody_payload(&[CUSTODY_DEPOSIT, 1, 2]), None);
     }
 }
 
