@@ -355,7 +355,6 @@ class TestCgroupStepMemoryBudget:
     def cluster_config_overrides(self):
         return {"cgroup": {"constrain_swap": True, "allowed_swap_percent": 0}}
 
-
     def test_a_step_is_bound_by_the_jobs_memory_max(self, cgroup_cluster):
         cluster = cgroup_cluster
         marker = f"{cluster.remote_dir}/cg-step-mem-marker.txt"
