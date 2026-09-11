@@ -80,6 +80,8 @@ pub struct StepdLaunchSpec {
     pub has_user_namespace: bool,
     #[serde(default)]
     pub has_mount_namespace: bool,
+    #[serde(default)]
+    pub resources: StepdJobResources,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +109,25 @@ impl From<StepdMemlock> for spur_core::config::MemlockLimit {
             StepdMemlock::Bytes(value) => spur_core::config::MemlockLimit::Bytes(value),
         }
     }
+}
+
+/// What a step launched into an already-running job needs from that job. The
+/// supervisor cannot derive it, and an agent that restarts has nowhere else to
+/// read it back from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepdJobResources {
+    #[serde(default)]
+    pub cpus: u32,
+    #[serde(default)]
+    pub memory_mb: u64,
+    #[serde(default)]
+    pub gpu_devices: Vec<u32>,
+    #[serde(default)]
+    pub partition: String,
+    #[serde(default)]
+    pub nodelist: String,
+    #[serde(default)]
+    pub mpi: String,
 }
 
 impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
@@ -154,6 +175,14 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             has_pid_namespace: false,
             has_user_namespace: false,
             has_mount_namespace: false,
+            resources: StepdJobResources {
+                cpus: config.cpus,
+                memory_mb: config.memory_mb,
+                gpu_devices: config.gpu_devices.clone(),
+                partition: config.partition.clone(),
+                nodelist: config.nodelist.clone(),
+                mpi: config.mpi.clone(),
+            },
         })
     }
 }
@@ -172,6 +201,7 @@ impl StepdLaunchSpec {
             node: self.node,
             array_job_id: None,
             array_task_id: None,
+            mpi: self.resources.mpi.clone(),
             environment: self.environment,
             stdout_path: self.stdout_path,
             stderr_path: self.stderr_path,
@@ -733,6 +763,8 @@ pub struct StepdDescriptor {
     pub has_user_namespace: bool,
     #[serde(default)]
     pub has_mount_namespace: bool,
+    #[serde(default)]
+    pub resources: StepdJobResources,
 }
 
 impl StepdDescriptor {
@@ -763,6 +795,7 @@ impl StepdDescriptor {
             has_pid_namespace: false,
             has_user_namespace: false,
             has_mount_namespace: false,
+            resources: StepdJobResources::default(),
         }
     }
 }
@@ -1516,6 +1549,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.has_pid_namespace = launch_spec.has_pid_namespace;
     descriptor.has_user_namespace = launch_spec.has_user_namespace;
     descriptor.has_mount_namespace = launch_spec.has_mount_namespace;
+    descriptor.resources = launch_spec.resources.clone();
     store.publish(&descriptor)?;
     let listener = UnixListener::bind(&socket_path)?;
     // Custody of an interactive session's pty master outlives the agent that
@@ -2203,6 +2237,14 @@ mod launch_spec_compat {
     }
 
     #[test]
+    fn an_older_launch_spec_reports_no_job_resources_rather_than_failing() {
+        let spec: StepdLaunchSpec =
+            serde_json::from_str(FROZEN_LAUNCH_JSON).expect("older launch.json");
+
+        assert_eq!(spec.resources, super::StepdJobResources::default());
+    }
+
+    #[test]
     fn a_launch_spec_from_an_older_build_still_loads() {
         let spec: StepdLaunchSpec =
             serde_json::from_str(FROZEN_LAUNCH_JSON).expect("an older launch.json must still load");
@@ -2256,6 +2298,7 @@ mod tests {
             has_pid_namespace: false,
             has_user_namespace: false,
             has_mount_namespace: false,
+            resources: super::StepdJobResources::default(),
             job_id: 42,
             step_id: spur_core::step::STEP_BATCH,
             cgroup: Default::default(),

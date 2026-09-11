@@ -221,6 +221,7 @@ async fn launch_stepd(
     launch_spec.has_pid_namespace = namespaces.pid;
     launch_spec.has_user_namespace = namespaces.user;
     launch_spec.has_mount_namespace = namespaces.mount;
+    descriptor.resources = launch_spec.resources.clone();
     let launch_path = session_dir.join("launch.json");
     let launch_json = serde_json::to_vec(&launch_spec)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
@@ -977,12 +978,12 @@ pub async fn recover_stepds(
             uid: descriptor.uid,
             gid: descriptor.gid,
             user: descriptor.owner.clone(),
-            partition: String::new(),
-            gpu_devices: Vec::new(),
-            cpus: 0,
-            memory_mb: 0,
-            nodelist: String::new(),
-            mpi: String::new(),
+            partition: descriptor.resources.partition.clone(),
+            gpu_devices: descriptor.resources.gpu_devices.clone(),
+            cpus: descriptor.resources.cpus,
+            memory_mb: descriptor.resources.memory_mb,
+            nodelist: descriptor.resources.nodelist.clone(),
+            mpi: descriptor.resources.mpi.clone(),
             run_attempt: descriptor.run_attempt,
         });
     }
@@ -4159,6 +4160,7 @@ impl SlurmAgent for AgentService {
             prolog_script: None,
             partition: spec.partition.clone(),
             nodelist: spec.nodelist.clone(),
+            mpi: spec.mpi.clone(),
             host_device_plan: Some(host_device_plan),
             memlock: self.limits.memlock,
             cgroup: self.cgroup.clone(),
@@ -4835,6 +4837,7 @@ impl SlurmAgent for AgentService {
                 prolog_script: None,
                 partition: req.partition.clone(),
                 nodelist: req.nodelist.clone(),
+                mpi: req.mpi.clone(),
                 host_device_plan: None,
                 memlock: self.limits.memlock,
                 cgroup: self.cgroup.clone(),
@@ -5376,7 +5379,8 @@ impl SlurmAgent for AgentService {
                 container: None,
                 prolog_script: None,
                 partition: partition.clone(),
-                nodelist: nodelist.clone(),
+                nodelist: job_nodelist.clone(),
+                mpi: job_mpi.clone(),
                 host_device_plan: None,
                 memlock,
                 cgroup: self.cgroup.clone(),
@@ -10156,6 +10160,41 @@ mod tests {
             adopted.cgroup_path.as_deref(),
             Some(std::path::Path::new("/sys/fs/cgroup/spur/job_77_1"))
         );
+    }
+
+    #[tokio::test]
+    async fn an_adopted_job_keeps_the_resources_a_step_launches_against() {
+        // A step reads its GPU set from the job; recovering an empty one denies
+        // the step every device instead of the ones the job holds.
+        let running = new_running_jobs();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            78,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/unused.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources = crate::stepd::StepdJobResources {
+            cpus: 8,
+            memory_mb: 4096,
+            gpu_devices: vec![2, 3],
+            partition: "gpu".into(),
+            nodelist: "node-a,node-b".into(),
+            mpi: "pmix".into(),
+        };
+
+        recover_stepds(&running, vec![descriptor]).await;
+
+        let jobs = running.lock().await;
+        let adopted = jobs.get(&78).expect("adopted");
+        assert_eq!(adopted.gpu_devices, vec![2, 3]);
+        assert_eq!(adopted.cpus, 8);
+        assert_eq!(adopted.memory_mb, 4096);
+        assert_eq!(adopted.partition, "gpu");
+        assert_eq!(adopted.nodelist, "node-a,node-b");
+        assert_eq!(adopted.mpi, "pmix");
     }
 
     #[tokio::test]

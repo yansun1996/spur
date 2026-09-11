@@ -165,6 +165,7 @@ pub struct JobLaunchConfig {
     pub prolog_script: Option<String>,
     pub partition: String,
     pub nodelist: String,
+    pub mpi: String,
     /// Registry-based device injection plan for host (non-container) jobs.
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
     /// RLIMIT_MEMLOCK to apply before exec (while still privileged).
@@ -3315,6 +3316,7 @@ mod tests {
             step_id: spur_core::step::STEP_BATCH,
             job_id,
             run_attempt: 1,
+            mpi: String::new(),
             script: String::new(),
             work_dir: String::new(),
             name: name.to_string(),
