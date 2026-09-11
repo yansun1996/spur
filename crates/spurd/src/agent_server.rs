@@ -677,6 +677,13 @@ async fn teardown_completed_job(
     if let Some(ref cgroup) = completed.cgroup {
         crate::executor::cleanup_cgroup(cgroup);
     }
+    // The node above whatever was recorded: an allocation's is a step's leaf,
+    // and nothing else removes the job's own. Derived from identity because the
+    // recorded path is a leaf in one shape and absent in another.
+    crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
+        job_id,
+        completed.run_attempt,
+    ));
     allocation.lock().await.release_job(job_id);
     cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
 }
@@ -4478,6 +4485,14 @@ impl SlurmAgent for AgentService {
             }
         }
         drop(jobs);
+
+        // An allocation ends here rather than through the completion teardown,
+        // so this is where its cgroup node has to go: the steps inside only
+        // ever remove their own leaf.
+        crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
+            job_id,
+            req.run_attempt,
+        ));
 
         if let Err(err) = self.mpi_host.release_prepared_pmix(job_id) {
             warn!(job_id, error = %err, "PMIx prepare release on cancel failed");
