@@ -905,6 +905,19 @@ async fn release_stepd_tracking(
     };
     drop(sessions);
 
+    // The job node is the agent's to remove: it creates it, and the steps that
+    // live in it only ever own their own leaf. Once the last of them is gone
+    // nothing else will, so it would sit there empty for the node's lifetime.
+    // Derived from the job's identity rather than by walking up from a leaf,
+    // which is unreliable when the descriptor has no path yet and one level too
+    // far when it does not.
+    if was_last_step {
+        crate::executor::cleanup_cgroup(&executor::expected_cgroup_path(
+            descriptor.job_id,
+            descriptor.run_attempt,
+        ));
+    }
+
     // Recorded even when a sibling keeps the job alive: this step's session is
     // pruned only once its own release is durable.
     if let Err(error) = crate::stepd::record_resources_released(descriptor) {

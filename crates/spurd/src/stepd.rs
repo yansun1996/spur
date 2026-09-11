@@ -1613,8 +1613,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let teardown = |cgroup: Option<PathBuf>| async move {
         if let Some(cgroup) = cgroup.as_ref() {
             crate::executor::cleanup_cgroup(cgroup);
-            // The job node outlives its steps' leaves; the step that owns the
-            // job's lifetime takes it with it, once its siblings are gone.
+            // The agent reaps the job node once its last step releases; this
+            // covers the case where teardown here runs and that never does.
+            // Removing an absent directory is a no-op, so both trying is safe.
             if !spur_core::step::is_user_step(step_id) {
                 if let Some(job_cgroup) = cgroup.parent() {
                     crate::executor::cleanup_cgroup(job_cgroup);
