@@ -211,6 +211,11 @@ async fn launch_stepd(
     descriptor.uid = config.uid;
     descriptor.gid = config.gid;
     descriptor.work_dir = config.work_dir.clone();
+    let namespaces =
+        launch_namespaces(nix::unistd::geteuid().is_root(), config.container.is_some());
+    descriptor.has_pid_namespace = namespaces.pid;
+    descriptor.has_user_namespace = namespaces.user;
+    descriptor.has_mount_namespace = namespaces.mount;
     let launch_path = session_dir.join("launch.json");
     let launch_json = serde_json::to_vec(&launch_spec)
         .map_err(|error| executor::LaunchError::Other(anyhow::anyhow!(error)))?;
@@ -931,15 +936,17 @@ pub async fn recover_stepds(
 ) {
     let mut jobs = running.lock().await;
     for descriptor in descriptors {
+        let cgroup_path = (!descriptor.cgroup_path.as_os_str().is_empty())
+            .then(|| descriptor.cgroup_path.clone());
         jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
             job: executor::RunningJob::AllocationOnly,
-            cgroup_path: None,
+            cgroup_path,
             rootfs_mode: crate::container::RootfsMode::Extracted,
             stdout_path: String::new(),
             stderr_path: String::new(),
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
+            has_pid_namespace: descriptor.has_pid_namespace,
+            has_user_namespace: descriptor.has_user_namespace,
+            has_mount_namespace: descriptor.has_mount_namespace,
             _pty_master: None,
             work_dir: descriptor.work_dir.clone(),
             uid: descriptor.uid,
@@ -1886,6 +1893,22 @@ async fn step_cancel_requested(
 /// meant the job's own output there.
 fn requested_step_of(req: &spur_proto::proto::StreamJobOutputRequest) -> Option<u32> {
     req.step.or((req.step_id != 0).then_some(req.step_id))
+}
+
+/// Which namespaces a launch lands a job in. Shared so a job adopted after an
+/// agent restart is described exactly as the live launch described it.
+fn launch_namespaces(is_root: bool, is_container: bool) -> LaunchNamespaces {
+    LaunchNamespaces {
+        pid: is_root || is_container,
+        user: is_container && !is_root,
+        mount: is_root || is_container,
+    }
+}
+
+struct LaunchNamespaces {
+    pid: bool,
+    user: bool,
+    mount: bool,
 }
 
 /// A step that builds its own container keeps the agent in its exec path, so it
@@ -4239,6 +4262,7 @@ impl SlurmAgent for AgentService {
                 info!(job_id, gpus = ?launch_cfg.gpu_devices, "job launched successfully");
                 let is_root = nix::unistd::geteuid().is_root();
                 let is_container = launch_cfg.container.is_some();
+                let namespaces = launch_namespaces(is_root, is_container);
                 // Report the real resolved paths back so the controller can
                 // surface where output actually landed (e.g. the /tmp fallback).
                 let stdout_path = result.stdout_path.clone();
@@ -4250,9 +4274,9 @@ impl SlurmAgent for AgentService {
                         rootfs_mode: rootfs_mode.clone(),
                         stdout_path: result.stdout_path,
                         stderr_path: result.stderr_path,
-                        has_pid_namespace: is_root || is_container,
-                        has_user_namespace: is_container && !is_root,
-                        has_mount_namespace: is_root || is_container,
+                        has_pid_namespace: namespaces.pid,
+                        has_user_namespace: namespaces.user,
+                        has_mount_namespace: namespaces.mount,
                         _pty_master: result.pty_master,
                         work_dir: launch_cfg.work_dir,
                         uid: launch_cfg.uid,
@@ -9926,6 +9950,58 @@ mod tests {
         };
 
         assert_eq!(requested_step_of(&legacy), Some(4));
+    }
+
+    #[test]
+    fn a_root_launch_lands_the_job_in_namespaces() {
+        let ns = launch_namespaces(true, false);
+
+        assert!(ns.pid && ns.mount, "a root launch unshares pid and mount");
+        assert!(!ns.user, "no user namespace without a container");
+    }
+
+    #[test]
+    fn an_unprivileged_plain_launch_lands_nowhere() {
+        let ns = launch_namespaces(false, false);
+
+        assert!(!ns.pid && !ns.user && !ns.mount);
+    }
+
+    #[test]
+    fn an_unprivileged_container_needs_a_user_namespace() {
+        let ns = launch_namespaces(false, true);
+
+        assert!(ns.user, "rootless containers need one");
+        assert!(ns.pid && ns.mount);
+    }
+
+    #[tokio::test]
+    async fn an_adopted_job_keeps_the_namespaces_it_was_launched_into() {
+        // Otherwise exec and attach run beside the job on the host instead of
+        // inside it, outside its cgroup and device filter.
+        let running = new_running_jobs();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            77,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/unused.sock"),
+            std::path::PathBuf::from("/sys/fs/cgroup/spur/job_77_1"),
+        );
+        descriptor.has_pid_namespace = true;
+        descriptor.has_mount_namespace = true;
+
+        recover_stepds(&running, vec![descriptor]).await;
+
+        let jobs = running.lock().await;
+        let adopted = jobs.get(&77).expect("adopted");
+        assert!(adopted.has_pid_namespace);
+        assert!(adopted.has_mount_namespace);
+        assert_eq!(
+            adopted.cgroup_path.as_deref(),
+            Some(std::path::Path::new("/sys/fs/cgroup/spur/job_77_1"))
+        );
     }
 
     #[tokio::test]

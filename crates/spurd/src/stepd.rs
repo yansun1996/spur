@@ -563,6 +563,14 @@ pub struct StepdDescriptor {
     pub gid: u32,
     #[serde(default)]
     pub work_dir: String,
+    /// What the job was launched into, so an agent that restarts can put work
+    /// back inside it rather than beside it on the host.
+    #[serde(default)]
+    pub has_pid_namespace: bool,
+    #[serde(default)]
+    pub has_user_namespace: bool,
+    #[serde(default)]
+    pub has_mount_namespace: bool,
 }
 
 impl StepdDescriptor {
@@ -590,6 +598,9 @@ impl StepdDescriptor {
             uid: 0,
             gid: 0,
             work_dir: String::new(),
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
         }
     }
 }
