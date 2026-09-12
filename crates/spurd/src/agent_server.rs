@@ -2064,6 +2064,15 @@ fn step_can_be_supervised(container_image: &str) -> bool {
     container_image.is_empty()
 }
 
+/// The user-script and wrapper file names for one step. Concurrent steps of a
+/// job share a scratch directory, so the step id has to be part of the name.
+fn step_scratch_names(node_id: u32, step_id: u32) -> (String, String) {
+    (
+        format!("cmd_{node_id}_{step_id}.sh"),
+        format!("wrapper_{node_id}_{step_id}.sh"),
+    )
+}
+
 /// The script a supervised step runs. A step joining a running job enters its
 /// namespaces from inside the script, so the supervisor itself stays outside
 /// them and survives independently of the job it is running work for.
@@ -5352,13 +5361,14 @@ impl SlurmAgent for AgentService {
                 paths: Vec::new(),
             };
 
-            let user_script_path = step_dir.join(format!("cmd_{node_id}.sh"));
+            let (user_script_name, wrapper_name) = step_scratch_names(node_id, step_id);
+            let user_script_path = step_dir.join(user_script_name);
             let user_script = build_one_shot_command_script(&req.command)?;
             crate::executor::write_job_scratch(&user_script_path, &user_script, req.uid, req.gid)
                 .map_err(|e| Status::internal(format!("failed to write step script: {e}")))?;
             guard.paths.push(user_script_path.clone());
 
-            let wrapper_path = step_dir.join(format!("wrapper_{node_id}.sh"));
+            let wrapper_path = step_dir.join(wrapper_name);
             let wrapper = if num_tasks > 1 {
                 if step_mpi {
                     build_multi_task_pmix_wrapper(
@@ -9133,6 +9143,18 @@ mod tests {
     #[test]
     fn a_step_building_its_own_container_is_not_supervisable() {
         assert!(!step_can_be_supervised("docker://alpine"));
+    }
+
+    // Concurrent steps of one job share a scratch dir, and a supervised step's
+    // wrapper is written after its launch, so a shared name is a silent swap.
+    #[test]
+    fn concurrent_steps_on_one_node_get_their_own_scratch_scripts() {
+        let (first_script, first_wrapper) = step_scratch_names(0, 1);
+        let (second_script, second_wrapper) = step_scratch_names(0, 2);
+
+        assert_ne!(first_script, second_script);
+        assert_ne!(first_wrapper, second_wrapper);
+        assert_ne!(first_script, first_wrapper);
     }
 
     #[test]
