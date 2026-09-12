@@ -1613,6 +1613,11 @@ impl SupervisedPmix {
 /// only the process hosting the server can hand out each rank's environment.
 fn start_supervised_pmix(spec: &mut StepdLaunchSpec) -> anyhow::Result<Option<SupervisedPmix>> {
     let Some(pmix) = spec.pmix.take() else {
+        // The agent leaves a fan-out launch's script unwrapped for the wrapper
+        // below; running it as-is would quietly start one rank instead of all.
+        if spec.pmix_multi_task {
+            anyhow::bail!("a multi-rank PMIx launch arrived without its PMIx plan");
+        }
         return Ok(None);
     };
     if pmix.plan.step_id != spec.step_id {
@@ -2676,6 +2681,22 @@ mod tests {
         assert!(
             error.to_string().contains("user script path"),
             "a missing input must be caught before the server starts: {error}"
+        );
+    }
+
+    #[test]
+    fn a_fan_out_launch_missing_its_pmix_plan_is_refused_rather_than_run_once() {
+        let mut spec = launch_spec();
+        spec.pmix_multi_task = true;
+        spec.pmix = None;
+
+        let error = start_supervised_pmix(&mut spec)
+            .err()
+            .expect("a fan-out launch cannot run without its plan");
+
+        assert!(
+            error.to_string().contains("without its PMIx plan"),
+            "unexpected error: {error}"
         );
     }
 
