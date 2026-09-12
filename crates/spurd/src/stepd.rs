@@ -82,6 +82,25 @@ pub struct StepdLaunchSpec {
     pub has_mount_namespace: bool,
     #[serde(default)]
     pub resources: StepdJobResources,
+    /// Absent unless this launch hosts a PMIx server; see [`StepdPmix`].
+    #[serde(default)]
+    pub pmix: Option<StepdPmix>,
+}
+
+/// Everything the supervisor needs to host its own PMIx server. The agent still
+/// builds the plan: `peer_hosts`, `node_index` and `universe_size` are cluster
+/// facts a single-job supervisor has no way to derive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepdPmix {
+    pub plan: spur_core::mpi::PmixLaunchPlan,
+    /// The supervisor cannot read the agent's config file, so the [mpi] section
+    /// it needs to resolve the plugin travels with the launch.
+    #[serde(default)]
+    pub config: spur_core::config::MpiConfig,
+    /// Set when more than one rank runs here: the wrapper that exports each
+    /// rank's environment can only be written once the server is up.
+    #[serde(default)]
+    pub user_script_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +202,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 nodelist: config.nodelist.clone(),
                 mpi: config.mpi.clone(),
             },
+            pmix: None,
         })
     }
 }
@@ -2359,6 +2379,14 @@ mod launch_spec_compat {
     }
 
     #[test]
+    fn an_older_launch_spec_hosts_no_pmix_server_rather_than_failing() {
+        let spec: StepdLaunchSpec =
+            serde_json::from_str(FROZEN_LAUNCH_JSON).expect("older launch.json");
+
+        assert!(spec.pmix.is_none());
+    }
+
+    #[test]
     fn a_launch_spec_from_an_older_build_still_loads() {
         let spec: StepdLaunchSpec =
             serde_json::from_str(FROZEN_LAUNCH_JSON).expect("an older launch.json must still load");
@@ -2446,6 +2474,7 @@ mod tests {
             capability: "test-capability".into(),
             allocation_only: false,
             pmix_multi_task: false,
+            pmix: None,
         }
     }
 
@@ -2454,6 +2483,43 @@ mod tests {
         let mut spec = launch_spec();
         spec.pmix_multi_task = true;
         assert!(spec.into_launch_config().pmix_multi_task);
+    }
+
+    #[test]
+    fn launch_spec_persists_the_pmix_plan_for_the_supervisor() {
+        let mut spec = launch_spec();
+        spec.pmix = Some(StepdPmix {
+            plan: spur_core::mpi::PmixLaunchPlan::local_tasks(
+                42,
+                spur_core::step::STEP_BATCH,
+                2,
+                0,
+                2,
+                "/tmp/spur-pmix",
+                1000,
+                1000,
+                1,
+                0,
+                vec![],
+            ),
+            config: spur_core::config::MpiConfig {
+                plugin_dir: "/opt/spur/lib".into(),
+                ..spur_core::config::MpiConfig::default()
+            },
+            user_script_path: "/tmp/.spur_user_42.sh".into(),
+        });
+
+        let restored: StepdLaunchSpec =
+            serde_json::from_slice(&serde_json::to_vec(&spec).expect("encode launch spec"))
+                .expect("decode launch spec");
+
+        let pmix = restored
+            .pmix
+            .expect("the PMIx plan must survive launch.json");
+        assert_eq!(pmix.plan.namespace, "spur.42.4294967294");
+        assert_eq!(pmix.plan.local_procs.len(), 2);
+        assert_eq!(pmix.config.plugin_dir, "/opt/spur/lib");
+        assert_eq!(pmix.user_script_path, "/tmp/.spur_user_42.sh");
     }
 
     #[test]

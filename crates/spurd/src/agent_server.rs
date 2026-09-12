@@ -50,6 +50,7 @@ struct StepdLaunchOptions {
     container_rootfs_mode: Option<crate::container::RootfsMode>,
     hooks: HooksConfig,
     plugstack_path: String,
+    pmix: Option<crate::stepd::StepdPmix>,
 }
 
 /// `spurstepd` is expected to be installed alongside `spurd`; the bare-name
@@ -189,6 +190,7 @@ async fn launch_stepd(
     launch_spec.container_rootfs_mode = options.container_rootfs_mode;
     launch_spec.hooks = options.hooks;
     launch_spec.plugstack_path = options.plugstack_path;
+    launch_spec.pmix = options.pmix;
     let store = crate::stepd::StepdStore::new(state_dir);
     let session_dir = store
         .prepare_session_dir(config.job_id, run_attempt, launch_spec.step_id)
@@ -2796,6 +2798,7 @@ impl AgentService {
                 container_rootfs_mode: None,
                 hooks: (*self.hooks).clone(),
                 plugstack_path: self.plugstack_path.clone(),
+                pmix: None,
             },
         )
         .await;
@@ -4310,6 +4313,7 @@ impl SlurmAgent for AgentService {
                         .map(|_| rootfs_mode.clone()),
                     hooks: (*self.hooks).clone(),
                     plugstack_path: self.plugstack_path.clone(),
+                    pmix: None,
                 },
             )
             .await
@@ -5004,6 +5008,7 @@ impl SlurmAgent for AgentService {
                     container_rootfs_mode: None,
                     hooks: (*self.hooks).clone(),
                     plugstack_path: self.plugstack_path.clone(),
+                    pmix: None,
                 },
             )
             .await
