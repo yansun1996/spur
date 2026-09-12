@@ -2137,6 +2137,38 @@ async fn awaited_step_response(
     }
 }
 
+/// A step whose supervisor exited while the agent was down is in no in-memory
+/// map, so the durable record is the only thing left that can answer for it.
+async fn unadopted_step_response(
+    store: &crate::stepd::StepdStore,
+    job_id: u32,
+    step_id: u32,
+) -> Result<Response<RunCommandResponse>, Status> {
+    let finished = store
+        .finished_session(job_id, step_id)
+        .unwrap_or_else(|error| {
+            warn!(job_id, step_id, %error, "failed to search finished stepd sessions");
+            None
+        });
+    let Some((descriptor, exit_code, signal)) = finished else {
+        return Err(Status::not_found("this node is not running that step"));
+    };
+
+    let response = awaited_step_response(job_id, step_id, exit_code, signal).await;
+    // Nothing else will: the session was never adopted, so without this its
+    // release obligation stays unmet and the directory is never pruned.
+    if let Err(error) = crate::stepd::record_resources_released(&descriptor) {
+        warn!(
+            job_id,
+            run_attempt = descriptor.run_attempt,
+            step_id,
+            %error,
+            "failed to record runtime resource release for an unadopted session"
+        );
+    }
+    Ok(Response::new(response))
+}
+
 async fn read_back_step_output(job_id: u32, step_id: u32, stderr: bool) -> String {
     for path in crate::executor::step_output_path_candidates(job_id, step_id, stderr) {
         if let Ok(bytes) = tokio::fs::read(&path).await {
@@ -5930,17 +5962,19 @@ impl SlurmAgent for AgentService {
         self.check_job_access(req.job_id, identity.as_ref(), &req.user, "await a step of")
             .await?;
 
-        let descriptor = self
+        let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
+        let tracked = self
             .stepds
             .lock()
             .await
             .get(&(req.job_id, req.step_id))
-            .cloned()
-            .ok_or_else(|| Status::not_found("this node is not running that step"))?;
+            .cloned();
+        let Some(descriptor) = tracked else {
+            return unadopted_step_response(&store, req.job_id, req.step_id).await;
+        };
 
         // A supervisor that finished while nobody was listening recorded its exit
         // durably; the rendezvous is in memory and does not survive a restart.
-        let store = crate::stepd::StepdStore::new(&self.stepd_state_dir);
         if let Ok(Some((exit_code, signal))) = durable_runtime_exit(&store, &descriptor) {
             return Ok(Response::new(
                 awaited_step_response(req.job_id, req.step_id, exit_code, signal).await,
@@ -11030,6 +11064,139 @@ mod tests {
             .expect("a recorded exit must be returned, not parked on");
 
         assert_eq!(response.into_inner().exit_code, 5);
+    }
+
+    /// Publishes a stale session (pid 0 never matches a live process) carrying
+    /// one observed exit, without adopting it into the agent's live map.
+    fn publish_unadopted_session(
+        store: &crate::stepd::StepdStore,
+        job_id: u32,
+        step_id: u32,
+        exit_code: i32,
+    ) {
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            1,
+            step_id,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.socket_path = store.session_dir(job_id, 1, step_id).join("runtime.sock");
+        store.publish(&descriptor).expect("publish descriptor");
+        store
+            .obligations(job_id, 1, step_id)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code,
+                signal: 0,
+            })
+            .expect("record the step's exit");
+    }
+
+    #[tokio::test]
+    async fn await_step_answers_from_a_session_the_restart_never_adopted() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.path().to_path_buf());
+        svc.insert_test_job(44, TrackedJob::dummy(std::process::id()))
+            .await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        // Startup adopts only live sessions, so this one stays out of `stepds`
+        // exactly as a supervisor that exited during the outage does.
+        publish_unadopted_session(&store, 44, 3, 0);
+
+        let response = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+            }))
+            .await
+            .expect("a step that finished during the outage must report its exit");
+
+        assert_eq!(response.into_inner().exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn await_step_releases_the_unadopted_session_it_answered_for() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.path().to_path_buf());
+        svc.insert_test_job(44, TrackedJob::dummy(std::process::id()))
+            .await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        publish_unadopted_session(&store, 44, 3, 0);
+        // Startup replay reports the completion before the agent serves RPCs,
+        // so the release this call owes is the session's last open obligation.
+        store
+            .obligations(44, 1, 3)
+            .append(&crate::stepd::StepdObligation::CompletionAcknowledged)
+            .expect("record the completion acknowledgement");
+        let session_dir = store.session_dir(44, 1, 3);
+        assert!(session_dir.exists());
+
+        svc.await_step(Request::new(AwaitStepRequest {
+            job_id: 44,
+            step_id: 3,
+            user: "testuser".into(),
+        }))
+        .await
+        .expect("a step that finished during the outage must report its exit");
+
+        assert!(
+            !session_dir.exists(),
+            "the answered session must be released and pruned, not left to accumulate"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_step_still_rejects_a_step_with_no_recorded_exit() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.path().to_path_buf());
+        svc.insert_test_job(44, TrackedJob::dummy(std::process::id()))
+            .await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        // A session whose supervisor died before observing an exit: the outcome
+        // is genuinely unknown, so it must not be answered as a success.
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            44,
+            1,
+            3,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.socket_path = store.session_dir(44, 1, 3).join("runtime.sock");
+        store.publish(&descriptor).expect("publish descriptor");
+
+        let err = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+            }))
+            .await
+            .expect_err("an unobserved exit must not be invented");
+
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]

@@ -2231,6 +2231,41 @@ impl StepdStore {
         Ok(completions)
     }
 
+    /// The finished session of a supervisor that exited while the agent was
+    /// down. Nothing adopts one, so its record is the step's only answer left.
+    pub(crate) fn finished_session(
+        &self,
+        job_id: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<Option<(StepdDescriptor, i32, i32)>> {
+        let mut newest: Option<(StepdDescriptor, i32, i32)> = None;
+        for session_dir in self.session_dirs()? {
+            let Ok(descriptor) = self.load_descriptor(&session_dir) else {
+                continue;
+            };
+            if descriptor.job_id != job_id || descriptor.step_id != step_id {
+                continue;
+            }
+            // A live supervisor still owns its session; answering from its log
+            // would race the rendezvous and prune the state out from under it.
+            if !matches!(stepd_liveness(&descriptor), Ok(StepdLiveness::Stale)) {
+                continue;
+            }
+            let Some((exit_code, signal)) =
+                self.observed_exit(job_id, descriptor.run_attempt, step_id)?
+            else {
+                continue;
+            };
+            if newest
+                .as_ref()
+                .is_none_or(|(seen, _, _)| seen.run_attempt < descriptor.run_attempt)
+            {
+                newest = Some((descriptor, exit_code, signal));
+            }
+        }
+        Ok(newest)
+    }
+
     pub fn prune_finalized(&self) -> io::Result<usize> {
         let mut pruned = 0;
         for session_dir in self.session_dirs()? {
