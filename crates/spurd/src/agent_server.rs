@@ -5312,9 +5312,12 @@ impl SlurmAgent for AgentService {
                 "step mpi=pmix requires a PMIx launch plan",
             ));
         }
-        // Logical steps inside a Stepd land in a follow-up PR; a step
-        // always spawns directly here for now, even against a runtime-backed
-        // allocation (so it won't survive an spurd restart, unlike its job).
+        // Decided here rather than at the dispatch chain below because who runs
+        // the step also decides who hosts its PMIx server.
+        let supervise_step =
+            step_can_be_supervised(req.container.as_ref().map_or("", |c| c.image.as_str()));
+        #[cfg(test)]
+        let supervise_step = supervise_step && !self.force_legacy_launch;
         let runtime_step_pmix = false;
 
         let mut pmix_step_guard = None;
@@ -5467,13 +5470,7 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        // Built before the dispatch chain so the arms stay a plain match on
-        // where the step runs, not on whether it is supervised.
-        let supervise_step =
-            step_can_be_supervised(req.container.as_ref().map_or("", |c| c.image.as_str()));
         let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
-        #[cfg(test)]
-        let supervise_step = supervise_step && !self.force_legacy_launch;
         let mut supervised_step_cfg = if supervise_step {
             let run_attempt = self
                 .running
