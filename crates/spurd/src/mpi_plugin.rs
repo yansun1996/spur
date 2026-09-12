@@ -376,8 +376,7 @@ impl MpiPluginHost {
     }
 
     /// Pre-flight for a `--mpi=pmix` dispatch: the plan is well formed and this
-    /// node can load a PMIx runtime new enough to serve it. Starts nothing --
-    /// the server belongs to the process that will supervise the ranks.
+    /// node can load a PMIx runtime new enough to serve it. Starts nothing.
     pub fn validate_pmix_dispatch(&self, plan: &PmixLaunchPlan) -> Result<(), String> {
         let mut plan = plan.clone();
         self.apply_modex_timeouts(&mut plan);
@@ -385,9 +384,8 @@ impl MpiPluginHost {
         self.load_plugin()
     }
 
-    /// Stop the server registered for one step. An unknown key is an error: the
-    /// caller believed this process hosted it, and a silent `Ok` there hides a
-    /// teardown that never happened.
+    /// Stop the server registered for one step. An unknown key is an error: a
+    /// silent `Ok` there hides a teardown that never happened.
     pub fn release_pmix_server(&self, job_id: u32, step_id: StepId) -> Result<(), String> {
         let key = (job_id, step_id);
         let Some(namespace) = self

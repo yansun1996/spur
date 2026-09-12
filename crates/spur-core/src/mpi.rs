@@ -79,8 +79,7 @@ impl PmixLaunchPlan {
     }
 
     /// Re-key a controller-built plan to the step this node is actually
-    /// launching, so the rendezvous can never disagree with the process that
-    /// ends up owning the server.
+    /// launching, so it cannot disagree with the process that owns the server.
     pub fn rekey_to_step(&mut self, step_id: crate::step::StepId) {
         self.step_id = step_id;
         self.namespace = Self::namespace_for_step(self.job_id, step_id);

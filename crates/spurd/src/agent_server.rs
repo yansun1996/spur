@@ -4074,9 +4074,8 @@ impl SlurmAgent for AgentService {
             (script, crate::container::RootfsMode::Extracted)
         };
 
-        // A supervised launch hosts its own PMIx server, so the agent only
-        // forwards the plan; the server's lifetime has to be the supervisor's or
-        // an agent restart takes the ranks' rendezvous socket down with it.
+        // A supervised launch hosts its own server, so the agent only forwards
+        // the plan: an agent restart must not take the rendezvous down with it.
         let mut pmix_guard = None;
         let mut supervised_pmix = None;
         let mut pmix_plan: Option<PmixLaunchPlan> = None;

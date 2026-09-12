@@ -87,9 +87,8 @@ pub struct StepdLaunchSpec {
     pub pmix: Option<StepdPmix>,
 }
 
-/// Everything the supervisor needs to host its own PMIx server. The agent still
-/// builds the plan: `peer_hosts`, `node_index` and `universe_size` are cluster
-/// facts a single-job supervisor has no way to derive.
+/// Everything the supervisor needs to host its own PMIx server. The agent builds
+/// the plan: `peer_hosts` and `universe_size` are facts only it has.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepdPmix {
     pub plan: spur_core::mpi::PmixLaunchPlan,
@@ -1609,8 +1608,7 @@ impl SupervisedPmix {
 }
 
 /// Start this step's PMIx server and fold the ranks' bootstrap environment into
-/// the launch. Multi-rank launches need a wrapper the agent could not write:
-/// only the process hosting the server can hand out each rank's environment.
+/// the launch. Only the server's host can hand out each rank's environment.
 fn start_supervised_pmix(spec: &mut StepdLaunchSpec) -> anyhow::Result<Option<SupervisedPmix>> {
     let Some(pmix) = spec.pmix.take() else {
         // The agent leaves a fan-out launch's script unwrapped for the wrapper
