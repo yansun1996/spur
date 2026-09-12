@@ -408,6 +408,18 @@ int spur_modex_session_start(spur_modex_session_t *session) {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(session->port);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        int bind_errno = errno;
+        fprintf(
+            stderr,
+            "spur_mpi_pmix: modex bind port %u for job %u step %u failed: %s%s\n",
+            (unsigned)session->port,
+            session->job_id,
+            session->step_id,
+            strerror(bind_errno),
+            bind_errno == EADDRINUSE
+                ? " (another process already holds the modex port for this job/step)"
+                : ""
+        );
         close(fd);
         return SPUR_MODEX_ERR_CONNECT;
     }
