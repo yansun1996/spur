@@ -271,7 +271,8 @@ Follow this order for any cluster upgrade:
    ``spur_mpi_pmix.so`` is versioned against the binaries that load it, and this
    release bumps that version. Replace the plugin in ``[mpi].plugin_dir`` in the
    same window, or ``--mpi=pmix`` jobs fail with ``unsupported MPI plugin API
-   version``. The plugin is now loaded by ``spurstepd`` rather than ``spurd``.
+   version``. The plugin is now loaded by ``spurstepd`` rather than ``spurd``, for
+   steps as well as jobs.
 
 .. note::
 

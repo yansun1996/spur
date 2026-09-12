@@ -22,8 +22,9 @@ MPI plugin (optional)
 ~~~~~~~~~~~~~~~~~~~~~
 
 Open MPI jobs use ``--mpi=pmix``, which loads ``spur_mpi_pmix.so`` on compute
-nodes at runtime (no Spur binary links libpmix). The job's supervisor
-(``spurstepd``) is what loads it and hosts the PMIx server.
+nodes at runtime (no Spur binary links libpmix). The supervisor
+(``spurstepd``) is what loads it and hosts the PMIx server, for an
+``srun --mpi=pmix`` step as well as for a job.
 
 **For production clusters**, use a **release or nightly tarball** from GitHub
 Releases (or your artifactory mirror). Both ship ``lib/spur/spur_mpi_pmix.so``

@@ -421,7 +421,9 @@ impl MpiPluginHost {
     }
 
     /// Stop every PMIx namespace this process hosts for a job. Cancel and
-    /// reclaim teardown name only the job, so they land here.
+    /// reclaim teardown name only the job, so they land here. In an agent this
+    /// normally finds nothing — servers live in supervisors — so its `Ok` is not
+    /// evidence that a teardown happened.
     pub fn stop_pmix_job(&self, job_id: u32) -> Result<(), String> {
         let hosted: Vec<NamespaceKey> = self
             .active_namespaces
