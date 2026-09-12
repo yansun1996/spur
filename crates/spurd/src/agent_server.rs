@@ -4548,10 +4548,9 @@ impl SlurmAgent for AgentService {
         &self,
         request: Request<ReleasePmixRequest>,
     ) -> Result<Response<ReleasePmixResponse>, Status> {
-        let job_id = request.into_inner().job_id;
-        if let Err(err) = self.mpi_host.release_unlaunched_pmix(job_id) {
-            warn!(job_id, error = %err, "PMIx prepare release failed");
-        }
+        // PreparePmix only validates, so a prepare that never launched left no
+        // server here to roll back. Kept on the wire for controller compatibility.
+        let _ = request.into_inner().job_id;
         Ok(Response::new(ReleasePmixResponse {}))
     }
 
@@ -12925,8 +12924,6 @@ mod tests {
     // server, since the monitor loop's completion cleanup never runs for it.
     #[tokio::test]
     async fn completion_cleanup_stops_every_pmix_namespace_the_agent_hosts_for_the_job() {
-        use crate::mpi_plugin::ActiveNamespace;
-
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
             HooksConfig::default(),
@@ -12935,13 +12932,11 @@ mod tests {
         );
 
         for step_id in [spur_core::step::STEP_BATCH, 0] {
-            svc.mpi_host.active_namespaces.lock().unwrap().insert(
-                (99, step_id),
-                ActiveNamespace {
-                    namespace: format!("spur.99.{step_id}"),
-                    refs: 2,
-                },
-            );
+            svc.mpi_host
+                .active_namespaces
+                .lock()
+                .unwrap()
+                .insert((99, step_id), format!("spur.99.{step_id}"));
         }
 
         cleanup_completed_job_mpi(99, MPI_PMIX, &svc.mpi_host).await;
