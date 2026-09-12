@@ -1591,28 +1591,16 @@ type PmixLaunchSetup = (
     Option<Vec<HashMap<String, String>>>,
 );
 
+/// Agent-hosted PMIx, for the launch paths that have no supervisor of their own.
 fn start_pmix_launch(
     mpi_host: Arc<MpiPluginHost>,
     proto_plan: &spur_proto::proto::PmixLaunchPlan,
-    pmix_prepared: bool,
     task_offset: u32,
     tasks_on_node: u32,
 ) -> Result<PmixLaunchSetup, Status> {
     let plan = mpi_plugin::plan_from_proto(proto_plan).map_err(Status::failed_precondition)?;
-    let guard = if pmix_prepared {
-        match PmixLaunchGuard::join_prepared(mpi_host.clone(), &plan) {
-            Ok(guard) => guard,
-            Err(err) if err.contains("PMIx was not prepared") => {
-                // Step inside a running `--mpi=pmix` batch job: the batch
-                // launch already started/joined this namespace via start().
-                PmixLaunchGuard::start(mpi_host.clone(), &plan)
-                    .map_err(Status::failed_precondition)?
-            }
-            Err(err) => return Err(Status::failed_precondition(err)),
-        }
-    } else {
-        PmixLaunchGuard::start(mpi_host.clone(), &plan).map_err(Status::failed_precondition)?
-    };
+    let guard =
+        PmixLaunchGuard::start(mpi_host.clone(), &plan).map_err(Status::failed_precondition)?;
     // Per-rank direct fork under Spur's embedded PMIx server.
     let per_local_rank_env = if tasks_on_node > 1 {
         Some(
@@ -4086,23 +4074,33 @@ impl SlurmAgent for AgentService {
             (script, crate::container::RootfsMode::Extracted)
         };
 
+        // A supervised launch hosts its own PMIx server, so the agent only
+        // forwards the plan; the server's lifetime has to be the supervisor's or
+        // an agent restart takes the ranks' rendezvous socket down with it.
         let mut pmix_guard = None;
+        let mut supervised_pmix = None;
         let mut pmix_plan: Option<PmixLaunchPlan> = None;
         let mut pmix_per_local_rank_env: Option<Vec<HashMap<String, String>>> = None;
         if spec.mpi == MPI_PMIX && !batch_script_uses_step_launch(&spec.script) {
             let proto = req.pmix_plan.as_ref().ok_or_else(|| {
                 Status::failed_precondition("missing PMIx launch plan for --mpi=pmix job")
             })?;
-            let (guard, plan, per_local_rank_env) = start_pmix_launch(
-                self.mpi_host.clone(),
-                proto,
-                req.pmix_prepared,
-                task_offset,
-                tasks_per_node,
-            )?;
-            pmix_guard = Some(guard);
-            pmix_plan = Some(plan);
-            pmix_per_local_rank_env = per_local_rank_env;
+            if stepd_enabled {
+                let mut plan =
+                    mpi_plugin::plan_from_proto(proto).map_err(Status::failed_precondition)?;
+                plan.rekey_to_step(launch_step);
+                supervised_pmix = Some(crate::stepd::StepdPmix {
+                    plan,
+                    config: self.mpi_host.config().clone(),
+                    user_script_path: String::new(),
+                });
+            } else {
+                let (guard, plan, per_local_rank_env) =
+                    start_pmix_launch(self.mpi_host.clone(), proto, task_offset, tasks_per_node)?;
+                pmix_guard = Some(guard);
+                pmix_plan = Some(plan);
+                pmix_per_local_rank_env = per_local_rank_env;
+            }
         }
 
         // Batch scripts run once per node unless fan-out is requested. Spur fans
@@ -4126,15 +4124,22 @@ impl SlurmAgent for AgentService {
 
                 if spec.mpi == MPI_PMIX {
                     warn_mpi_mpirun_skipped_affinity(job_id, &spec.environment);
-                    build_multi_task_pmix_wrapper(
-                        &user_script_path,
-                        tasks_per_node,
-                        pmix_per_local_rank_env.as_ref().ok_or_else(|| {
-                            Status::internal("missing PMIx per-rank env for multi-task launch")
-                        })?,
-                        Some(&spec.environment),
-                    )
-                    .map_err(Status::failed_precondition)?
+                    // The per-rank wrapper needs each rank's PMIx environment,
+                    // which only the process hosting the server can hand out.
+                    if let Some(pmix) = supervised_pmix.as_mut() {
+                        pmix.user_script_path = user_script_path.clone();
+                        launch_script
+                    } else {
+                        build_multi_task_pmix_wrapper(
+                            &user_script_path,
+                            tasks_per_node,
+                            pmix_per_local_rank_env.as_ref().ok_or_else(|| {
+                                Status::internal("missing PMIx per-rank env for multi-task launch")
+                            })?,
+                            Some(&spec.environment),
+                        )
+                        .map_err(Status::failed_precondition)?
+                    }
                 } else {
                     build_multi_task_wrapper(&user_script_path, tasks_per_node, None)
                 }
@@ -4313,7 +4318,7 @@ impl SlurmAgent for AgentService {
                         .map(|_| rootfs_mode.clone()),
                     hooks: (*self.hooks).clone(),
                     plugstack_path: self.plugstack_path.clone(),
-                    pmix: None,
+                    pmix: supervised_pmix,
                 },
             )
             .await
@@ -4525,9 +4530,9 @@ impl SlurmAgent for AgentService {
             .and_then(|proto| {
                 mpi_plugin::plan_from_proto(proto).map_err(Status::invalid_argument)
             })?;
-        // PMIx support inside a Stepd lands in a follow-up PR; this
-        // always prepares the legacy (non-runtime) PMIx server for now.
-        match self.mpi_host.prepare_pmix_server(&plan, req.run_attempt) {
+        // A pre-flight, not a server: the ranks' server belongs to the
+        // supervisor that will own them, and it does not exist yet.
+        match self.mpi_host.validate_pmix_dispatch(&plan) {
             Ok(()) => Ok(Response::new(PreparePmixResponse {
                 success: true,
                 error: String::new(),
@@ -4544,7 +4549,7 @@ impl SlurmAgent for AgentService {
         request: Request<ReleasePmixRequest>,
     ) -> Result<Response<ReleasePmixResponse>, Status> {
         let job_id = request.into_inner().job_id;
-        if let Err(err) = self.mpi_host.release_prepared_pmix(job_id) {
+        if let Err(err) = self.mpi_host.release_unlaunched_pmix(job_id) {
             warn!(job_id, error = %err, "PMIx prepare release failed");
         }
         Ok(Response::new(ReleasePmixResponse {}))
@@ -4654,8 +4659,8 @@ impl SlurmAgent for AgentService {
             ));
         }
 
-        if let Err(err) = self.mpi_host.release_prepared_pmix(job_id) {
-            warn!(job_id, error = %err, "PMIx prepare release on cancel failed");
+        if let Err(err) = self.mpi_host.stop_pmix_job(job_id) {
+            warn!(job_id, error = %err, "PMIx teardown on cancel failed");
         }
 
         Ok(Response::new(()))
@@ -5322,13 +5327,8 @@ impl SlurmAgent for AgentService {
                 .pmix_plan
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("missing PMIx launch plan"))?;
-            let (guard, plan, per_local_rank_env) = start_pmix_launch(
-                self.mpi_host.clone(),
-                proto,
-                req.pmix_prepared,
-                req.task_offset,
-                num_tasks,
-            )?;
+            let (guard, plan, per_local_rank_env) =
+                start_pmix_launch(self.mpi_host.clone(), proto, req.task_offset, num_tasks)?;
             pmix_step_guard = Some(guard);
             pmix_plan = Some(plan);
             pmix_per_local_rank_env = per_local_rank_env;

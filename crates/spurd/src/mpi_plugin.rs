@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Runtime-loaded PMIx plugin host for spurd.
+//! Runtime-loaded PMIx plugin host. A supervised launch hosts its server in
+//! `spurstepd`; the agent keeps one only for the launches it runs itself.
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
@@ -97,15 +98,10 @@ impl Drop for NamespaceReservation<'_> {
     }
 }
 
-struct PreparedPmix {
-    run_attempt: u32,
-}
-
 pub struct MpiPluginHost {
     config: MpiConfig,
     plugin: Mutex<Option<PluginApi>>,
     pub(crate) active_namespaces: Mutex<HashMap<NamespaceKey, ActiveNamespace>>,
-    prepared: Mutex<HashMap<NamespaceKey, PreparedPmix>>,
 }
 
 /// Rolls back a PMIx namespace reference when launch fails before the job is committed.
@@ -118,15 +114,6 @@ pub struct PmixLaunchGuard {
 impl PmixLaunchGuard {
     pub fn start(host: Arc<MpiPluginHost>, plan: &PmixLaunchPlan) -> Result<Self, String> {
         host.start_pmix_server(plan)?;
-        Ok(Self {
-            host,
-            key: (plan.job_id, plan.step_id),
-            rollback: true,
-        })
-    }
-
-    pub fn join_prepared(host: Arc<MpiPluginHost>, plan: &PmixLaunchPlan) -> Result<Self, String> {
-        host.join_prepared_pmix(plan)?;
         Ok(Self {
             host,
             key: (plan.job_id, plan.step_id),
@@ -157,7 +144,6 @@ impl MpiPluginHost {
             config,
             plugin: Mutex::new(None),
             active_namespaces: Mutex::new(HashMap::new()),
-            prepared: Mutex::new(HashMap::new()),
         }
     }
 
@@ -175,6 +161,12 @@ impl MpiPluginHost {
 
     pub fn plugin_path(&self) -> PathBuf {
         self.config.resolve_pmix_plugin_path()
+    }
+
+    /// The resolved [mpi] settings, handed to a supervisor that hosts its own
+    /// server and has no config file of its own to read them from.
+    pub fn config(&self) -> &MpiConfig {
+        &self.config
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -397,7 +389,13 @@ impl MpiPluginHost {
 
         let start_result = (|| {
             self.load_plugin()?;
-            self.call_server_start(&plan)
+            self.call_server_start(&plan)?;
+            // The cross-node modex rendezvous is checked here, by whoever hosts
+            // the server, rather than in a separate pre-flight on the agent.
+            if plan.num_nodes > 1 {
+                self.call_verify_peers(&plan)?;
+            }
+            Ok(())
         })();
 
         if let Err(err) = start_result {
@@ -436,184 +434,36 @@ impl MpiPluginHost {
         Ok(!joined)
     }
 
-    /// Start PMIx server and verify peers before rank exec (multi-node prepare phase).
-    pub fn prepare_pmix_server(
-        &self,
-        plan: &PmixLaunchPlan,
-        run_attempt: u32,
-    ) -> Result<(), String> {
-        let key = (plan.job_id, plan.step_id);
-        let existing_attempt = self
-            .prepared
-            .lock()
-            .map_err(|_| "prepared lock poisoned".to_string())?
-            .get(&key)
-            .map(|entry| entry.run_attempt);
-        if existing_attempt == Some(run_attempt) {
-            if plan.num_nodes > 1 {
-                let mut plan = plan.clone();
-                self.apply_modex_timeouts(&mut plan);
-                mpi::validate_pmix_plan(&plan)?;
-                self.load_plugin()?;
-                self.call_verify_peers(&plan)?;
-            }
-            return Ok(());
-        }
-        if existing_attempt.is_some() {
-            self.release_prepared_key(key)?;
-        }
-
+    /// Pre-flight for a `--mpi=pmix` dispatch: the plan is well formed and this
+    /// node can load a PMIx runtime new enough to serve it. Starts nothing --
+    /// the server belongs to the process that will supervise the ranks.
+    pub fn validate_pmix_dispatch(&self, plan: &PmixLaunchPlan) -> Result<(), String> {
         let mut plan = plan.clone();
         self.apply_modex_timeouts(&mut plan);
         mpi::validate_pmix_plan(&plan)?;
-        self.load_plugin()?;
-        {
-            let mut namespaces = self
-                .active_namespaces
-                .lock()
-                .map_err(|_| "namespace lock poisoned".to_string())?;
-            namespaces.insert(
-                key,
-                ActiveNamespace {
-                    namespace: plan.namespace.clone(),
-                    refs: 0,
-                },
-            );
-        }
-        if let Err(err) = self.call_server_start(&plan) {
-            let _ = self
-                .active_namespaces
-                .lock()
-                .map_err(|_| "namespace lock poisoned".to_string())?
-                .remove(&key);
-            return Err(err);
-        }
-        if plan.num_nodes > 1 {
-            if let Err(err) = self.call_verify_peers(&plan) {
-                if let Err(stop_err) = self.call_server_stop(&plan.namespace) {
-                    warn!(
-                        job_id = plan.job_id,
-                        namespace = %plan.namespace,
-                        error = %stop_err,
-                        "PMIx server stop failed during prepare verify rollback"
-                    );
-                }
-                let _ = self
-                    .active_namespaces
-                    .lock()
-                    .map_err(|_| "namespace lock poisoned".to_string())?
-                    .remove(&key);
-                return Err(err);
-            }
-        }
-        self.prepared
-            .lock()
-            .map_err(|_| "prepared lock poisoned".to_string())?
-            .insert(key, PreparedPmix { run_attempt });
-        Ok(())
+        self.load_plugin()
     }
 
-    /// Join a prepared PMIx server at launch time (controller two-phase dispatch).
-    pub fn join_prepared_pmix(&self, plan: &PmixLaunchPlan) -> Result<(), String> {
-        let key = (plan.job_id, plan.step_id);
-        {
-            let guard = self
-                .prepared
-                .lock()
-                .map_err(|_| "prepared lock poisoned".to_string())?;
-            if !guard.contains_key(&key) {
-                return Err(format!(
-                    "job {} step {} PMIx was not prepared on this agent",
-                    plan.job_id, plan.step_id
-                ));
-            }
-        }
-        mpi::validate_pmix_plan(plan)?;
-        self.load_plugin()?;
-        {
-            let mut namespaces = self
-                .active_namespaces
-                .lock()
-                .map_err(|_| "namespace lock poisoned".to_string())?;
-            let entry = namespaces.get_mut(&key).ok_or_else(|| {
-                format!(
-                    "job {} step {} PMIx namespace not active after prepare",
-                    plan.job_id, plan.step_id
-                )
-            })?;
-            if entry.namespace != plan.namespace {
-                return Err(format!(
-                    "PMIx namespace mismatch for job {} step {} (prepared {}, join {})",
-                    plan.job_id, plan.step_id, entry.namespace, plan.namespace
-                ));
-            }
-            entry.refs = entry.refs.saturating_add(1);
-        }
-        self.prepared
+    /// Drop any namespace this agent registered for a job but never launched
+    /// into. A launched one is left alone: the release RPC names only the job,
+    /// and a step rolling back must not take its running job's server with it.
+    pub fn release_unlaunched_pmix(&self, job_id: u32) -> Result<(), String> {
+        let unlaunched: Vec<(NamespaceKey, String)> = self
+            .active_namespaces
             .lock()
-            .map_err(|_| "prepared lock poisoned".to_string())?
-            .remove(&key);
-        debug!(
-            job_id = plan.job_id,
-            step_id = plan.step_id,
-            namespace = %plan.namespace,
-            "PMIx prepared namespace joined for launch"
-        );
-        Ok(())
-    }
-
-    /// Tear down every prepared-but-not-launched PMIx server for a job. The
-    /// release RPC names only the job, so it covers each step prepared under it.
-    pub fn release_prepared_pmix(&self, job_id: u32) -> Result<(), String> {
-        let mut keys: Vec<NamespaceKey> = self
-            .prepared
-            .lock()
-            .map_err(|_| "prepared lock poisoned".to_string())?
-            .keys()
-            .filter(|(id, _)| *id == job_id)
-            .copied()
+            .map_err(|_| "namespace lock poisoned".to_string())?
+            .iter()
+            .filter(|((id, _), entry)| *id == job_id && entry.refs == 0)
+            .map(|(key, entry)| (*key, entry.namespace.clone()))
             .collect();
-        keys.extend(
+        for (key, namespace) in unlaunched {
             self.active_namespaces
                 .lock()
                 .map_err(|_| "namespace lock poisoned".to_string())?
-                .keys()
-                .filter(|(id, _)| *id == job_id)
-                .copied(),
-        );
-        keys.sort_unstable();
-        keys.dedup();
-        for key in keys {
-            self.release_prepared_key(key)?;
+                .remove(&key);
+            self.call_server_stop(&namespace)?;
         }
         Ok(())
-    }
-
-    fn release_prepared_key(&self, key: NamespaceKey) -> Result<(), String> {
-        let was_prepared = self
-            .prepared
-            .lock()
-            .map_err(|_| "prepared lock poisoned".to_string())?
-            .remove(&key);
-        let has_unrefd_namespace = self
-            .active_namespaces
-            .lock()
-            .map_err(|_| "namespace lock poisoned".to_string())?
-            .get(&key)
-            .is_some_and(|entry| entry.refs == 0);
-        if was_prepared.is_none() && !has_unrefd_namespace {
-            return Ok(());
-        }
-        if self
-            .active_namespaces
-            .lock()
-            .map_err(|_| "namespace lock poisoned".to_string())?
-            .contains_key(&key)
-        {
-            return self.release_pmix_server(key.0, key.1);
-        }
-        let namespace = PmixLaunchPlan::namespace_for_step(key.0, key.1);
-        self.call_server_stop(&namespace)
     }
 
     /// Release one reference to a step's PMIx namespace; stops the C server when
@@ -1278,15 +1128,6 @@ mod tests {
     }
 
     #[test]
-    fn join_prepared_fails_when_not_prepared() {
-        let host = MpiPluginHost::new(MpiConfig::default());
-        let plan =
-            PmixLaunchPlan::local_tasks(42, TEST_STEP, 2, 0, 2, "/tmp/pmix", 0, 0, 2, 0, vec![]);
-        let err = host.join_prepared_pmix(&plan).unwrap_err();
-        assert!(err.contains("was not prepared"));
-    }
-
-    #[test]
     fn strip_launcher_mpi_env_removes_stale_launcher_keys() {
         let mut env = HashMap::from([
             ("PMIX_RANK".into(), "0".into()),
@@ -1311,13 +1152,13 @@ mod tests {
     }
 
     #[test]
-    fn release_prepared_is_noop_when_not_prepared() {
+    fn release_unlaunched_is_noop_when_the_agent_hosts_nothing() {
         let host = MpiPluginHost::new(MpiConfig::default());
-        host.release_prepared_pmix(99).unwrap();
+        host.release_unlaunched_pmix(99).unwrap();
     }
 
     #[test]
-    fn release_prepared_stops_unrefd_namespace_before_prepared_insert() {
+    fn release_unlaunched_stops_a_namespace_nothing_ever_launched_into() {
         let host = MpiPluginHost::new(MpiConfig::default());
         host.active_namespaces.lock().unwrap().insert(
             (55, TEST_STEP),
@@ -1326,7 +1167,7 @@ mod tests {
                 refs: 0,
             },
         );
-        host.release_prepared_pmix(55).unwrap();
+        host.release_unlaunched_pmix(55).unwrap();
         assert!(!host
             .active_namespaces
             .lock()
@@ -1335,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn release_prepared_does_not_stop_active_launched_namespace() {
+    fn release_unlaunched_does_not_stop_an_active_launched_namespace() {
         let host = MpiPluginHost::new(MpiConfig::default());
         host.active_namespaces.lock().unwrap().insert(
             (42, TEST_STEP),
@@ -1344,83 +1185,12 @@ mod tests {
                 refs: 1,
             },
         );
-        host.release_prepared_pmix(42).unwrap();
+        host.release_unlaunched_pmix(42).unwrap();
         assert!(host
             .active_namespaces
             .lock()
             .unwrap()
             .contains_key(&(42, TEST_STEP)));
-    }
-
-    #[test]
-    fn release_prepared_clears_prepared_entry() {
-        let host = MpiPluginHost::new(MpiConfig {
-            plugin_dir: "/nonexistent/spur/plugins".into(),
-            ..MpiConfig::default()
-        });
-        host.prepared
-            .lock()
-            .unwrap()
-            .insert((77, TEST_STEP), PreparedPmix { run_attempt: 1 });
-        host.release_prepared_pmix(77).unwrap();
-        assert!(host
-            .prepared
-            .lock()
-            .unwrap()
-            .get(&(77, TEST_STEP))
-            .is_none());
-    }
-
-    #[test]
-    fn prepare_same_run_attempt_is_idempotent() {
-        let host = MpiPluginHost::new(MpiConfig::default());
-        host.prepared
-            .lock()
-            .unwrap()
-            .insert((88, TEST_STEP), PreparedPmix { run_attempt: 2 });
-        let plan =
-            PmixLaunchPlan::local_tasks(88, TEST_STEP, 2, 0, 2, "/tmp/pmix", 0, 0, 1, 0, vec![]);
-        host.prepare_pmix_server(&plan, 2).unwrap();
-    }
-
-    #[test]
-    fn prepare_stale_run_attempt_releases_prior_prepare() {
-        let host = MpiPluginHost::new(MpiConfig {
-            plugin_dir: "/nonexistent/spur/plugins".into(),
-            ..MpiConfig::default()
-        });
-        host.prepared
-            .lock()
-            .unwrap()
-            .insert((89, TEST_STEP), PreparedPmix { run_attempt: 1 });
-        let plan = PmixLaunchPlan::local_tasks(
-            89,
-            TEST_STEP,
-            2,
-            0,
-            2,
-            "/tmp/pmix",
-            0,
-            0,
-            2,
-            0,
-            vec!["10.0.0.1".into(), "10.0.0.2".into()],
-        );
-        assert!(host.prepare_pmix_server(&plan, 2).is_err());
-        assert!(host
-            .prepared
-            .lock()
-            .unwrap()
-            .get(&(89, TEST_STEP))
-            .is_none());
-    }
-
-    #[test]
-    fn pmix_launch_guard_join_prepared_fails_when_not_prepared() {
-        let host = Arc::new(MpiPluginHost::new(MpiConfig::default()));
-        let plan =
-            PmixLaunchPlan::local_tasks(90, TEST_STEP, 2, 0, 2, "/tmp/pmix", 0, 0, 2, 0, vec![]);
-        assert!(PmixLaunchGuard::join_prepared(host, &plan).is_err());
     }
 
     #[test]

@@ -691,10 +691,9 @@ async fn spawn_job_process(
 
     // --- Non-container jobs: existing tokio::Command path ---
 
-    // Issue #99: If root, wrap job with namespace isolation.
-    // Batch `--mpi=pmix` multi-rank wrappers must stay in the host mount/PID
-    // namespace so Open MPI's PMIx client can reach spurd's embedded server
-    // (same as standalone `srun` via `run_command`, which never uses unshare).
+    // If root, wrap job with namespace isolation. Batch `--mpi=pmix` multi-rank
+    // wrappers must stay in the host mount/PID namespace so Open MPI's PMIx
+    // client can reach the embedded server, which runs outside them.
     let use_namespaces = would_use_namespaces(cfg, nix::unistd::geteuid().is_root());
     let (launch_cmd, launch_args) = if use_namespaces {
         let wrapper_path = spool_dir.join(namespace_wrapper_name(cfg.step_id));

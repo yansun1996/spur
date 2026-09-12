@@ -1587,6 +1587,96 @@ fn rootfs_base(job_id: u32, step_id: spur_core::step::StepId) -> String {
     }
 }
 
+/// The supervisor's own PMIx server. Its lifetime is the supervisor's, so the
+/// rank-to-server socket cannot outlive the process the ranks talk to.
+struct SupervisedPmix {
+    host: Arc<crate::mpi_plugin::MpiPluginHost>,
+    job_id: u32,
+    step_id: spur_core::step::StepId,
+}
+
+impl SupervisedPmix {
+    fn stop(&self) {
+        if let Err(error) = self.host.stop_pmix_job(self.job_id) {
+            tracing::warn!(
+                job_id = self.job_id,
+                step_id = self.step_id,
+                %error,
+                "failed to stop the supervised PMIx server"
+            );
+        }
+    }
+}
+
+/// Start this step's PMIx server and fold the ranks' bootstrap environment into
+/// the launch. Multi-rank launches need a wrapper the agent could not write:
+/// only the process hosting the server can hand out each rank's environment.
+fn start_supervised_pmix(spec: &mut StepdLaunchSpec) -> anyhow::Result<Option<SupervisedPmix>> {
+    let Some(pmix) = spec.pmix.take() else {
+        return Ok(None);
+    };
+    if pmix.plan.step_id != spec.step_id {
+        anyhow::bail!(
+            "PMIx plan is keyed to step {} but this supervisor owns step {}",
+            pmix.plan.step_id,
+            spec.step_id
+        );
+    }
+    let ranks = pmix.plan.local_procs.len() as u32;
+    // Checked before the server starts so a missing input cannot leave one running.
+    if ranks > 1 && pmix.user_script_path.is_empty() {
+        anyhow::bail!("a multi-rank PMIx launch needs the user script path from the agent");
+    }
+    let host = Arc::new(crate::mpi_plugin::MpiPluginHost::new(pmix.config));
+    host.start_pmix_server(&pmix.plan)
+        .map_err(|error| anyhow::anyhow!("failed to start the PMIx server: {error}"))?;
+    let server = SupervisedPmix {
+        host,
+        job_id: spec.job_id,
+        step_id: spec.step_id,
+    };
+    let applied = if ranks > 1 {
+        apply_multi_rank_pmix(spec, &server, &pmix.plan, &pmix.user_script_path, ranks)
+    } else {
+        crate::mpi_plugin::apply_pmix_setup_fork_env(
+            &server.host,
+            &pmix.plan,
+            pmix.plan.task_offset,
+            &mut spec.environment,
+        )
+        .map_err(|error| anyhow::anyhow!("failed to build the PMIx rank environment: {error}"))
+    };
+    if let Err(error) = applied {
+        server.stop();
+        return Err(error);
+    }
+    Ok(Some(server))
+}
+
+fn apply_multi_rank_pmix(
+    spec: &mut StepdLaunchSpec,
+    server: &SupervisedPmix,
+    plan: &spur_core::mpi::PmixLaunchPlan,
+    user_script_path: &str,
+    ranks: u32,
+) -> anyhow::Result<()> {
+    let per_rank_env = crate::mpi_plugin::pmix_setup_fork_env_for_node_tasks(
+        &server.host,
+        plan,
+        plan.task_offset,
+        ranks,
+    )
+    .map_err(|error| anyhow::anyhow!("failed to build the PMIx rank environment: {error}"))?;
+    spec.script = spur_core::task_launch::build_multi_task_pmix_wrapper(
+        user_script_path,
+        ranks,
+        &per_rank_env,
+        Some(&spec.environment),
+    )
+    .map_err(|error| anyhow::anyhow!("failed to build the PMIx rank wrapper: {error}"))?;
+    Ok(())
+}
+
 const STEPD_USAGE: &str = "usage: spurstepd <state-dir> <job-id> <attempt> <launch-spec>\n\n\
      Per-step supervisor. spurd spawns this; it is not meant to be run by hand.";
 
@@ -1605,7 +1695,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let run_attempt: u32 = args[2]
         .parse()
         .map_err(|error| anyhow::anyhow!("invalid run attempt: {error}"))?;
-    let launch_spec: StepdLaunchSpec = serde_json::from_slice(&std::fs::read(&args[3])?)?;
+    let mut launch_spec: StepdLaunchSpec = serde_json::from_slice(&std::fs::read(&args[3])?)?;
     if launch_spec.job_id != job_id {
         anyhow::bail!("runtime launch spec job id does not match process arguments");
     }
@@ -1652,7 +1742,6 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         );
         tokio::spawn(serve_pty_custody(custody));
     }
-    let runtime_environment = launch_spec.environment.clone();
     let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     let hooks = launch_spec.hooks.clone();
     let spank = load_runtime_spank(&launch_spec.plugstack_path);
@@ -1693,20 +1782,36 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             return Err(error);
         }
     }
+    let cleanup_failed_launch = || {
+        if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
+            crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
+        }
+        if spur_core::step::is_user_step(step_id) {
+            crate::executor::cleanup_step_spool(job_id, step_id);
+        } else {
+            crate::executor::cleanup_job_spool(job_id);
+        }
+    };
+    // Before the workload execs: the ranks look the server up through the
+    // environment this folds into the launch.
+    let pmix = match start_supervised_pmix(&mut launch_spec) {
+        Ok(pmix) => pmix,
+        Err(error) => {
+            cleanup_failed_launch();
+            return Err(error);
+        }
+    };
+    let runtime_environment = launch_spec.environment.clone();
     let (job, launched_cgroup) = if launch_spec.allocation_only {
         (RunningJob::AllocationOnly, None)
     } else {
         match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref()).await {
             Ok(result) => (result.job, result.cgroup_path),
             Err(error) => {
-                if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
-                    crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
+                if let Some(pmix) = pmix.as_ref() {
+                    pmix.stop();
                 }
-                if spur_core::step::is_user_step(step_id) {
-                    crate::executor::cleanup_step_spool(job_id, step_id);
-                } else {
-                    crate::executor::cleanup_job_spool(job_id);
-                }
+                cleanup_failed_launch();
                 return Err(anyhow::anyhow!(error.to_string()));
             }
         }
@@ -1741,6 +1846,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let _ = std::fs::remove_file(socket_path);
     let cgroup = session.take_cgroup().await.or(recorded_cgroup);
     let teardown = |cgroup: Option<PathBuf>| async move {
+        if let Some(pmix) = pmix.as_ref() {
+            pmix.stop();
+        }
         if let Some(cgroup) = cgroup.as_ref() {
             crate::executor::cleanup_cgroup(cgroup);
             // The agent reaps the job node once its last step releases; this
@@ -2483,6 +2591,106 @@ mod tests {
         let mut spec = launch_spec();
         spec.pmix_multi_task = true;
         assert!(spec.into_launch_config().pmix_multi_task);
+    }
+
+    fn pmix_spec(step_id: spur_core::step::StepId, ranks: u32, plugin: &str) -> StepdPmix {
+        StepdPmix {
+            plan: spur_core::mpi::PmixLaunchPlan::local_tasks(
+                42,
+                step_id,
+                ranks,
+                0,
+                ranks,
+                "/tmp/spur-pmix",
+                1000,
+                1000,
+                1,
+                0,
+                vec![],
+            ),
+            config: spur_core::config::MpiConfig {
+                pmix_plugin: plugin.into(),
+                ..spur_core::config::MpiConfig::default()
+            },
+            user_script_path: "/tmp/.spur_user_42.sh".into(),
+        }
+    }
+
+    #[test]
+    fn a_supervisor_resolves_the_pmix_plugin_from_its_own_launch_spec() {
+        let mut spec = launch_spec();
+        spec.job_id = 42;
+        spec.step_id = spur_core::step::STEP_BATCH;
+        spec.pmix = Some(pmix_spec(
+            spur_core::step::STEP_BATCH,
+            1,
+            "/nonexistent/spur/from-the-spec/spur_mpi_pmix.so",
+        ));
+
+        let error = start_supervised_pmix(&mut spec)
+            .err()
+            .expect("the plugin does not exist");
+
+        assert!(
+            error
+                .to_string()
+                .contains("/nonexistent/spur/from-the-spec/spur_mpi_pmix.so"),
+            "the supervisor must look where the launch spec points: {error}"
+        );
+    }
+
+    #[test]
+    fn a_supervisor_refuses_a_pmix_plan_keyed_to_another_step() {
+        let mut spec = launch_spec();
+        spec.job_id = 42;
+        spec.step_id = spur_core::step::STEP_BATCH;
+        spec.pmix = Some(pmix_spec(0, 1, "/nonexistent/spur/spur_mpi_pmix.so"));
+
+        let error = start_supervised_pmix(&mut spec)
+            .err()
+            .expect("the plan names a different step");
+
+        assert!(
+            error.to_string().contains("keyed to step 0"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_multi_rank_pmix_launch_is_refused_before_a_server_starts_without_its_user_script() {
+        let mut spec = launch_spec();
+        spec.job_id = 42;
+        spec.step_id = spur_core::step::STEP_BATCH;
+        let mut pmix = pmix_spec(
+            spur_core::step::STEP_BATCH,
+            2,
+            "/nonexistent/spur/plugin.so",
+        );
+        pmix.user_script_path.clear();
+        spec.pmix = Some(pmix);
+
+        let error = start_supervised_pmix(&mut spec)
+            .err()
+            .expect("the wrapper has nothing to wrap");
+
+        assert!(
+            error.to_string().contains("user script path"),
+            "a missing input must be caught before the server starts: {error}"
+        );
+    }
+
+    #[test]
+    fn a_launch_without_pmix_starts_no_server_and_leaves_the_script_alone() {
+        let mut spec = launch_spec();
+        let script = spec.script.clone();
+
+        let server = start_supervised_pmix(&mut spec).expect("no PMIx work to do");
+
+        assert!(
+            server.is_none(),
+            "a launch without PMIx must host no server"
+        );
+        assert_eq!(spec.script, script);
     }
 
     #[test]

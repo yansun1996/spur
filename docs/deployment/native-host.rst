@@ -128,6 +128,11 @@ The two daemons are configured with command-line flags. The most common are belo
    leaks its unpacked rootfs, which nothing reclaims. Containerized *jobs* are
    supervised and survive a restart normally.
 
+   One further exception applies to MPI: a ``--mpi=pmix`` **job** hosts its PMIx
+   server inside its own supervisor and survives a restart, but an inner
+   ``srun --mpi=pmix`` **step** still hosts its server in ``spurd``. Restarting
+   the agent under such a step breaks its ranks' rendezvous.
+
    Setting ``[auth] jwt_key`` (or ``jwt_key_file``) to the same value on the
    controller and every agent lets the controller verify a supervisor an agent
    recovered after a restart, and fence one belonging to a superseded run.
@@ -570,6 +575,13 @@ MPI (PMIx)
 Spur supports Open MPI jobs via ``--mpi=pmix`` on **single-node and multi-node**
 allocations. The controller and CLI do not link libpmix; each compute node loads
 ``spur_mpi_pmix.so`` from ``[mpi].plugin_dir`` when a PMIx job starts.
+
+The PMIx server runs inside the job's supervisor (``spurstepd``), not inside
+``spurd``, so it lives and dies with the ranks it serves rather than with the
+node agent. The supervisor inherits the agent's environment, so ``[Service]``
+settings such as ``Environment=PMIX_MCA_gds=hash`` still reach the server. The
+plugin is loaded by the supervisor and must be readable at ``[mpi].plugin_dir``
+on every agent.
 
 .. _mpi-pmix-install:
 
