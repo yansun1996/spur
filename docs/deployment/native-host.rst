@@ -124,7 +124,9 @@ The two daemons are configured with command-line flags. The most common are belo
    Two launches are still unsupervised and do **not** survive a restart: a step
    given its own ``--container-image``, and an ``srun --pty`` that allocates its
    own job. A terminal opened *inside* an existing allocation is supervised —
-   see :doc:`../user-guide/interactive`.
+   see :doc:`../user-guide/interactive`. A container step killed that way also
+   leaks its unpacked rootfs, which nothing reclaims. Containerized *jobs* are
+   supervised and survive a restart normally.
 
    Setting ``[auth] jwt_key`` (or ``jwt_key_file``) to the same value on the
    controller and every agent lets the controller verify a supervisor an agent

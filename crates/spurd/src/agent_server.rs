@@ -697,8 +697,8 @@ struct CompletedJob {
 
 async fn cleanup_completed_job_mpi(job_id: u32, mpi: &str, mpi_host: &MpiPluginHost) {
     if mpi == MPI_PMIX {
-        if let Err(e) = mpi_host.release_pmix_server(job_id) {
-            warn!(job_id, error = %e, "PMIx batch ref release failed");
+        if let Err(e) = mpi_host.stop_pmix_job(job_id) {
+            warn!(job_id, error = %e, "PMIx teardown on job completion failed");
         }
     }
 }
@@ -4337,7 +4337,7 @@ impl SlurmAgent for AgentService {
                             run_attempt,
                             "stepd superseded by a newer attempt before it could be tracked; aborting"
                         );
-                        if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+                        if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
                             warn!(job_id, error = %e, "PMIx stop failed after superseded stepd");
                         }
                         if let Err(error) = stop_stepd_process(&descriptor).await {
@@ -4385,7 +4385,7 @@ impl SlurmAgent for AgentService {
                         job_id,
                         "reservation reclaimed during launch; aborting to avoid running unbacked"
                     );
-                    if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+                    if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
                         warn!(job_id, error = %e, "PMIx stop failed after reclaimed reservation");
                     }
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
@@ -6592,7 +6592,7 @@ impl AgentService {
                 warn!(job_id, %error, "failed to record runtime resource release");
             }
         }
-        if let Err(e) = self.mpi_host.stop_pmix_server(job_id) {
+        if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
             warn!(job_id, error = %e, "PMIx stop failed on job drop");
         }
     }
@@ -12919,7 +12919,7 @@ mod tests {
     // A launch that aborts before entering `running` must tear down its PMI
     // server, since the monitor loop's completion cleanup never runs for it.
     #[tokio::test]
-    async fn completion_cleanup_releases_batch_pmix_ref_without_force_stop() {
+    async fn completion_cleanup_stops_every_pmix_namespace_the_agent_hosts_for_the_job() {
         use crate::mpi_plugin::ActiveNamespace;
 
         let svc = AgentService::new(
@@ -12929,20 +12929,24 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
         );
 
-        svc.mpi_host.active_namespaces.lock().unwrap().insert(
-            99,
-            ActiveNamespace {
-                namespace: "spur.99".into(),
-                refs: 2,
-            },
-        );
+        for step_id in [spur_core::step::STEP_BATCH, 0] {
+            svc.mpi_host.active_namespaces.lock().unwrap().insert(
+                (99, step_id),
+                ActiveNamespace {
+                    namespace: format!("spur.99.{step_id}"),
+                    refs: 2,
+                },
+            );
+        }
 
         cleanup_completed_job_mpi(99, MPI_PMIX, &svc.mpi_host).await;
 
-        assert!(
-            svc.mpi_host.has_active_pmix(99),
-            "batch completion must release one ref, not force-stop an active step namespace"
-        );
+        for step_id in [spur_core::step::STEP_BATCH, 0] {
+            assert!(
+                !svc.mpi_host.has_active_pmix(99, step_id),
+                "a finished job must leave no PMIx namespace hosted on the agent"
+            );
+        }
     }
 
     // A guard dropped while another task holds the steps lock must still
