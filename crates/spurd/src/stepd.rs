@@ -891,19 +891,42 @@ fn finalized_obligations(obligations: &[StepdObligation]) -> bool {
 /// only ever reaches the caller parked on `await_step`. Keep the record until
 /// that caller has had every chance to ask, across as many agent restarts as
 /// the window holds; a caller that never returns cannot pin it past that.
-fn settled_answer_still_retained(
+/// Returns when it settled, so a caller bounding the retained set can order it.
+fn retained_settled_answer(
     obligations: &StepdObligationLog,
     step_id: spur_core::step::StepId,
-) -> io::Result<bool> {
+) -> io::Result<Option<SystemTime>> {
     if !spur_core::step::is_user_step(step_id) {
-        return Ok(false);
+        return Ok(None);
     }
-    let settled_at = obligations.last_written()?;
-    Ok(settled_at.is_some_and(|settled_at| {
+    Ok(obligations.last_written()?.filter(|settled_at| {
         SystemTime::now()
-            .duration_since(settled_at)
+            .duration_since(*settled_at)
             .is_ok_and(|age| age < crate::step_completion::SETTLED_RETENTION)
     }))
+}
+
+/// What a sweep did with one session, so a caller can bound the answers it
+/// chose to keep rather than rediscovering which ones those were.
+enum SweptSession {
+    Unfinalized,
+    Pruned,
+    RetainedAnswer { settled_at: SystemTime },
+}
+
+fn sweep_finalized_session(
+    session_dir: &Path,
+    obligations: &StepdObligationLog,
+    step_id: spur_core::step::StepId,
+) -> io::Result<SweptSession> {
+    if !finalized_obligations(&obligations.read()?) {
+        return Ok(SweptSession::Unfinalized);
+    }
+    if let Some(settled_at) = retained_settled_answer(obligations, step_id)? {
+        return Ok(SweptSession::RetainedAnswer { settled_at });
+    }
+    fs::remove_dir_all(session_dir)?;
+    Ok(SweptSession::Pruned)
 }
 
 fn prune_finalized_session(
@@ -911,14 +934,10 @@ fn prune_finalized_session(
     obligations: &StepdObligationLog,
     step_id: spur_core::step::StepId,
 ) -> io::Result<bool> {
-    if !finalized_obligations(&obligations.read()?) {
-        return Ok(false);
-    }
-    if settled_answer_still_retained(obligations, step_id)? {
-        return Ok(false);
-    }
-    fs::remove_dir_all(session_dir)?;
-    Ok(true)
+    Ok(matches!(
+        sweep_finalized_session(session_dir, obligations, step_id)?,
+        SweptSession::Pruned
+    ))
 }
 
 /// Session records carry the job's environment, so they are owner-only.
@@ -2267,6 +2286,7 @@ impl StepdStore {
 
     pub fn prune_finalized(&self) -> io::Result<usize> {
         let mut pruned = 0;
+        let mut retained: Vec<(SystemTime, PathBuf)> = Vec::new();
         for session_dir in self.session_dirs()? {
             let descriptor = match self.load_descriptor(&session_dir) {
                 Ok(descriptor) => descriptor,
@@ -2277,7 +2297,23 @@ impl StepdStore {
                 descriptor.run_attempt,
                 descriptor.step_id,
             );
-            if prune_finalized_session(&session_dir, &obligations, descriptor.step_id)? {
+            match sweep_finalized_session(&session_dir, &obligations, descriptor.step_id)? {
+                SweptSession::Pruned => pruned += 1,
+                SweptSession::RetainedAnswer { settled_at } => {
+                    retained.push((settled_at, session_dir))
+                }
+                SweptSession::Unfinalized => {}
+            }
+        }
+        // Age alone lets step churn grow the retained set without limit, and
+        // every kept session is re-read by each sweep; cap it like the memo.
+        let excess = retained
+            .len()
+            .saturating_sub(crate::step_completion::SETTLED_CAPACITY);
+        if excess > 0 {
+            retained.sort_by_key(|(settled_at, _)| *settled_at);
+            for (_, session_dir) in retained.iter().take(excess) {
+                fs::remove_dir_all(session_dir)?;
                 pruned += 1;
             }
         }
@@ -3547,6 +3583,103 @@ mod tests {
         assert!(store
             .session_dir(17, 1, spur_core::step::STEP_BATCH)
             .exists());
+    }
+
+    /// The append-only log's mtime dates a session, so fixing it fixes the
+    /// order a sweep sees without waiting for real time to pass.
+    fn date_user_step_session(
+        store: &StepdStore,
+        step_id: spur_core::step::StepId,
+        at: SystemTime,
+    ) {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(store.session_dir(21, 1, step_id).join(OBLIGATION_FILE))
+            .expect("open the obligation log")
+            .set_modified(at)
+            .expect("date the session");
+    }
+
+    /// What a finished `srun` step leaves on disk once its exit has been
+    /// reported, acknowledged and released: finalized, kept for a late caller.
+    fn settled_user_step_session(
+        store: &StepdStore,
+        step_id: spur_core::step::StepId,
+        settled_at: SystemTime,
+    ) {
+        user_step_session(
+            store,
+            step_id,
+            &[
+                USER_STEP_EXIT,
+                StepdObligation::CompletionAcknowledged,
+                StepdObligation::ResourcesReleased,
+            ],
+        );
+        date_user_step_session(store, step_id, settled_at);
+    }
+
+    #[test]
+    fn retained_answers_past_the_ceiling_drop_the_oldest_first() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let capacity = crate::step_completion::SETTLED_CAPACITY;
+        let excess = 3;
+        let now = SystemTime::now();
+        for index in 0..capacity + excess {
+            let age = (capacity + excess - index) as u64;
+            settled_user_step_session(
+                &store,
+                index as spur_core::step::StepId,
+                now - std::time::Duration::from_millis(age),
+            );
+        }
+
+        assert_eq!(store.prune_finalized().expect("prune"), excess);
+
+        for index in 0..excess {
+            assert!(
+                !store.session_dir(21, 1, index as u32).exists(),
+                "the oldest answers must go first once the retained set is over its ceiling"
+            );
+        }
+        assert!(
+            store.session_dir(21, 1, excess as u32).exists(),
+            "pruning must stop at the ceiling, not sweep the whole retained set"
+        );
+        assert!(
+            store
+                .session_dir(21, 1, (capacity + excess - 1) as u32)
+                .exists(),
+            "the newest answer must survive"
+        );
+    }
+
+    #[test]
+    fn the_retained_ceiling_never_evicts_a_step_still_owed_a_report() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let capacity = crate::step_completion::SETTLED_CAPACITY;
+        let now = SystemTime::now();
+        user_step_session(&store, 0, &[USER_STEP_EXIT]);
+        // Older than every settled answer, so a sweep ranking by age alone
+        // would take this one first.
+        date_user_step_session(&store, 0, now - std::time::Duration::from_secs(5));
+        for index in 1..=capacity {
+            let age = (capacity + 1 - index) as u64;
+            settled_user_step_session(
+                &store,
+                index as spur_core::step::StepId,
+                now - std::time::Duration::from_millis(age),
+            );
+        }
+
+        assert_eq!(store.prune_finalized().expect("prune"), 0);
+
+        assert!(
+            store.session_dir(21, 1, 0).exists(),
+            "a step whose exit has not reached the controller is not a retained answer"
+        );
     }
 
     #[test]

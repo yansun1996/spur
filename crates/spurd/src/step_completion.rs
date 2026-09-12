@@ -23,8 +23,9 @@ pub struct StepOutcome {
 /// `stepd` keeps a settled step's durable record for the same span, so the
 /// memo and the disk it is a fast path for expire together.
 pub(crate) const SETTLED_RETENTION: Duration = Duration::from_secs(600);
-/// A hard ceiling independent of retention, so step churn cannot grow the memo.
-const SETTLED_CAPACITY: usize = 1024;
+/// A hard ceiling independent of retention, so step churn cannot grow the memo
+/// or the durable records it is a fast path for.
+pub(crate) const SETTLED_CAPACITY: usize = 1024;
 
 struct SettledStep {
     key: (JobId, StepId),
