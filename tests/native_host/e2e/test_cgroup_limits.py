@@ -550,6 +550,32 @@ class TestCgroupRequired:
         )
         cluster.scancel(str(job_id))
 
+    def test_a_step_runs_when_enforcement_is_required(self, cgroup_cluster):
+        # A step holds no cores of its own, so reconfiguring the job cgroup from the
+        # step's limits degrades enforcement and `required` then refuses the step.
+        cluster = cgroup_cluster
+        marker = f"{cluster.remote_dir}/cg-required-step-marker.txt"
+        step = cluster.write_file(
+            "cg-required-step-probe.sh", f"#!/bin/bash\necho STEP_RAN > {marker}\n"
+        )
+        script = cluster.write_file(
+            "cg-required-step.sh", "#!/bin/bash\n" f"srun bash {step}\n"
+        )
+        sb = cluster.sbatch(
+            ["-J", "cg-required-step", "-N", "1", "-w", cluster.node_names[0],
+             "-t", "2", "--cpus-per-task=1", "--mem=256", script]
+        )
+        job_id = parse_job_id(sb)
+        assert job_id is not None, f"sbatch failed: {sb}"
+        state = wait_job(cluster, job_id, timeout=120)
+        marker_out = cluster.nodes[0].read_file(marker)
+
+        assert "STEP_RAN" in marker_out, (
+            f"a step must join the job's cgroup rather than reconfigure it: under "
+            f"[cgroup] required it was refused instead (state {state})\n"
+            f"{cluster.debug_job(job_id)}\nmarker:\n{marker_out!r}"
+        )
+
 
 class TestCgroupConfigValidation:
     def test_controller_refuses_a_zero_ram_percent(self, unstarted_cluster):
