@@ -100,6 +100,11 @@ pub struct StepdPmix {
     /// rank's environment can only be written once the server is up.
     #[serde(default)]
     pub user_script_path: String,
+    /// A step's launch script already points at a wrapper file the agent
+    /// reserved, so the supervisor fills that file in rather than replacing the
+    /// script — replacing it would drop the step's nsenter into its job.
+    #[serde(default)]
+    pub wrapper_path: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1630,7 +1635,12 @@ fn start_supervised_pmix(spec: &mut StepdLaunchSpec) -> anyhow::Result<Option<Su
     if ranks > 1 && pmix.user_script_path.is_empty() {
         anyhow::bail!("a multi-rank PMIx launch needs the user script path from the agent");
     }
-    let host = Arc::new(crate::mpi_plugin::MpiPluginHost::new(pmix.config));
+    // A step's script runs a wrapper file by path. Without that path this would
+    // fall through to replacing the script, running one rank instead of all.
+    if ranks > 1 && spur_core::step::is_user_step(spec.step_id) && pmix.wrapper_path.is_empty() {
+        anyhow::bail!("a multi-rank PMIx step needs the wrapper path from the agent");
+    }
+    let host = Arc::new(crate::mpi_plugin::MpiPluginHost::new(pmix.config.clone()));
     host.start_pmix_server(&pmix.plan)
         .map_err(|error| anyhow::anyhow!("failed to start the PMIx server: {error}"))?;
     let server = SupervisedPmix {
@@ -1639,7 +1649,7 @@ fn start_supervised_pmix(spec: &mut StepdLaunchSpec) -> anyhow::Result<Option<Su
         step_id: spec.step_id,
     };
     let applied = if ranks > 1 {
-        apply_multi_rank_pmix(spec, &server, &pmix.plan, &pmix.user_script_path, ranks)
+        apply_multi_rank_pmix(spec, &server, &pmix, ranks)
     } else {
         crate::mpi_plugin::apply_pmix_setup_fork_env(
             &server.host,
@@ -1659,25 +1669,39 @@ fn start_supervised_pmix(spec: &mut StepdLaunchSpec) -> anyhow::Result<Option<Su
 fn apply_multi_rank_pmix(
     spec: &mut StepdLaunchSpec,
     server: &SupervisedPmix,
-    plan: &spur_core::mpi::PmixLaunchPlan,
-    user_script_path: &str,
+    pmix: &StepdPmix,
     ranks: u32,
 ) -> anyhow::Result<()> {
     let per_rank_env = crate::mpi_plugin::pmix_setup_fork_env_for_node_tasks(
         &server.host,
-        plan,
-        plan.task_offset,
+        &pmix.plan,
+        pmix.plan.task_offset,
         ranks,
     )
     .map_err(|error| anyhow::anyhow!("failed to build the PMIx rank environment: {error}"))?;
-    spec.script = spur_core::task_launch::build_multi_task_pmix_wrapper(
-        user_script_path,
+    let wrapper = spur_core::task_launch::build_multi_task_pmix_wrapper(
+        &pmix.user_script_path,
         ranks,
         &per_rank_env,
         Some(&spec.environment),
     )
     .map_err(|error| anyhow::anyhow!("failed to build the PMIx rank wrapper: {error}"))?;
-    Ok(())
+    if pmix.wrapper_path.is_empty() {
+        spec.script = wrapper;
+        return Ok(());
+    }
+    crate::executor::write_job_scratch(
+        std::path::Path::new(&pmix.wrapper_path),
+        &wrapper,
+        spec.uid,
+        spec.gid,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "failed to write the PMIx rank wrapper at {}: {error}",
+            pmix.wrapper_path
+        )
+    })
 }
 
 const STEPD_USAGE: &str = "usage: spurstepd <state-dir> <job-id> <attempt> <launch-spec>\n\n\
@@ -2504,6 +2528,86 @@ mod launch_spec_compat {
         assert!(spec.pmix.is_none());
     }
 
+    /// Captured from the build that first shipped `pmix` in launch.json, before
+    /// `wrapper_path` existed. A supervisor started by an older agent mid-upgrade
+    /// reads exactly this, so it has to keep decoding.
+    /// Never regenerate this: its value is that it stays at the old shape.
+    const FROZEN_PMIX_LAUNCH_JSON: &str = r##"{
+        "job_id": 42,
+        "step_id": 4294967294,
+        "script": "#!/bin/bash\necho hi\n",
+        "work_dir": "/tmp",
+        "name": "demo",
+        "user": "someone",
+        "node": "node-1",
+        "environment": {"SPUR_JOB_ID": "42"},
+        "stdout_path": "/tmp/out",
+        "stderr_path": "/tmp/err",
+        "stdin_path": "",
+        "cpus": 2,
+        "memory_mb": 1024,
+        "cpu_ids": [0, 1],
+        "open_mode": null,
+        "uid": 1000,
+        "gid": 1000,
+        "partition": "batch",
+        "nodelist": "node-1",
+        "memlock": "Unlimited",
+        "pmix_multi_task": true,
+        "pmix": {
+            "plan": {
+                "job_id": 42,
+                "step_id": 4294967294,
+                "namespace": "spur.42.4294967294",
+                "universe_size": 2,
+                "task_offset": 0,
+                "local_procs": [
+                    {"rank": 0, "local_rank": 0},
+                    {"rank": 1, "local_rank": 1}
+                ],
+                "tmpdir": "/tmp/spur-pmix",
+                "job_uid": 1000,
+                "job_gid": 1000,
+                "num_nodes": 1,
+                "node_index": 0,
+                "peer_hosts": [],
+                "modex_connect_timeout_secs": 5,
+                "modex_fence_timeout_secs": 60,
+                "modex_verify_timeout_secs": 5
+            },
+            "config": {
+                "plugin_dir": "/opt/spur/lib",
+                "pmix_plugin": "",
+                "pmix_tmpdir": "/tmp/spur-pmix",
+                "pmix_min_version": "4.1.0",
+                "modex_connect_timeout_secs": 5,
+                "modex_fence_timeout_secs": 60,
+                "modex_verify_timeout_secs": 5
+            },
+            "user_script_path": "/tmp/.spur_user_42.sh"
+        }
+    }"##;
+
+    #[test]
+    fn a_pmix_launch_spec_from_an_older_build_still_loads() {
+        let spec: StepdLaunchSpec = serde_json::from_str(FROZEN_PMIX_LAUNCH_JSON)
+            .expect("a launch.json carrying a PMIx plan must still load");
+
+        let pmix = spec.pmix.expect("the PMIx plan must survive the decode");
+        assert_eq!(pmix.plan.namespace, "spur.42.4294967294");
+        assert_eq!(pmix.plan.local_procs.len(), 2);
+        assert_eq!(pmix.config.plugin_dir, "/opt/spur/lib");
+        assert_eq!(pmix.user_script_path, "/tmp/.spur_user_42.sh");
+    }
+
+    #[test]
+    fn an_older_pmix_launch_spec_reserves_no_wrapper_rather_than_failing() {
+        let spec: StepdLaunchSpec =
+            serde_json::from_str(FROZEN_PMIX_LAUNCH_JSON).expect("older launch.json");
+
+        assert!(spec.pmix.expect("a PMIx plan").wrapper_path.is_empty());
+    }
+
     #[test]
     fn a_launch_spec_from_an_older_build_still_loads() {
         let spec: StepdLaunchSpec =
@@ -2623,6 +2727,7 @@ mod tests {
                 ..spur_core::config::MpiConfig::default()
             },
             user_script_path: "/tmp/.spur_user_42.sh".into(),
+            wrapper_path: "/tmp/.spur_step_42/wrapper_0_3.sh".into(),
         }
     }
 
@@ -2689,6 +2794,27 @@ mod tests {
         );
     }
 
+    // A step's launch script runs a wrapper file by path, so an empty path would
+    // fall through to replacing the script and run one rank instead of all.
+    #[test]
+    fn a_multi_rank_pmix_step_is_refused_before_a_server_starts_without_its_wrapper_path() {
+        let mut spec = launch_spec();
+        spec.job_id = 42;
+        spec.step_id = 3;
+        let mut pmix = pmix_spec(3, 2, "/nonexistent/spur/plugin.so");
+        pmix.wrapper_path.clear();
+        spec.pmix = Some(pmix);
+
+        let error = start_supervised_pmix(&mut spec)
+            .err()
+            .expect("the agent reserved no wrapper for the supervisor to fill");
+
+        assert!(
+            error.to_string().contains("wrapper path"),
+            "a missing input must be caught before the server starts: {error}"
+        );
+    }
+
     #[test]
     fn a_fan_out_launch_missing_its_pmix_plan_is_refused_rather_than_run_once() {
         let mut spec = launch_spec();
@@ -2741,6 +2867,7 @@ mod tests {
                 ..spur_core::config::MpiConfig::default()
             },
             user_script_path: "/tmp/.spur_user_42.sh".into(),
+            wrapper_path: "/tmp/.spur_step_42/wrapper_0_3.sh".into(),
         });
 
         let restored: StepdLaunchSpec =
@@ -2754,6 +2881,7 @@ mod tests {
         assert_eq!(pmix.plan.local_procs.len(), 2);
         assert_eq!(pmix.config.plugin_dir, "/opt/spur/lib");
         assert_eq!(pmix.user_script_path, "/tmp/.spur_user_42.sh");
+        assert_eq!(pmix.wrapper_path, "/tmp/.spur_step_42/wrapper_0_3.sh");
     }
 
     #[test]
