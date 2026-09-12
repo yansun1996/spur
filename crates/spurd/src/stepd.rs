@@ -64,7 +64,7 @@ pub struct StepdLaunchSpec {
     pub capability: String,
     #[serde(default)]
     pub allocation_only: bool,
-    // Batch `--mpi=pmix` jobs skip process_group(0)/namespace isolation (see
+    // A multi-rank `--mpi=pmix` launch stays out of fresh namespaces (see
     // executor.rs); persisted so a restarted supervisor launches identically.
     #[serde(default)]
     pub pmix_multi_task: bool,

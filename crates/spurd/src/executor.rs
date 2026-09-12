@@ -3247,6 +3247,20 @@ mod tests {
         assert!(would_use_namespaces(&normal, true));
     }
 
+    // A `--mpi=pmix` parent has no namespaces of its own, so its step joins
+    // none — leaving only this term between the ranks and a fresh PID namespace
+    // their server sits outside of.
+    #[test]
+    fn a_multi_rank_pmix_step_stays_in_the_hosts_namespaces() {
+        let step = JobLaunchConfig {
+            pmix_multi_task: true,
+            step_id: 3,
+            ..holder_cfg(false)
+        };
+
+        assert!(!would_use_namespaces(&step, true));
+    }
+
     #[test]
     fn an_unprivileged_launch_is_never_isolated() {
         assert!(!would_use_namespaces(&holder_cfg(false), false));

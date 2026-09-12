@@ -5592,7 +5592,7 @@ impl SlurmAgent for AgentService {
                 memlock,
                 cgroup: self.cgroup.clone(),
                 io_mode: executor::LaunchIo::File,
-                pmix_multi_task: false,
+                pmix_multi_task: step_mpi && num_tasks > 1,
             })
         } else {
             None
