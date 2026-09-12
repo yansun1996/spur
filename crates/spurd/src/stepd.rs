@@ -7,6 +7,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -535,6 +536,16 @@ impl StepdObligationLog {
         file.sync_data()
     }
 
+    /// When the last obligation was appended. The log is append-only, so its
+    /// mtime dates the session's final state without storing a timestamp in it.
+    pub fn last_written(&self) -> io::Result<Option<SystemTime>> {
+        match fs::metadata(&self.path) {
+            Ok(metadata) => metadata.modified().map(Some),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn read(&self) -> io::Result<Vec<StepdObligation>> {
         let contents = match fs::read_to_string(&self.path) {
             Ok(contents) => contents,
@@ -848,10 +859,10 @@ pub(crate) fn record_resources_released(descriptor: &StepdDescriptor) -> io::Res
         .iter()
         .any(|obligation| matches!(obligation, StepdObligation::ResourcesReleased))
     {
-        return prune_finalized_session(session_dir, &obligations).map(|_| ());
+        return prune_finalized_session(session_dir, &obligations, descriptor.step_id).map(|_| ());
     }
     obligations.append(&StepdObligation::ResourcesReleased)?;
-    prune_finalized_session(session_dir, &obligations).map(|_| ())
+    prune_finalized_session(session_dir, &obligations, descriptor.step_id).map(|_| ())
 }
 
 fn finalized_obligations(obligations: &[StepdObligation]) -> bool {
@@ -876,11 +887,34 @@ fn finalized_obligations(obligations: &[StepdObligation]) -> bool {
     completion_acknowledged && resources_released
 }
 
+/// A user step's exit is reported to a controller that discards it — the answer
+/// only ever reaches the caller parked on `await_step`. Keep the record until
+/// that caller has had every chance to ask, across as many agent restarts as
+/// the window holds; a caller that never returns cannot pin it past that.
+fn settled_answer_still_retained(
+    obligations: &StepdObligationLog,
+    step_id: spur_core::step::StepId,
+) -> io::Result<bool> {
+    if !spur_core::step::is_user_step(step_id) {
+        return Ok(false);
+    }
+    let settled_at = obligations.last_written()?;
+    Ok(settled_at.is_some_and(|settled_at| {
+        SystemTime::now()
+            .duration_since(settled_at)
+            .is_ok_and(|age| age < crate::step_completion::SETTLED_RETENTION)
+    }))
+}
+
 fn prune_finalized_session(
     session_dir: &Path,
     obligations: &StepdObligationLog,
+    step_id: spur_core::step::StepId,
 ) -> io::Result<bool> {
     if !finalized_obligations(&obligations.read()?) {
+        return Ok(false);
+    }
+    if settled_answer_still_retained(obligations, step_id)? {
         return Ok(false);
     }
     fs::remove_dir_all(session_dir)?;
@@ -2231,41 +2265,6 @@ impl StepdStore {
         Ok(completions)
     }
 
-    /// The finished session of a supervisor that exited while the agent was
-    /// down. Nothing adopts one, so its record is the step's only answer left.
-    pub(crate) fn finished_session(
-        &self,
-        job_id: u32,
-        step_id: spur_core::step::StepId,
-    ) -> io::Result<Option<(StepdDescriptor, i32, i32)>> {
-        let mut newest: Option<(StepdDescriptor, i32, i32)> = None;
-        for session_dir in self.session_dirs()? {
-            let Ok(descriptor) = self.load_descriptor(&session_dir) else {
-                continue;
-            };
-            if descriptor.job_id != job_id || descriptor.step_id != step_id {
-                continue;
-            }
-            // A live supervisor still owns its session; answering from its log
-            // would race the rendezvous and prune the state out from under it.
-            if !matches!(stepd_liveness(&descriptor), Ok(StepdLiveness::Stale)) {
-                continue;
-            }
-            let Some((exit_code, signal)) =
-                self.observed_exit(job_id, descriptor.run_attempt, step_id)?
-            else {
-                continue;
-            };
-            if newest
-                .as_ref()
-                .is_none_or(|(seen, _, _)| seen.run_attempt < descriptor.run_attempt)
-            {
-                newest = Some((descriptor, exit_code, signal));
-            }
-        }
-        Ok(newest)
-    }
-
     pub fn prune_finalized(&self) -> io::Result<usize> {
         let mut pruned = 0;
         for session_dir in self.session_dirs()? {
@@ -2278,7 +2277,7 @@ impl StepdStore {
                 descriptor.run_attempt,
                 descriptor.step_id,
             );
-            if prune_finalized_session(&session_dir, &obligations)? {
+            if prune_finalized_session(&session_dir, &obligations, descriptor.step_id)? {
                 pruned += 1;
             }
         }
@@ -2302,8 +2301,61 @@ impl StepdStore {
                 completion.step_id,
             ),
             &obligations,
+            completion.step_id,
         )
         .map(|_| ())
+    }
+
+    /// Whether the exit this session recorded has already reached the
+    /// controller, so a session kept past that is a retained answer and not a
+    /// step still owed a report.
+    pub fn completion_reported(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<bool> {
+        let mut exit_observed = false;
+        let mut acknowledged = false;
+        for obligation in self.obligations(job_id, run_attempt, step_id).read()? {
+            match obligation {
+                StepdObligation::ExitObserved { .. } => {
+                    exit_observed = true;
+                    acknowledged = false;
+                }
+                StepdObligation::CompletionAcknowledged if exit_observed => acknowledged = true,
+                _ => {}
+            }
+        }
+        Ok(acknowledged)
+    }
+
+    /// The newest exit any attempt of this step recorded, whatever became of
+    /// its supervisor. The last tier `await_step` has once its memo is gone.
+    pub(crate) fn recorded_step_exit(
+        &self,
+        job_id: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<Option<(i32, i32)>> {
+        let mut newest: Option<(u32, (i32, i32))> = None;
+        for session_dir in self.session_dirs()? {
+            let Ok(descriptor) = self.load_descriptor(&session_dir) else {
+                continue;
+            };
+            if descriptor.job_id != job_id || descriptor.step_id != step_id {
+                continue;
+            }
+            let Some(exit) = self.observed_exit(job_id, descriptor.run_attempt, step_id)? else {
+                continue;
+            };
+            if newest
+                .as_ref()
+                .is_none_or(|(seen, _)| *seen < descriptor.run_attempt)
+            {
+                newest = Some((descriptor.run_attempt, exit));
+            }
+        }
+        Ok(newest.map(|(_, exit)| exit))
     }
 
     pub(crate) fn observed_exit(
@@ -3361,6 +3413,96 @@ mod tests {
                 .observed_exit(5, 1, spur_core::step::STEP_BATCH)
                 .expect("observed exit"),
             Some((7, 0))
+        );
+    }
+
+    /// One user step of job 21, published with the obligations given.
+    fn user_step_session(
+        store: &StepdStore,
+        step_id: spur_core::step::StepId,
+        obligations: &[StepdObligation],
+    ) {
+        let descriptor = StepdDescriptor::new(
+            21,
+            1,
+            step_id,
+            0,
+            0,
+            store.session_dir(21, 1, step_id).join("runtime.sock"),
+            PathBuf::new(),
+        );
+        store.publish(&descriptor).expect("publish descriptor");
+        let log = store.obligations(21, 1, step_id);
+        for obligation in obligations {
+            log.append(obligation).expect("append obligation");
+        }
+    }
+
+    const USER_STEP_EXIT: StepdObligation = StepdObligation::ExitObserved {
+        exit_code: 7,
+        signal: 0,
+    };
+
+    #[test]
+    fn a_reported_exit_reads_as_reported() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        user_step_session(
+            &store,
+            4,
+            &[USER_STEP_EXIT, StepdObligation::CompletionAcknowledged],
+        );
+
+        assert!(store
+            .completion_reported(21, 1, 4)
+            .expect("read obligations"));
+    }
+
+    #[test]
+    fn an_exit_observed_after_the_last_acknowledgement_is_still_owed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        user_step_session(
+            &store,
+            4,
+            &[
+                USER_STEP_EXIT,
+                StepdObligation::CompletionAcknowledged,
+                USER_STEP_EXIT,
+            ],
+        );
+
+        assert!(!store
+            .completion_reported(21, 1, 4)
+            .expect("read obligations"));
+    }
+
+    #[test]
+    fn a_settled_user_step_answers_from_its_ledger() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        user_step_session(
+            &store,
+            4,
+            &[USER_STEP_EXIT, StepdObligation::CompletionAcknowledged],
+        );
+
+        assert_eq!(
+            store.recorded_step_exit(21, 4).expect("read the ledger"),
+            Some((7, 0))
+        );
+    }
+
+    #[test]
+    fn a_sibling_steps_exit_is_never_answered_as_this_ones() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        user_step_session(&store, 4, &[USER_STEP_EXIT]);
+        user_step_session(&store, 5, &[]);
+
+        assert_eq!(
+            store.recorded_step_exit(21, 5).expect("read the ledger"),
+            None
         );
     }
 

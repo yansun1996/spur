@@ -181,9 +181,12 @@ administrator restarting or upgrading ``spurd`` does not kill it. An allocation
 stays held, a running ``srun`` step keeps running and still reports its exit
 status, and a terminal opened inside an allocation is reattached — the session
 pauses for the restart and resumes where it was. A step that *finishes* while
-the agent is down is covered too: its supervisor records the exit durably, and
-the restarted agent answers the waiting caller with that exit and the step's
-output instead of reporting the step as lost.
+the agent is down is covered too: its supervisor records the exit durably, that
+record is kept for ten minutes after the step settles, and the restarted agent
+answers the waiting caller with the exit and the step's output instead of
+reporting the step as lost. Any number of restarts inside that window are
+covered; a caller that only comes back after it is still told the step is
+unknown.
 
 Two cases are not covered: a step given its own ``--container-image``, and an
 ``srun --pty`` that allocates its own job rather than running inside an existing
