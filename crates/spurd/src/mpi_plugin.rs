@@ -111,7 +111,7 @@ impl Drop for PmixLaunchGuard {
             return;
         }
         let (job_id, step_id) = self.key;
-        if let Err(err) = self.host.release_pmix_server(job_id, step_id) {
+        if let Err(err) = self.host.release_hosted_pmix_server(job_id, step_id) {
             warn!(job_id, step_id, error = %err, "PMIx rollback release failed");
         }
     }
@@ -387,6 +387,17 @@ impl MpiPluginHost {
     /// Stop the server registered for one step. An unknown key is an error: a
     /// silent `Ok` there hides a teardown that never happened.
     pub fn release_pmix_server(&self, job_id: u32, step_id: StepId) -> Result<(), String> {
+        match self.release_hosted_pmix_server(job_id, step_id)? {
+            true => Ok(()),
+            false => Err(format!(
+                "no PMIx server registered for job {job_id} step {step_id}"
+            )),
+        }
+    }
+
+    /// Releases only if this process still hosts it, reporting whether it did.
+    /// A rollback races teardown, and finding it already stopped is success.
+    pub fn release_hosted_pmix_server(&self, job_id: u32, step_id: StepId) -> Result<bool, String> {
         let key = (job_id, step_id);
         let Some(namespace) = self
             .active_namespaces
@@ -394,19 +405,19 @@ impl MpiPluginHost {
             .map_err(|_| "namespace lock poisoned".to_string())?
             .remove(&key)
         else {
-            return Err(format!(
-                "no PMIx server registered for job {job_id} step {step_id}"
-            ));
+            return Ok(false);
         };
-        self.call_server_stop(&namespace).inspect_err(|err| {
-            warn!(
-                job_id,
-                step_id,
-                namespace = %namespace,
-                error = %err,
-                "PMIx server stop failed — the namespace entry was evicted anyway"
-            );
-        })
+        self.call_server_stop(&namespace)
+            .map(|()| true)
+            .inspect_err(|err| {
+                warn!(
+                    job_id,
+                    step_id,
+                    namespace = %namespace,
+                    error = %err,
+                    "PMIx server stop failed — the namespace entry was evicted anyway"
+                );
+            })
     }
 
     /// Stop every PMIx namespace this process hosts for a job. Cancel and

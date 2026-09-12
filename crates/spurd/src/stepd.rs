@@ -1785,7 +1785,14 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             return Err(error);
         }
     }
-    let cleanup_failed_launch = || {
+    // The workload never ran, so nothing will report an exit and the watchdog
+    // synthesises a SIGKILL — record the real reason the way a failed spawn does.
+    let cleanup_failed_launch = |error: &dyn std::fmt::Display| {
+        let failure_path = session_dir.join(FAILURE_FILE);
+        if let Err(write_error) = write_private(&failure_path, error.to_string().as_bytes()) {
+            tracing::warn!(%write_error, path = %failure_path.display(),
+                "failed to record stepd failure");
+        }
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
@@ -1800,7 +1807,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     let pmix = match start_supervised_pmix(&mut launch_spec) {
         Ok(pmix) => pmix,
         Err(error) => {
-            cleanup_failed_launch();
+            cleanup_failed_launch(&error);
             return Err(error);
         }
     };
@@ -1814,7 +1821,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
                 if let Some(pmix) = pmix.as_ref() {
                     pmix.stop();
                 }
-                cleanup_failed_launch();
+                cleanup_failed_launch(&error);
                 return Err(anyhow::anyhow!(error.to_string()));
             }
         }
