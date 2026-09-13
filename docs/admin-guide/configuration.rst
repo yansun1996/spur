@@ -184,9 +184,14 @@ and Raft high-availability topology.
    * - ``state_dir``
      - string
      - ``"/var/spool/spur"``
-     - Not implemented
-     - Ignored. The controller always uses its ``--state-dir`` flag, which
-       defaults to ``/var/spool/spur``.
+     - Restart
+     - Ignored by ``spurctld``, which always uses its ``--state-dir`` flag
+       (itself defaulting to ``/var/spool/spur``). Read by ``spurd`` as the
+       fallback root for the supervisor session spool that lets running jobs
+       survive an agent restart, used when neither the agent's ``--state-dir``
+       flag nor ``SPUR_STEPD_STATE_DIR`` is set. Changing it relocates that
+       spool on every node sharing this file, so restarted agents no longer
+       find the sessions they left behind; drain the nodes before changing it.
    * - ``max_job_id``
      - integer
      - ``999999999``
@@ -1214,11 +1219,12 @@ Job isolation layers.
 
 cgroup-v2 resource enforcement that ``spurd`` applies to native-host jobs. Every
 process the agent starts for a job — the batch payload, ``srun`` steps, ``spur
-exec``, and interactive attach — runs in a cgroup at
-``/sys/fs/cgroup/spur/job_<id>_<attempt>``, and the limits are derived from the **per-node
-budget the controller allocated** — not from the ``--cpus-per-task`` / ``--mem``
-the user requested. Kubernetes jobs are unaffected: there the kubelet owns the
-cgroups.
+exec``, and interactive attach — is confined beneath
+``/sys/fs/cgroup/spur/job_<id>_<attempt>``. That directory carries the limits and
+the device filter; an ``srun`` step runs in its own ``step_<n>`` leaf underneath
+it and inherits both. The limits are derived from the **per-node budget the
+controller allocated** — not from the ``--cpus-per-task`` / ``--mem`` the user
+requested. Kubernetes jobs are unaffected: there the kubelet owns the cgroups.
 
 .. warning::
 
@@ -1226,8 +1232,9 @@ cgroups.
    default ``required = false`` a host that cannot apply a constraint — missing
    ``CAP_NET_ADMIN`` for the device filter, say — logs a warning and runs the work
    unconstrained. Set ``required = true`` to make that case fail closed instead.
-   See :ref:`cgroup-containment-gaps` for what remains even then: per-step
-   granularity, and the site-supplied task hooks that run outside the job cgroup.
+   See :ref:`cgroup-containment-gaps` for what remains even then: a step leaf
+   carries no budget of its own, and the site-supplied task hooks run outside
+   the job cgroup.
 
 .. note::
 

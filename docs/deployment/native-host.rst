@@ -103,9 +103,10 @@ The two daemons are configured with command-line flags. The most common are belo
      - ``[::]:6818``
      - Agent gRPC listen address.
    * - ``--state-dir <PATH>``
-     - *(from config, then* ``/var/spool/spur`` *)*
+     - *(*\ ``[controller] state_dir``\ *, then* ``/var/spool/spur`` *)*
      - Directory for this agent's own persisted runtime state (job supervisor
-       sessions that survive an ``spurd`` restart). Also settable via
+       sessions that survive an ``spurd`` restart). Falls back to
+       ``[controller] state_dir`` from the config file. Also settable via
        ``SPUR_STEPD_STATE_DIR``. Give each ``spurd`` its own path when
        co-locating multiple agents on one host (e.g. dev/test setups) — it
        must not collide with another agent's or the controller's directory.
@@ -510,6 +511,8 @@ Inspect what a running job actually got:
    cat /sys/fs/cgroup/spur/job_1234_1/memory.max
    cat /sys/fs/cgroup/spur/job_1234_1/memory.swap.max
    bpftool cgroup show /sys/fs/cgroup/spur/job_1234_1 # the device filter, if attached
+   ls /sys/fs/cgroup/spur/job_1234_1/                 # a step_<n> leaf per srun step
+   cat /sys/fs/cgroup/spur/job_1234_1/step_0/cpu.stat # that step's own CPU usage
 
 Enforcement requires ``spurd`` to run as root. An unprivileged agent logs a warning
 and runs jobs unconstrained. Every knob — including turning enforcement off
@@ -522,10 +525,11 @@ Slurm's ``cgroup.conf``.
 What is not contained yet
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Every process the agent starts for a job joins ``job_<id>_<attempt>`` — the batch payload,
-``srun`` steps, ``spur exec``, and interactive attach alike — so all of them are
-bounded by the job's limits and checked against its device filter. What remains
-is a granularity gap *inside* the job rather than a hole between jobs:
+Every process the agent starts for a job is confined beneath ``job_<id>_<attempt>``
+— the batch payload, ``srun`` steps, ``spur exec``, and interactive attach alike
+— so all of them are bounded by the job's limits and checked against its device
+filter. What remains is a granularity gap *inside* the job rather than a hole
+between jobs:
 
 .. list-table::
    :header-rows: 1
@@ -533,16 +537,23 @@ is a granularity gap *inside* the job rather than a hole between jobs:
 
    * - What is missing
      - Where it stands
-   * - Per-step limits and accounting
-     - Steps join the **job's** cgroup, not one of their own, so every step in a
-       job draws on one shared budget and there is no per-step CPU or memory
-       reading to attribute. Nested ``job_<id>/step_<n>`` cgroups are planned; a
-       BPF device filter attached at ``job_<id>_<attempt>`` is inherited by descendant
-       cgroups, so the filter will keep working unchanged when they arrive.
+   * - Per-step **limits**
+     - An ``srun`` step gets its own ``job_<id>_<attempt>/step_<n>`` cgroup, but
+       that leaf carries no budget of its own: it inherits the job's limits and
+       device filter, so every step in a job still draws on one shared budget.
+       Per-step CPU and memory *readings* are available from the leaf's
+       ``cpu.stat`` and ``memory.current``; Spur does not yet collect them into
+       step accounting.
+   * - A cgroup for every kind of step
+     - Only user ``srun`` steps get a leaf. The batch payload, the extern step,
+       and ``--pty`` interactive work run in ``job_<id>_<attempt>`` itself. If
+       the leaf cannot be created, the step falls back to the job cgroup — and
+       with ``required = true`` the launch fails instead.
    * - Precise kill-by-step
-     - Cancelling one step signals its process group rather than a cgroup of its
-       own, so a step process that leaves that group (``setsid``) is missed.
-       Cancelling the whole *job* is exact, because that is a cgroup operation.
+     - Cancelling one step signals its process tree rather than its cgroup, so a
+       step process that leaves that tree (``setsid``) is missed even though the
+       step now has a cgroup that would catch it. Cancelling the whole *job* is
+       exact, because that is a cgroup operation.
    * - ``task_prolog`` / ``task_epilog``
      - Run by ``spurd`` around each step, as root and in ``spurd``'s own cgroup.
        They are site-supplied rather than user code, but they are neither
