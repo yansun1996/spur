@@ -1221,10 +1221,12 @@ cgroup-v2 resource enforcement that ``spurd`` applies to native-host jobs. Every
 process the agent starts for a job — the batch payload, ``srun`` steps, ``spur
 exec``, and interactive attach — is confined beneath
 ``/sys/fs/cgroup/spur/job_<id>_<attempt>``. That directory carries the limits and
-the device filter; an ``srun`` step runs in its own ``step_<n>`` leaf underneath
-it and inherits both. The limits are derived from the **per-node budget the
-controller allocated** — not from the ``--cpus-per-task`` / ``--mem`` the user
-requested. Kubernetes jobs are unaffected: there the kubelet owns the cgroups.
+the device filter; each step runs in its own ``step_<n>`` leaf underneath it and
+inherits both, because cgroup v2 will not hold processes in a node whose
+children have controllers enabled. The limits are derived from the **per-node
+budget the controller allocated** — not from the ``--cpus-per-task`` / ``--mem``
+the user requested. Kubernetes jobs are unaffected: there the kubelet owns the
+cgroups.
 
 .. warning::
 

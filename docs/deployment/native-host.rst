@@ -511,8 +511,12 @@ Inspect what a running job actually got:
    cat /sys/fs/cgroup/spur/job_1234_1/memory.max
    cat /sys/fs/cgroup/spur/job_1234_1/memory.swap.max
    bpftool cgroup show /sys/fs/cgroup/spur/job_1234_1 # the device filter, if attached
-   ls /sys/fs/cgroup/spur/job_1234_1/                 # a step_<n> leaf per srun step
+   ls /sys/fs/cgroup/spur/job_1234_1/                 # one step_<n> leaf per step
    cat /sys/fs/cgroup/spur/job_1234_1/step_0/cpu.stat # that step's own CPU usage
+
+The job directory holds the limits but no processes — those live in the leaves.
+``srun`` steps are numbered from ``step_0``; the batch payload uses the reserved
+step id it was launched under, so its leaf is a large number rather than ``0``.
 
 Enforcement requires ``spurd`` to run as root. An unprivileged agent logs a warning
 and runs jobs unconstrained. Every knob — including turning enforcement off
@@ -528,8 +532,10 @@ What is not contained yet
 Every process the agent starts for a job is confined beneath ``job_<id>_<attempt>``
 — the batch payload, ``srun`` steps, ``spur exec``, and interactive attach alike
 — so all of them are bounded by the job's limits and checked against its device
-filter. What remains is a granularity gap *inside* the job rather than a hole
-between jobs:
+filter. Each step runs in its own ``step_<n>`` leaf under that directory: cgroup
+v2 refuses to hold processes in a node whose children have controllers enabled,
+so the job node carries the limits and the steps sit beneath it. What remains is
+a granularity gap *inside* the job rather than a hole between jobs:
 
 .. list-table::
    :header-rows: 1
@@ -538,17 +544,11 @@ between jobs:
    * - What is missing
      - Where it stands
    * - Per-step **limits**
-     - An ``srun`` step gets its own ``job_<id>_<attempt>/step_<n>`` cgroup, but
-       that leaf carries no budget of its own: it inherits the job's limits and
-       device filter, so every step in a job still draws on one shared budget.
-       Per-step CPU and memory *readings* are available from the leaf's
-       ``cpu.stat`` and ``memory.current``; Spur does not yet collect them into
-       step accounting.
-   * - A cgroup for every kind of step
-     - Only user ``srun`` steps get a leaf. The batch payload, the extern step,
-       and ``--pty`` interactive work run in ``job_<id>_<attempt>`` itself. If
-       the leaf cannot be created, the step falls back to the job cgroup — and
-       with ``required = true`` the launch fails instead.
+     - Each step gets its own ``step_<n>`` cgroup, but that leaf carries no
+       budget of its own: it inherits the job's limits and device filter, so
+       every step in a job still draws on one shared budget. Per-step CPU and
+       memory *readings* are there in the leaf's ``cpu.stat`` and
+       ``memory.current``; Spur does not yet collect them into step accounting.
    * - Precise kill-by-step
      - Cancelling one step signals its process tree rather than its cgroup, so a
        step process that leaves that tree (``setsid``) is missed even though the
