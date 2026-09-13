@@ -2442,14 +2442,7 @@ impl ClusterManager {
     /// nodes is responsible for sending the cancel RPC once eviction
     /// succeeds.
     ///
-    /// No longer called from `scheduler_loop`: batch dispatch is now
-    /// confirmed on every assigned node *before* a job is allowed to become
-    /// Running (see `confirm_dispatch_on_nodes`), so a job can no longer
-    /// reach Running with only some of its nodes actually launched — this
-    /// function's original trigger. Kept as a public primitive, with its
-    /// back-off/requeue contract still exercised directly by this module's
-    /// tests, for any other caller that needs to evict an already-Running
-    /// job (e.g. a future admin-initiated NodeFail).
+    /// `scheduler_loop` evicts here when a node refuses the post-Running release.
     #[allow(dead_code)]
     pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<()> {
         self.evict_job_with_detail(job_id, None)
