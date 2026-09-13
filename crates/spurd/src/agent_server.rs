@@ -2875,10 +2875,12 @@ impl AgentService {
         let mut allocation = self.allocation.lock().await;
         for descriptor in replayable_allocations(descriptors) {
             let resources = &descriptor.resources;
+            // Dropping a contested core costs this job some occupancy; dropping
+            // the whole replay would leave its live GPUs reading free.
             let cpu_ids = if resources.cpu_ids.is_empty() {
                 fallback_cpu_ids(&allocation, resources.cpus)
             } else {
-                resources.cpu_ids.clone()
+                allocation.claimable_cpu_ids(descriptor.job_id, &resources.cpu_ids)
             };
             if cpu_ids.len() < resources.cpus as usize {
                 warn!(
@@ -15392,6 +15394,51 @@ mod tests {
             .lock()
             .await
             .contains_key(&(902, spur_core::step::STEP_BATCH)));
+    }
+
+    // Two descriptors recording the same core is the corrupt case the ledger
+    // guards; losing the loser's GPUs to it would be worse than the overlap.
+    #[tokio::test]
+    async fn a_contested_core_costs_an_adopted_job_occupancy_not_its_gpus() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let descriptor = |job_id: u32, cpu_ids: Vec<u32>, gpu: u32| {
+            let mut descriptor = crate::stepd::StepdDescriptor::new(
+                job_id,
+                1,
+                spur_core::step::STEP_BATCH,
+                0,
+                0,
+                state.path().join(format!("{job_id}.sock")),
+                std::path::PathBuf::new(),
+            );
+            descriptor.resources = crate::stepd::StepdJobResources {
+                cpus: cpu_ids.len() as u32,
+                memory_mb: 1024,
+                gpu_devices: vec![gpu],
+                cpu_ids,
+                ..Default::default()
+            };
+            descriptor
+        };
+        let first = descriptor(910, vec![1, 2], 0);
+        let second = descriptor(911, vec![2, 3], 1);
+
+        svc.replay_adopted_allocations(&[first, second]).await;
+
+        let alloc = svc.allocation.lock().await;
+        // Job 911 yields core 2 to job 910, but its GPU and memory stay on.
+        assert_eq!(alloc.allocated_gpu_ids(), vec![0, 1]);
+        assert_eq!(alloc.free_gpus(None), 0);
+        assert_eq!(alloc.free_memory_mb(), 8192 - 2048);
+        assert!(alloc.allocated_cpus[1] && alloc.allocated_cpus[2] && alloc.allocated_cpus[3]);
+        assert!(!alloc.allocated_cpus[0]);
+        assert_eq!(alloc.conflicting_owners(&[1]), vec![911]);
     }
 
     // An empty ledger was only correct while a restart killed every job: it now
