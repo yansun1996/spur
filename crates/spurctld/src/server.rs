@@ -434,12 +434,30 @@ impl ControllerService {
         })
     }
 
-    async fn fence_stepd_recovery(&self, job_id: u32, run_attempt: u32) -> Result<bool, Status> {
+    async fn fence_stepd_recovery(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> Result<StepdFenceOutcome, Status> {
         let Some(job) = self.cluster.get_job(job_id) else {
-            return Ok(false);
+            return Ok(StepdFenceOutcome::Stale);
         };
-        if !job.state.is_active() || job.run_attempt != run_attempt {
-            return Ok(false);
+        if job.run_attempt != run_attempt {
+            return Ok(StepdFenceOutcome::Stale);
+        }
+        // preempt_job only acts on a running job, so declining is the honest
+        // answer here; erroring would just be retried by the reporter forever.
+        match job.state {
+            spur_core::job::JobState::Running => {}
+            state if state.is_active() => {
+                warn!(
+                    job_id,
+                    ?state,
+                    "declining to fence a job that is not running"
+                );
+                return Ok(StepdFenceOutcome::DeclinedAlive);
+            }
+            _ => return Ok(StepdFenceOutcome::Stale),
         }
         match self
             .cluster
@@ -447,7 +465,7 @@ impl ControllerService {
         {
             Ok(crate::cluster::PreemptOutcome::Killed) => {
                 crate::scheduler_loop::send_cancel_to_agents(&self.cluster, &job, 0).await;
-                Ok(true)
+                Ok(StepdFenceOutcome::Fenced)
             }
             Ok(crate::cluster::PreemptOutcome::Suspended) => Err(Status::internal(
                 "runtime recovery fence suspended instead of requeuing the job",
@@ -455,6 +473,16 @@ impl ControllerService {
             Err(error) => Err(Status::internal(format!(
                 "failed to fence incomplete runtime recovery: {error}"
             ))),
+        }
+    }
+
+    /// The message must stay empty: the agent re-reports every two seconds for as
+    /// long as a retained response carries one, and no retry can resolve this.
+    fn retain_live_run() -> StepdRecoveryResponse {
+        StepdRecoveryResponse {
+            retained: true,
+            fenced: false,
+            message: String::new(),
         }
     }
 
@@ -1004,6 +1032,12 @@ enum StepdRecoveryProbe {
         expected_nodes: Vec<String>,
         missing: Vec<String>,
     },
+}
+
+enum StepdFenceOutcome {
+    Fenced,
+    DeclinedAlive,
+    Stale,
 }
 
 /// Resolve a user to the (namespace, ServiceAccount) its scoped kubeconfig must be bound to.
@@ -2357,12 +2391,14 @@ impl SlurmController for ControllerService {
                                 .into(),
                         }));
                     }
-                    let fenced = self
+                    // No supervisor to retain here whatever the fence decided: this
+                    // reporter is the one that just said its descriptor is unreadable.
+                    let outcome = self
                         .fence_stepd_recovery(request.job_id, request.run_attempt)
                         .await?;
                     return Ok(Response::new(StepdRecoveryResponse {
                         retained: false,
-                        fenced,
+                        fenced: matches!(outcome, StepdFenceOutcome::Fenced),
                         message: "stepd descriptor has no live supervisor".into(),
                     }));
                 }
@@ -2382,29 +2418,21 @@ impl SlurmController for ControllerService {
             StepdRecoveryProbe::Retained => {
                 self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
                     .await;
-                Ok(Response::new(StepdRecoveryResponse {
-                    retained: true,
-                    fenced: false,
-                    message: String::new(),
-                }))
+                Ok(Response::new(Self::retain_live_run()))
             }
             StepdRecoveryProbe::Incomplete {
                 expected_nodes,
                 missing,
             } => {
-                // Retained with no message so the agent stops retrying and keeps its
-                // supervisor: the job outlives the report rather than being abandoned.
+                // An unproven reporter may not fence, so the job outlives the report
+                // rather than being abandoned on its say-so.
                 if matches!(reporter, StepdReporter::Unproven) {
                     self.refuse_unproven_fence(
                         request.job_id,
                         request.run_attempt,
                         &request.hostname,
                     );
-                    return Ok(Response::new(StepdRecoveryResponse {
-                        retained: true,
-                        fenced: false,
-                        message: String::new(),
-                    }));
+                    return Ok(Response::new(Self::retain_live_run()));
                 }
                 if self
                     .claim_stepd_recovery_fence(request.job_id, request.run_attempt)
@@ -2412,15 +2440,18 @@ impl SlurmController for ControllerService {
                 {
                     // Clear before propagating: a fence that fails must leave the
                     // cohort claimable, not stuck until the sweep expires it.
-                    let fenced = self
+                    let outcome = self
                         .fence_stepd_recovery(request.job_id, request.run_attempt)
                         .await;
                     self.clear_stepd_recovery_cohort(request.job_id, request.run_attempt)
                         .await;
-                    let fenced = fenced?;
+                    let outcome = outcome?;
+                    if matches!(outcome, StepdFenceOutcome::DeclinedAlive) {
+                        return Ok(Response::new(Self::retain_live_run()));
+                    }
                     return Ok(Response::new(StepdRecoveryResponse {
                         retained: false,
-                        fenced,
+                        fenced: matches!(outcome, StepdFenceOutcome::Fenced),
                         message: "runtime recovery cohort did not become available before its grace period elapsed".into(),
                     }));
                 }
@@ -7145,18 +7176,78 @@ mod tests {
             .expect("running job")
             .run_attempt;
 
-        assert!(svc
-            .fence_stepd_recovery(job_id, run_attempt)
-            .await
-            .expect("fence matching attempt"));
+        assert!(matches!(
+            svc.fence_stepd_recovery(job_id, run_attempt)
+                .await
+                .expect("fence matching attempt"),
+            StepdFenceOutcome::Fenced
+        ));
         let job = svc.cluster.get_job(job_id).expect("requeued job");
         assert_eq!(job.state, JobState::Pending);
         assert!(job.allocated_nodes.is_empty());
 
-        assert!(!svc
+        assert!(matches!(
+            svc.fence_stepd_recovery(job_id, run_attempt)
+                .await
+                .expect("ignore stale recovery fence"),
+            StepdFenceOutcome::Stale
+        ));
+    }
+
+    // A suspended job never leaves that state on its own, so an erroring fence
+    // would be retried by the reporter forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stepd_recovery_fence_declines_a_suspended_job_without_erroring() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+
+        // Asserted while the job still runs, so the state gate cannot mask a
+        // regression in the attempt gate.
+        assert!(
+            matches!(
+                svc.fence_stepd_recovery(job_id, run_attempt + 1)
+                    .await
+                    .expect("a superseded attempt must not error"),
+                StepdFenceOutcome::Stale
+            ),
+            "a superseded attempt is stale, not a live run to retain"
+        );
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("untouched job").state,
+            JobState::Running,
+            "a superseded attempt must not requeue the running job"
+        );
+
+        assert!(matches!(
+            svc.cluster
+                .preempt_job(job_id, spur_core::partition::PreemptMode::Suspend)
+                .expect("suspend the running job"),
+            crate::cluster::PreemptOutcome::Suspended
+        ));
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("suspended job").state,
+            JobState::Suspended
+        );
+
+        let outcome = svc
             .fence_stepd_recovery(job_id, run_attempt)
             .await
-            .expect("ignore stale recovery fence"));
+            .expect("fencing a suspended job must not error");
+        assert!(
+            matches!(outcome, StepdFenceOutcome::DeclinedAlive),
+            "a suspended run is alive and must keep its supervisor"
+        );
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("still suspended").state,
+            JobState::Suspended,
+            "a declined fence must leave the job exactly as it found it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7765,6 +7856,67 @@ mod tests {
         );
     }
 
+    // The triple the agent branches on: anything but retained-with-no-message
+    // makes it stop the supervisor and hand back the node's allocation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expired_cohort_retains_a_suspended_run_instead_of_fencing_it() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let svc = test_service_with_node_identity(&dir).await;
+        let job_id = running_job_owned_by(&svc, "alice").await;
+        let agent = spawn_probe_agent(false).await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+        let run_attempt = svc
+            .cluster
+            .get_job(job_id)
+            .expect("running job")
+            .run_attempt;
+        svc.incomplete_stepd_recoveries.lock().await.insert(
+            (job_id, run_attempt),
+            StepdRecoveryCohortState::Tracking(
+                std::time::Instant::now() - STEPD_RECOVERY_COHORT_GRACE,
+            ),
+        );
+        svc.cluster
+            .preempt_job(job_id, spur_core::partition::PreemptMode::Suspend)
+            .expect("suspend the running job");
+
+        // Pin the branch: the retain response is also what a complete cohort
+        // returns, so without this the assertions below would not prove it.
+        assert!(matches!(
+            svc.probe_stepd_recovery("n1", job_id, run_attempt, spur_core::step::STEP_BATCH)
+                .await
+                .expect("probe the suspended run"),
+            StepdRecoveryProbe::Incomplete { .. }
+        ));
+
+        let response = svc
+            .report_stepd_recovery(Request::new(stepd_recovery_request(
+                &svc,
+                "n1",
+                job_id,
+                run_attempt,
+                false,
+            )))
+            .await
+            .expect("suspended run report")
+            .into_inner();
+
+        assert!(
+            response.retained,
+            "a suspended run is alive, so its supervisor must be kept"
+        );
+        assert!(!response.fenced);
+        assert!(
+            response.message.is_empty(),
+            "a message here makes the agent re-report every two seconds forever"
+        );
+        assert_eq!(
+            svc.cluster.get_job(job_id).expect("job").state,
+            JobState::Suspended,
+            "the run must be left exactly as it was found"
+        );
+    }
+
     /// A job that actually completed while spurd was down must land as
     /// Completed even with a stale, expired recovery cohort entry racing it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7792,12 +7944,12 @@ mod tests {
                 std::time::Instant::now() - STEPD_RECOVERY_COHORT_GRACE,
             ),
         );
-        let fenced = svc
+        let outcome = svc
             .fence_stepd_recovery(job_id, run_attempt)
             .await
             .expect("fencing a terminal job must not error");
         assert!(
-            !fenced,
+            matches!(outcome, StepdFenceOutcome::Stale),
             "fencing must no-op once the job already reached a terminal state"
         );
         assert_eq!(
