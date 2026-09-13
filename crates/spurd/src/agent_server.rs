@@ -1081,15 +1081,12 @@ pub async fn recover_stepds(
     for descriptor in descriptors {
         let cgroup_path = (!descriptor.cgroup_path.as_os_str().is_empty())
             .then(|| descriptor.cgroup_path.clone());
-        jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
+        let tracked = jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
             job: executor::RunningJob::AllocationOnly,
             cgroup_path,
-            rootfs_mode: descriptor
-                .container_rootfs_mode
-                .clone()
-                .unwrap_or(crate::container::RootfsMode::Extracted),
-            stdout_path: descriptor.stdout_path.clone(),
-            stderr_path: descriptor.stderr_path.clone(),
+            rootfs_mode: crate::container::RootfsMode::Extracted,
+            stdout_path: String::new(),
+            stderr_path: String::new(),
             has_pid_namespace: descriptor.has_pid_namespace,
             has_user_namespace: descriptor.has_user_namespace,
             has_mount_namespace: descriptor.has_mount_namespace,
@@ -1106,6 +1103,20 @@ pub async fn recover_stepds(
             mpi: descriptor.resources.mpi.clone(),
             run_attempt: descriptor.run_attempt,
         });
+        // Sessions arrive in directory order, so only take these from the job's
+        // own: a step's spool file and rootfs are the step's, not the job's.
+        if spur_core::step::is_user_step(descriptor.step_id) {
+            continue;
+        }
+        if !descriptor.stdout_path.is_empty() {
+            tracked.stdout_path = descriptor.stdout_path.clone();
+        }
+        if !descriptor.stderr_path.is_empty() {
+            tracked.stderr_path = descriptor.stderr_path.clone();
+        }
+        if let Some(mode) = descriptor.container_rootfs_mode.clone() {
+            tracked.rootfs_mode = mode;
+        }
     }
 }
 
@@ -11663,8 +11674,6 @@ mod tests {
         assert_eq!(response.into_inner().exit_code, 5);
     }
 
-    /// One session of job 44's second attempt, on disk the way a supervisor
-    /// leaves it, with `exit` recorded when the supervisor observed one.
     /// A batch session as its supervisor published it, recording where the
     /// job's output landed so an agent that restarts can still find it.
     fn published_batch_descriptor(
@@ -11717,6 +11726,57 @@ mod tests {
             crate::container::RootfsMode::Overlay,
             "guessing Extracted would skip the unmount and leak the overlay"
         );
+    }
+
+    // Sessions are adopted in directory order, so a job whose step supervisor
+    // is enumerated first must still report the job's own output, not the step's.
+    #[tokio::test]
+    async fn a_steps_session_never_supplies_the_jobs_output_paths() {
+        let mut step = crate::stepd::StepdDescriptor::new(
+            44,
+            1,
+            0,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        step.stdout_path = "/spool/job44/step0.out".into();
+        step.stderr_path = "/spool/job44/step0.err".into();
+        let mut batch = crate::stepd::StepdDescriptor::new(
+            44,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        batch.stdout_path = "/spool/job44.out".into();
+        batch.stderr_path = "/spool/job44.err".into();
+        batch.container_rootfs_mode = Some(crate::container::RootfsMode::Overlay);
+
+        for order in [
+            vec![step.clone(), batch.clone()],
+            vec![batch.clone(), step.clone()],
+        ] {
+            let seen: Vec<_> = order.iter().map(|d| d.step_id).collect();
+            let running = new_running_jobs();
+            recover_stepds(&running, order).await;
+
+            let jobs = running.lock().await;
+            let tracked = jobs.get(&44).expect("the adopted job is tracked");
+            assert_eq!(
+                tracked.stdout_path, "/spool/job44.out",
+                "a step's spool file is not the job's output (order {seen:?})"
+            );
+            assert_eq!(tracked.stderr_path, "/spool/job44.err", "order {seen:?}");
+            assert_eq!(
+                tracked.rootfs_mode,
+                crate::container::RootfsMode::Overlay,
+                "a step carries no rootfs mode and must not reset the job's (order {seen:?})"
+            );
+        }
     }
 
     #[tokio::test]
@@ -11791,6 +11851,8 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
+    /// One session of job 44's second attempt, on disk the way a supervisor
+    /// leaves it, with `exit` recorded when the supervisor observed one.
     fn publish_session(
         store: &crate::stepd::StepdStore,
         step_id: u32,

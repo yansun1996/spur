@@ -1971,11 +1971,12 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if let Some(cgroup_path) = launched_cgroup.as_deref() {
         descriptor.cgroup_path = cgroup_path.to_path_buf();
     }
-    if let Some((stdout_path, stderr_path)) = launched_output.clone() {
+    let recorded_output = launched_output.is_some();
+    if let Some((stdout_path, stderr_path)) = launched_output {
         descriptor.stdout_path = stdout_path;
         descriptor.stderr_path = stderr_path;
     }
-    if workload_pid > 0 || launched_cgroup.is_some() || launched_output.is_some() {
+    if workload_pid > 0 || launched_cgroup.is_some() || recorded_output {
         if let Err(error) = store.publish(&descriptor) {
             tracing::warn!(job_id, %error, "failed to republish the runtime descriptor");
         }
