@@ -3059,10 +3059,7 @@ impl AgentService {
             self.step_completions
                 .deregister(job_id, run_attempt, step_id)
                 .await;
-            if let Err(error) = stop_stepd_process(&descriptor).await {
-                warn!(job_id, step_id, %error, "failed to stop a superseded step supervisor");
-            }
-            cleanup_stepd_files(&descriptor);
+            discard_stepd_session(&descriptor).await;
             return Err(Status::aborted(
                 "step supervisor superseded before it could be tracked",
             ));
@@ -15036,6 +15033,9 @@ mod tests {
         let session_dir = store
             .prepare_session_dir(77, 3, spur_core::step::STEP_BATCH)
             .expect("session directory");
+        // Named job_* so cleanup_cgroup accepts it as one of ours.
+        let cgroup_dir = state.path().join("job_77_3");
+        std::fs::create_dir_all(&cgroup_dir).expect("stand-in cgroup directory");
 
         let mut child = std::process::Command::new("sleep")
             .arg("300")
@@ -15049,7 +15049,7 @@ mod tests {
             pid,
             crate::stepd::process_start_ticks(pid).expect("start ticks"),
             session_dir.join("runtime.sock"),
-            std::path::PathBuf::new(),
+            cgroup_dir.clone(),
         );
         assert_eq!(
             crate::stepd::stepd_liveness(&descriptor).expect("liveness check"),
@@ -15063,6 +15063,10 @@ mod tests {
             await_proc_state(pid as i32, &['Z', 'X']).await,
             'Z',
             "the abort must stop the supervisor, not leave it parked"
+        );
+        assert!(
+            !cgroup_dir.exists(),
+            "the abort must reap the abandoned supervisor's cgroup"
         );
         assert!(
             !session_dir.exists(),
