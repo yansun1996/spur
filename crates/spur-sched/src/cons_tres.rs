@@ -215,6 +215,14 @@ impl NodeAllocation {
         Ok(result)
     }
 
+    /// On this node, and either free or already this job's. Narrowing and the
+    /// replay check share it so the two can never disagree about one core.
+    fn cpu_is_claimable(&self, held: &[u32], cpu: u32) -> bool {
+        self.allocated_cpus
+            .get(cpu as usize)
+            .is_some_and(|&taken| !taken || held.contains(&cpu))
+    }
+
     /// The cores of `cpu_ids` this job may claim: free, or already its own.
     /// Lets a replay under-count rather than be refused over a contested core.
     pub fn claimable_cpu_ids(&self, job_id: u32, cpu_ids: &[u32]) -> Vec<u32> {
@@ -225,16 +233,12 @@ impl NodeAllocation {
         cpu_ids
             .iter()
             .copied()
-            .filter(|&cpu| {
-                self.allocated_cpus
-                    .get(cpu as usize)
-                    .is_some_and(|&taken| !taken || held.contains(&cpu))
-            })
+            .filter(|&cpu| self.cpu_is_claimable(held, cpu))
             .collect()
     }
 
     /// Re-record the allocation of a job adopted after an agent restart. Cores
-    /// are replayed verbatim; one the node lost or another job holds is rejected.
+    /// are replayed verbatim; narrow with `claimable_cpu_ids` to drop, not reject.
     pub fn restore_for_job(
         &mut self,
         job_id: u32,
@@ -254,12 +258,9 @@ impl NodeAllocation {
         let held_cpus: &[u32] = owned.map_or(&[], |result| result.cpu_ids.as_slice());
         let held_gpus: &[u32] = owned.map_or(&[], |result| result.gpu_ids.as_slice());
         for &cpu in cpu_ids {
-            let Some(&allocated) = self.allocated_cpus.get(cpu as usize) else {
-                return Err(AllocError::CpusUnavailable);
-            };
             // A core another job still holds would be freed by the first
             // release, handing both jobs an overlapping cpuset.
-            if allocated && !held_cpus.contains(&cpu) {
+            if !self.cpu_is_claimable(held_cpus, cpu) {
                 return Err(AllocError::CpusUnavailable);
             }
         }
@@ -880,6 +881,18 @@ mod tests {
         assert_eq!(node.free_gpus(None), 1);
         assert_eq!(node.free_cpus(), 6, "rejected replay claimed cores anyway");
         assert!(!node.release_job(2));
+    }
+
+    #[test]
+    fn test_restore_for_job_records_memory_and_gpus_with_no_cores() {
+        let mut node = make_node_with_ids(4, 64_000, vec![0], "mi300x");
+
+        // Narrowing can strip every recorded core. The GPU and memory still
+        // have to land, or a live job's device reads free.
+        node.restore_for_job(6, 1, &[], 8_000, &[0]).unwrap();
+        assert_eq!(node.free_gpus(None), 0);
+        assert_eq!(node.free_memory_mb(), 56_000);
+        assert_eq!(node.conflicting_owners(&[0]), vec![6]);
     }
 
     #[test]

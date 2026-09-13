@@ -15431,7 +15431,7 @@ mod tests {
 
         svc.replay_adopted_allocations(&[first, second]).await;
 
-        let alloc = svc.allocation.lock().await;
+        let mut alloc = svc.allocation.lock().await;
         // Job 911 yields core 2 to job 910, but its GPU and memory stay on.
         assert_eq!(alloc.allocated_gpu_ids(), vec![0, 1]);
         assert_eq!(alloc.free_gpus(None), 0);
@@ -15439,6 +15439,12 @@ mod tests {
         assert!(alloc.allocated_cpus[1] && alloc.allocated_cpus[2] && alloc.allocated_cpus[3]);
         assert!(!alloc.allocated_cpus[0]);
         assert_eq!(alloc.conflicting_owners(&[1]), vec![911]);
+
+        // Core 2 is 910's alone: had 911 replayed it verbatim, releasing 911
+        // would clear a core 910 is still running on.
+        alloc.release_job(911);
+        assert!(alloc.allocated_cpus[2]);
+        assert!(!alloc.allocated_cpus[3]);
     }
 
     // An empty ledger was only correct while a restart killed every job: it now
