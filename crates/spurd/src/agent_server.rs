@@ -1051,6 +1051,23 @@ fn cleanup_stepd_files(descriptor: &crate::stepd::StepdDescriptor) {
     }
 }
 
+/// Tear down a supervisor whose launch is being abandoned: stop the process,
+/// reap its cgroup, and drop the session it left on disk.
+async fn discard_stepd_session(descriptor: &crate::stepd::StepdDescriptor) {
+    let job_id = descriptor.job_id;
+    let run_attempt = descriptor.run_attempt;
+    if let Err(error) = stop_stepd_process(descriptor).await {
+        warn!(job_id, run_attempt, %error, "failed to stop abandoned stepd");
+    }
+    if !runtime_cgroup_reaped(&effective_cgroup_path(descriptor)) {
+        warn!(
+            job_id,
+            run_attempt, "could not confirm the abandoned stepd's cgroup is empty"
+        );
+    }
+    cleanup_stepd_files(descriptor);
+}
+
 /// Build an empty running-jobs map to share between the reporter and the agent.
 pub fn new_running_jobs() -> RunningJobs {
     Arc::new(Mutex::new(HashMap::new()))
@@ -3509,6 +3526,11 @@ mod controller_rpc_tests {
 /// monitor loop no longer polls it, so without this a killed `Forked` run would
 /// linger as a zombie until spurd exits.
 async fn reap_killed_job(mut job: executor::RunningJob) {
+    // An allocation owns no process, so try_wait never settles: polling it would
+    // spin for the lifetime of the agent, pinning whatever the task captured.
+    if job.is_allocation_only() {
+        return;
+    }
     loop {
         match job.try_wait() {
             Ok(Some(_)) | Err(_) => break,
@@ -4599,20 +4621,9 @@ impl SlurmAgent for AgentService {
                         if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
                             warn!(job_id, error = %e, "PMIx stop failed after superseded stepd");
                         }
-                        if let Err(error) = stop_stepd_process(&descriptor).await {
-                            warn!(job_id, run_attempt, %error, "failed to stop superseded stepd");
-                        }
                         // This session never entered `stepds`, so the
                         // crash watchdog will never see it either — reap it here.
-                        let cgroup_path = effective_cgroup_path(&descriptor);
-                        if !runtime_cgroup_reaped(&cgroup_path) {
-                            warn!(
-                                job_id,
-                                run_attempt,
-                                "could not confirm the superseded stepd's cgroup is empty"
-                            );
-                        }
-                        cleanup_stepd_files(&descriptor);
+                        discard_stepd_session(&descriptor).await;
                         let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                         tokio::spawn(reap_killed_job(result.job));
                         return Ok(Response::new(LaunchJobResponse {
@@ -4646,6 +4657,13 @@ impl SlurmAgent for AgentService {
                     );
                     if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
                         warn!(job_id, error = %e, "PMIx stop failed after reclaimed reservation");
+                    }
+                    // `kill_signal` cannot reach a supervised workload, and the tracked
+                    // session would otherwise be fenced into a completion for this failure.
+                    if let Some(ref descriptor) = runtime_descriptor {
+                        if claim_stepd(&self.stepds, descriptor).await {
+                            discard_stepd_session(descriptor).await;
+                        }
                     }
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                     let cgroup = result.cgroup_path.take();
@@ -14989,6 +15007,68 @@ mod tests {
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
             "reap_killed_job must reap the Forked child (pid {pid} still present)"
         );
+    }
+
+    /// Aborting a supervised launch spawns a reaper over an allocation, whose
+    /// `try_wait` never settles — it must not poll for the life of the agent.
+    #[tokio::test(start_paused = true)]
+    async fn reap_killed_job_returns_for_an_allocation_with_no_process() {
+        // Paused time: a looping reaper burns its virtual sleeps instantly, so
+        // this resolves without ever depending on how fast the machine is.
+        let reaped = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            reap_killed_job(executor::RunningJob::AllocationOnly),
+        )
+        .await;
+
+        assert!(
+            reaped.is_ok(),
+            "reap_killed_job must return for an allocation instead of polling forever"
+        );
+    }
+
+    /// The reclaimed-reservation abort has to reach a supervised workload, which
+    /// `kill_signal` cannot touch: only stopping the supervisor ends the run.
+    #[tokio::test]
+    async fn discarding_a_stepd_session_stops_the_supervisor_and_its_state() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let session_dir = store
+            .prepare_session_dir(77, 3, spur_core::step::STEP_BATCH)
+            .expect("session directory");
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in supervisor");
+        let pid = child.id();
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            77,
+            3,
+            spur_core::step::STEP_BATCH,
+            pid,
+            crate::stepd::process_start_ticks(pid).expect("start ticks"),
+            session_dir.join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        assert_eq!(
+            crate::stepd::stepd_liveness(&descriptor).expect("liveness check"),
+            crate::stepd::StepdLiveness::Live,
+            "the stand-in supervisor must be live before the abort tears it down"
+        );
+
+        discard_stepd_session(&descriptor).await;
+
+        assert_eq!(
+            await_proc_state(pid as i32, &['Z', 'X']).await,
+            'Z',
+            "the abort must stop the supervisor, not leave it parked"
+        );
+        assert!(
+            !session_dir.exists(),
+            "the abort must drop the abandoned session's on-disk state"
+        );
+        let _ = child.wait();
     }
 
     #[tokio::test]
