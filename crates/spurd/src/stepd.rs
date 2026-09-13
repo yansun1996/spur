@@ -2332,38 +2332,16 @@ impl StepdStore {
         let now = SystemTime::now();
         let mut retained: Vec<(SystemTime, PathBuf)> = Vec::new();
         for session_dir in self.session_dirs()? {
-            let descriptor = match self.load_descriptor(&session_dir) {
-                Ok(descriptor) => descriptor,
-                // Nothing can ever finalize a session whose descriptor will not
-                // load, and it still holds the job's environment on disk.
-                Err(_) => {
-                    if session_is_abandoned(&session_dir, now) {
-                        fs::remove_dir_all(&session_dir)?;
-                        pruned += 1;
-                    }
-                    continue;
-                }
-            };
-            let obligations = self.obligations(
-                descriptor.job_id,
-                descriptor.run_attempt,
-                descriptor.step_id,
-            );
-            match sweep_finalized_session(&session_dir, &obligations, descriptor.step_id)? {
-                SweptSession::Pruned => pruned += 1,
-                SweptSession::RetainedAnswer { settled_at } => {
-                    retained.push((settled_at, session_dir))
-                }
-                // A supervisor that died before recording an exit leaves a session
-                // no one can finalize; only its own death makes it safe to sweep.
-                SweptSession::Unfinalized => {
-                    if matches!(stepd_liveness(&descriptor), Ok(StepdLiveness::Stale))
-                        && session_is_abandoned(&session_dir, now)
-                    {
-                        fs::remove_dir_all(&session_dir)?;
-                        pruned += 1;
-                    }
-                }
+            match self.sweep_session(&session_dir, now, &mut retained) {
+                Ok(true) => pruned += 1,
+                Ok(false) => {}
+                // This sweep also runs at startup, so one damaged session must
+                // not fail the rest of it and stop the agent booting.
+                Err(error) => tracing::warn!(
+                    session = %session_dir.display(),
+                    %error,
+                    "failed to sweep a runtime session"
+                ),
             }
         }
         // Age alone lets step churn grow the retained set without limit, and
@@ -2374,11 +2352,62 @@ impl StepdStore {
         if excess > 0 {
             retained.sort_by_key(|(settled_at, _)| *settled_at);
             for (_, session_dir) in retained.iter().take(excess) {
-                fs::remove_dir_all(session_dir)?;
-                pruned += 1;
+                match fs::remove_dir_all(session_dir) {
+                    Ok(()) => pruned += 1,
+                    Err(error) => tracing::warn!(
+                        session = %session_dir.display(),
+                        %error,
+                        "failed to drop an over-capacity runtime session"
+                    ),
+                }
             }
         }
         Ok(pruned)
+    }
+
+    /// Whether the session was removed. Retained answers are collected rather
+    /// than capped here, so the caller can bound them across every session.
+    fn sweep_session(
+        &self,
+        session_dir: &Path,
+        now: SystemTime,
+        retained: &mut Vec<(SystemTime, PathBuf)>,
+    ) -> io::Result<bool> {
+        let descriptor = match self.load_descriptor(session_dir) {
+            Ok(descriptor) => descriptor,
+            // Nothing can ever finalize a session whose descriptor will not
+            // load, and it still holds the job's environment on disk.
+            Err(_) => {
+                if !session_is_abandoned(session_dir, now) {
+                    return Ok(false);
+                }
+                fs::remove_dir_all(session_dir)?;
+                return Ok(true);
+            }
+        };
+        let obligations = self.obligations(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+        );
+        match sweep_finalized_session(session_dir, &obligations, descriptor.step_id)? {
+            SweptSession::Pruned => Ok(true),
+            SweptSession::RetainedAnswer { settled_at } => {
+                retained.push((settled_at, session_dir.to_path_buf()));
+                Ok(false)
+            }
+            // A supervisor that died before recording an exit leaves a session
+            // no one can finalize; only its own death makes it safe to sweep.
+            SweptSession::Unfinalized => {
+                if !matches!(stepd_liveness(&descriptor), Ok(StepdLiveness::Stale))
+                    || !session_is_abandoned(session_dir, now)
+                {
+                    return Ok(false);
+                }
+                fs::remove_dir_all(session_dir)?;
+                Ok(true)
+            }
+        }
     }
 
     pub(crate) fn acknowledge_completion(
@@ -3643,6 +3672,51 @@ mod tests {
         assert_eq!(store.prune_finalized().expect("prune"), 0);
         assert!(store
             .session_dir(17, 1, spur_core::step::STEP_BATCH)
+            .exists());
+    }
+
+    #[test]
+    fn a_damaged_session_neither_fails_the_sweep_nor_spares_the_rest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+
+        let damaged = descriptor(31, 1, std::process::id());
+        store.publish(&damaged).expect("publish damaged descriptor");
+        fs::write(
+            store
+                .session_dir(31, 1, spur_core::step::STEP_BATCH)
+                .join("obligations.jsonl"),
+            b"{not valid json}\n",
+        )
+        .expect("corrupt the obligation log");
+
+        let finalized = descriptor(32, 1, std::process::id());
+        store
+            .publish(&finalized)
+            .expect("publish finalized descriptor");
+        let obligations = store.obligations(32, 1, spur_core::step::STEP_BATCH);
+        for obligation in [
+            StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            },
+            StepdObligation::CompletionAcknowledged,
+            StepdObligation::ResourcesReleased,
+        ] {
+            obligations.append(&obligation).expect("append obligation");
+        }
+
+        assert_eq!(
+            store
+                .prune_finalized()
+                .expect("a damaged session fails one session, not the sweep"),
+            1
+        );
+        assert!(!store
+            .session_dir(32, 1, spur_core::step::STEP_BATCH)
+            .exists());
+        assert!(store
+            .session_dir(31, 1, spur_core::step::STEP_BATCH)
             .exists());
     }
 

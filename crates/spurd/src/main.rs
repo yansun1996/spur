@@ -502,9 +502,12 @@ async fn main() -> anyhow::Result<()> {
         args.controller.clone(),
         hostname.clone(),
     );
-    let pruned_stepds = stepds.prune_finalized()?;
-    if pruned_stepds > 0 {
-        info!(sessions = pruned_stepds, "pruned finalized stepd state");
+    // Housekeeping, and the periodic sweeper retries it; failing to read the
+    // runtime root is not a reason to refuse to start.
+    match stepds.prune_finalized() {
+        Ok(pruned) if pruned > 0 => info!(sessions = pruned, "pruned finalized stepd state"),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "failed to prune finalized stepd state"),
     }
 
     // Start agent gRPC server (receives job launches + cluster-component RPCs from spurctld).
