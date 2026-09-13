@@ -820,6 +820,16 @@ pub struct StepdDescriptor {
     pub workload_pid: u32,
     #[serde(default)]
     pub workload_start_ticks: u64,
+    /// Where the workload's output actually landed, resolved at launch: an
+    /// agent that restarts has no spec left to re-derive it from.
+    #[serde(default)]
+    pub stdout_path: String,
+    #[serde(default)]
+    pub stderr_path: String,
+    /// `None` for an uncontainerized job. Cleanup has to unmount an overlay
+    /// before removing it, so guessing the mode leaks the mounts.
+    #[serde(default)]
+    pub container_rootfs_mode: Option<crate::container::RootfsMode>,
 }
 
 impl StepdDescriptor {
@@ -853,6 +863,9 @@ impl StepdDescriptor {
             resources: StepdJobResources::default(),
             workload_pid: 0,
             workload_start_ticks: 0,
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            container_rootfs_mode: None,
         }
     }
 }
@@ -1858,6 +1871,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     descriptor.has_user_namespace = launch_spec.has_user_namespace;
     descriptor.has_mount_namespace = launch_spec.has_mount_namespace;
     descriptor.resources = launch_spec.resources.clone();
+    descriptor.container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     store.publish(&descriptor)?;
     let listener = UnixListener::bind(&socket_path)?;
     // Custody of an interactive session's pty master outlives the agent that
@@ -1931,11 +1945,15 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         }
     };
     let runtime_environment = launch_spec.environment.clone();
-    let (job, launched_cgroup) = if launch_spec.allocation_only {
-        (RunningJob::AllocationOnly, None)
+    let (job, launched_cgroup, launched_output) = if launch_spec.allocation_only {
+        (RunningJob::AllocationOnly, None, None)
     } else {
         match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref()).await {
-            Ok(result) => (result.job, result.cgroup_path),
+            Ok(result) => (
+                result.job,
+                result.cgroup_path,
+                Some((result.stdout_path, result.stderr_path)),
+            ),
             Err(error) => {
                 if let Some(pmix) = pmix.as_ref() {
                     pmix.stop();
@@ -1953,7 +1971,11 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     if let Some(cgroup_path) = launched_cgroup.as_deref() {
         descriptor.cgroup_path = cgroup_path.to_path_buf();
     }
-    if workload_pid > 0 || launched_cgroup.is_some() {
+    if let Some((stdout_path, stderr_path)) = launched_output.clone() {
+        descriptor.stdout_path = stdout_path;
+        descriptor.stderr_path = stderr_path;
+    }
+    if workload_pid > 0 || launched_cgroup.is_some() || launched_output.is_some() {
         if let Err(error) = store.publish(&descriptor) {
             tracing::warn!(job_id, %error, "failed to republish the runtime descriptor");
         }
@@ -3271,7 +3293,17 @@ mod tests {
         let fields = serialized
             .as_object_mut()
             .expect("descriptor must encode as an object");
-        for field in ["step_id", "capability", "owner", "uid", "gid", "work_dir"] {
+        for field in [
+            "step_id",
+            "capability",
+            "owner",
+            "uid",
+            "gid",
+            "work_dir",
+            "stdout_path",
+            "stderr_path",
+            "container_rootfs_mode",
+        ] {
             fields.remove(field);
         }
         let restored: StepdDescriptor =
@@ -3282,6 +3314,9 @@ mod tests {
         assert_eq!(restored.uid, 0);
         assert_eq!(restored.gid, 0);
         assert!(restored.work_dir.is_empty());
+        assert!(restored.stdout_path.is_empty());
+        assert!(restored.stderr_path.is_empty());
+        assert_eq!(restored.container_rootfs_mode, None);
     }
 
     #[test]

@@ -1084,9 +1084,12 @@ pub async fn recover_stepds(
         jobs.entry(descriptor.job_id).or_insert_with(|| TrackedJob {
             job: executor::RunningJob::AllocationOnly,
             cgroup_path,
-            rootfs_mode: crate::container::RootfsMode::Extracted,
-            stdout_path: String::new(),
-            stderr_path: String::new(),
+            rootfs_mode: descriptor
+                .container_rootfs_mode
+                .clone()
+                .unwrap_or(crate::container::RootfsMode::Extracted),
+            stdout_path: descriptor.stdout_path.clone(),
+            stderr_path: descriptor.stderr_path.clone(),
             has_pid_namespace: descriptor.has_pid_namespace,
             has_user_namespace: descriptor.has_user_namespace,
             has_mount_namespace: descriptor.has_mount_namespace,
@@ -6147,8 +6150,7 @@ impl SlurmAgent for AgentService {
         }
 
         // Backward-compatible: the response still carries the step's output by
-        // reading the spool files back. #781 replaces this with a client-side
-        // StreamJobOutput tail and drops the read-back, removing the memory bound.
+        // reading the spool files back, which is what bounds it in memory.
         let read_back = |path: String| async move {
             match tokio::fs::read(&path).await {
                 Ok(b) => String::from_utf8_lossy(&b).into_owned(),
@@ -6254,7 +6256,7 @@ impl SlurmAgent for AgentService {
         // Step output: tail the per-step spool file recorded by run_command and
         // finish when the step leaves active_steps (rather than the batch file,
         // which ends only when the whole allocation does). This is what lets an
-        // srun step stream live and terminate at step exit (#781).
+        // srun step stream live and terminate at step exit.
         if let Some(requested_step) = requested_step_of(&req) {
             let active_steps = self.active_steps.clone();
             let stepds = self.stepds.clone();
@@ -6392,8 +6394,7 @@ impl SlurmAgent for AgentService {
         // No retry on a miss, same as run_command: a Running job has been
         // confirmed on every node (confirm_dispatch_on_nodes). Callers here
         // (srun --attach, sattach) hit the agent directly with no controller
-        // proxy, so they inherit their own job.state check. Restart mid-job
-        // (empty `running`) is the one uncovered case.
+        // proxy, so they inherit their own job.state check.
         let file_path = {
             let jobs = self.running.lock().await;
             match jobs.get(&job_id) {
@@ -6412,6 +6413,18 @@ impl SlurmAgent for AgentService {
                 }
             }
         };
+        // An allocation has no job-level output, and a session adopted from a
+        // descriptor written before this was recorded has none to give either.
+        if file_path.is_empty() {
+            return Err(Status::not_found(format!(
+                "job {job_id} has no {} file on this node",
+                if req.stream == "stderr" {
+                    "stderr"
+                } else {
+                    "stdout"
+                }
+            )));
+        }
 
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let running = self.running.clone();
@@ -11652,6 +11665,132 @@ mod tests {
 
     /// One session of job 44's second attempt, on disk the way a supervisor
     /// leaves it, with `exit` recorded when the supervisor observed one.
+    /// A batch session as its supervisor published it, recording where the
+    /// job's output landed so an agent that restarts can still find it.
+    fn published_batch_descriptor(
+        store: &crate::stepd::StepdStore,
+        stdout_path: &str,
+    ) -> crate::stepd::StepdDescriptor {
+        let step_id = spur_core::step::STEP_BATCH;
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            44,
+            1,
+            step_id,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.socket_path = store.session_dir(44, 1, step_id).join("runtime.sock");
+        descriptor.owner = "testuser".into();
+        descriptor.stdout_path = stdout_path.into();
+        store.publish(&descriptor).expect("publish descriptor");
+        descriptor
+    }
+
+    // Adoption rebuilds the tracked job from the descriptor alone; a field it
+    // leaves at a default is one every consumer of `running` then reads wrong.
+    #[tokio::test]
+    async fn adoption_restores_the_output_paths_and_rootfs_mode_it_recorded() {
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            44,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+        );
+        descriptor.stdout_path = "/spool/job44.out".into();
+        descriptor.stderr_path = "/spool/job44.err".into();
+        descriptor.container_rootfs_mode = Some(crate::container::RootfsMode::Overlay);
+
+        let running = new_running_jobs();
+        recover_stepds(&running, vec![descriptor]).await;
+
+        let jobs = running.lock().await;
+        let tracked = jobs.get(&44).expect("the adopted job is tracked");
+        assert_eq!(tracked.stdout_path, "/spool/job44.out");
+        assert_eq!(tracked.stderr_path, "/spool/job44.err");
+        assert_eq!(
+            tracked.rootfs_mode,
+            crate::container::RootfsMode::Overlay,
+            "guessing Extracted would skip the unmount and leak the overlay"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_job_output_tails_a_job_the_restart_adopted() {
+        use tokio_stream::StreamExt as _;
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let output = state_dir.path().join("job44.out");
+        std::fs::write(&output, b"before-restart\n").expect("seed the job's output");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = published_batch_descriptor(&store, &output.to_string_lossy());
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.path().to_path_buf());
+        recover_stepds(&svc.running, vec![descriptor.clone()]).await;
+        svc.adopt_stepds(&[descriptor]).await;
+
+        let mut stream = svc
+            .stream_job_output(Request::new(StreamJobOutputRequest {
+                start_offset: 0,
+                step: None,
+                job_id: 44,
+                step_id: 0,
+                stream: "stdout".into(),
+                user: "testuser".into(),
+            }))
+            .await
+            .expect("an adopted job's output must still be attachable")
+            .into_inner();
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("a chunk should arrive")
+            .expect("stream still open")
+            .expect("chunk");
+        assert_eq!(first.data, b"before-restart\n");
+    }
+
+    // Waiting forever on a path that cannot be resolved is the worst outcome:
+    // the caller sees a banner, no output, no error, and never returns.
+    #[tokio::test]
+    async fn stream_job_output_refuses_a_job_whose_output_path_is_unknown() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = published_batch_descriptor(&store, "");
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state_dir.path().to_path_buf());
+        recover_stepds(&svc.running, vec![descriptor.clone()]).await;
+        svc.adopt_stepds(&[descriptor]).await;
+
+        let status = svc
+            .stream_job_output(Request::new(StreamJobOutputRequest {
+                start_offset: 0,
+                step: None,
+                job_id: 44,
+                step_id: 0,
+                stream: "stdout".into(),
+                user: "testuser".into(),
+            }))
+            .await
+            .expect_err("an unresolvable output path must be an error, not a silent wait");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
     fn publish_session(
         store: &crate::stepd::StepdStore,
         step_id: u32,
@@ -12984,8 +13123,8 @@ mod tests {
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
         // The step's stdout must live in a spool file the agent can tail, not
-        // only in the RPC response — this file is what StreamJobOutput follows
-        // (#781). step_id defaults to 0 here, so the file is step0.out.
+        // only in the RPC response — this file is what StreamJobOutput follows.
+        // step_id defaults to 0 here, so the file is step0.out.
         let contents = [
             std::path::PathBuf::from("/var/spool/spur"),
             std::env::temp_dir().join("spur"),
