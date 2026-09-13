@@ -225,6 +225,7 @@ fn is_agent_connection_loss(status: &Status) -> bool {
 async fn reawait_step(
     agent_addr: &str,
     job_id: u32,
+    run_attempt: u32,
     step_id: u32,
     user: &str,
 ) -> Result<spur_proto::RunCommandResponse, Status> {
@@ -240,6 +241,7 @@ async fn reawait_step(
                 job_id,
                 step_id,
                 user: user.to_string(),
+                run_attempt,
             })
             .await;
         // Not-found is retried like the rest: an agent that has just come back
@@ -3579,7 +3581,7 @@ impl SlurmController for ControllerService {
                             %error,
                             "lost the step's agent mid-run; re-attaching"
                         );
-                        reawait_step(&agent_addr, job_id, step_id, &step_user).await?
+                        reawait_step(&agent_addr, job_id, run_attempt, step_id, &step_user).await?
                     }
                     Err(error) => {
                         return Err(Status::internal(format!(
@@ -3617,6 +3619,7 @@ impl SlurmController for ControllerService {
                         crate::scheduler_loop::cancel_step_on_nodes(
                             &self.cluster,
                             job_id,
+                            run_attempt,
                             step_id,
                             &step_node_names,
                             15,
@@ -3633,6 +3636,7 @@ impl SlurmController for ControllerService {
                         crate::scheduler_loop::cancel_step_on_nodes(
                             &self.cluster,
                             job_id,
+                            run_attempt,
                             step_id,
                             &step_node_names,
                             15,

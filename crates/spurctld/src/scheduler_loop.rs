@@ -2426,13 +2426,20 @@ pub async fn cancel_job_on_nodes(
 pub async fn cancel_step_on_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
+    run_attempt: u32,
     step_id: u32,
     node_names: &[String],
     signal: i32,
 ) {
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
-        set.spawn(cancel_one_step_agent(agent_addr, job_id, step_id, signal));
+        set.spawn(cancel_one_step_agent(
+            agent_addr,
+            job_id,
+            run_attempt,
+            step_id,
+            signal,
+        ));
     }
     while set.join_next().await.is_some() {}
 }
@@ -2441,6 +2448,7 @@ pub async fn cancel_step_on_nodes(
 async fn cancel_one_step_agent(
     agent_addr: String,
     job_id: spur_core::job::JobId,
+    run_attempt: u32,
     step_id: u32,
     signal: i32,
 ) {
@@ -2459,6 +2467,7 @@ async fn cancel_one_step_agent(
                         job_id,
                         step_id,
                         signal,
+                        run_attempt,
                     })
                     .await
                 {

@@ -464,12 +464,12 @@ fn stepds_for_attempt(
         .collect()
 }
 
-/// Whether a supervisor holds the job's own processes. An allocation's extern
-/// step only tracks its lifetime — its steps still run under the agent.
+/// Whether a supervisor holds the job's own processes, so the agent has no
+/// child handle of its own. A step supervisor speaks only for that step.
 fn owns_job_processes(descriptors: &[crate::stepd::StepdDescriptor]) -> bool {
     descriptors
         .iter()
-        .any(|descriptor| descriptor.step_id != spur_core::step::STEP_EXTERN)
+        .any(|descriptor| descriptor.step_id == spur_core::step::STEP_BATCH)
 }
 
 async fn fence_displaced_stepd(
@@ -1076,6 +1076,7 @@ async fn settle_recovered_stepd(
     completions
         .complete(
             descriptor.job_id,
+            descriptor.run_attempt,
             descriptor.step_id,
             crate::step_completion::StepOutcome { exit_code, signal },
         )
@@ -1385,6 +1386,7 @@ async fn fence_dead_stepd(
     if completions
         .complete(
             descriptor.job_id,
+            descriptor.run_attempt,
             descriptor.step_id,
             crate::step_completion::StepOutcome { exit_code, signal },
         )
@@ -1529,6 +1531,7 @@ async fn handle_completion_notification(
                 .step_completions
                 .complete(
                     job_id,
+                    run_attempt,
                     step_id,
                     crate::step_completion::StepOutcome { exit_code, signal },
                 )
@@ -2817,6 +2820,7 @@ impl AgentService {
                     self.step_completions
                         .complete(
                             descriptor.job_id,
+                            descriptor.run_attempt,
                             descriptor.step_id,
                             crate::step_completion::StepOutcome { exit_code, signal },
                         )
@@ -2896,11 +2900,12 @@ impl AgentService {
         step_key: (u32, u32),
     ) -> Result<Option<std::process::ExitStatus>, Status> {
         let (job_id, step_id) = step_key;
+        let run_attempt = cfg.run_attempt;
         // The supervisor opens the spool files itself from the launch spec;
         // holding our own copies would pin the fds for the life of the step.
         drop(step_files);
 
-        fence_displaced_stepd(&self.stepds, job_id, step_id, cfg.run_attempt)
+        fence_displaced_stepd(&self.stepds, job_id, step_id, run_attempt)
             .await
             .map_err(|error| {
                 Status::internal(format!(
@@ -2910,11 +2915,14 @@ impl AgentService {
 
         // Registered before the spawn: a step that outruns this RPC would
         // otherwise deliver its exit status to nobody.
-        let waiter = self.step_completions.register(job_id, step_id).await;
+        let waiter = self
+            .step_completions
+            .register(job_id, run_attempt, step_id)
+            .await;
 
         let launched = launch_stepd(
             cfg,
-            cfg.run_attempt,
+            run_attempt,
             &self.reporter.controller_addr,
             &self.reporter.hostname,
             &self.stepd_state_dir,
@@ -2931,7 +2939,9 @@ impl AgentService {
         let descriptor = match launched {
             Ok((_, descriptor)) => descriptor,
             Err(error) => {
-                self.step_completions.deregister(job_id, step_id).await;
+                self.step_completions
+                    .deregister(job_id, run_attempt, step_id)
+                    .await;
                 return Err(Status::internal(format!(
                     "step supervisor failed to start: {error}"
                 )));
@@ -2939,7 +2949,9 @@ impl AgentService {
         };
 
         if let Err(descriptor) = claim_stepd_slot(&self.stepds, descriptor.clone()).await {
-            self.step_completions.deregister(job_id, step_id).await;
+            self.step_completions
+                .deregister(job_id, run_attempt, step_id)
+                .await;
             if let Err(error) = stop_stepd_process(&descriptor).await {
                 warn!(job_id, step_id, %error, "failed to stop a superseded step supervisor");
             }
@@ -2953,7 +2965,9 @@ impl AgentService {
             crate::stepd::start_job(&descriptor, uuid::Uuid::new_v4().to_string()).await
         {
             // The gate is still shut, so the workload never ran.
-            self.step_completions.deregister(job_id, step_id).await;
+            self.step_completions
+                .deregister(job_id, run_attempt, step_id)
+                .await;
             if let Err(stop_error) = stop_stepd_process(&descriptor).await {
                 warn!(job_id, step_id, %stop_error, "failed to stop an unreleased step supervisor");
             }
@@ -4817,6 +4831,17 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<()>, Status> {
         Self::require_controller(&request)?;
         let req = request.into_inner();
+        // Step ids restart at 0 on a requeue, so a cancel from a superseded
+        // attempt would otherwise signal the redispatch's step of the same id.
+        if !self.runs_attempt(req.job_id, req.run_attempt).await {
+            warn!(
+                job_id = req.job_id,
+                run_attempt = req.run_attempt,
+                step_id = req.step_id,
+                "dropping a step cancel for a superseded run"
+            );
+            return Ok(Response::new(()));
+        }
         let step_key = (req.job_id, req.step_id);
         let signal = if req.signal > 0 {
             req.signal
@@ -5327,7 +5352,7 @@ impl SlurmAgent for AgentService {
             .as_ref()
             .map(|state| std::path::PathBuf::from(&state.cgroup_path))
             .filter(|path| !path.as_os_str().is_empty());
-        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, job_entry) = {
+        let (gpu_devices, partition, cpus, memory_mb, nodelist, job_mpi, job_entry, job_attempt) = {
             let jobs = self.running.lock().await;
             let tracked = jobs.get(&job_id).ok_or_else(|| {
                 Status::not_found(format!("job {} not running on this node", job_id))
@@ -5368,6 +5393,7 @@ impl SlurmAgent for AgentService {
                 nodelist,
                 tracked.mpi.clone(),
                 entry,
+                tracked.run_attempt,
             )
         };
 
@@ -5653,20 +5679,13 @@ impl SlurmAgent for AgentService {
 
         let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
         let mut supervised_step_cfg = if supervise_step {
-            let run_attempt = self
-                .running
-                .lock()
-                .await
-                .get(&job_id)
-                .map(|tracked| tracked.run_attempt)
-                .unwrap_or_default();
             let command: Vec<String> = std::iter::once(program.clone())
                 .chain(program_args.iter().cloned())
                 .collect();
             Some(executor::JobLaunchConfig {
                 step_id,
                 job_id,
-                run_attempt,
+                run_attempt: job_attempt,
                 script: supervised_step_script(&job_entry, req.uid, req.gid, &command)?,
                 joins_parent_namespaces,
                 allocation_holder: false,
@@ -6046,22 +6065,30 @@ impl SlurmAgent for AgentService {
             .lock()
             .await
             .get(&(req.job_id, req.step_id))
-            .cloned();
+            .cloned()
+            // Step ids restart at 0 on a requeue, so a supervisor from another
+            // attempt is a different run of this step, not this caller's.
+            .filter(|descriptor| req.run_attempt == 0 || descriptor.run_attempt == req.run_attempt);
         let Some(descriptor) = tracked else {
             // Untracked is not unknown: a step whose exit was consumed before
             // this caller re-attached is settled, and answering not_found here
             // is what turns a successful step into a synthesised failure. The
             // memo answers within this agent's life, the ledger across restarts.
-            let settled = match self.step_completions.settled(req.job_id, req.step_id).await {
-                Some(outcome) => Some((outcome.exit_code, outcome.signal)),
-                None => store
-                    .recorded_step_exit(req.job_id, req.step_id)
-                    .unwrap_or_else(|error| {
-                        warn!(job_id = req.job_id, step_id = req.step_id, %error,
-                            "failed to read a settled step's recorded exit");
-                        None
-                    }),
+            let recorded = match self
+                .step_completions
+                .settled(req.job_id, req.run_attempt, req.step_id)
+                .await
+            {
+                Some(outcome) => Ok(Some((outcome.exit_code, outcome.signal))),
+                None if req.run_attempt == 0 => store.recorded_step_exit(req.job_id, req.step_id),
+                None => store.observed_exit(req.job_id, req.run_attempt, req.step_id),
             };
+            let settled = recorded.unwrap_or_else(|error| {
+                warn!(job_id = req.job_id, run_attempt = req.run_attempt,
+                    step_id = req.step_id, %error,
+                    "failed to read a settled step's recorded exit");
+                None
+            });
             let Some((exit_code, signal)) = settled else {
                 return Err(Status::not_found("this node is not running that step"));
             };
@@ -6080,7 +6107,7 @@ impl SlurmAgent for AgentService {
 
         let waiter = self
             .step_completions
-            .reregister(req.job_id, req.step_id)
+            .reregister(req.job_id, descriptor.run_attempt, req.step_id)
             .await
             .ok_or_else(|| Status::already_exists("that step already has a caller awaiting it"))?;
 
@@ -7003,6 +7030,9 @@ impl AgentService {
                     "runtime signal request failed");
             }
         }
+        // A step without a supervisor of its own still runs under the agent, so
+        // a supervised sibling must not spare it.
+        self.cancel_active_steps_for_job(job_id, signal).await;
         if supervised {
             return;
         }
@@ -7013,7 +7043,6 @@ impl AgentService {
                 .map(|tracked| tracked.run_attempt)
         };
         if let Some(run_attempt) = allocation_only_attempt {
-            self.cancel_active_steps_for_job(job_id, signal).await;
             self.drop_tracked_job(job_id, run_attempt).await;
             return;
         }
@@ -7037,22 +7066,23 @@ impl AgentService {
         };
         info!(job_id, resume, "sending suspend/resume signal to job");
 
-        // A supervised job's processes belong to its supervisor, so freeze the
-        // whole tree through it rather than the agent's own (absent) handle.
+        // A supervised process belongs to its supervisor, so freeze the whole
+        // tree through it rather than the agent's own (absent) handle.
         let runtimes = stepds_for_job(&*self.stepds.lock().await, job_id);
-        if owns_job_processes(&runtimes) {
-            for descriptor in runtimes {
-                if let Err(error) = crate::stepd::signal_allocation(
-                    &descriptor,
-                    uuid::Uuid::new_v4().to_string(),
-                    sig as i32,
-                )
-                .await
-                {
-                    warn!(job_id, step_id = descriptor.step_id, %error,
-                        "runtime suspend/resume request failed");
-                }
+        let supervised = owns_job_processes(&runtimes);
+        for descriptor in runtimes {
+            if let Err(error) = crate::stepd::signal_allocation(
+                &descriptor,
+                uuid::Uuid::new_v4().to_string(),
+                sig as i32,
+            )
+            .await
+            {
+                warn!(job_id, step_id = descriptor.step_id, %error,
+                    "runtime suspend/resume request failed");
             }
+        }
+        if supervised {
             return;
         }
 
@@ -7171,6 +7201,10 @@ impl AgentService {
                 }
             }
         }
+        // A step without a supervisor of its own still runs under the agent, so
+        // a supervised sibling must not spare it.
+        self.cancel_active_steps_for_job(job_id, nix::sys::signal::Signal::SIGTERM as i32)
+            .await;
         if supervised {
             return;
         }
@@ -7181,8 +7215,6 @@ impl AgentService {
                 .map(|tracked| tracked.run_attempt)
         };
         if let Some(run_attempt) = allocation_only_attempt {
-            self.cancel_active_steps_for_job(job_id, nix::sys::signal::Signal::SIGTERM as i32)
-                .await;
             self.drop_tracked_job(job_id, run_attempt).await;
             return;
         }
@@ -8832,8 +8864,14 @@ mod tests {
         assert!(owns_job_processes(&[descriptor(
             spur_core::step::STEP_BATCH
         )]));
-        assert!(owns_job_processes(&[
+        // A supervised step speaks only for itself: the allocation's own steps
+        // may still be running under the agent.
+        assert!(!owns_job_processes(&[
             descriptor(spur_core::step::STEP_EXTERN),
+            descriptor(7),
+        ]));
+        assert!(owns_job_processes(&[
+            descriptor(spur_core::step::STEP_BATCH),
             descriptor(7),
         ]));
     }
@@ -9048,7 +9086,7 @@ mod tests {
             .insert(stepd_key(&descriptor), descriptor.clone());
 
         let completions = crate::step_completion::StepCompletions::new();
-        let mut waiter = completions.register(43, step_id).await;
+        let mut waiter = completions.register(43, 7, step_id).await;
 
         fence_dead_stepd(
             &fence_context(&running, &allocation, &sessions, &completions, &store),
@@ -9439,6 +9477,66 @@ mod tests {
         .with_supervised_launch()
     }
 
+    /// The attempt keys the session directory and the step's cgroup leaf, so a
+    /// step keyed to 0 lands outside the job's enforced limits.
+    #[tokio::test]
+    async fn a_supervised_step_takes_the_attempt_of_the_job_it_joins() {
+        let svc = supervised_agent("/nonexistent/spur/spur_mpi_pmix.so");
+        let job_id = 7755;
+        let step_id = 3;
+        svc.insert_test_job(
+            job_id,
+            TrackedJob {
+                run_attempt: 5,
+                ..TrackedJob::allocation_only(None)
+            },
+        )
+        .await;
+
+        // A session left by an earlier attempt of this step. Displacing it is
+        // refused unless the launch names an attempt that supersedes it.
+        let sockets = tempfile::tempdir().expect("socket dir");
+        let displaced = crate::stepd::StepdDescriptor::new(
+            job_id,
+            3,
+            step_id,
+            0,
+            0,
+            sockets.path().join("displaced.sock"),
+            std::path::PathBuf::new(),
+        );
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&displaced), displaced);
+
+        let work_dir = tempfile::tempdir().expect("work dir");
+        let error = svc
+            .run_command(Request::new(RunCommandRequest {
+                command: vec!["true".into()],
+                work_dir: work_dir.path().to_string_lossy().into_owned(),
+                job_id,
+                step_id,
+                num_tasks: 1,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("spurstepd is not built beside the test binary");
+
+        assert!(
+            !error
+                .message()
+                .contains("fence a displaced step supervisor"),
+            "a step keyed to attempt 0 cannot supersede attempt 3, got: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("step supervisor failed to start"),
+            "the launch must reach the spawn, got: {}",
+            error.message()
+        );
+    }
+
     // The supervised dispatch is unreachable without `with_supervised_launch`,
     // so this is the only unit-level cover for who hosts a step's PMIx server.
     #[tokio::test]
@@ -9642,7 +9740,7 @@ mod tests {
         const STEP: spur_core::step::StepId = 3;
         let (context, _running, _sessions, _state_dir, completions) =
             completion_listener_fixture_for_step("http://127.0.0.1:1", STEP).await;
-        let mut waiter = completions.register(42, STEP).await;
+        let mut waiter = completions.register(42, 7, STEP).await;
         let (server_stream, client_stream) = tokio::net::UnixStream::pair().expect("socket pair");
         let handler =
             tokio::spawn(
@@ -11335,6 +11433,7 @@ mod tests {
                 job_id: 44,
                 step_id: 0,
                 user: "intruder".into(),
+                run_attempt: 0,
             }))
             .await
             .expect_err("a non-owner must not await another user's step");
@@ -11360,6 +11459,7 @@ mod tests {
                 job_id: 44,
                 step_id: 3,
                 user: "testuser".into(),
+                run_attempt: 0,
             }))
             .await
             .expect_err("an unknown step must not park the caller forever");
@@ -11408,6 +11508,7 @@ mod tests {
                 job_id: 44,
                 step_id: 3,
                 user: "testuser".into(),
+                run_attempt: 0,
             }))
             .await
             .expect("a recorded exit must be returned, not parked on");
@@ -11529,6 +11630,7 @@ mod tests {
                 job_id: 44,
                 step_id: 3,
                 user: "testuser".into(),
+                run_attempt: 0,
             }))
             .await
             .expect("a step settled before the re-attach must still report its exit");
@@ -11549,6 +11651,7 @@ mod tests {
                 job_id: 44,
                 step_id: 3,
                 user: "testuser".into(),
+                run_attempt: 0,
             }))
             .await
             .expect("a step that exited during the outage must still report its exit");
@@ -11633,11 +11736,62 @@ mod tests {
                 job_id: 44,
                 step_id: 3,
                 user: "testuser".into(),
+                run_attempt: 0,
             }))
             .await
             .expect("a restart must not lose a step's exit");
 
         assert_eq!(response.into_inner().exit_code, 7);
+    }
+
+    #[tokio::test]
+    async fn await_step_does_not_hand_a_caller_the_next_attempts_exit() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = restarted_agent(state_dir.path()).await;
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+
+        // The redispatch after a requeue. Step ids restart, so attempt 2 has a
+        // step 3 of its own, and its exit is the newest one on disk.
+        let mut redispatch = crate::stepd::StepdDescriptor::new(
+            44,
+            2,
+            3,
+            0,
+            0,
+            Default::default(),
+            Default::default(),
+        );
+        redispatch.socket_path = store.session_dir(44, 2, 3).join("runtime.sock");
+        store.publish(&redispatch).expect("publish the redispatch");
+        store
+            .obligations(44, 2, 3)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 9,
+                signal: 0,
+            })
+            .expect("record the redispatch's exit");
+
+        let err = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+                run_attempt: 1,
+            }))
+            .await
+            .expect_err("a superseded attempt must not be answered with the redispatch's exit");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        let response = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 44,
+                step_id: 3,
+                user: "testuser".into(),
+                run_attempt: 2,
+            }))
+            .await
+            .expect("the attempt that ran it is still answerable");
+        assert_eq!(response.into_inner().exit_code, 9);
     }
 
     #[tokio::test]
@@ -11657,6 +11811,7 @@ mod tests {
                 job_id: 44,
                 step_id: 3,
                 user: "testuser".into(),
+                run_attempt: 0,
             }))
             .await
             .expect_err("an unobserved exit must not be invented");
@@ -12504,6 +12659,76 @@ mod tests {
         assert!(exited, "the in-flight step process must be signaled dead");
     }
 
+    /// A `--container-image` step has no supervisor, so it runs under the agent
+    /// beside supervised siblings. A cancel must reach both.
+    #[tokio::test]
+    async fn a_supervised_sibling_does_not_spare_an_unsupervised_step() {
+        use std::os::unix::process::CommandExt;
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 78,
+            cpus: 1,
+            run_attempt: 1,
+            ..Default::default()
+        }))
+        .await
+        .expect("register allocation");
+
+        // Unbound socket paths: the supervisors are unreachable on purpose, so
+        // the cancel fans out over them without this test hosting one.
+        let state = tempfile::tempdir().expect("state dir");
+        for step_id in [spur_core::step::STEP_EXTERN, 1] {
+            let mut descriptor = crate::stepd::StepdDescriptor::new(
+                78,
+                1,
+                step_id,
+                0,
+                0,
+                state.path().join(format!("{step_id}.sock")),
+                std::path::PathBuf::new(),
+            );
+            descriptor.capability = "mixed-cancel-test".into();
+            svc.stepds
+                .lock()
+                .await
+                .insert(stepd_key(&descriptor), descriptor);
+        }
+
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("300");
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        svc.register_test_step(78, 2, Some(child.id())).await;
+
+        svc.graceful_cancel(78, 1).await;
+
+        assert!(
+            svc.step_cancel_requested(78, 2).await,
+            "an unsupervised step must be cancelled beside its supervised sibling"
+        );
+        let mut exited = false;
+        for _ in 0..50 {
+            if child.try_wait().expect("try_wait").is_some() {
+                exited = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            exited,
+            "the unsupervised step's process must be signaled dead"
+        );
+    }
+
     #[tokio::test]
     async fn run_command_uses_provided_work_dir() {
         // The bug repro: the user's workflow is `salloc; srun hostname`.
@@ -12570,10 +12795,51 @@ mod tests {
             job_id: 10,
             step_id: 1,
             signal: 0,
+            run_attempt: 0,
         }))
         .await
         .unwrap();
         assert!(svc.step_cancel_requested(10, 1).await);
+    }
+
+    #[tokio::test]
+    async fn cancel_step_ignores_a_superseded_attempt() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        // The redispatch: step ids restart, so its step 1 wears the id the
+        // superseded attempt's cancel names.
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            10,
+            4,
+            1,
+            0,
+            0,
+            Default::default(),
+            Default::default(),
+        );
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+        svc.register_test_step(10, 1, None).await;
+
+        svc.cancel_step(Request::new(CancelStepRequest {
+            job_id: 10,
+            step_id: 1,
+            signal: 0,
+            run_attempt: 3,
+        }))
+        .await
+        .expect("a superseded cancel is dropped, not an error");
+
+        assert!(
+            !svc.step_cancel_requested(10, 1).await,
+            "a cancel for a superseded attempt must not reach the redispatch's step"
+        );
     }
 
     #[tokio::test]
@@ -12605,6 +12871,7 @@ mod tests {
             job_id,
             step_id,
             signal: 0,
+            run_attempt: 0,
         }))
         .await
         .unwrap();
@@ -12649,6 +12916,7 @@ mod tests {
             job_id,
             step_id,
             signal: 0,
+            run_attempt: 0,
         }))
         .await
         .unwrap();
