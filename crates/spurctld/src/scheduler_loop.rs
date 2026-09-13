@@ -519,13 +519,15 @@ async fn process_assignment(
             0,
         )
         .await;
-        // Cancelled first, while this attempt is still the current one: the job
-        // is already Running, so without a transition it would hold its nodes.
+        // Already Running, so without a transition it would hold its nodes. Both
+        // calls name this attempt: the awaits above give a requeue time to land.
         let detail = format!(
             "job started but was not released on every node ({})",
             dispatch_nodes.join(",")
         );
-        if let Err(e) = cluster.evict_job_with_detail(job_id, Some(detail)) {
+        if let Err(e) =
+            cluster.evict_job_attempt(job_id, Some(prospective_run_attempt), Some(detail))
+        {
             error!(job_id, error = %e, "failed to evict a job that could not be released");
         }
         return false;
@@ -5254,10 +5256,17 @@ mod tests {
                 cancel_calls.load(Ordering::SeqCst) >= 1
             });
             let job = cm.get_job(job_id).unwrap();
-            assert_ne!(
+            assert_eq!(
                 job.state,
-                JobState::Running,
+                JobState::NodeFail,
                 "the job would hold its allocation forever if left Running"
+            );
+            assert!(
+                job.launch_failure_detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("n1")),
+                "the eviction must say which nodes would not take the job, got {:?}",
+                job.launch_failure_detail
             );
             assert!(
                 cm.get_node("n1")
@@ -5266,6 +5275,36 @@ mod tests {
                     .is_empty(),
                 "the node's resources must be given back, not left allocated"
             );
+        }
+
+        // The cancel above is awaited, which is long enough for a requeue to
+        // land; evicting then would take down a run that is doing nothing wrong.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn evicting_a_superseded_attempt_leaves_the_current_run_alone() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("superseded", 1));
+            assert!(
+                process_assignment(cm.clone(), assignment(job_id, &["n1"])).await,
+                "the job must reach Running first"
+            );
+            let current = cm.get_job(job_id).unwrap().run_attempt;
+
+            cm.evict_job_attempt(job_id, Some(current.wrapping_sub(1)), Some("stale".into()))
+                .expect("a stale eviction must be a no-op, not an error");
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(
+                job.state,
+                JobState::Running,
+                "an eviction naming an older attempt must not touch the current run"
+            );
+            assert_eq!(job.run_attempt, current);
         }
 
         fn make_script(body: &str) -> tempfile::TempPath {

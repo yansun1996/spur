@@ -2439,10 +2439,8 @@ impl ClusterManager {
     /// node goes Down, but scoped to a single job. Unlike the health-check
     /// path, this does not by itself cancel the job on nodes that *did*
     /// launch it — a caller evicting a job with launched-but-unconfirmed
-    /// nodes is responsible for sending the cancel RPC once eviction
-    /// succeeds.
-    ///
-    /// `scheduler_loop` evicts here when a node refuses the post-Running release.
+    /// nodes owns sending the cancel RPC, and should send it before evicting
+    /// so the cancel still names the attempt being torn down.
     #[allow(dead_code)]
     pub fn evict_job(&self, job_id: JobId) -> anyhow::Result<()> {
         self.evict_job_with_detail(job_id, None)
@@ -2453,12 +2451,26 @@ impl ClusterManager {
         job_id: JobId,
         detail: Option<String>,
     ) -> anyhow::Result<()> {
+        self.evict_job_attempt(job_id, None, detail)
+    }
+
+    /// Evict only while `run_attempt` is still the job's current one. A caller
+    /// that awaited anything may be holding an epoch the job has already left.
+    pub fn evict_job_attempt(
+        &self,
+        job_id: JobId,
+        run_attempt: Option<u32>,
+        detail: Option<String>,
+    ) -> anyhow::Result<()> {
         {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
             if job.state.is_terminal() {
+                return Ok(());
+            }
+            if run_attempt.is_some_and(|attempt| job.run_attempt != attempt) {
                 return Ok(());
             }
         }

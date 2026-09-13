@@ -2957,8 +2957,8 @@ impl AgentService {
                         )
                         .await;
                 }
-                // Only a numbered step reaches this now — a job-level session is
-                // given a synthetic exit at startup; the recovery report has it.
+                // A job-level session is usually given a synthetic exit at
+                // startup; whatever is left here the recovery report speaks for.
                 Ok(None) => {}
                 Err(error) => {
                     warn!(
