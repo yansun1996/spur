@@ -136,11 +136,21 @@ The two daemons are configured with command-line flags. The most common are belo
    its server stays in ``spurd``, so restarting the agent breaks its
    rendezvous along with the step itself.
 
-   Setting ``[auth] jwt_key`` (or ``jwt_key_file``) to the same value on the
-   controller and every agent lets the controller verify a supervisor an agent
-   recovered after a restart, and fence one belonging to a superseded run.
-   Without it the agent still supervises and still re-adopts, but the recovery
-   report cannot be verified and the supervisor is kept unconfirmed.
+   Before the controller will *fence* a supervisor belonging to a superseded
+   run, the reporting node has to prove its identity, and that takes **two**
+   settings together: ``[auth] jwt_key`` (or ``jwt_key_file``) **and**
+   ``[admission] mode = "token"``. The credential a recovery report is checked
+   against is only minted when an agent registers with an admission token, so
+   a signing key on its own — the common case, since admission defaults to
+   ``open`` — proves nothing.
+
+   With either setting missing, recovery still works and is simply taken on
+   trust: the agent supervises and re-adopts as normal, and the controller
+   keeps the job alive rather than dropping a supervisor it cannot verify. What
+   it will not do is fence one, so a supervisor left over from a superseded run
+   is not torn down by this path. See :doc:`../admin-guide/configuration` for
+   both settings, and note that admission tokens themselves are forgeable until
+   a signing key is set.
 
 .. note::
 
