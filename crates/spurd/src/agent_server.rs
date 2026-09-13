@@ -472,6 +472,14 @@ fn owns_job_processes(descriptors: &[crate::stepd::StepdDescriptor]) -> bool {
         .any(|descriptor| descriptor.step_id == spur_core::step::STEP_BATCH)
 }
 
+/// Whether a supervisor is running the job's teardown, so the agent must not
+/// retire its tracking underneath one and strand its completion.
+fn supervisor_owns_teardown(descriptors: &[crate::stepd::StepdDescriptor]) -> bool {
+    descriptors
+        .iter()
+        .any(|descriptor| descriptor.step_id != spur_core::step::STEP_EXTERN)
+}
+
 async fn fence_displaced_stepd(
     stepds: &Arc<Mutex<StepdMap>>,
     job_id: u32,
@@ -7017,7 +7025,7 @@ impl AgentService {
         // A signal reaches every step the job holds; one failing must not
         // silently spare its siblings.
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
-        let supervised = owns_job_processes(&runtimes);
+        let supervised = supervisor_owns_teardown(&runtimes);
         for descriptor in runtimes {
             if let Err(error) = crate::stepd::signal_allocation(
                 &descriptor,
@@ -7106,7 +7114,14 @@ impl AgentService {
     /// dropped. Only SIGKILL and SIGSTOP are force-delivered. So the requested
     /// signal is sent first (graceful for host steps), then SIGKILL after a short
     /// grace period guarantees a container init dies.
+    /// Steps with a supervisor are skipped: it runs its own ordered shutdown,
+    /// and the escalation below would cut that short.
     async fn cancel_active_steps_for_job(&self, job_id: u32, signal: i32) {
+        let supervised: Vec<spur_core::step::StepId> =
+            stepds_for_job(&*self.stepds.lock().await, job_id)
+                .iter()
+                .map(|descriptor| descriptor.step_id)
+                .collect();
         // Snapshot (key, pid, epoch) under the lock, then signal *outside* it:
         // signal_step_tree walks /proc, so holding active_steps across it would
         // block every concurrent run_command (and the ActiveStepGuard's try_lock
@@ -7115,7 +7130,7 @@ impl AgentService {
             let mut steps = self.active_steps.lock().await;
             let mut targets = Vec::new();
             for (key, step) in steps.iter_mut() {
-                if key.0 == job_id {
+                if key.0 == job_id && !supervised.contains(&key.1) {
                     step.cancel_requested = true;
                     if let Some(pid) = step.pid {
                         targets.push((*key, pid, step.epoch));
@@ -7161,7 +7176,7 @@ impl AgentService {
             return;
         }
         let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
-        let supervised = owns_job_processes(&runtimes);
+        let supervised = supervisor_owns_teardown(&runtimes);
         for descriptor in runtimes {
             match crate::stepd::shutdown_allocation(&descriptor, uuid::Uuid::new_v4().to_string())
                 .await
@@ -9477,8 +9492,8 @@ mod tests {
         .with_supervised_launch()
     }
 
-    /// The attempt keys the session directory and the step's cgroup leaf, so a
-    /// step keyed to 0 lands outside the job's enforced limits.
+    /// Pins the attempt the supervised dispatch carries. It keys the session
+    /// directory and the cgroup leaf, so 0 escapes the job's enforced limits.
     #[tokio::test]
     async fn a_supervised_step_takes_the_attempt_of_the_job_it_joins() {
         let svc = supervised_agent("/nonexistent/spur/spur_mpi_pmix.so");
@@ -12659,6 +12674,98 @@ mod tests {
         assert!(exited, "the in-flight step process must be signaled dead");
     }
 
+    /// Unbound socket paths: the supervisors are unreachable on purpose, so a
+    /// cancel fans out over them without the test hosting one.
+    async fn track_test_stepds(
+        svc: &AgentService,
+        job_id: u32,
+        run_attempt: u32,
+        step_ids: &[spur_core::step::StepId],
+        sockets: &std::path::Path,
+    ) {
+        for step_id in step_ids {
+            let mut descriptor = crate::stepd::StepdDescriptor::new(
+                job_id,
+                run_attempt,
+                *step_id,
+                0,
+                0,
+                sockets.join(format!("{step_id}.sock")),
+                std::path::PathBuf::new(),
+            );
+            descriptor.capability = "cancel-fanout-test".into();
+            svc.stepds
+                .lock()
+                .await
+                .insert(stepd_key(&descriptor), descriptor);
+        }
+    }
+
+    /// The supervisor runs its own ordered shutdown, so the agent's escalation
+    /// must not reach a step that has one.
+    #[tokio::test]
+    async fn a_cancel_leaves_a_supervised_step_to_its_own_supervisor() {
+        use std::os::unix::process::CommandExt;
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("state dir");
+        track_test_stepds(&svc, 79, 1, &[spur_core::step::STEP_BATCH, 4], state.path()).await;
+
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("300");
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        svc.register_test_step(79, 4, Some(child.id())).await;
+
+        svc.cancel_active_steps_for_job(79, nix::sys::signal::Signal::SIGTERM as i32)
+            .await;
+
+        assert!(
+            !svc.step_cancel_requested(79, 4).await,
+            "a supervised step's shutdown belongs to its supervisor"
+        );
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "the agent must not signal a step its supervisor is shutting down"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The job's own supervisor says nothing about a step that has none: a
+    /// `--container-image` step still runs under the agent and must be reached.
+    #[tokio::test]
+    async fn a_supervised_batch_job_does_not_spare_its_unsupervised_step() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        svc.insert_test_job(
+            80,
+            TrackedJob {
+                run_attempt: 1,
+                ..TrackedJob::allocation_only(None)
+            },
+        )
+        .await;
+        let state = tempfile::tempdir().expect("state dir");
+        track_test_stepds(&svc, 80, 1, &[spur_core::step::STEP_BATCH], state.path()).await;
+        svc.register_test_step(80, 6, None).await;
+
+        svc.graceful_cancel(80, 1).await;
+
+        assert!(
+            svc.step_cancel_requested(80, 6).await,
+            "a batch job's supervisor does not own its unsupervised step"
+        );
+    }
+
     /// A `--container-image` step has no supervisor, so it runs under the agent
     /// beside supervised siblings. A cancel must reach both.
     #[tokio::test]
@@ -12679,25 +12786,15 @@ mod tests {
         .await
         .expect("register allocation");
 
-        // Unbound socket paths: the supervisors are unreachable on purpose, so
-        // the cancel fans out over them without this test hosting one.
         let state = tempfile::tempdir().expect("state dir");
-        for step_id in [spur_core::step::STEP_EXTERN, 1] {
-            let mut descriptor = crate::stepd::StepdDescriptor::new(
-                78,
-                1,
-                step_id,
-                0,
-                0,
-                state.path().join(format!("{step_id}.sock")),
-                std::path::PathBuf::new(),
-            );
-            descriptor.capability = "mixed-cancel-test".into();
-            svc.stepds
-                .lock()
-                .await
-                .insert(stepd_key(&descriptor), descriptor);
-        }
+        track_test_stepds(
+            &svc,
+            78,
+            1,
+            &[spur_core::step::STEP_EXTERN, 1],
+            state.path(),
+        )
+        .await;
 
         let mut cmd = std::process::Command::new("sleep");
         cmd.arg("300");
