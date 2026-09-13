@@ -25,6 +25,9 @@ pub enum AllocError {
     /// A newer run_attempt already owns this job id's reservation; this
     /// (older or duplicate) attempt lost the race and must not proceed.
     Superseded,
+    /// A core being replayed does not exist on this node (the node's CPU count
+    /// shrank since the allocation was made).
+    CpusUnavailable,
 }
 
 /// Per-node resource allocation state.
@@ -209,6 +212,67 @@ impl NodeAllocation {
             },
         );
         self.launching.insert(job_id, Instant::now());
+        Ok(result)
+    }
+
+    /// Re-record the allocation of a job adopted after an agent restart. Cores
+    /// are replayed verbatim so the ledger agrees with the job's live cpuset.
+    pub fn restore_for_job(
+        &mut self,
+        job_id: u32,
+        run_attempt: u32,
+        cpu_ids: &[u32],
+        memory_mb: u64,
+        gpu_device_ids: &[u32],
+    ) -> Result<AllocationResult, AllocError> {
+        if let Some(existing) = self.owners.get(&job_id) {
+            if existing.run_attempt > run_attempt {
+                return Err(AllocError::Superseded);
+            }
+        }
+        if cpu_ids
+            .iter()
+            .any(|&cpu| cpu as usize >= self.allocated_cpus.len())
+        {
+            return Err(AllocError::CpusUnavailable);
+        }
+        self.release_job(job_id);
+
+        let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
+        for &id in gpu_device_ids {
+            let idx = self
+                .gpus
+                .iter()
+                .position(|g| g.device_id == id)
+                .ok_or(AllocError::GpusUnavailable)?;
+            if self.gpu_allocated[idx] || gpu_indices.contains(&idx) {
+                return Err(AllocError::GpusUnavailable);
+            }
+            gpu_indices.push(idx);
+        }
+
+        for &cpu in cpu_ids {
+            self.allocated_cpus[cpu as usize] = true;
+        }
+        self.allocated_memory_mb += memory_mb;
+        for &idx in &gpu_indices {
+            self.gpu_allocated[idx] = true;
+        }
+
+        let result = AllocationResult {
+            cpu_ids: cpu_ids.to_vec(),
+            gpu_ids: gpu_device_ids.to_vec(),
+            memory_mb,
+        };
+        // Committed outright: an adopted job is already running, and leaving it
+        // `launching` would let reconcile reclaim it once the TTL elapsed.
+        self.owners.insert(
+            job_id,
+            Owned {
+                run_attempt,
+                result: result.clone(),
+            },
+        );
         Ok(result)
     }
 

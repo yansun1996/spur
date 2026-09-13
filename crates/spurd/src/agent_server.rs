@@ -435,6 +435,19 @@ fn stepd_key(descriptor: &crate::stepd::StepdDescriptor) -> StepdKey {
     (descriptor.job_id, descriptor.step_id)
 }
 
+/// A descriptor written before the exact cores were persisted records only a
+/// count; the lowest free cores keep occupancy right even if the ids differ.
+fn fallback_cpu_ids(allocation: &NodeAllocation, cpus: u32) -> Vec<u32> {
+    allocation
+        .allocated_cpus
+        .iter()
+        .enumerate()
+        .filter(|(_, &taken)| !taken)
+        .map(|(index, _)| index as u32)
+        .take(cpus as usize)
+        .collect()
+}
+
 /// Every supervisor a job currently holds. Job-level operations (signal,
 /// cancel, teardown) act on all of its steps, not just the batch one.
 fn stepds_for_job(sessions: &StepdMap, job_id: u32) -> Vec<crate::stepd::StepdDescriptor> {
@@ -2817,6 +2830,50 @@ impl AgentService {
         }
     }
 
+    /// Put adopted jobs back on the node's ledger, which is built empty — only
+    /// correct back when a restart killed every job it could have held.
+    pub async fn replay_adopted_allocations(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
+        let mut replayed: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut allocation = self.allocation.lock().await;
+        for descriptor in descriptors {
+            // Steps of one job share the job's allocation, so the first wins and
+            // the rest would only re-release and re-reserve the same cores.
+            if !replayed.insert(descriptor.job_id) {
+                continue;
+            }
+            let resources = &descriptor.resources;
+            let cpu_ids = if resources.cpu_ids.is_empty() {
+                fallback_cpu_ids(&allocation, resources.cpus)
+            } else {
+                resources.cpu_ids.clone()
+            };
+            match allocation.restore_for_job(
+                descriptor.job_id,
+                descriptor.run_attempt,
+                &cpu_ids,
+                resources.memory_mb,
+                &resources.gpu_devices,
+            ) {
+                Ok(_) => info!(
+                    job_id = descriptor.job_id,
+                    run_attempt = descriptor.run_attempt,
+                    cpus = cpu_ids.len(),
+                    gpus = resources.gpu_devices.len(),
+                    "restored an adopted job's allocation"
+                ),
+                // Refusing to serve would strand the adopted job with no agent to
+                // report it; run degraded and let reconcile settle the difference.
+                Err(error) => warn!(
+                    job_id = descriptor.job_id,
+                    run_attempt = descriptor.run_attempt,
+                    ?error,
+                    "could not restore an adopted job's allocation; this node's \
+                     accounting is short until the job ends"
+                ),
+            }
+        }
+    }
+
     /// A stale session's supervisor is confirmed dead, so nothing adopts it and
     /// nothing else will ever speak for it: carry any exit it recorded to the
     /// caller still waiting on the step, and release it so it can be pruned.
@@ -5080,6 +5137,9 @@ impl SlurmAgent for AgentService {
                         "job {} was superseded by a newer attempt on this node",
                         req.job_id
                     )),
+                    AllocError::CpusUnavailable => {
+                        Status::resource_exhausted("allocated cores unavailable on this node")
+                    }
                 })?;
             result
         };
@@ -6956,6 +7016,14 @@ impl AgentService {
                 return Err(Status::failed_precondition(format!(
                     "job {job_id} was superseded by a newer attempt on this node"
                 )));
+            }
+            // Only a replay of recorded cores can raise this; dispatch derives
+            // its own, so reaching here means the ledger disagrees with the node.
+            Err(AllocError::CpusUnavailable) => {
+                warn!(job_id, "rejecting launch: allocated cores unavailable");
+                return Err(Status::resource_exhausted(
+                    "allocated cores unavailable on this node",
+                ));
             }
         };
 
@@ -11415,6 +11483,7 @@ mod tests {
             cpus: 8,
             memory_mb: 4096,
             gpu_devices: vec![2, 3],
+            cpu_ids: vec![0, 1, 2, 3, 4, 5, 6, 7],
             partition: "gpu".into(),
             nodelist: "node-a,node-b".into(),
             mpi: "pmix".into(),
@@ -15214,6 +15283,87 @@ mod tests {
             .lock()
             .await
             .contains_key(&(902, spur_core::step::STEP_BATCH)));
+    }
+
+    // An empty ledger was only correct while a restart killed every job: it now
+    // lets a later dispatch hand out cores and GPUs an adopted job still holds.
+    #[tokio::test]
+    async fn an_adopted_job_puts_its_resources_back_on_the_ledger() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            903,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            state.path().join("adopted.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.resources = crate::stepd::StepdJobResources {
+            cpus: 2,
+            memory_mb: 1024,
+            gpu_devices: vec![1],
+            cpu_ids: vec![2, 3],
+            ..Default::default()
+        };
+
+        svc.adopt_stepds(std::slice::from_ref(&descriptor)).await;
+        svc.replay_adopted_allocations(std::slice::from_ref(&descriptor))
+            .await;
+
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(alloc.free_cpus(), 2);
+        assert!(alloc.allocated_cpus[2] && alloc.allocated_cpus[3]);
+        assert!(!alloc.allocated_cpus[0] && !alloc.allocated_cpus[1]);
+        assert_eq!(alloc.allocated_gpu_ids(), vec![1]);
+        assert_eq!(alloc.free_gpus(None), 1);
+        assert_eq!(alloc.free_memory_mb(), 8192 - 1024);
+    }
+
+    // Adoption replays every step of a job, and each carries the job's
+    // resources: counting them once is what keeps the ledger honest.
+    #[tokio::test]
+    async fn replaying_an_adopted_job_twice_counts_it_once() {
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0, 1]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let mut batch = crate::stepd::StepdDescriptor::new(
+            904,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            state.path().join("batch.sock"),
+            std::path::PathBuf::new(),
+        );
+        batch.resources = crate::stepd::StepdJobResources {
+            cpus: 2,
+            memory_mb: 1024,
+            gpu_devices: vec![0],
+            cpu_ids: vec![0, 1],
+            ..Default::default()
+        };
+        let mut step = batch.clone();
+        step.step_id = 0;
+        step.socket_path = state.path().join("step.sock");
+
+        svc.replay_adopted_allocations(&[batch.clone(), step]).await;
+        svc.replay_adopted_allocations(&[batch]).await;
+
+        let alloc = svc.allocation.lock().await;
+        assert_eq!(alloc.free_cpus(), 2);
+        assert_eq!(alloc.free_memory_mb(), 8192 - 1024);
+        assert_eq!(alloc.allocated_gpu_ids(), vec![0]);
     }
 
     #[tokio::test]

@@ -563,6 +563,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_runtime_state_dir(stepd_state_dir.clone());
     agent_service.adopt_stepds(&recovered_stepds).await;
+    agent_service
+        .replay_adopted_allocations(&recovered_stepds)
+        .await;
     // After the replay above, so an exit it has already reported is still on
     // disk to be read here, and before the server accepts its first re-attach.
     agent_service.settle_stale_stepds(&stale_stepds).await;

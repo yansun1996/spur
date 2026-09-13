@@ -150,6 +150,10 @@ pub struct StepdJobResources {
     pub memory_mb: u64,
     #[serde(default)]
     pub gpu_devices: Vec<u32>,
+    /// The exact cores, so a restart replays the binding the job is pinned to
+    /// instead of re-deriving one that overlaps it.
+    #[serde(default)]
+    pub cpu_ids: Vec<u32>,
     #[serde(default)]
     pub partition: String,
     #[serde(default)]
@@ -209,6 +213,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
                 cpus: config.cpus,
                 memory_mb: config.memory_mb,
                 gpu_devices: config.gpu_devices.clone(),
+                cpu_ids: config.cpu_ids.clone(),
                 partition: config.partition.clone(),
                 nodelist: config.nodelist.clone(),
                 mpi: config.mpi.clone(),
