@@ -149,8 +149,8 @@ The two daemons are configured with command-line flags. The most common are belo
    keeps the job alive rather than dropping a supervisor it cannot verify. What
    it will not do is fence one, so a supervisor left over from a superseded run
    is not torn down by this path. See :doc:`../admin-guide/configuration` for
-   both settings, and note that admission tokens themselves are forgeable until
-   a signing key is set.
+   both settings, and note that without a signing key no node credential is
+   issued or demanded at all, so node identity is unattested cluster-wide.
 
 .. note::
 

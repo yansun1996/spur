@@ -626,9 +626,13 @@ How client requests are authenticated.
 
 .. note::
 
-   When neither ``jwt_key`` nor ``jwt_key_file`` is set, admission tokens are
-   signed with a well-known built-in key and are therefore forgeable; set an
-   explicit key before enabling token admission (``[admission] mode = "token"``).
+   Token admission needs a signing key to attest node identity. When neither
+   ``jwt_key`` nor ``jwt_key_file`` is set, ``[admission] mode = "token"`` still
+   gates which nodes may register — the join token is checked — but registered
+   agents are issued no node credential and none is demanded of them afterwards,
+   so a caller that reaches the controller port can act as any registered node.
+   ``spurctld`` warns at startup in this configuration; set an explicit key
+   before relying on token admission.
 
 .. _privileged-operations:
 
