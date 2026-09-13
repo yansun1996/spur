@@ -2166,6 +2166,41 @@ impl StepdStore {
         (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 
+    /// Invent the exit a supervisor that died while the agent was down never
+    /// recorded, so the ordinary completion replay can report its loss.
+    pub fn record_lost_supervisor_exit(&self, descriptor: &StepdDescriptor) -> io::Result<bool> {
+        // Re-checked here, not trusted from the caller's classification: a
+        // supervisor that survived must never be reported as lost.
+        if !matches!(stepd_liveness(descriptor), Ok(StepdLiveness::Stale)) {
+            return Ok(false);
+        }
+        // A numbered step's loss is that step's failure; only a job-level
+        // session speaks for the allocation the controller is holding.
+        if spur_core::step::is_user_step(descriptor.step_id) {
+            return Ok(false);
+        }
+        if self
+            .observed_exit(
+                descriptor.job_id,
+                descriptor.run_attempt,
+                descriptor.step_id,
+            )?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        self.obligations(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+        )
+        .append(&StepdObligation::ExitObserved {
+            exit_code: 0,
+            signal: nix::sys::signal::Signal::SIGKILL as i32,
+        })?;
+        Ok(true)
+    }
+
     pub fn obligations(
         &self,
         job_id: u32,
@@ -2873,6 +2908,23 @@ mod tests {
         )
     }
 
+    fn descriptor_for_step(
+        job_id: u32,
+        run_attempt: u32,
+        pid: u32,
+        step_id: spur_core::step::StepId,
+    ) -> StepdDescriptor {
+        StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            step_id,
+            pid,
+            process_start_ticks(pid).unwrap_or(0),
+            PathBuf::from("/run/spur/runtime.sock"),
+            PathBuf::from("/sys/fs/cgroup/spur/test"),
+        )
+    }
+
     fn write_descriptor(store: &StepdStore, descriptor: &StepdDescriptor) -> PathBuf {
         let session_dir = store.session_dir(
             descriptor.job_id,
@@ -3368,6 +3420,133 @@ mod tests {
                 "{signal:?} must not end session"
             );
         }
+    }
+
+    // A supervisor killed while the agent was down records no exit, so without
+    // a synthetic one nothing ever reports the job and it holds its allocation.
+    #[test]
+    fn a_lost_job_supervisor_gets_an_exit_the_completion_replay_reports() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let lost = descriptor(43, 1, 999_999);
+        write_descriptor(&store, &lost);
+
+        let discovered = store.discover_live().expect("discover live sessions");
+        assert_eq!(
+            discovered.stale,
+            vec![lost.clone()],
+            "fixture must be stale"
+        );
+        assert!(
+            store
+                .record_lost_supervisor_exit(&lost)
+                .expect("record the lost supervisor's exit"),
+            "a job-level session with no recorded exit must gain one"
+        );
+
+        let pending = store
+            .discover_unacknowledged_completions()
+            .expect("discover unacknowledged completions");
+        let reported: Vec<_> = pending
+            .iter()
+            .map(|c| (c.job_id, c.run_attempt, c.step_id, c.exit_code, c.signal))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![(
+                43,
+                1,
+                spur_core::step::STEP_BATCH,
+                0,
+                nix::sys::signal::Signal::SIGKILL as i32
+            )],
+            "the ordinary completion replay must pick the loss up"
+        );
+    }
+
+    // The headline of supervised execution is that a job survives an agent
+    // restart; reporting a live supervisor as lost would turn that into a kill.
+    #[test]
+    fn a_surviving_supervisor_is_never_recorded_as_lost() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let survived = descriptor(42, 3, std::process::id());
+        write_descriptor(&store, &survived);
+
+        let discovered = store.discover_live().expect("discover live sessions");
+        assert_eq!(
+            discovered.live,
+            vec![survived.clone()],
+            "fixture must be live"
+        );
+        assert!(
+            !store
+                .record_lost_supervisor_exit(&survived)
+                .expect("classify the surviving supervisor"),
+            "a supervisor still running must not be given an exit"
+        );
+        assert!(
+            store
+                .observed_exit(42, 3, spur_core::step::STEP_BATCH)
+                .expect("read observed exit")
+                .is_none(),
+            "nothing may be recorded against a live session"
+        );
+        assert!(
+            store
+                .discover_unacknowledged_completions()
+                .expect("discover unacknowledged completions")
+                .is_empty(),
+            "a live session must never reach the completion replay"
+        );
+    }
+
+    #[test]
+    fn a_lost_numbered_step_is_left_to_its_own_reporting() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let step = descriptor_for_step(44, 1, 999_999, 0);
+        write_descriptor(&store, &step);
+
+        assert!(
+            !store
+                .record_lost_supervisor_exit(&step)
+                .expect("classify the lost step"),
+            "a numbered step's loss is that step's failure, not the job's"
+        );
+        assert!(store
+            .discover_unacknowledged_completions()
+            .expect("discover unacknowledged completions")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_session_that_recorded_its_own_exit_is_not_given_a_synthetic_one() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let settled = descriptor(45, 1, 999_999);
+        write_descriptor(&store, &settled);
+        store
+            .obligations(45, 1, spur_core::step::STEP_BATCH)
+            .append(&StepdObligation::ExitObserved {
+                exit_code: 7,
+                signal: 0,
+            })
+            .expect("record the real exit");
+
+        assert!(
+            !store
+                .record_lost_supervisor_exit(&settled)
+                .expect("classify the settled session"),
+            "a recorded exit is the real outcome and must stand"
+        );
+        assert_eq!(
+            store
+                .observed_exit(45, 1, spur_core::step::STEP_BATCH)
+                .expect("read observed exit"),
+            Some((7, 0)),
+            "the workload's own exit must not be overwritten"
+        );
     }
 
     #[test]

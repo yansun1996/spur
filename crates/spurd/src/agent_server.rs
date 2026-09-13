@@ -1626,11 +1626,15 @@ fn durable_runtime_exit(
     )
 }
 
+/// One runtime session: a step of one attempt of one job. Two sessions of the
+/// same attempt are distinct, so dedup keyed on the job alone over-matches.
+pub type SessionIdentity = (u32, u32, spur_core::step::StepId);
+
 pub async fn replay_unacknowledged_stepd_completions(
     store: &crate::stepd::StepdStore,
     controller_addr: &str,
     reporting_node: &str,
-) -> anyhow::Result<Vec<(u32, u32)>> {
+) -> anyhow::Result<Vec<SessionIdentity>> {
     let mut reconciled = Vec::new();
     for completion in store.discover_unacknowledged_completions()? {
         if report_completion(
@@ -1650,7 +1654,11 @@ pub async fn replay_unacknowledged_stepd_completions(
         .await
         {
             store.acknowledge_completion(&completion)?;
-            reconciled.push((completion.job_id, completion.run_attempt));
+            reconciled.push((
+                completion.job_id,
+                completion.run_attempt,
+                completion.step_id,
+            ));
         }
     }
     Ok(reconciled)
@@ -2935,8 +2943,8 @@ impl AgentService {
                         )
                         .await;
                 }
-                // An exit nobody observed is not a success; leave it to the
-                // recovery report so the controller decides the step's fate.
+                // Only a numbered step reaches this now — a job-level session is
+                // given a synthetic exit at startup; the recovery report has it.
                 Ok(None) => {}
                 Err(error) => {
                     warn!(
