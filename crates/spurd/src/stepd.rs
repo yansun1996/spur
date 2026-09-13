@@ -30,6 +30,10 @@ pub struct StepdLaunchSpec {
     pub name: String,
     pub user: String,
     pub node: String,
+    #[serde(default)]
+    pub array_job_id: Option<spur_core::job::JobId>,
+    #[serde(default)]
+    pub array_task_id: Option<u32>,
     pub environment: std::collections::HashMap<String, String>,
     pub stdout_path: String,
     pub stderr_path: String,
@@ -168,6 +172,8 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             name: config.name.clone(),
             user: config.user.clone(),
             node: config.node.clone(),
+            array_job_id: config.array_job_id,
+            array_task_id: config.array_task_id,
             environment: config.environment.clone(),
             stdout_path: config.stdout_path.clone(),
             stderr_path: config.stderr_path.clone(),
@@ -224,8 +230,8 @@ impl StepdLaunchSpec {
             name: self.name,
             user: self.user,
             node: self.node,
-            array_job_id: None,
-            array_task_id: None,
+            array_job_id: self.array_job_id,
+            array_task_id: self.array_task_id,
             mpi: self.resources.mpi.clone(),
             environment: self.environment,
             stdout_path: self.stdout_path,
@@ -2741,6 +2747,15 @@ mod launch_spec_compat {
         assert!(spec.pmix.is_none());
     }
 
+    #[test]
+    fn an_older_launch_spec_carries_no_array_identity_rather_than_failing() {
+        let spec: StepdLaunchSpec =
+            serde_json::from_str(FROZEN_LAUNCH_JSON).expect("older launch.json");
+
+        assert!(spec.array_job_id.is_none());
+        assert!(spec.array_task_id.is_none());
+    }
+
     /// Captured from the build that first shipped `pmix` in launch.json, before
     /// `wrapper_path` existed. A supervisor started by an older agent mid-upgrade
     /// reads exactly this, so it has to keep decoding.
@@ -2884,6 +2899,8 @@ mod tests {
             name: "runtime-test".into(),
             user: "spur".into(),
             node: "node-a".into(),
+            array_job_id: None,
+            array_task_id: None,
             environment: HashMap::new(),
             stdout_path: String::new(),
             stderr_path: String::new(),
@@ -3120,6 +3137,27 @@ mod tests {
         );
     }
 
+    // Drives the whole agent -> launch.json -> supervisor boundary: the array
+    // identity has to survive it or every task expands to the same filename.
+    #[test]
+    fn a_supervised_array_task_keeps_the_identity_its_output_name_expands() {
+        let mut config = launch_spec().into_launch_config();
+        config.array_job_id = Some(100);
+        config.array_task_id = Some(3);
+        config.stdout_path = "out-%A_%a.out".into();
+
+        let spec = StepdLaunchSpec::try_from(&config).expect("spec from launch config");
+        let encoded = serde_json::to_vec(&spec).expect("encode launch spec");
+        let restored: StepdLaunchSpec =
+            serde_json::from_slice(&encoded).expect("decode launch spec");
+        let restored = restored.into_launch_config();
+
+        assert_eq!(
+            crate::executor::resolve_output_path(&restored, "/work", &restored.stdout_path),
+            "/work/out-100_3.out"
+        );
+    }
+
     #[test]
     fn legacy_launch_spec_deserializes_runtime_defaults() {
         let mut serialized = serde_json::to_value(launch_spec()).expect("encode launch spec");
@@ -3140,6 +3178,8 @@ mod tests {
             "capability",
             "allocation_only",
             "pmix_multi_task",
+            "array_job_id",
+            "array_task_id",
         ] {
             fields.remove(field);
         }
@@ -3161,6 +3201,8 @@ mod tests {
         assert!(restored.reporting_node.is_empty());
         assert_eq!(restored.run_attempt, 0);
         assert!(restored.capability.is_empty());
+        assert!(restored.array_job_id.is_none());
+        assert!(restored.array_task_id.is_none());
         assert!(!restored.allocation_only);
         assert!(!restored.pmix_multi_task);
     }
