@@ -435,8 +435,30 @@ fn stepd_key(descriptor: &crate::stepd::StepdDescriptor) -> StepdKey {
     (descriptor.job_id, descriptor.step_id)
 }
 
-/// A descriptor written before the exact cores were persisted records only a
-/// count; the lowest free cores keep occupancy right even if the ids differ.
+/// One descriptor per adopted job, ranked rather than taken first: directory
+/// order is arbitrary and only batch and allocation ones record the cores.
+fn replayable_allocations(
+    descriptors: &[crate::stepd::StepdDescriptor],
+) -> Vec<&crate::stepd::StepdDescriptor> {
+    let mut best: std::collections::HashMap<u32, &crate::stepd::StepdDescriptor> =
+        std::collections::HashMap::new();
+    for descriptor in descriptors {
+        let rank =
+            |d: &crate::stepd::StepdDescriptor| (d.run_attempt, !d.resources.cpu_ids.is_empty());
+        match best.get(&descriptor.job_id) {
+            Some(current) if rank(current) >= rank(descriptor) => {}
+            _ => {
+                best.insert(descriptor.job_id, descriptor);
+            }
+        }
+    }
+    let mut chosen: Vec<&crate::stepd::StepdDescriptor> = best.into_values().collect();
+    chosen.sort_by_key(|d| (d.resources.cpu_ids.is_empty(), d.job_id));
+    chosen
+}
+
+/// A descriptor with no recorded cores — a step, or one written before they
+/// were persisted; the lowest free cores keep occupancy right if not identity.
 fn fallback_cpu_ids(allocation: &NodeAllocation, cpus: u32) -> Vec<u32> {
     allocation
         .allocated_cpus
@@ -2833,20 +2855,23 @@ impl AgentService {
     /// Put adopted jobs back on the node's ledger, which is built empty — only
     /// correct back when a restart killed every job it could have held.
     pub async fn replay_adopted_allocations(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
-        let mut replayed: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut allocation = self.allocation.lock().await;
-        for descriptor in descriptors {
-            // Steps of one job share the job's allocation, so the first wins and
-            // the rest would only re-release and re-reserve the same cores.
-            if !replayed.insert(descriptor.job_id) {
-                continue;
-            }
+        for descriptor in replayable_allocations(descriptors) {
             let resources = &descriptor.resources;
             let cpu_ids = if resources.cpu_ids.is_empty() {
                 fallback_cpu_ids(&allocation, resources.cpus)
             } else {
                 resources.cpu_ids.clone()
             };
+            if cpu_ids.len() < resources.cpus as usize {
+                warn!(
+                    job_id = descriptor.job_id,
+                    wanted = resources.cpus,
+                    got = cpu_ids.len(),
+                    "fewer free cores than an adopted job recorded; its cores are \
+                     under-counted until it ends"
+                );
+            }
             match allocation.restore_for_job(
                 descriptor.job_id,
                 descriptor.run_attempt,
@@ -2862,7 +2887,7 @@ impl AgentService {
                     "restored an adopted job's allocation"
                 ),
                 // Refusing to serve would strand the adopted job with no agent to
-                // report it; run degraded and let reconcile settle the difference.
+                // report it, and nothing reconciles a job the ledger never saw.
                 Err(error) => warn!(
                     job_id = descriptor.job_id,
                     run_attempt = descriptor.run_attempt,
@@ -5212,7 +5237,7 @@ impl SlurmAgent for AgentService {
                 cpus,
                 memory_mb,
                 gpu_devices: controller_gpu_ids.clone(),
-                cpu_ids: Vec::new(),
+                cpu_ids: alloc_result.cpu_ids.clone(),
                 open_mode: None,
                 uid: req.uid,
                 gid: req.gid,
@@ -15324,6 +15349,59 @@ mod tests {
         assert_eq!(alloc.allocated_gpu_ids(), vec![1]);
         assert_eq!(alloc.free_gpus(None), 1);
         assert_eq!(alloc.free_memory_mb(), 8192 - 1024);
+    }
+
+    // Only the batch descriptor records the cores, and sessions are discovered
+    // in arbitrary order, so a step must not decide the job's replayed cpuset.
+    #[tokio::test]
+    async fn a_step_descriptor_does_not_displace_the_cores_its_job_recorded() {
+        for step_first in [false, true] {
+            let svc = AgentService::new(
+                test_reporter_with_gpus(&[0, 1]),
+                HooksConfig::default(),
+                Arc::new(Mutex::new(DeviceRegistry::new())),
+                spur_core::config::MemlockLimit::Unlimited,
+            );
+            let state = tempfile::tempdir().expect("runtime state directory");
+            let mut batch = crate::stepd::StepdDescriptor::new(
+                905,
+                1,
+                spur_core::step::STEP_BATCH,
+                0,
+                0,
+                state.path().join("batch.sock"),
+                std::path::PathBuf::new(),
+            );
+            batch.resources = crate::stepd::StepdJobResources {
+                cpus: 2,
+                memory_mb: 1024,
+                gpu_devices: vec![0],
+                cpu_ids: vec![2, 3],
+                ..Default::default()
+            };
+            let mut step = batch.clone();
+            step.step_id = 0;
+            step.socket_path = state.path().join("step.sock");
+            step.resources.cpu_ids = Vec::new();
+
+            let descriptors = if step_first {
+                vec![step, batch]
+            } else {
+                vec![batch, step]
+            };
+            svc.replay_adopted_allocations(&descriptors).await;
+
+            let alloc = svc.allocation.lock().await;
+            assert!(
+                alloc.allocated_cpus[2] && alloc.allocated_cpus[3],
+                "step_first={step_first}: the job's recorded cores must be held"
+            );
+            assert!(
+                !alloc.allocated_cpus[0] && !alloc.allocated_cpus[1],
+                "step_first={step_first}: cores the job never held must stay free"
+            );
+            assert_eq!(alloc.free_cpus(), 2);
+        }
     }
 
     // Adoption replays every step of a job, and each carries the job's

@@ -236,8 +236,12 @@ impl NodeAllocation {
         {
             return Err(AllocError::CpusUnavailable);
         }
-        self.release_job(job_id);
-
+        // Resolved before releasing, so a rejected replay leaves the ledger
+        // exactly as it found it rather than dropping the outgoing owner.
+        let held: &[u32] = self
+            .owners
+            .get(&job_id)
+            .map_or(&[], |owned| owned.result.gpu_ids.as_slice());
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
         for &id in gpu_device_ids {
             let idx = self
@@ -245,11 +249,12 @@ impl NodeAllocation {
                 .iter()
                 .position(|g| g.device_id == id)
                 .ok_or(AllocError::GpusUnavailable)?;
-            if self.gpu_allocated[idx] || gpu_indices.contains(&idx) {
+            if (self.gpu_allocated[idx] && !held.contains(&id)) || gpu_indices.contains(&idx) {
                 return Err(AllocError::GpusUnavailable);
             }
             gpu_indices.push(idx);
         }
+        self.release_job(job_id);
 
         for &cpu in cpu_ids {
             self.allocated_cpus[cpu as usize] = true;
