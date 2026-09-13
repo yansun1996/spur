@@ -107,9 +107,10 @@ The two daemons are configured with command-line flags. The most common are belo
      - Directory for this agent's own persisted runtime state (job supervisor
        sessions that survive an ``spurd`` restart). Falls back to
        ``[controller] state_dir`` from the config file. Also settable via
-       ``SPUR_STEPD_STATE_DIR``. Give each ``spurd`` its own path when
-       co-locating multiple agents on one host (e.g. dev/test setups) — it
-       must not collide with another agent's or the controller's directory.
+       ``SPUR_STEPD_STATE_DIR``. Sessions live in a ``runtime/`` subdirectory
+       the agent owns, so sharing the controller's directory is safe and is the
+       default. Give each ``spurd`` its own path when co-locating multiple
+       agents on one host (e.g. dev/test setups) — two agents must not share one.
    * - ``--log-level <LEVEL>``
      - ``info``
      - Log verbosity.
@@ -514,9 +515,10 @@ Inspect what a running job actually got:
    ls /sys/fs/cgroup/spur/job_1234_1/                 # one step_<n> leaf per step
    cat /sys/fs/cgroup/spur/job_1234_1/step_0/cpu.stat # that step's own CPU usage
 
-The job directory holds the limits but no processes — those live in the leaves.
-``srun`` steps are numbered from ``step_0``; the batch payload uses the reserved
-step id it was launched under, so its leaf is a large number rather than ``0``.
+The job directory normally holds the limits and no processes — those live in the
+leaves; a step whose leaf could not be created falls back into the job directory
+itself. ``srun`` steps are numbered from ``step_0``; the batch payload uses the
+reserved step id it was launched under, so its leaf is a large number, not ``0``.
 
 Enforcement requires ``spurd`` to run as root. An unprivileged agent logs a warning
 and runs jobs unconstrained. Every knob — including turning enforcement off
@@ -546,9 +548,10 @@ a granularity gap *inside* the job rather than a hole between jobs:
    * - Per-step **limits**
      - Each step gets its own ``step_<n>`` cgroup, but that leaf carries no
        budget of its own: it inherits the job's limits and device filter, so
-       every step in a job still draws on one shared budget. Per-step CPU and
-       memory *readings* are there in the leaf's ``cpu.stat`` and
-       ``memory.current``; Spur does not yet collect them into step accounting.
+       every step in a job still draws on one shared budget. Where the host lets
+       the job delegate its controllers, per-step CPU and memory *readings* show
+       up in the leaf's ``cpu.stat`` and ``memory.current``; Spur does not yet
+       collect them into step accounting.
    * - Precise kill-by-step
      - Cancelling one step signals its process tree rather than its cgroup, so a
        step process that leaves that tree (``setsid``) is missed even though the
