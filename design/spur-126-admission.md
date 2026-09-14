@@ -98,7 +98,6 @@ struct RunAdmission {                     // admission/<job>.<attempt>/run.json
     created_at_unix_ms: u64,                           // agent wall clock — GC age and audit
     reject_before_unix_ms: u64,
     max_launch_expiry_unix_ms: u64,
-    clock_high_water_unix_ms: u64,                     // rollback guard
     prolog: HookState,                                 // NotStarted|Running|Succeeded|Failed|Unknown
     lifecycle_owner_step: Option<StepId>,
     cleanup: CleanupState,                             // state + epilog_state
@@ -141,9 +140,18 @@ So an agent clock jump cannot un-fence a cancelled run. What remains is a backwa
 jump letting a stale launch expire late — but that launch was issued by the
 controller and has not been fenced, so it is work the controller wants. Low harm.
 
-`clock_high_water_unix_ms` therefore stays as a cheap sanity guard rather than
-load-bearing machinery: a clock reading below the highest value ever recorded
-means something is badly wrong, and refusing to admit is the right failure.
+**The clock-rollback guard (§9) is observability, not a gate.** A persisted
+high-water mark that refused admission whenever the clock read below it was
+considered and rejected: its response to a low-harm problem is to refuse *every*
+launch on the node until the clock catches up, which for a large jump is a
+self-inflicted outage — worse than the stale launch it prevents, and NTP steps and
+VM restores are not exotic. Instead the agent warns and increments a metric when
+it observes its clock moving backwards, and an operator decides.
+
+The forward direction was checked too, since early collection would be the more
+dangerous failure: a forward jump cannot collect a live run, because the GC rule's
+first two conditions — no participants remain, cleanup acknowledged — are **state**
+based. Time gates only the last condition.
 
 `created_at_unix_ms` exists for garbage collection and audit, not for expiry
 enforcement. It is what gives a run record an age even when its launch aborted
@@ -184,6 +192,13 @@ GC: a run directory is removable when no participants remain, cleanup is
 acknowledged, and `max_launch_expiry` has passed. Folded into the existing sweep
 loop rather than a new one.
 
+Every record must have an age, or it can never be collected. A run whose launch
+aborted before any expiry was set gets one from `created_at_unix_ms`. A
+participant normally ages out on its own `expires_at`, but a launch from a
+**pre-upgrade controller** carries none — that field is new — so when `expires_at`
+is absent or zero the participant falls back to the run's `created_at_unix_ms`
+plus a default retention.
+
 *spurd only.*
 
 ### 2 — `fix(spurd): rebuild the node claim index from admission records`
@@ -219,11 +234,10 @@ forever.
   allocation for the same identity is rejected rather than silently relaunched.
 - A higher `run_attempt` is a different run and is never fenced by a lower
   attempt's cutoff.
-- **Clock-rollback guard** (§9). Only expiry is exposed to the agent's clock — the
-  fence compares two controller-stamped values and is clock-independent (see
-  "Time" above). Persist the highest wall-clock value ever observed in `run.json`;
-  a reading below it means something is badly wrong, so the launch is refused.
-  Fail closed, consistent with §7.
+- **Clock rollback** (§9) is handled by a warning and a metric, not by refusing
+  admission. Only expiry is exposed to the agent's clock; the fence compares two
+  controller-stamped values and is clock-independent. See "Time" above for why a
+  gate here would cost more than it saves.
 
 Proto is append-only: `LaunchJobRequest` gains `issued_at_unix_ms`,
 `expires_at_unix_ms`, `command_digest`; a new `FenceRun` RPC is added. Nothing is
@@ -416,7 +430,6 @@ Every requirement in the spec gets a row. Deferred items get a reason, not silen
 | §2 | Restart / missing in-memory entry is not confirmation | 3 |
 | §2 | Cleanup is participant-scoped; release needs the final participant + epilog | 754, strengthened by 7 |
 | §2 | Exact participant and CPU/GPU committed before dispatch | 9 |
-| §9 | Clock-rollback guard — a sanity check; the fence is clock-independent by construction | 1, 4 |
 | §9 | Garbage-collection delay — the run record carries an age | 1 |
 | §5 | Conflicting identities, digests, deadlines, allocations rejected | 4 |
 | §5 | Claim index is a local safety check, not scheduler authority | 8 |
@@ -439,7 +452,7 @@ Every requirement in the spec gets a row. Deferred items get a reason, not silen
 | §7 | `auth.mode=required` in production | **out of scope** — flagged; the fences are not authorization |
 | §8 | Launch expiry; participant-only Stop/Clean does not fence siblings | 4, partly 754 |
 | §8 | Missing completion → idempotent retry | 7a |
-| §9 | Clock-rollback guard | 4 |
+| §9 | Clock-rollback guard | 4 — resolved as a warning and a metric; a gate would cost a node outage to prevent a late-but-authorized launch |
 | §9 | Snapshot chunk size, retry policy, concurrency limits | **deferred** with the transport |
 | §9 | Permanent node loss: trusted fencing or deregistration | **deferred** — needs its own design |
 | §9 | Task hooks run once per task under the job UID/GID | **deferred** — independent of reconciliation |
@@ -455,8 +468,11 @@ Every requirement in the spec gets a row. Deferred items get a reason, not silen
 - Rebuild-from-run-records is exact where descriptor rebuild under-counts —
   mutation-tested, since that is the whole point of commit 2.
 - Fence table: stale rejected; higher attempt not fenced; duplicate digest
-  idempotent; conflicting digest rejected; expired rejected; backward clock
-  refused.
+  idempotent; conflicting digest rejected; expired rejected. A backward clock is
+  *not* a rejection — it warns and keeps serving.
+- A launch carrying no `expires_at` (pre-upgrade controller) still yields a
+  collectable participant, via the run record's `created_at` plus a default
+  retention.
 - Fail-closed on a corrupt or foreign-node record.
 - Hook left `running` loads as `Unknown` and is not re-run.
 - Gate: no ledger → not gated; ledger → gated → diff → ungated; old-log replay
