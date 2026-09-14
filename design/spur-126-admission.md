@@ -13,80 +13,131 @@ unmerged**; PR #492 (obligation ledger)
 > must reconcile, never a decision it may ignore; and the agent may never
 > release on its own judgement.
 
-The agent is never forced to accept a dispatch. It is the only party that knows
-what is physically pinned, so forcing acceptance would double-book hardware. The
-model is symmetric in both directions: the agent supplies evidence, Raft decides.
+The agent is never forced to accept. It is the only party that knows what is
+physically pinned, so forcing acceptance would double-book hardware. The model is
+symmetric in both directions: the agent supplies evidence, Raft decides.
 
 ## Verified baseline
 
-Facts established by reading the branch, with citations, so this plan can be
-checked rather than trusted.
+Established by reading the branch. Citations name the binary, because `spurd` and
+`spurctld` both have a `main.rs` and an earlier revision of this document confused
+them.
 
 | Area | Today |
 | --- | --- |
-| Spool | `<state_dir>/runtime/<job>.<attempt>.<step>/` — `descriptor.json`, `launch.json`, `obligations.jsonl`, `failure.txt`, sockets (`stepd.rs:2168`; `launch.json` written agent-side at `agent_server.rs:226`) |
-| State root | `--state-dir` → `config.controller.state_dir` → `/var/spool/spur` (`main.rs:343`). Controller Raft at `<state_dir>/raft/` (`raft.rs:152`). Job spool is a separate hardcoded const (`executor.rs:117`) |
-| Durability | temp → fsync → rename → dir-fsync, 0600 (`stepd.rs:2265`); journal append + `sync_data` (`stepd.rs:530`) |
-| Obligations | `ExitObserved → EpilogCompleted → CompletionAcknowledged → ResourcesReleased`, order enforced by `finalized_obligations` (`stepd.rs:513`, `:892`) |
-| Node ledger | `NodeAllocation` — in-memory only; `owners: HashMap<u32, Owned>` keyed by job id, `launching: HashMap<u32, Instant>` (`cons_tres.rs:53`, `:56`) |
-| Claim rebuild | from supervisor descriptors, with `claimable_cpu_ids`/`fallback_cpu_ids` that admit under-counting (`agent_server.rs:2896`, `:2907`) |
+| Spool | `<agent state_dir>/runtime/<job>.<attempt>.<step>/` — `descriptor.json`, `launch.json`, `obligations.jsonl`, `failure.txt`, sockets (`spurd/stepd.rs:2168`; `launch.json` written agent-side at `spurd/agent_server.rs:226`) |
+| Agent state root | `--state-dir` → `config.controller.state_dir` → `/var/spool/spur` (`spurd/main.rs:343`) |
+| Controller state root | **CLI only** — `#[arg(long, default_value = "/var/spool/spur")]` (`spurctld/main.rs:47`), passed straight through at `:138`/`:168`. `config.controller.state_dir` is *written* from the CLI value (`:98`) and never read as a fallback. Raft lands at `<that>/raft/` (`spurctld/raft.rs:152`) |
+| Job spool | a separate hardcoded const `/var/spool/spur` (`spurd/executor.rs:117`), independent of either state root |
+| Durability | temp → fsync → rename → dir-fsync, 0600 (`spurd/stepd.rs:2265`); journal append + `sync_data` (`:530`) |
+| Obligations | `ExitObserved`, `EpilogCompleted`, `CompletionAcknowledged`, `ResourcesReleased` (`spurd/stepd.rs:514`) |
+| Node ledger | `NodeAllocation` — in-memory only; `owners: HashMap<u32, Owned>` keyed by job id, `launching: HashMap<u32, Instant>` (`spur-sched/cons_tres.rs:53`, `:56`) |
+| Claim rebuild | from supervisor descriptors, with `claimable_cpu_ids`/`fallback_cpu_ids` that admit under-counting (`spurd/agent_server.rs:2896`, `:2907`) |
 | Agent release | on observed exit (`:1008`) and on absent in-memory entry past a 600 s TTL (`:3326`, `:3332` — "using the running set as ground truth") |
-| Ack semantics | `propose` = `raft.client_write().await` — returns after commit and apply (`cluster.rs:5466`) |
-| Report retry | bounded attempt budget; `not_found` / `invalid_argument` give up immediately (`:3436`, `:3990`) |
-| Heartbeat | 30 s (`reporter.rs:191`), timeout 90 s (`main.rs:228`). `RunningJobStatus { job_id, ..Default::default() }` — `state` and `exit_code` never populated (`reporter.rs:200`) |
-| Reporter source | `held_job_ids()` reads the `running` map, not the allocation ledger (`reporter.rs:96`) |
-| Absence | never evidence — `stale_reported_jobs` iterates only what was reported (`server.rs:1126`) |
-| Registration | `Register` / `Update` / `Skip`; Skip preserves allocations (`cluster.rs:7839`) |
-| Schedulability | `is_schedulable() = state.is_available()` (`node.rs:445`). No reconciling state exists (`node.rs:14`) |
-| Recovery | `ReportStepdRecovery` per session; `probe_stepd_recovery` fans out across `job.allocated_nodes` (`server.rs:2306`, `:342`) |
-| Refusal detail | `LaunchFailureKind` is only `UNSPECIFIED \| PROLOG`; `scheduler_loop.rs:1137` notes paths with no kind "yet" |
-| Agent authz | `require_controller` refuses a *user* token but allows unauthenticated callers (`agent_server.rs:7424`) |
-| SIGTERM | with live supervisors, does not deregister (`main.rs:834`) — 754 already fixed the restart cascade |
+| Ack semantics | `propose` blocks a worker thread on `raft.client_write(op).await` via `block_in_place` (`spurctld/cluster.rs:5459-5470`); openraft returns after commit and apply |
+| Report retry | bounded attempt budget; `not_found` / `invalid_argument` give up immediately (`spurd/agent_server.rs:3436`, `:3990`) |
+| Heartbeat | 30 s (`spurd/reporter.rs:191`), timeout 90 s (`spurctld/main.rs:228`). `RunningJobStatus { job_id, ..Default::default() }` — `state` and `exit_code` never populated (`spurd/reporter.rs:200`) |
+| Reporter source | `held_job_ids()` reads the `running` map, not the allocation ledger (`spurd/reporter.rs:96`) |
+| Absence | never evidence — `stale_reported_jobs` iterates only what was reported (`spurctld/server.rs:1126`) |
+| Registration | `Register` / `Update` / `Skip`; Skip preserves allocations (`spurctld/cluster.rs:7839`) |
+| Schedulability | `is_schedulable() = state.is_available()` (`spur-core/node.rs:445`). No reconciling state exists (`node.rs:14`) |
+| Recovery | `ReportStepdRecovery` per session (`spurctld/server.rs:2306`); `probe_stepd_recovery` (`:342`) fans out across `job.allocated_nodes` — **but short-circuits to `Retained` for user steps before any fan-out** (`:365-367`) |
+| Refusal detail | `LaunchFailureKind` is only `UNSPECIFIED \| PROLOG` (`proto/slurm.proto:976`) |
+| Agent authz | `require_controller` refuses a *user* token but allows unauthenticated callers (`spurd/agent_server.rs:7424`) |
+| SIGTERM | with live supervisors, does not deregister (`spurd/main.rs:834`) — 754 already fixed the restart cascade |
 
 ### The two structural holes
 
 1. **The reporter reads `running`; the resource ledger is `allocation`.** Different
    maps. An entry present in `allocation` but absent from `running` is never
-   reported, so it is invisible to the controller by construction — reclaimable
-   only by the agent's own 600 s TTL. Not a race; a design gap.
+   reported, so it is invisible to the controller by construction. Not a race; a
+   design gap.
 2. **A registering node is schedulable immediately.** Reconciliation evidence
-   arrives 30–90 s later. Any dispatch into that window can double-book.
+   arrives later. Any dispatch into that window can double-book.
 
-### Open finding, to verify in commit 4
+### Confirmed defects found while planning
 
-`allocate_for_job` (`cons_tres.rs:190-202`) does not error when fewer CPUs are
-free than requested — it fills what it can and returns `Ok` with a short
-`cpu_ids`. Memory is added unconditionally with no ceiling against
-`total_memory_mb`. On a contended node the agent may silently under-serve and
-over-commit rather than refuse. Callers (`agent_server.rs:5185`, `:7021`) may
-guard this; not yet verified.
+These were verified against the code, not inferred.
+
+1. **`allocate_for_job` silently under-serves and over-commits.**
+   `spur-sched/cons_tres.rs:190-202` fills what CPUs are free and returns `Ok`
+   with a short `cpu_ids`; `allocated_memory_mb += memory_mb` has no ceiling
+   against `total_memory_mb`. **Both callers are unguarded** — `:5183-5207` feeds
+   the short vector straight into cgroup setup at `:5217`, and `:7021`/`:7048`
+   pre-check GPUs only. The tell: both callers handle `AllocError::CpusUnavailable`
+   (`:5204`, `:7096`), a variant `allocate_for_job` **never returns**. They were
+   written expecting a refusal the allocator does not make. Fixed in commit 4.
+2. **`StepdDescriptor` has no frozen-fixture coverage.** The fixtures at
+   `spurd/stepd.rs:2757-2900` all deserialize `StepdLaunchSpec`. `descriptor.json`
+   is the record re-read across every agent restart and it has no compatibility
+   guard. Commit 1 adds one.
+3. **SECURITY — the Raft directory is world-readable.** `spurctld/raft.rs:152-154`
+   and `:917` use bare `create_dir_all` with no `set_permissions`, so the
+   directory lands at umask default. The Raft log contains submitted batch scripts
+   and job environments. Spec §7 explicitly requires the same 0700 restriction
+   there as on the agent spool. Pre-existing; fixed in commit 1.
+4. **SECURITY — this ladder increases the blast radius of unauthenticated agent
+   RPCs.** Today an unauthenticated caller can inject a launch. After commit 5
+   (an asserted-empty ledger causes eviction) and commit 8 (an overlap refusal
+   causes the controller to cancel the named job), it can also cause releases,
+   evictions and cancellations — because this design elevates agent statements to
+   evidence the controller acts on. `auth.mode=required` is therefore a
+   precondition of the ladder, not an unrelated hardening item.
+5. **`finalized_obligations` is a read-time predicate, not an append-time gate**
+   (`spurd/stepd.rs:892-912`). It orders only `ExitObserved → CompletionAcknowledged`;
+   `EpilogCompleted` falls into an ignore arm and participates in neither the
+   ordering nor the return value. Commit 7 must not assume the epilog is gated.
+6. **`JobStart`'s node loop is outside its `if let Some(job)`**
+   (`spurctld/cluster.rs:6031-6063`), so it charges a node even when no job record
+   exists, and a re-proposed `JobStart` double-adds. Commit 0's derivation cannot
+   reproduce either, which is a deliberate behaviour change.
 
 ## Spool layout
 
 ```
-<state_dir>/                              resolved exactly as 754 does it
-├── raft/                                 controller — untouched
+<agent state_dir>/                        resolved as 754 does it today
 ├── admission/                     0700   NEW — the entitlement ledger
 │   └── <job>.<attempt>/           0700
 │       ├── run.json               0600
 │       └── participants/          0700
 │           └── <step>.json        0600
-├── runtime/                       0700   UNCHANGED — the liveness record
-│   ├── agent.sock
-│   └── <job>.<attempt>.<step>/    0700
-│       ├── descriptor.json   launch.json
-│       ├── obligations.jsonl failure.txt
-│       └── runtime.sock  agent.sock  ptyfd.sock
-└── job<id>/                       UNCHANGED — scripts + stdout
+└── runtime/                       0700   layout UNCHANGED from 754
+    ├── agent.sock
+    └── <job>.<attempt>.<step>/    0700
+        ├── descriptor.json   launch.json      ← descriptor gains boot_id (commit 1)
+        ├── obligations.jsonl failure.txt
+        └── runtime.sock  agent.sock  ptyfd.sock
+
+/var/spool/spur/job<id>/                  scratch — a SEPARATE hardcoded root
+<user work_dir>/.spur_step_<id>/          scratch — in the user's directory
 ```
 
 `runtime/` answers "is it alive". `admission/` answers "what is it entitled to".
 
-`admission/<job>.<attempt>/` is flat for the reason 754 flattened its runtime
-dirs: one `read_dir`, no multi-level walk aborting on a single bad entry, no
-empty parent directories leaking. `participants/` is a real subdirectory because
-a run has N of them created and removed independently, and that walk is bounded
-by the run. Nesting is not being re-proposed.
+**Shape.** `admission/<job>.<attempt>/` is flat at the top level so discovery is a
+single `read_dir` over run directories that no single unreadable entry can abort.
+`participants/` is a bounded fan-out *within* one run, whose members are created
+and removed independently; an empty `participants/` is removed with its run
+directory, not orphaned. 754's reverted three-level `job/attempt/step` nesting is
+not being re-proposed.
+
+**Scratch is not relocated.** Spec §7 draws `scratch/`, `containers/` and
+`images/` as siblings under the agent root. 754 already places scripts and
+container state elsewhere, and moving them is churn with no correctness payoff —
+so the *locations* stay and the spec's *rules* are adopted, which is where the
+value is: scratch is executable input, never trusted recovery state; a missing
+scratch directory never confirms cleanup; container and image presence or absence
+is never allocation authority.
+
+**Legacy scratch is not authority** (§7). `job<id>/` and `.spur_step_<id>` are
+removed only once no matching process, cgroup, mount, **or controller obligation**
+remains. Commit 7 lengthens the obligation window, which turns today's
+unconditional `remove_dir_all` (`spurd/executor.rs:1443`) into a real hazard.
+
+**Deviation, acknowledged:** §7 states "Numeric Job ID never appears in a path used
+as identity." `admission/<job>.<attempt>/` violates that. It follows from deferring
+SPUID, and the `admission/` tree is greenfield so it could have used an opaque key
+— recorded here rather than left implicit, and revisited when SPUID lands.
 
 ## Record schemas
 
@@ -97,12 +148,13 @@ struct RunAdmission {                     // admission/<job>.<attempt>/run.json
     allocation: AdmittedResources,                     // cpu_ids, memory_mb, gpu_devices
     state: RunState,                                   // Admitted|Running|Cleaning|Cleaned
     created_at_unix_ms: u64,                           // agent wall clock — GC age and audit
-    reject_before_unix_ms: u64,
-    max_launch_expiry_unix_ms: u64,
-    prolog: HookState,                                 // NotStarted|Running|Succeeded|Failed|Unknown
+    reject_before_unix_ms: u64,                        // controller
+    max_launch_expiry_unix_ms: u64,                    // derived over participants
+    prolog: HookState,                                 // NEW type: NotStarted|Running|Succeeded|Failed|Unknown
     lifecycle_owner_step: Option<StepId>,
     cleanup: CleanupState,                             // state + epilog_state
-    controller_ack: ControllerAck,                     // admission_raft_index, release_raft_index
+    conflict_hold: Option<ConflictHold>,               // why evidence is being preserved
+    controller_ack: ControllerAck,                     // release_raft_index
 }
 
 struct ParticipantAdmission {             // admission/<job>.<attempt>/participants/<step>.json
@@ -110,157 +162,163 @@ struct ParticipantAdmission {             // admission/<job>.<attempt>/participa
     job_id: u32, run_attempt: u32, step_id: StepId, node: String,
     command_digest: String,                            // sha256 of the resolved command
     allocation_subset: AdmittedResources,
-    issued_at_unix_ms: u64,                            // controller's
-    expires_at_unix_ms: u64,                           // controller's, respected as delivered
-    admission_state: AdmissionState,
-    pending_start: bool,                               // 754's start gate, not yet opened
+    issued_at_unix_ms: u64,                            // controller
+    expires_at_unix_ms: u64,                           // controller, respected as delivered
+    lifecycle: ParticipantLifecycle,                   // the five §6 states, separately observed
     supervisor: Option<SupervisorRef>,                 // pid + start_ticks + boot_id
     final_report: FinalReport,                         // required / acknowledged
 }
 ```
 
-Only `spuid` is omitted relative to the spec; `controller_ack` is real because
-commit 7 makes the Raft log index available.
+`HookState` is a **new** type — nothing like it exists in the tree today. An
+earlier revision claimed otherwise.
 
-### Time
+`controller_ack` carries only `release_raft_index`. An `admission_raft_index` was
+proposed and dropped: no commit in this ladder gives the controller a wire field
+on which to deliver it, so it would have been a permanently empty field.
 
-**The controller's deadline is respected as delivered.** Expiry exists to bound
-staleness *including transit*, so a duration measured from local admission would
-hand a launch delayed in the network a full fresh window — weakening the very
-guarantee expiry provides. One clock domain owns the decision.
+**The five acknowledgement states are separately persisted** (§6: "Receipt
+acknowledgement is distinct from process start, exit, cleanup completion, and
+durable report acknowledgement"). `ParticipantLifecycle` records receipt, start,
+exit, cleanup-complete and report-acknowledged as five distinct observations.
+Commit 9 moves the `JobStart` commit — which sets `job.start_time` — earlier, into
+precisely the receipt-but-not-started window, so this distinction becomes more
+load-bearing, not less.
 
-The two checks are not equally exposed to clock skew, and an earlier revision of
-this document conflated them:
+**Removal conditions** (§7), both of which an earlier revision stated incompletely:
 
-| Check | Compares | Agent's clock involved? |
-| --- | --- | --- |
-| Fence (`reject_before`) | launch's `issued_at` vs `reject_before` — both controller-stamped | **no; clock-independent** |
-| Expiry | agent's now vs `expires_at` | yes, inherently cross-clock |
-
-So an agent clock jump cannot un-fence a cancelled run. What remains is a backward
-jump letting a stale launch expire late — but that launch was issued by the
-controller and has not been fenced, so it is work the controller wants. Low harm.
-
-**The clock-rollback guard (§9) is observability, not a gate.** A persisted
-high-water mark that refused admission whenever the clock read below it was
-considered and rejected: its response to a low-harm problem is to refuse *every*
-launch on the node until the clock catches up, which for a large jump is a
-self-inflicted outage — worse than the stale launch it prevents, and NTP steps and
-VM restores are not exotic. Instead the agent warns and increments a metric when
-it observes its clock moving backwards, and an operator decides.
-
-The forward direction was checked too, since early collection would be the more
-dangerous failure: a forward jump cannot collect a live run, because the GC rule's
-first two conditions — no participants remain, cleanup acknowledged — are **state**
-based. Time gates only the last condition.
-
-`created_at_unix_ms` exists for garbage collection and audit, not for expiry
-enforcement. It is what gives a run record an age even when its launch aborted
-before any expiry was set — such a record otherwise has no age at all and can
-never be collected. It replaces 754's directory-`mtime` `ORPHAN_RETENTION`
-fallback, which any touch resets.
-
-Boot-relative *timestamps* were considered and rejected: boot ticks can only
-measure locally originated durations, so they cannot be compared against a
-controller-supplied absolute deadline, and they were only ever the mechanism for
-the duration-based expiry rejected above. `boot_id` is kept, but for an unrelated
-reason — see below. It is not reboot detection for the controller;
-`inventory_complete` already carries that assertion.
-
-### `boot_id` scopes supervisor identity
-
-A supervisor is identified by `(pid, process_start_ticks)`, and `stepd_liveness`
-(`stepd.rs:2701`) declares it **Live** on that pair matching. But
-`process_start_ticks` reads field 22 of `/proc/pid/stat` (`stepd.rs:2670`), which
-is *time the process started after system boot, in clock ticks* — **boot
-relative**. The pair is therefore unique only *within a boot*, while the spool
-survives reboot, so `discover_live()` does compare across boots.
-
-A cross-boot collision needs the pid counter to land on the same value *and* the
-new process to start at the same tick offset, so it is unlikely. The severity is
-what justifies the field: a false `Live` makes the agent adopt a phantom, report
-the job as **running**, hold its allocation, and never settle it. That is the one
-failure mode where the evidence channel actively lies rather than saying
-"unknown", and every reconcile path here trusts the agent's liveness answer.
-
-This is a **pre-existing hazard**, not one introduced here; `stepd_liveness` has
-it today.
-
-Recording `boot_id` alongside the pair also settles the routine case. After a
-reboot nothing from before survives — no supervisors, no cgroups, no processes —
-so a record whose boot differs is *definitively* dead rather than `unknown`.
-Without it, every such record hits commit 3's hold rule and a rebooted node comes
-up holding its entire prior capacity as unknown claims, blocked at the
-registration gate until the controller has reconciled each one.
-
-**Rule, and it is a test gate: an absent `boot_id` means "not comparable", never
-"changed".** It falls back to `(pid, start_ticks)` alone, which is exactly today's
-behaviour. Treating absent as changed would invert the logic — live supervisors
-would be declared dead, their records settled, their allocations released, and the
-node double-booked. Absence arises only from records written by a pre-upgrade
-agent, so it is bounded to one upgrade generation.
-
-The field is added to `ParticipantAdmission.supervisor` and, additively with
-`#[serde(default)]`, to 754's `StepdDescriptor`, which carries the same pair and
-the same hazard. That record already has frozen-fixture coverage
-(`stepd.rs:2757-2900`), which is the guard for exactly this kind of addition.
+- A **run** record is removable when all participants are gone, allocation
+  release is acknowledged, **no conflict hold remains**, and every launch it
+  fenced has expired. The conflict-hold clause is load-bearing here because
+  commits 1 and 3 both *create* holds, and collecting the record would destroy
+  the evidence the hold exists to preserve.
+- A **participant** record is removable when it is clean, its final report is
+  durably acknowledged, **no supervisor and no pending start remain**, and its
+  launch has expired.
 
 **Admission order** (§7): hold the admission lock → persist `run.json` → persist
 the participant → update the in-memory claim index → acknowledge. Processes start
 outside the lock. Today the record is written after the in-memory reserve and the
 supervisor can publish before anything durable exists; this closes that window.
 
-**Fail closed:** unknown schema, corruption, or a foreign `node` value means keep
-the record, hold the resources, log, and mark the inventory incomplete. A claim is
-never dropped.
+**Fail closed** (§7) on unknown schema, corruption, identity mismatch, **or
+residual runtime state** — a cgroup, mount or process with no matching record.
+That fourth trigger is the one that catches an incomplete ledger, and an earlier
+revision omitted it. The response is to preserve evidence, hold the affected
+resources, take a conflict hold, and request reconciliation — actively, via
+commit 8's contradiction trigger, not by waiting.
+
+### Time
+
+**The controller's deadline is respected as delivered.** Expiry bounds staleness
+*including transit*, so a duration measured from local admission would hand a
+launch delayed in the network a full fresh window. One clock domain owns the
+decision.
+
+The two checks are not equally exposed to skew:
+
+| Check | Compares | Agent's clock? |
+| --- | --- | --- |
+| Fence (`reject_before`) | launch's `issued_at` vs `reject_before` — both controller-stamped | **no** |
+| Expiry | agent's now vs `expires_at` | yes |
+
+So an agent clock jump cannot un-fence a cancelled run. A backward jump lets a
+stale launch expire late — but that launch was issued by the controller and not
+fenced, so it is work the controller wants. **Clock rollback is therefore handled
+with a warning and a metric, never by refusing admission**: a persisted high-water
+mark that refused would answer a low-harm problem with a node outage. A forward
+jump cannot collect a live run, because the first clauses of both removal rules
+are state-based.
+
+**Chosen values** (§9 asks for these explicitly):
+
+| Parameter | Value |
+| --- | --- |
+| Fixed launch lifetime (controller-set `expires_at`) | 120 s from issue |
+| Default retention when a launch carries no expiry (pre-upgrade controller) | 1 h from the run's `created_at` |
+| Ledger pull deadline | 10 s, matching the existing agent RPC timeout |
+| Controller→agent pull concurrency | √(node count), min 8, max 64 |
+| Routine pull sweep | 1 h |
+| Per-node ledger message cap | 4 MiB, below the default gRPC limit |
+
+### `boot_id` scopes supervisor identity
+
+A supervisor is identified by `(pid, process_start_ticks)`, and `stepd_liveness`
+(`spurd/stepd.rs:2701`) declares it **Live** on that pair matching. But
+`process_start_ticks` reads field 22 of `/proc/pid/stat` (`:2670`) — *time the
+process started after system boot, in clock ticks*. **Boot relative.** The pair is
+unique only within a boot, while the spool survives reboot, so `discover_live()`
+does compare across boots.
+
+A collision needs the pid counter to land on the same value *and* the new process
+to start at the same tick offset, so it is unlikely. The severity justifies the
+field: a false `Live` makes the agent adopt a phantom, report the job as
+**running**, hold its allocation and never settle it — the one failure mode where
+the evidence channel lies rather than saying "unknown", and every reconcile path
+here trusts the liveness answer. **Pre-existing hazard.**
+
+It also settles the routine case: after a reboot nothing survives, so a record
+from a different boot is definitively dead rather than `unknown`, and a rebooted
+node no longer comes up holding its entire prior capacity as unknown claims.
+
+**Rule, and a test gate: an absent `boot_id` means "not comparable", never
+"changed".** It falls back to `(pid, start_ticks)` alone, today's behaviour.
+Inverting it would declare live supervisors dead, settle their records, release
+their allocations and double-book the node. Absence arises only from pre-upgrade
+records, so it is bounded to one upgrade generation.
+
+Added to `ParticipantAdmission.supervisor` and, additively with
+`#[serde(default)]`, to 754's `StepdDescriptor` — which per defect 2 above has no
+frozen-fixture guard today, so commit 1 writes one before adding the field.
 
 ## Commits
 
 ### 0 — `fix(spurctld): derive node allocation totals from job records`
 
-**A prerequisite, not an addition.** The controller holds two durable records of
+**A prerequisite, not an addition.** The controller keeps two durable records of
 one fact and never cross-checks them: `Job.per_node_alloc` is exact, while
-`Node.alloc_resources` is an independent accumulator mutated by `add`/`subtract`
-at four sites (`cluster.rs:5500, 5936, 6060, 6104`). PR #681 attempted this and
-is **closed, unmerged**; nothing in the tree derives or reconciles the two.
+`Node.alloc_resources` is an independent accumulator mutated at four sites
+(`cluster.rs:5500, 5936, 6060, 6104`). PR #681 attempted this and is closed
+unmerged.
 
-Commits 5 and 8 both diff "Raft" against the agent's ledger. Without this, there
-is no single Raft answer to diff against: the agent's slice can match
-`Job.per_node_alloc` exactly, the node be declared reconciled and released from
-the gate, while `Node.alloc_resources` — **the value the scheduler actually reads
-for placement** (`node.rs:436`, `:441`, `:466`) — is still drifted. The node then
-passes reconcile and is immediately double-booked by the controller's own
-accounting.
+Commits 5, 6 and 8 all diff "Raft" against the agent's ledger. Without one Raft
+answer, the agent's slice can match `per_node_alloc` exactly, the node be declared
+reconciled and released from the gate, while `alloc_resources` — which the
+scheduler reads for placement (`spur-core/node.rs:436`, `:441`) — is still
+drifted. The node passes reconcile and is immediately double-booked by the
+controller's own accounting.
 
-`Node.alloc_resources` therefore stops being durable authority and becomes a
-**derived cache**:
+`Node.alloc_resources` becomes a **derived cache**:
 
 ```
 charged(node) = Σ over jobs j where
-      node ∈ j.allocated_nodes
-    ∧ node ∉ j.node_completions        // the existing per-node release signal
+      !j.state.is_finalized()            // the clause an earlier revision omitted
+    ∧ node ∈ j.allocated_nodes
+    ∧ node ∉ j.node_completions
 ```
 
-Both clauses are existing durable job state, and together they reproduce exactly
-what the accumulator should have held — `JobNodeComplete` inserts into
-`node_completions` as each node reports (`:6084`), and the requeue/evict paths
-clear `allocated_nodes`. Jobs whose `per_node_alloc` lacks an entry use the same
-scalar-split fallback `JobStart`'s apply already warns about.
+**The liveness clause is not optional.** `JobComplete` (`cluster.rs:6237-6240`)
+and `evict_job_locked` (`:5584-5587`) both clear `node_completions` while leaving
+`allocated_nodes` populated, so without it the formula charges every node of every
+terminal job and grows without bound across job history. `is_finalized()` rather
+than `is_active()` because commit 9 charges while the job is still Pending.
+
+Two deliberate divergences from the accumulator, both consequences of defect 6: a
+`JobStart` for a job with no record charges the node today and will not after this,
+and a re-proposed `JobStart` double-adds today and will not after this.
 
 - **On load** (snapshot restore and replay) and **on leadership gain**, recompute
   in full. The cache cannot drift durably, because truth rebuilds it at every
   restart and every leadership change.
 - **In steady state**, the four existing sites keep updating it incrementally —
-  they become cache maintenance rather than authority, so scheduling stays O(1).
+  cache maintenance rather than authority, so scheduling stays O(1).
 
 **Why this is exact where #681 had to widen only.** #681 could not subtract,
-because the controller's durable state cannot distinguish a leaked charge from a
-release in flight. That distinction does not arise here: this derivation is exact
-**with respect to job records**, and a leak and an in-flight release are both
-states in which the slice *should* remain charged. Whether a job record is itself
-stale is a different question, answered by agent evidence in commits 5, 6 and 8.
-
-That is the layering this establishes:
+because the controller cannot distinguish a leaked charge from a release in
+flight. That distinction does not arise: this derivation is exact *with respect
+to job records*, and both are states in which the slice should remain charged.
+Whether a job record is itself stale is the separate question agent evidence
+answers.
 
 | Layer | One source of truth | Resolved by |
 | --- | --- | --- |
@@ -269,32 +327,42 @@ That is the layering this establishes:
 
 **Not a breaking change.** The field stays in `Node` and keeps serializing, so a
 new controller reading an old snapshot recomputes and is correct, and an old
-controller reading a new snapshot reads the persisted value exactly as it does
-today. No proto change, no `WalOperation` change.
+controller reading a new snapshot reads the persisted value as it does today.
 
-*spurctld only. Lands before the agent work, since 2, 5 and 8 all depend on the
-controller having one answer.*
+*spurctld only. Lands before the agent work, since 5, 6 and 8 depend on the
+controller having one answer. `NodeRegister`'s apply also resets the accumulator
+by wholesale-replacing the `Node` (`:6353`, `:6396`); benign today because
+`evaluate_registration` only returns `Register` for an unknown node, but the
+derivation must account for it rather than assume four writers.*
 
 ### 1 — `feat(spurd): persist a durable admission record per job-run`
 
 Records, writers, atomic writes reusing `write_private` and the publish pattern,
-0700/0600, admission ordering, load-time validation, fail-closed handling.
+0700/0600, admission ordering, load-time validation, fail-closed handling
+including residual runtime state, conflict holds, and both removal rules in full.
 
-A hook left `running` when its owner dies loads as `Unknown` and is never
-re-run automatically (§7). `HookState` already has the variant; nothing sets it.
+`lifecycle_owner_step` is **set** here — the job-owning step — not merely declared.
+Commit 7 enforces that only the owner's completion releases the allocation.
 
-GC: a run directory is removable when no participants remain, cleanup is
-acknowledged, and `max_launch_expiry` has passed. Folded into the existing sweep
-loop rather than a new one.
+The job Prolog's state lives in `run.json` (§7) and a hook left `running` when its
+owner dies loads as `Unknown` and is never re-run automatically.
 
-Every record must have an age, or it can never be collected. A run whose launch
+Also in this commit, because they are prerequisites rather than follow-ups:
+
+- A frozen-fixture guard for `StepdDescriptor` (defect 2), written **before**
+  `boot_id` is added to it.
+- `0700` on the controller's Raft directory (defect 3).
+- The agent logs its resolved state root at startup and refuses a silent `/tmp`
+  fallback in production (§7). These cost nothing and are independent of whether
+  the root is shared.
+
+GC: every record must have an age or it can never be collected. A run whose launch
 aborted before any expiry was set gets one from `created_at_unix_ms`. A
 participant normally ages out on its own `expires_at`, but a launch from a
-**pre-upgrade controller** carries none — that field is new — so when `expires_at`
-is absent or zero the participant falls back to the run's `created_at_unix_ms`
-plus a default retention.
+pre-upgrade controller carries none, so it falls back to the run's `created_at`
+plus the default retention.
 
-*spurd only.*
+*spurd + a one-line spurctld permissions fix.*
 
 ### 2 — `fix(spurd): rebuild the node claim index from admission records`
 
@@ -302,22 +370,30 @@ Replaces descriptor-derived replay. The recorded slice is exact and complete
 before any supervisor exists, so `fallback_cpu_ids` under-counting disappears.
 Descriptors continue to answer liveness; run records answer entitlement.
 
-A session with no admission record falls back to 754's descriptor replay, which
-is what makes an in-place upgrade over a live 754 node lossless.
+The claim index **points at the job run, not at one step** (§5). Steps of the same
+run legitimately share the run's allocation, and an overlap between them is not a
+conflict — a distinction commit 8 depends on, since it turns overlap into a
+cancel.
 
-The restart cross-check between the two trees:
+Restart cross-check between the two trees:
 
 | Found | Meaning | Action |
 | --- | --- | --- |
 | record + live supervisor | running | adopt; hold the claim |
 | record + dead supervisor + recorded exit | settled | carry the exit, release |
 | record from a **different boot** | definitively dead | settle locally — nothing survived the reboot |
+| record + **pending start**, no supervisor | admitted, never spawned | classify as pending (§7); do not treat as running or as finished |
 | record + dead supervisor, no exit | **unknown** | **hold the claim, release nothing** (commit 3's rule) |
 | live supervisor, no record | pre-upgrade session | fall back to 754's descriptor replay |
-| record unreadable, or a foreign `node` | corrupt | fail closed: hold, mark the inventory incomplete |
+| record unreadable, foreign `node`, or residual runtime state | corrupt | fail closed: hold, take a conflict hold, request reconciliation |
 
-Only the different-boot row can settle without evidence of an exit, and only
-because a reboot leaves nothing behind to be uncertain about.
+Only the different-boot row settles without evidence of an exit, and only because
+a reboot leaves nothing to be uncertain about.
+
+A session with no admission record falls back to 754's descriptor replay, which
+makes an in-place upgrade over a live 754 node lossless — so §7's "claims rebuilt
+only from job-run allocation slices" holds for post-upgrade sessions with a
+bounded fallback for the rest.
 
 *spurd only.*
 
@@ -327,9 +403,14 @@ because a reboot leaves nothing behind to be uncertain about.
 `running` map past 600 s. That is the inference §2 forbids: "a missing in-memory
 entry must not be treated as confirmation that execution or cleanup finished."
 
-Changed to report held-but-untracked rather than free. A much longer, loudly
-logged backstop remains so a controller that never speaks cannot strand a node
-forever.
+Changed to take a conflict hold and request reconciliation rather than free.
+**No timeout backstop replaces it** — §9 is explicit that "timeout alone cannot
+confirm cleanup or release resources", and an earlier revision of this document
+kept a longer backstop that contradicted both §9 and commit 7's own guarantee.
+The release comes from the controller, over commit 6's pull or commit 5's gate.
+Permanent node loss is handled by fencing or deregistration, not by waiting; that
+design is deferred, and until it lands a permanently unreachable node holds its
+claims, which is the correct failure.
 
 *spurd only.*
 
@@ -337,99 +418,112 @@ forever.
 
 - `reject_before_unix_ms` per `(job, attempt)`, monotonic, persisted before
   acknowledgement. A launch issued at or before the cutoff is rejected even if
-  unexpired.
+  unexpired. It fences that run attempt only — never a sibling step, never
+  another job (§5, "Ordering").
 - `expires_at_unix_ms` — a launch arriving past its deadline is rejected.
 - `command_digest` — an exact duplicate stays idempotent; a conflicting digest or
   allocation for the same identity is rejected rather than silently relaunched.
-- A higher `run_attempt` is a different run and is never fenced by a lower
-  attempt's cutoff.
-- **Clock rollback** (§9) is handled by a warning and a metric, not by refusing
-  admission. Only expiry is exposed to the agent's clock; the fence compares two
-  controller-stamped values and is clock-independent. See "Time" above for why a
-  gate here would cost more than it saves.
+- A higher `run_attempt` is a different run, never fenced by a lower attempt's
+  cutoff.
+- Participant-only Stop or Clean affects one participant and does not fence
+  siblings or release the run allocation (§8).
+- Clock rollback warns and increments a metric; it never refuses admission.
+- **Fixes defect 1:** `allocate_for_job` returns `CpusUnavailable` on shortfall —
+  the variant both callers already handle and it never returned — and enforces a
+  ceiling against `total_memory_mb`.
 
 Proto is append-only: `LaunchJobRequest` gains `issued_at_unix_ms`,
-`expires_at_unix_ms`, `command_digest`; a new `FenceRun` RPC is added. Nothing is
-renumbered.
+`expires_at_unix_ms`, `command_digest`; a new `FenceRun` RPC. Nothing renumbered.
 
 These defend against stale, duplicate and reordered commands from the legitimate
-controller. **They are not authorization.** `require_controller` still admits
-unauthenticated callers under the default `auth.mode`; §7 already states that
-production requires `auth.mode=required`.
-
-Also verify and, if confirmed, fix the `allocate_for_job` under-serve/over-commit
-finding above.
+controller. **They are not authorization** — see defect 4.
 
 ### 5 — `feat(proto,spurd,spurctld): reconcile a registering node before it takes work`
 
-§6's substance without its chunked transport.
+The registration push half of §6. The agent computes one immutable cut of its
+ledger from `admission/` and sends it with its registration; the controller holds
+the node **not schedulable** until it has diffed and acted; then the node becomes
+schedulable.
 
-- The agent computes one immutable cut of its ledger from `admission/` and sends
-  it in a single message (tens of runs; a few KB).
-- The controller holds the node **not schedulable** until it has processed it.
-- The controller diffs Raft against the ledger and acts.
-- The node becomes schedulable.
-
-The gate is **not** a new `NodeState` variant — that enum is serialized into the
-WAL and proto, so a variant would be the break being avoided. Instead an additive
-`Node.reconcile_pending: bool` with `#[serde(default)]`, and
-`is_schedulable() = state.is_available() && !reconcile_pending`. Old logs replay
-as `false`, i.e. today's behaviour.
-
-An agent that sends no ledger is **not** gated: a pre-upgrade agent registers
-without the field, which is treated as *no evidence*. This preserves mixed-version
-rollout. The gate is otherwise self-bounding because the diff is local synchronous
-work.
-
-Reconcile triggers (§6), all routed through the same diff-and-act code:
-
-| Trigger | Source |
-| --- | --- |
-| startup / registration | agent |
-| reconnect | agent |
-| **leader failover** | controller, on leadership gain |
-| **operator request / audit** | admin CLI |
-| contradiction | commit 8 |
+- The registration message carries **`inventory_complete`**. Direction B below
+  releases and evicts on absence, and that is only safe against an asserted
+  complete ledger — an earlier revision put that flag only on the heartbeat, the
+  one channel where absence must never be acted on.
+- An **agent session id** (§6) is established at registration and carried on every
+  ledger. A cut from a pre-restart session arriving after re-registration is
+  discarded rather than applied as current.
+- Registration **retries with bounded exponential backoff and jitter until
+  accepted** (§6). This stops being incidental once the controller can reject.
+- The gate is **not** a new `NodeState` variant — that enum is serialized into the
+  WAL and proto. An additive `Node.reconcile_pending: bool` with
+  `#[serde(default)]`, and `is_schedulable() = state.is_available() &&
+  !reconcile_pending`. Old logs replay as `false`.
+- **The gate is visible.** `sinfo` and `scontrol show node` surface a reconciling
+  reason rather than showing an idle node that silently refuses work, following
+  the effective-state display convention already used for planned nodes.
+- An agent that sends no ledger is **not** gated — a pre-upgrade agent registers
+  without the field, treated as *no evidence*, preserving mixed-version rollout.
 
 | Direction | Resolution |
 | --- | --- |
 | A — agent holds a slice Raft does not record | cancel via the existing path |
-| B — Raft records a job here, agent found nothing | release/evict — safe only because the ledger asserts completeness |
-| C — both agree the job exists, slices differ | detect, log, metric. Correcting means rewriting `Node.alloc_resources` in Raft, i.e. a new `WalOperation` variant. Deferred. |
-| D — job cancelled or requeued while the agent was down, supervisor alive | already handled in 754 by the cohort probe |
+| B — Raft records a job here, agent found nothing | release/evict — safe only against an asserted complete ledger |
+| C — both agree the job exists, slices differ | detect, log, metric. Correcting means rewriting `Job.per_node_alloc`, the authority commit 0 derives from, which needs a new `WalOperation` variant. Deferred. |
+| D — job cancelled or requeued while the agent was down, supervisor alive | 754's cohort probe — **which short-circuits for user steps** (`server.rs:365`), so a numbered step is retained without a cohort check |
 
-### 6 — `feat(proto,spurd,spurctld): report the held ledger on the heartbeat`
+### 6 — `feat(proto,spurd,spurctld): let the controller pull a node's ledger`
 
-Steady-state drift detection between restarts. Registration remains the
-authoritative reconcile, so the two channels have distinct jobs rather than
-overlapping ones.
+The pull half of §6, and a correction. An earlier revision put the ledger on the
+heartbeat, which §6 forbids twice — "it carries no participant inventory" and "no
+periodic full inventories are sent" — and filed it as compliant by quoting half
+the sentence. **The heartbeat stays liveness-only and `running_jobs` is left
+exactly as it is.**
 
-- `RunningJobStatus` gains `run_attempt`, `step_id` and the allocated slice
-  (append-only tags). This also fixes `state` and `exit_code` being declared but
-  never populated.
-- `HeartbeatRequest` gains `inventory_complete`.
-- The source moves from the `running` map to the admission ledger. **This is what
-  closes structural hole 1**, making every held slice visible to the controller.
-- Absence is still never acted on here. Acting on absence belongs to commit 5,
-  where completeness is asserted as part of a bounded exchange. Consistent with
-  §6: the heartbeat "cannot grant authority or release resources".
+A new `RequestNodeLedger` RPC, controller → agent, answered from one immutable cut
+of `admission/`, carrying the agent session and `inventory_complete`. Same message
+as commit 5's, pulled rather than pushed. Chunking is deferred; one message
+suffices at current node counts, bounded by the per-node cap above.
+
+This is what closes structural hole 1 — the ledger the controller sees comes from
+`admission/`, not from the `running` map — and it is what makes three of the five
+§6 triggers real, since they are controller-side events with no push to ride on:
+
+| Trigger | Source |
+| --- | --- |
+| startup / registration | agent push (commit 5) |
+| reconnect | agent push (commit 5) |
+| **leader failover** | controller, on leadership gain |
+| **operator request / audit** | admin CLI |
+| **contradiction** | commit 8 |
+| routine sweep, 1 h | controller |
+
+**Mixed-version rollout** follows §6's prescription rather than inventing one:
+capability is negotiated at registration, the existing `running_jobs` heartbeat
+behaviour is kept until then, and the controller relies on the pull only for
+agents that advertise it.
 
 ### 7 — `feat(spurd,spurctld)!: hold resources until Raft commits the completion`
 
-§5's core rule. Small, because 754 already built the ledger for it.
+§5's core rule, and small because 754 built the ledger for it.
 
-- Move `allocation.release_job()` from the exit path (`:1008`) to fire on
-  `CompletionAcknowledged`. Ordering is already enforced by
-  `finalized_obligations`.
+- Move `allocation.release_job()` from the exit path (`agent_server.rs:1008`) to
+  fire on `CompletionAcknowledged`.
+- **Only the `lifecycle_owner_step`'s completion releases the run allocation**
+  (§7). Cleaning any other participant cannot. Without this the release is
+  triggered by whichever participant happens to be acknowledged first.
+- The epilog is gated explicitly. Per defect 5, `finalized_obligations` does not
+  order `EpilogCompleted` — release must check it rather than assume it.
 - Fill `controller_ack.release_raft_index` from the completion response.
+- Legacy scratch (`job<id>/`, `.spur_step_<id>`) is removed only once no process,
+  cgroup, mount **or controller obligation** remains — the window this commit
+  lengthens.
 
 Three things ship with it, all load-bearing:
 
-- **(a) The completion report becomes a durable, indefinitely retried
-  obligation**, driven from the obligations log and surviving agent restarts.
-  Today's bounded budget with immediate give-up on `not_found` /
-  `invalid_argument` would strand a node's resources permanently. This is the
-  largest risk in the change.
+- **(a) The completion report becomes a durable, indefinitely retried obligation**,
+  driven from the obligations log and surviving agent restarts. Today's bounded
+  budget with immediate give-up on `not_found` / `invalid_argument` would strand a
+  node's resources permanently. The largest risk in the change.
 - **(b) The acknowledgement is idempotent** — re-reporting an already-committed
   completion returns success, so a lost *response* does not strand.
 - **(c) "I have no record of this job" is an acknowledgement**, reusing
@@ -437,12 +531,11 @@ Three things ship with it, all load-bearing:
 
 The partition case is safe because an unreachable controller times out the
 heartbeat at 90 s, the node goes Down and is not schedulable, so held resources
-are invisible and harmless; commit 5's gate resolves them on reconnect.
-Release-after-ack composes only because the gate exists.
+are invisible; commit 5's gate resolves them on reconnect. Release-after-ack
+composes only because the gate exists.
 
 Restart mid-flight is handled by the existing shape: acked-but-not-released
-appears as `CompletionAcknowledged` without `ResourcesReleased`, exactly what
-`finalized_obligations` tests.
+appears as `CompletionAcknowledged` without `ResourcesReleased`.
 
 Takes the `!`: resources become free one round trip later, and under controller
 unavailability stay held rather than being freed locally.
@@ -450,215 +543,277 @@ unavailability stay held rather than being freed locally.
 ### 8 — `feat(proto,spurd,spurctld): reconcile on a refused dispatch`
 
 `LaunchJobResponse` gains a structured refusal (append-only): a reason enum plus
-the conflicting ledger entry (job, attempt, step, slice). The controller acts on
-it in the same round trip instead of waiting up to 30 s for a heartbeat.
+the conflicting ledger entry. The controller acts in the same round trip.
 
 | Refusal | Agent's claim | Controller reconciles by |
 | --- | --- | --- |
-| expired launch | "too old" | redispatch fresh — its own latency, not a conflict |
-| fenced (`reject_before`) | "you cancelled this run" | stop retrying this attempt; the controller's state is stale |
+| expired launch | "too old" | redispatch fresh — its own latency |
+| fenced (`reject_before`) | "you cancelled this run" | stop retrying this attempt; controller state is stale |
 | conflicting digest | "different command, same identity" | hard error; do not retry blindly |
-| **local overlap** | **"I hold slice S for job Y"** | **look up Y.** Not on this node in Raft → cancel Y, then retry. On this node in Raft → the controller's accounting is wrong → C-drift, log, do not retry here |
+| **local overlap** | **"I hold slice S for job Y"** | **look up Y.** Not on this node in Raft → cancel Y, then retry. On this node in Raft → C-drift, log, do not retry here |
+| residual runtime state | "I found state with no record" | trigger a ledger pull (commit 6) |
 | target mismatch | misroute | controller bug; log loudly |
-| prolog failure | node-local failure | existing backoff path, unchanged |
+| prolog failure | node-local failure | existing backoff path |
 
-The overlap row is the mechanism by which the controller makes `spurd` agree with
-Raft. Without it, a conflicting refusal only collapses into `JobDispatchBackoff`
-and the controller tries elsewhere, leaving the conflict unresolved — the
-SPUR-124 dispatch hot-loop shape.
+The overlap row is how the controller makes `spurd` agree with Raft. **It must not
+fire for two steps of the same run**, which legitimately share the run's
+allocation (§5) — otherwise this machinery cancels a job that is entitled to those
+CPUs.
 
-Depends on 4 (which creates the refusal reasons) and 1 (which supplies the
-conflicting entry).
+Refusal is also the **contradiction** trigger for commit 6's pull.
 
 ### 9 — `fix(spurctld): commit the placement before dispatching it`
 
 **Verified ordering today** (`scheduler_loop.rs:468-470`): `LaunchJob` is sent and
 the agent reserves and spawns *before* `cluster.start_job()` proposes
-`JobStateChange` + `JobStart`. The comment is explicit — the Running transition is
-"reached only once every assigned node has confirmed". 754 mitigated the visible
-symptom with the start gate and by absorbing a repeat `LaunchJob` for a tracked
-`(job, step, attempt)`, but **the allocation is still reserved on the agent before
-Raft records it**, which §2 forbids.
+`JobStateChange` + `JobStart`. 754 mitigated the visible symptom with the start
+gate, but the allocation is still reserved on the agent before Raft records it,
+which §2 forbids.
 
 Failure mode: leader failover between the two. The new leader sees the job as
 Pending and redispatches. Absorb-repeat covers same-node/same-attempt; it does not
-cover redispatch to a *different* node, which leaves node A holding a phantom
+cover redispatch to a different node, leaving node A holding a phantom
 reservation.
 
-Commits 5, 6 and 8 **repair** that within 30 s. Commit 9 **prevents** it:
-reserve-before-launch, activate-after-confirm, plus an abort guard on every
-non-Activate exit from `process_assignment`.
+Commits 5, 6 and 8 repair that. Commit 9 prevents it: reserve-before-launch,
+activate-after-confirm, and an abort guard on every non-Activate exit from
+`process_assignment`.
 
-**No new `WalOperation` variant, and no proto change.** An earlier revision of
-this document claimed both; that was asserted without reading the apply logic and
-is wrong. Verified:
+**No new `WalOperation` variant, and no proto change:**
 
-1. **Reserve is `JobStart`, moved earlier.** Its apply (`cluster.rs:6023`) is
-   `if let Some(job) = jobs.get_mut(job_id)` followed by an unconditional
-   `node.alloc_resources.add(&slice)`. There is **no job-state guard**, so
-   proposing it while the job is still Pending works with the apply unchanged.
-2. **Activate is the existing `JobStateChange(Pending→Running)`** — already legal,
-   already proposed today, simply moved after the dispatch.
-3. **Abort is the only new behaviour.** `JobDispatchBackoff`'s apply (`:5701`)
-   calls `reset_job_for_requeue` and never deallocates slices — correct today
-   because no charge exists at that point. Extend it to capture
-   `allocated_nodes` / `allocated_resources` / `per_node_alloc` and call
-   `deallocate_job_slices` *before* the reset (`clear_run_state_for_requeue`
-   wipes them), the pattern `JobPreemptRequeue` already uses at `:5714`.
+1. **Reserve is `JobStart`, moved earlier.** Its apply has no job-state guard, so
+   proposing it while the job is Pending works unchanged.
+2. **Activate is the existing `JobStateChange(Pending→Running)`**, moved after the
+   dispatch.
+3. **Abort** extends `JobDispatchBackoff`'s apply (`:5701`) to call
+   `deallocate_job_slices` *before* `reset_job_for_requeue` wipes the fields — the
+   pattern `JobPreemptRequeue` already uses (its dealloc call is at `:5769`).
 
-Replay compatibility:
-
-| Direction | Result |
+| Replay direction | Result |
 | --- | --- |
-| New controller, old log | `JobStateChange(→Running)` then `JobStart`; apply unchanged → identical state |
-| Old controller, new log | `JobStart` (no guard) charges, `JobStateChange` transitions → same final state; replays without crashing |
-| Old controller, new `JobDispatchBackoff` with a charge | does not deallocate → a leaked charge **on downgrade only**, caught by the widen/reconcile passes. Not corruption, not a crash |
+| New controller, old log | apply unchanged → identical state |
+| Old controller, new log | `JobStart` charges, `JobStateChange` transitions → same final state, no crash |
+| Old controller, new `JobDispatchBackoff` with a charge | does not deallocate → a leaked charge **on downgrade only**, caught by the reconcile passes |
 
 `deallocate_job_slices` early-returns when `allocated_resources` is `None`
 (`:5482`), and every pre-upgrade `JobDispatchBackoff` entry has no charge, so the
-extended apply is a **no-op on old entries**.
+extension is a no-op on old entries.
 
-Two non-breaking but user-visible semantic shifts:
+Two non-breaking but user-visible shifts: `JobStart`'s apply sets
+`job.start_time`, which moves earlier by one dispatch round trip, and it calls
+`set_pending_reason(PendingReason::None)`, so a Pending job shows no reason during
+the dispatch window.
 
-- `JobStart`'s apply sets `job.start_time = Some(timestamp)`, so StartTime and the
-  accounting record move earlier by one dispatch round trip. The activate can
-  re-stamp if that matters.
-- It also calls `set_pending_reason(PendingReason::None)`, so a Pending job shows
-  no reason in `squeue` during the dispatch window.
-
-Sequenced last because the abort guard is the risky part and needs commit 8's
-refusal plumbing regardless.
+Sequenced last because the abort guard needs commit 8's refusal plumbing.
 
 ## Spec traceability
 
-Every requirement in the spec gets a row. Deferred items get a reason, not silence.
+Built by walking the spec top to bottom — every section, table row, bullet and
+numbered step — and attaching commits second. An earlier matrix was organized
+around commits with spec sections attached, which is how twenty requirements went
+missing.
 
-| Spec | Requirement | Where |
+| Spec | Requirement | Disposition |
 | --- | --- | --- |
-| §2 | Duplicate, delayed, reordered commands safe | 4 |
-| §2 | Restart / missing in-memory entry is not confirmation | 3 |
-| §2 | Cleanup is participant-scoped; release needs the final participant + epilog | 754, strengthened by 7 |
+| §1 | Work may start before exact placement is durable | 9 |
+| §1 | Allocation records and node totals may disagree | 0 |
+| §1 | Job ID alone cannot distinguish attempt, step, node, resources | keyed `(job, attempt, step)`; SPUID **deferred** |
+| §1 | Empty `spurd` memory after restart does not prove execution stopped | 3 |
 | §2 | Exact participant and CPU/GPU committed before dispatch | 9 |
-| §9 | Garbage-collection delay — the run record carries an age | 1 |
-| §5 | Conflicting identities, digests, deadlines, allocations rejected | 4 |
-| §5 | Claim index is a local safety check, not scheduler authority | 8 |
-| §5 | `reject_before` monotonic per run | 4 |
-| §5 | Release requires cleanup + epilog + durable controller acknowledgement | 7 |
-| §6 | Node stays reconciling until its snapshot is accepted | 5 |
-| §6 | Trigger: startup / registration | 5 |
-| §6 | Trigger: reconnect | 5 |
-| §6 | Trigger: leader failover | 5 |
-| §6 | Trigger: operator request / audit | 5 |
-| §6 | Trigger: contradiction | 8 |
-| §6 | Heartbeat cannot grant authority or release resources | 6 (detection only) |
-| §6 | Chunked / resumable snapshot transport | **deferred** — scale work; one message suffices at current node counts |
-| §7 | Claims rebuilt only from job-run allocation slices | 2 |
-| §7 | Admission ordering; single writer per record | 1 |
-| §7 | Atomic rename + fsync; journal `fdatasync`; 0700/0600 | 1 |
-| §7 | Fail closed on unknown schema, corruption, identity mismatch | 1 |
-| §7 | Hook left `running` after its owner dies becomes `Unknown`, never auto-rerun | 1 |
-| — | Supervisor identity scoped to its boot (`process_start_ticks` is boot-relative) | 1, 2 — pre-existing hazard in 754 |
-| — | One durable record per fact: node totals derived from job records | 0 — prerequisite; PR #681 closed unmerged |
-| §7 | Separate agent state root | **deferred** — `admission/` is a disjoint sibling of `raft/`; deferring removes a config change from the diff |
-| §7 | `auth.mode=required` in production | **out of scope** — flagged; the fences are not authorization |
-| §8 | Launch expiry; participant-only Stop/Clean does not fence siblings | 4, partly 754 |
-| §8 | Missing completion → idempotent retry | 7a |
-| §9 | Clock-rollback guard | 4 — resolved as a warning and a metric; a gate would cost a node outage to prevent a late-but-authorized launch |
-| §9 | Snapshot chunk size, retry policy, concurrency limits | **deferred** with the transport |
-| §9 | Permanent node loss: trusted fencing or deregistration | **deferred** — needs its own design |
-| §9 | Task hooks run once per task under the job UID/GID | **deferred** — independent of reconciliation |
-| §5 | SPUID identity | **deferred** — blast radius: cgroup paths, PMIx namespace and port hash, container rootfs names, k8s labels |
-| — | Slice-drift correction (direction C) | **deferred** — needs a `WalOperation` variant |
+| §2 | Duplicate, delayed, reordered safe without a node-wide order | 4 |
+| §2 | Restart / missing in-memory entry is not confirmation | 3 |
+| §2 | Cleanup participant-scoped; release needs the final participant + job epilog | 7 (owner-gated) |
+| §3 | Liveness pull, registration push, work commands, completion reports | 5, 6 — the shape this ladder adopts |
+| §4 | Controller is the allocation authority | the invariant |
+| §4 | Purpose-specific message paths; no global event order | 4, 5, 6 |
+| §4 | Liveness controller-paced; detailed state only when needed | 6 |
+| §4 | Duplicates handled by current state and operation identity | 4 |
+| §4 | Forwarding trees are an optimization, not the correctness model | **not needed** at current scale |
+| §5 | Identity `(SPUID, run_attempt, step, node)` | **deferred** — blast radius: cgroup paths, PMIx namespace and port hash, container rootfs names, k8s labels |
+| §5 | SPUID generation, cluster code, durable high-water mark | **deferred** with SPUID |
+| §5 | Raft owns scheduling; `spurctld` dispatches only committed commands | 9 |
+| §5 | Job-run record owns the node-local slice; participants authorize steps | 1 |
+| §5 | Exact duplicates idempotent; conflicting identity/digest/deadline/allocation rejected | 4 |
+| §5 | Claim index derived from run allocations, points to the run not a step | 2 |
+| §5 | Steps in the same run may share the allocation | 2, and a constraint on 8's overlap row |
+| §5 | The index is a local safety check, not scheduler authority | 2, 4 |
+| §5 | No node-wide revision; `reject_before` scoped to one SPUID + attempt | 4 |
+| §5 | Release needs allocation-level cleanup, epilog, and durable controller ack | 7 |
+| §6 | Extend `RegisterAgent`; retry with bounded exponential backoff and jitter | 5 |
+| §6 | Node remains reconciling until its snapshot is accepted | 5 — as `reconcile_pending`, not a `NodeState` variant; **deviation**, surfaced in `sinfo` |
+| §6 | Heartbeat carries only identity and health; no participant inventory | 6 — heartbeat left unchanged |
+| §6 | Heartbeat cannot grant authority or release resources | 6 |
+| §6 | No periodic full inventories are sent | 6 |
+| §6 | `spurctld` **requests** a snapshot: startup, reconnect, leader failover, contradiction, audit | 5 (push half) + 6 (pull half) |
+| §6 | One immutable cut; agent session; request id; final acceptance | 5, 6 |
+| §6 | Chunk index/count; duplicate chunks idempotent | **deferred** — chunking only; one message at current scale |
+| §6 | Participant command names one exact scope | 4 |
+| §6 | Receipt ack distinct from start, exit, cleanup completion, durable report ack | 1 (`ParticipantLifecycle`) |
+| §6 | Runtime report cumulative; retained until the controller confirms it committed | 7 |
+| §6 | Mixed-version: keep `running_jobs` until capability is negotiated | 6 |
+| §6 | Session ids identify transport exchanges, not node revisions | 5 |
+| §7 | Local root-owned file store, versioned JSON, append-only journal; no embedded DB | 1 |
+| §7 | Separate state roots for `spurctld` and `spurd` | **deferred** — but the stated reason was wrong: `spurctld` never reads `config.controller.state_dir`, so the roots coincide only at the shared default. Recommend revisiting |
+| §7 | Log the resolved path at startup; no silent `/tmp` fallback | 1 |
+| §7 | `admission/`, `runtime/`, `scratch/`, container and image namespaces | 1 for the first two; scratch and container **locations deferred**, their rules adopted |
+| §7 | Node stored in every trusted record and checked on load | 1 |
+| §7 | Numeric Job ID never appears in a path used as identity | **deviation** — follows from deferring SPUID; recorded, not silent |
+| §7 | `run.json` contents and its four removal clauses | 1 |
+| §7 | `participants/<step>.json` contents and its four removal clauses | 1 |
+| §7 | `launch.json` write-once; **never store controller or join credentials** | 1 |
+| §7 | Descriptor published before tasks start; a missing socket never means Clean | 754, preserved |
+| §7 | `lifecycle.jsonl` event vocabulary | 754's four obligations are a subset; the remainder land in `ParticipantLifecycle` (1) |
+| §7 | Scratch is executable input, not trusted recovery state; missing scratch never confirms cleanup | 1 |
+| §7 | Container and image presence is not allocation authority | 1 |
+| §7 | `spurd` sole writer of admission; `spurstepd` sole writer of descriptor and journal | 1 |
+| §7 | Admission order: lock → run → participant → index → ack; processes start outside the lock | 1 |
+| §7 | Claims rebuilt only from active job-run allocation slices | 2 — with a bounded pre-upgrade descriptor-replay fallback |
+| §7 | On restart: load runs, then participants, rebuild claims, reconnect, **classify pending starts and reports** | 2 (pending starts), 7a (reports) |
+| §7 | A hook left `running` after its owner dies becomes `Unknown`, never auto-rerun | 1 |
+| §7 | Job Prolog owned by `spurd`, state in `run.json` | 1 |
+| §7 | TaskProlog/TaskEpilog once per task under the job UID/GID, result appended | **deferred** — independent of reconciliation; see §9 |
+| §7 | Cleanup and job Epilog owned by the step named in `lifecycle_owner` | 1 (sets it), 7 (enforces it) |
+| §7 | SrunProlog/SrunEpilog belong to the client, never worker spool state | a negative constraint the spool design honours; no worker-side record |
+| §7 | 0700 directories, 0600 records and sockets | 1 |
+| §7 | **Controller Raft storage uses the same restrictions** | 1 — defect 3, live gap |
+| §7 | Atomic rename + fsync; journal `fdatasync` | 1 |
+| §7 | Fail closed on unknown schema, corruption, identity mismatch, **residual runtime state** | 1 |
+| §7 | Fail closed *requests reconciliation* | 8 (contradiction trigger) + 6 (pull) |
+| §7 | Production requires `auth.mode=required` | **precondition of this ladder**, not out of scope — defect 4 |
+| §7 | Legacy `job<id>/` and `.spur_step_<id>` are scratch only; remove only when no obligation remains | 7 |
+| §7 | Open scripts before dropping privileges rather than widening trusted directories | 1 |
+| §7 | No local database unless measured node-scale workloads require it | 1 — file store, as specified |
+| §8 | Launch carries identity, exact resources, issue time, fixed expiry | 4 |
+| §8 | Agent checks expiry, `reject_before`, digest, local overlap; persists before acknowledging | 1, 4 |
+| §8 | Durable job Prolog, then create or reconnect to the supervisor | 1, 2 |
+| §8 | On exit `spurstepd` autonomously terminates siblings, cleans, runs the epilog when owner; does not wait for Clean | 754, owner clause enforced in 7 |
+| §8 | Controller commits cleanup completion before allocation release | 7 |
+| §8 | Whole-run cancel/requeue sends a monotonic `reject_before` | 4 |
+| §8 | Fence persisted before acknowledgement; a delayed launch at or before the cutoff is rejected | 4 |
+| §8 | Participant-only Stop/Clean does not fence siblings or release the run | 4 |
+| §8 | Missing completion causes idempotent retry or a requested snapshot | 7a, 6 |
+| §8 | Uncertain execution stays `unknown`; resources held until reconciliation or fencing | 3 |
+| §9 | Choose the fixed launch lifetime | 4 — 120 s |
+| §9 | Choose the garbage-collection delay | 1 — 1 h default retention |
+| §9 | Choose the clock-rollback guard | 4 — warn and metric, never refuse |
+| §9 | Snapshot chunk size and retry policy | **deferred** with chunking |
+| §9 | Per-node limit | 6 — 4 MiB cap |
+| §9 | Cluster-wide recovery concurrency | 6 — √n, min 8, max 64 |
+| §9 | Permanent node loss: trusted fencing or deregistration; timeout alone is not confirmation | **deferred** — needs its own design. Commit 3 therefore keeps no timeout backstop |
+| §9 | Append protobuf fields with new tags; keep persisted Raft fields backward-readable | throughout; see the breaking-change table |
+| §9 | Task hooks run once per task under the job UID/GID and persist their result | **deferred** — independent of reconciliation |
+| §9 | Required tests, all ten categories | see Testing |
+| Impl | Heartbeat: small periodic liveness push now; controller-paced polling later | 6 |
+| Impl | Registration establishes the agent session and triggers the snapshot handshake | 5 |
+| Impl | Agent-local state root with separate namespaces keyed by identity | 1, partly deferred |
+| Impl | Atomic records, immutable launch input, descriptors, journals, expiry, fences, GC, claim reconstruction | 1, 2, 4 |
+| Impl | Snapshot transfer and acknowledgement; resume pending starts and reports; release only after the commit | 5, 6, 2, 7 |
 
 ## Testing
 
-**Unit**
+Organized against §9's ten required categories, then the commit-specific work.
 
-- Derivation is exact: a generated cluster of jobs across nodes, in every
-  lifecycle state, derives the same totals the accumulator reaches by
-  `add`/`subtract`. Differential and mutation-tested — #681 established that a
-  generator keyed on `HashMap` iteration order is not reproducible from its seed,
-  so sort before generating.
-- Derivation charges a node that has not reported completion for a terminal job,
-  and stops charging one that has.
-- A snapshot carrying a drifted `alloc_resources` is corrected on load; an old
-  snapshot without the benefit of derivation still loads.
-- Frozen-fixture round-trip per record, so a later field addition cannot break
-  load (the #509 / #517 pattern).
-- Rebuild-from-run-records is exact where descriptor rebuild under-counts —
-  mutation-tested, since that is the whole point of commit 2.
-- Fence table: stale rejected; higher attempt not fenced; duplicate digest
-  idempotent; conflicting digest rejected; expired rejected. A backward clock is
-  *not* a rejection — it warns and keeps serving.
-- A launch carrying no `expires_at` (pre-upgrade controller) still yields a
-  collectable participant, via the run record's `created_at` plus a default
-  retention.
-- Fail-closed on a corrupt or foreign-node record.
-- Hook left `running` loads as `Unknown` and is not re-run.
-- `boot_id`: a matching boot uses `(pid, start_ticks)` as today; a differing boot
-  settles the record without an exit; and — the gate that matters — an **absent**
-  `boot_id` falls back to `(pid, start_ticks)` and **never** settles a live
-  supervisor. Mutation-test the absent case, since inverting it releases the
-  allocations of running jobs.
-- Gate: no ledger → not gated; ledger → gated → diff → ungated; old-log replay
-  defaults `reconcile_pending` false; a node always leaves the gate.
-- Release-after-ack: no release without acknowledgement; idempotent re-report;
-  `not_found` counts as acknowledgement; recovery completes an
+| §9 category | Coverage |
+| --- | --- |
+| Duplicate **and reordered** commands | duplicate digest idempotent; a launch, fence and re-launch delivered in every order reach the same state |
+| Restart during **each hook phase** | restart during prolog, during the task hooks, and during the epilog; each classifies as `Unknown` and is not re-run |
+| Stale fences | stale launch rejected; higher attempt not fenced; fence survives restart |
+| Corrupt records | fail closed on corrupt, foreign-node, and residual runtime state; a conflict hold is taken and the record is not collected |
+| Snapshot retry / duplication | a duplicate ledger is idempotent; a cut from a stale agent session is discarded |
+| **Leader change** | commit 0 recomputes on leadership gain; commit 6 pulls on leadership gain; a job dispatched across a failover is not double-charged |
+| Mixed versions | pre-upgrade agent not gated; pre-upgrade launch with no `expires_at` still ages out; old-log replay defaults `reconcile_pending` false; a session with no admission record falls back to descriptor replay |
+| **Multi-step shared allocations** | two steps of one run share the run's slice without tripping the overlap check, and commit 8 does not cancel either |
+| **Permanent node loss** | a node that never returns holds its claims; nothing releases on timeout alone |
+| **Large-cluster recovery** | many nodes gated simultaneously after a controller restart clear the gate within the pull concurrency bound, without a herd |
+
+Commit-specific:
+
+- **Commit 0 is carried by its differential test, not by review.** A generated
+  cluster of jobs across nodes, in every lifecycle state, must derive the same
+  totals the accumulator reaches by `add`/`subtract`. Mutation-tested. Sort before
+  generating — #681 established that a generator keyed on `HashMap` iteration
+  order is not reproducible from its seed.
+- Derivation charges a node of an active job that has not reported completion, and
+  does **not** charge any node of a finalized job — the case the earlier formula
+  got backwards.
+- A snapshot carrying a drifted `alloc_resources` is corrected on load.
+- Frozen-fixture round-trip for every record, **including `StepdDescriptor`**,
+  which has none today.
+- Rebuild-from-run-records is exact where descriptor rebuild under-counts.
+  Mutation-tested.
+- `boot_id`: matching boot behaves as today; differing boot settles without an
+  exit; **absent boot_id never settles a live supervisor**. Mutation-test the
+  absent case — inverting it releases running jobs' allocations.
+- Release-after-ack: no release without acknowledgement; only the lifecycle owner
+  releases; the epilog is checked explicitly rather than assumed; idempotent
+  re-report; `not_found` counts as acknowledgement; recovery completes an
   acked-but-unreleased session.
-- Refusal reasons map to the correct controller action, one case per row of the
-  commit 8 table.
+- `allocate_for_job` returns `CpusUnavailable` on shortfall and refuses memory
+  over the node total; both callers surface it.
+- Every refusal reason maps to the correct controller action, one case per row.
 
-**pytest e2e**
+**pytest e2e:** agent restart under a live two-node job restores the exact slice;
+cancel-then-late-launch is refused; a registering node does not take work before
+reconcile completes.
 
-- Agent restart under a live two-node job restores the exact slice.
-- Cancel-then-late-launch is refused.
-- A registering node does not take work before reconcile completes.
-
-**Live, two-node lab**
-
-- Controller killed between a job's exit and its completion report: resources stay
-  held, no double-booking, release happens on reconnect.
-- Agent restarted between acknowledgement and release: recovery completes it.
-- Restart slower than the 90 s heartbeat timeout — never tested before, and
-  commits 3, 5 and 7 all touch it.
+**Live, two-node lab:** controller killed between a job's exit and its completion
+report — resources stay held, no double-booking, release on reconnect; agent
+restarted between acknowledgement and release; **restart slower than the 90 s
+heartbeat timeout**, never tested before and touched by commits 3, 5 and 7.
 
 ## Breaking-change posture
 
 | Surface | Status |
 | --- | --- |
-| `WalOperation` | **no new variant anywhere**; none renamed or removed. Commit 9 widens `JobDispatchBackoff`'s apply, which is a no-op on pre-upgrade entries |
-| Persisted state | `Node.reconcile_pending` additive with `#[serde(default)]` |
-| Proto | append-only tags plus new RPCs; nothing renumbered. Commit 9 changes no proto |
+| `WalOperation` | **no new variant anywhere**; none renamed or removed. Commit 9 widens `JobDispatchBackoff`'s apply, a no-op on pre-upgrade entries |
+| Persisted controller state | `Node.reconcile_pending` additive with `#[serde(default)]` |
+| Persisted agent state | new `admission/` records; `StepdDescriptor` gains `boot_id` additively with `#[serde(default)]`, behind a frozen-fixture guard written first |
+| Proto | append-only tags plus new RPCs (`FenceRun`, `RequestNodeLedger`); nothing renumbered. Commit 9 changes no proto |
 | Config | no change |
-| CLI / REST | `squeue` StartTime and the pending reason shift within the dispatch window (commit 9) |
+| CLI / REST | `sinfo`/`scontrol` gain a reconciling reason; `squeue` StartTime and pending reason shift within the dispatch window (commit 9) |
 | Release timing | **changed — commit 7 takes the `!`** (behaviour; the log stays replayable) |
 | Log replay | unchanged in both directions; downgrade can leak a charge, which the reconcile passes catch |
 | 754 sessions | degrade to descriptor replay; in-place upgrade is lossless |
 
-**Commit 7 is the only `!` in the ladder.** Nothing here makes an older
-controller crash replaying a newer log.
+**Commit 7 is the only `!` in the ladder.** Nothing here makes an older controller
+crash replaying a newer log.
 
 ## Open risks
 
 1. **Durable retry (7a).** Get it wrong and a node bleeds capacity permanently
    rather than transiently. Highest test priority.
-2. **Gate deadlock.** Mitigated by not gating agents that send no ledger, and by
-   the diff being local synchronous work — but it needs an explicit test that a
-   node always leaves the gate.
-3. **Commit 3 in isolation would leak.** It removes a release path that 5, 6 and 8
-   replace. The ladder lands together; 3 is not pushed standalone.
-4. **Commit 0 touches `cluster.rs`,** the highest-churn file in the tree and the
-   one my own notes name as the binding constraint on this work. It is also the
-   commit most likely to surface latent disagreements between the accumulator and
-   the job records — which is the point, but it means the differential test is
-   what carries it, not review.
+2. **Gate deadlock.** Mitigated by not gating agents that send no ledger and by
+   the diff being local synchronous work, but it needs an explicit test that a
+   node always leaves the gate — and a herd test, since a controller restart gates
+   every node at once.
+3. **Commit 3 in isolation would strand.** It removes a release path that 5, 6 and
+   8 replace, and deliberately keeps no timeout backstop. The ladder lands
+   together; 3 is not pushed standalone.
+4. **Commit 0 touches `cluster.rs`,** the highest-churn file and the binding
+   constraint on this work. It is also the commit most likely to surface latent
+   disagreements between the accumulator and the job records — which is the point,
+   but the differential test is what carries it.
+5. **`auth.mode=required` is a precondition, not a follow-up** (defect 4). Shipping
+   this ladder onto an open-admission cluster widens what an unauthenticated
+   caller can do.
 
 ## Process note
 
-An earlier revision of this plan missed five spec requirements — the
-reconcile-on-contradiction behaviour, the leader-failover and operator-audit
-triggers, the `Unknown` hook rule, and the clock-rollback guard. The cause was
-converting the spec into an artifact-shaped gap table (paths, schemas, RPCs) and
-then working from that table instead of the source, so requirements expressed as
-*behaviours* had no row and fell out. The traceability matrix above exists to
-prevent a repeat and is checked before each commit.
+Two earlier revisions of this document each missed a class of requirement.
+
+The first missed five, by converting the spec into an artifact-shaped gap table —
+paths, schemas, RPCs — and planning from the table rather than the source, so
+requirements expressed as *behaviours* had no row.
+
+The second built a matrix, but organized it around commits with spec sections
+attached rather than a walk of the spec. An adversarial audit found roughly twenty
+further gaps, and §1, §3 and §4 had no rows at all. It also found four factual
+claims about the code that were false — a non-existent `HookState`, frozen-fixture
+coverage that belonged to a different record, a state root the controller does not
+actually read, and a derivation formula that would have charged every node of
+every terminal job without bound.
+
+The matrix above is built by walking the spec top to bottom and attaching commits
+second, which is the only ordering whose completeness claim can be true. The
+lesson underneath both failures is the same: assertions about the code are
+findings, to be read out of the source, not recalled.
