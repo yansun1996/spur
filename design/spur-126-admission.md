@@ -95,6 +95,9 @@ struct RunAdmission {                     // admission/<job>.<attempt>/run.json
     job_id: u32, run_attempt: u32, node: String,      // node verified on load
     allocation: AdmittedResources,                     // cpu_ids, memory_mb, gpu_devices
     state: RunState,                                   // Admitted|Running|Cleaning|Cleaned
+    created_at_unix_ms: u64,                           // agent wall clock at admission
+    created_at_boot_ticks: u64,                        // boot-relative, as process_start_ticks
+    boot_id: String,                                   // whether boot_ticks are comparable
     reject_before_unix_ms: u64,
     max_launch_expiry_unix_ms: u64,
     clock_high_water_unix_ms: u64,                     // rollback guard
@@ -109,7 +112,11 @@ struct ParticipantAdmission {             // admission/<job>.<attempt>/participa
     job_id: u32, run_attempt: u32, step_id: StepId, node: String,
     command_digest: String,                            // sha256 of the resolved command
     allocation_subset: AdmittedResources,
-    issued_at_unix_ms: u64, expires_at_unix_ms: u64,
+    issued_at_unix_ms: u64,                            // controller's, for cross-node agreement
+    admitted_at_unix_ms: u64,                          // agent's own
+    admitted_at_boot_ticks: u64,
+    expires_at_unix_ms: u64,                           // absolute, controller-computed
+    expire_after_ms: u64,                              // duration, agent-enforceable
     admission_state: AdmissionState,
     pending_start: bool,                               // 754's start gate, not yet opened
     supervisor: Option<SupervisorRef>,                 // pid + start_ticks
@@ -119,6 +126,27 @@ struct ParticipantAdmission {             // admission/<job>.<attempt>/participa
 
 Only `spuid` is omitted relative to the spec; `controller_ack` is real because
 commit 7 makes the Raft log index available.
+
+### Time, and why every record carries three stamps
+
+`issued_at` is the *controller's* clock but the agent enforces the deadline, so an
+absolute deadline alone spans two clocks with one guard. Each record therefore
+carries its own creation stamp in both wall and boot-relative form, plus the
+expiry as a **duration** alongside the absolute deadline.
+
+**Enforcement:** when `boot_id` matches the current boot, expire against
+`boot_ticks + expire_after_ms` — monotonic, and immune to NTP steps or VM
+restores. Otherwise fall back to wall clock guarded by `clock_high_water_unix_ms`.
+This demotes the clock-rollback guard from sole defence to fallback.
+`process_start_ticks` already uses boot-relative ticks, so the pattern is in-tree.
+
+**Named trap:** `boot_id` must never read as *changed* when it is merely *absent*.
+A missing string defaults to `""`, and `"" != previous` looks like a reboot, which
+would evict everything on the node. Absent means "no evidence", never "changed".
+
+A creation stamp also gives every record an age, which fixes run records that
+never received a launch expiry and so could never be collected, and lets 754's
+directory-`mtime` `ORPHAN_RETENTION` fallback go away.
 
 **Admission order** (§7): hold the admission lock → persist `run.json` → persist
 the participant → update the in-memory claim index → acknowledge. Processes start
@@ -306,6 +334,41 @@ SPUR-124 dispatch hot-loop shape.
 Depends on 4 (which creates the refusal reasons) and 1 (which supplies the
 conflicting entry).
 
+### 9 — `feat(spurctld)!: commit the placement before dispatching it`
+
+**Verified ordering today** (`scheduler_loop.rs:468-470`): `LaunchJob` is sent and
+the agent reserves and spawns *before* `cluster.start_job()` proposes
+`JobStateChange` + `JobStart`. The comment is explicit — the Running transition is
+"reached only once every assigned node has confirmed". 754 mitigated the visible
+symptom with the start gate and by absorbing a repeat `LaunchJob` for a tracked
+`(job, step, attempt)`, but **the allocation is still reserved on the agent before
+Raft records it**, which §2 forbids.
+
+Failure mode: leader failover between the two. The new leader sees the job as
+Pending and redispatches. Absorb-repeat covers same-node/same-attempt; it does not
+cover redispatch to a *different* node, which leaves node A holding a phantom
+reservation.
+
+Commits 5, 6 and 8 **repair** that within 30 s. Commit 9 **prevents** it:
+reserve-before-launch, activate-after-confirm, plus an abort guard on every
+non-Activate exit from `process_assignment`.
+
+**This is the only commit that adds a `WalOperation` variant**, and that is a
+different severity from commit 7's `!`:
+
+| | Effect |
+| --- | --- |
+| Commit 7 (behaviour break) | an old controller can still replay a new log; binary rollback works |
+| Commit 9 (state break) | an old controller crashes replaying a new log; no rollback without wiping state |
+
+The mitigation is already paid for: 754 already mandates an empty cluster for
+upgrade ("Drain every node and let jobs finish or cancel them before swapping
+binaries"), so a state break rides a cutover window this branch already requires.
+It does not add a second one.
+
+Sequenced last so the branch remains coherent and shippable if it stops at 8. The
+abort guard is the risky part and needs commit 8's refusal plumbing regardless.
+
 ## Spec traceability
 
 Every requirement in the spec gets a row. Deferred items get a reason, not silence.
@@ -315,7 +378,9 @@ Every requirement in the spec gets a row. Deferred items get a reason, not silen
 | §2 | Duplicate, delayed, reordered commands safe | 4 |
 | §2 | Restart / missing in-memory entry is not confirmation | 3 |
 | §2 | Cleanup is participant-scoped; release needs the final participant + epilog | 754, strengthened by 7 |
-| §2 | Exact participant and CPU/GPU committed before dispatch | **deferred** — the reserve-before-launch cutover |
+| §2 | Exact participant and CPU/GPU committed before dispatch | 9 |
+| §9 | Clock-rollback guard demoted to fallback by boot-relative expiry | 1, 4 |
+| §9 | Garbage-collection delay — every record carries an age | 1 |
 | §5 | Conflicting identities, digests, deadlines, allocations rejected | 4 |
 | §5 | Claim index is a local safety check, not scheduler authority | 8 |
 | §5 | `reject_before` monotonic per run | 4 |
@@ -383,13 +448,17 @@ Every requirement in the spec gets a row. Deferred items get a reason, not silen
 
 | Surface | Status |
 | --- | --- |
-| `WalOperation` | no new variant; none renamed or removed |
+| `WalOperation` | none renamed or removed. **Commits 1–8 add no variant; commit 9 adds one** |
 | Persisted state | `Node.reconcile_pending` additive with `#[serde(default)]` |
 | Proto | append-only tags plus new RPCs; nothing renumbered |
 | Config | no change |
 | CLI / REST | no change |
-| Release timing | **changed — commit 7 takes the `!`** |
-| 754 sessions | degrade to descriptor replay; in-place upgrade is lossless |
+| Release timing | **changed — commit 7 takes the `!`** (behaviour: rollback still works) |
+| Log replay | **changed — commit 9 takes the `!`** (state: an old controller crashes on a new log) |
+| 754 sessions | degrade to descriptor replay; in-place upgrade is lossless through commit 8 |
+
+Stopping at commit 8 keeps the log replayable by an older controller. Commit 9 is
+the line where that stops being true, which is why it is last and separable.
 
 ## Open risks
 
