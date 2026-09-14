@@ -113,7 +113,7 @@ struct ParticipantAdmission {             // admission/<job>.<attempt>/participa
     expires_at_unix_ms: u64,                           // controller's, respected as delivered
     admission_state: AdmissionState,
     pending_start: bool,                               // 754's start gate, not yet opened
-    supervisor: Option<SupervisorRef>,                 // pid + start_ticks
+    supervisor: Option<SupervisorRef>,                 // pid + start_ticks + boot_id
     final_report: FinalReport,                         // required / acknowledged
 }
 ```
@@ -159,15 +159,50 @@ before any expiry was set — such a record otherwise has no age at all and can
 never be collected. It replaces 754's directory-`mtime` `ORPHAN_RETENTION`
 fallback, which any touch resets.
 
-Boot-relative stamps and a `boot_id` were considered and rejected: boot ticks can
-only measure locally originated durations, so they cannot be compared against a
+Boot-relative *timestamps* were considered and rejected: boot ticks can only
+measure locally originated durations, so they cannot be compared against a
 controller-supplied absolute deadline, and they were only ever the mechanism for
-the duration-based expiry rejected above. `boot_id`'s one genuine use is reboot
-detection in the inventory, where `inventory_complete` already carries the
-assertion that made it useful — and it ships a footgun, since an absent value
-defaults to `""` and `"" != previous` reads as a reboot, which would evict
-everything on the node. If commit 5 or 6 needs it, it is added there on its own
-merits.
+the duration-based expiry rejected above. `boot_id` is kept, but for an unrelated
+reason — see below. It is not reboot detection for the controller;
+`inventory_complete` already carries that assertion.
+
+### `boot_id` scopes supervisor identity
+
+A supervisor is identified by `(pid, process_start_ticks)`, and `stepd_liveness`
+(`stepd.rs:2701`) declares it **Live** on that pair matching. But
+`process_start_ticks` reads field 22 of `/proc/pid/stat` (`stepd.rs:2670`), which
+is *time the process started after system boot, in clock ticks* — **boot
+relative**. The pair is therefore unique only *within a boot*, while the spool
+survives reboot, so `discover_live()` does compare across boots.
+
+A cross-boot collision needs the pid counter to land on the same value *and* the
+new process to start at the same tick offset, so it is unlikely. The severity is
+what justifies the field: a false `Live` makes the agent adopt a phantom, report
+the job as **running**, hold its allocation, and never settle it. That is the one
+failure mode where the evidence channel actively lies rather than saying
+"unknown", and every reconcile path here trusts the agent's liveness answer.
+
+This is a **pre-existing hazard**, not one introduced here; `stepd_liveness` has
+it today.
+
+Recording `boot_id` alongside the pair also settles the routine case. After a
+reboot nothing from before survives — no supervisors, no cgroups, no processes —
+so a record whose boot differs is *definitively* dead rather than `unknown`.
+Without it, every such record hits commit 3's hold rule and a rebooted node comes
+up holding its entire prior capacity as unknown claims, blocked at the
+registration gate until the controller has reconciled each one.
+
+**Rule, and it is a test gate: an absent `boot_id` means "not comparable", never
+"changed".** It falls back to `(pid, start_ticks)` alone, which is exactly today's
+behaviour. Treating absent as changed would invert the logic — live supervisors
+would be declared dead, their records settled, their allocations released, and the
+node double-booked. Absence arises only from records written by a pre-upgrade
+agent, so it is bounded to one upgrade generation.
+
+The field is added to `ParticipantAdmission.supervisor` and, additively with
+`#[serde(default)]`, to 754's `StepdDescriptor`, which carries the same pair and
+the same hazard. That record already has frozen-fixture coverage
+(`stepd.rs:2757-2900`), which is the guard for exactly this kind of addition.
 
 **Admission order** (§7): hold the admission lock → persist `run.json` → persist
 the participant → update the in-memory claim index → acknowledge. Processes start
@@ -209,6 +244,20 @@ Descriptors continue to answer liveness; run records answer entitlement.
 
 A session with no admission record falls back to 754's descriptor replay, which
 is what makes an in-place upgrade over a live 754 node lossless.
+
+The restart cross-check between the two trees:
+
+| Found | Meaning | Action |
+| --- | --- | --- |
+| record + live supervisor | running | adopt; hold the claim |
+| record + dead supervisor + recorded exit | settled | carry the exit, release |
+| record from a **different boot** | definitively dead | settle locally — nothing survived the reboot |
+| record + dead supervisor, no exit | **unknown** | **hold the claim, release nothing** (commit 3's rule) |
+| live supervisor, no record | pre-upgrade session | fall back to 754's descriptor replay |
+| record unreadable, or a foreign `node` | corrupt | fail closed: hold, mark the inventory incomplete |
+
+Only the different-boot row can settle without evidence of an exit, and only
+because a reboot leaves nothing behind to be uncertain about.
 
 *spurd only.*
 
@@ -448,6 +497,7 @@ Every requirement in the spec gets a row. Deferred items get a reason, not silen
 | §7 | Atomic rename + fsync; journal `fdatasync`; 0700/0600 | 1 |
 | §7 | Fail closed on unknown schema, corruption, identity mismatch | 1 |
 | §7 | Hook left `running` after its owner dies becomes `Unknown`, never auto-rerun | 1 |
+| — | Supervisor identity scoped to its boot (`process_start_ticks` is boot-relative) | 1, 2 — pre-existing hazard in 754 |
 | §7 | Separate agent state root | **deferred** — `admission/` is a disjoint sibling of `raft/`; deferring removes a config change from the diff |
 | §7 | `auth.mode=required` in production | **out of scope** — flagged; the fences are not authorization |
 | §8 | Launch expiry; participant-only Stop/Clean does not fence siblings | 4, partly 754 |
@@ -475,6 +525,11 @@ Every requirement in the spec gets a row. Deferred items get a reason, not silen
   retention.
 - Fail-closed on a corrupt or foreign-node record.
 - Hook left `running` loads as `Unknown` and is not re-run.
+- `boot_id`: a matching boot uses `(pid, start_ticks)` as today; a differing boot
+  settles the record without an exit; and — the gate that matters — an **absent**
+  `boot_id` falls back to `(pid, start_ticks)` and **never** settles a live
+  supervisor. Mutation-test the absent case, since inverting it releases the
+  allocations of running jobs.
 - Gate: no ledger → not gated; ledger → gated → diff → ungated; old-log replay
   defaults `reconcile_pending` false; a node always leaves the gate.
 - Release-after-ack: no release without acknowledgement; idempotent re-report;
