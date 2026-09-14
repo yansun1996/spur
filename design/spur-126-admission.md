@@ -380,15 +380,23 @@ Restart cross-check between the two trees:
 | Found | Meaning | Action |
 | --- | --- | --- |
 | record + live supervisor | running | adopt; hold the claim |
-| record + dead supervisor + recorded exit | settled | carry the exit, release |
-| record from a **different boot** | definitively dead | settle locally — nothing survived the reboot |
+| record + dead supervisor + recorded exit | settled | report the exit; release on the acknowledgement |
+| record from a **different boot** | definitively dead | report as dead with no exit; release on the acknowledgement |
 | record + **pending start**, no supervisor | admitted, never spawned | classify as pending (§7); do not treat as running or as finished |
 | record + dead supervisor, no exit | **unknown** | **hold the claim, release nothing** (commit 3's rule) |
 | live supervisor, no record | pre-upgrade session | fall back to 754's descriptor replay |
 | record unreadable, foreign `node`, or residual runtime state | corrupt | fail closed: hold, take a conflict hold, request reconciliation |
 
-Only the different-boot row settles without evidence of an exit, and only because
-a reboot leaves nothing to be uncertain about.
+**No row releases locally.** What the evidence buys is the *content* of the
+report, not permission to act on it: a recorded exit reports an exit code, a
+differing boot reports a definite death with no exit code, and only the "dead
+supervisor, no exit" row has to report `unknown`. All three then wait for the
+acknowledgement, because the invariant admits no exception — an earlier revision
+had the first two releasing locally, which contradicted commit 7.
+
+The different-boot row is the only one that can report *definitively* without
+evidence of an exit, and only because a reboot leaves nothing to be uncertain
+about.
 
 A session with no admission record falls back to 754's descriptor replay, which
 makes an in-place upgrade over a live 754 node lossless — so §7's "claims rebuilt
