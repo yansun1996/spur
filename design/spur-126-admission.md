@@ -862,6 +862,47 @@ heartbeat timeout**, never tested before and touched by commits 3, 5 and 7.
 **Commit 7 is the only `!` in the ladder.** Nothing here makes an older controller
 crash replaying a newer log.
 
+## Upgrade and rollback
+
+**Drain the cluster. Do not wipe it.** Those are different operations and only the
+first is required.
+
+| | Keeps | Loses |
+| --- | --- | --- |
+| Drain + in-place binary swap | Raft state — nodes, partitions, QOS, reservations, tokens, k0s, job records — and PostgreSQL accounting | nothing |
+| Fresh install | PostgreSQL accounting, which is a separate database | every partition, QOS, reservation, node registration and token |
+
+**The drain requirement comes from PR 754, not from this ladder.** 754 already
+states that the upgrade needs an empty cluster: its sessions are not adopted by
+the new build, the two builds disagree on where a step's processes live, and a new
+controller dispatching to a not-yet-upgraded agent tears the job down. Every
+controller and agent moves in one window, and `spur_mpi_pmix.so` is replaced at the
+same time.
+
+This ladder adds nothing to that. Keeping it in-place upgradeable is why no commit
+introduces a `WalOperation` variant. The drain also makes most of its
+compatibility paths moot in practice — with no 754 sessions there is nothing for
+the descriptor-replay fallback to catch, no old descriptors for `boot_id` absence
+to arise from, and no running jobs for commit 7's release timing to affect.
+
+**One reason to drain is this ladder's own.** Commit 0 recomputes
+`alloc_resources` on load. On a cluster with live drift that can *lower* a node's
+charge — correctly, per the job records — while a process is still running there.
+Draining means the first derivation runs against a quiescent cluster, so every
+correction it makes is real.
+
+**Rollback is available, which is the argument against wiping.** No type in the
+workspace uses `serde(deny_unknown_fields)`, so an older controller reading a newer
+snapshot ignores `reconcile_pending` and an older agent reading a newer descriptor
+ignores `boot_id`. No new `WalOperation` variant means an older controller replays
+a newer log. The one asymmetry is commit 9's `JobDispatchBackoff` extension: a
+downgrade does not deallocate, leaking a charge that the reconcile passes catch.
+A fresh install discards that safety net for nothing — if the upgrade goes badly
+the wanted state is the old binary with the existing data, not an empty cluster.
+
+Fresh install is the right call for lab and development clusters, where the state
+has no value.
+
 ## Open risks
 
 1. **Durable retry (7a).** Get it wrong and a node bleeds capacity permanently
