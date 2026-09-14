@@ -76,13 +76,17 @@ These were verified against the code, not inferred.
    directory lands at umask default. The Raft log contains submitted batch scripts
    and job environments. Spec §7 explicitly requires the same 0700 restriction
    there as on the agent spool. Pre-existing; fixed in commit 1.
-4. **SECURITY — this ladder increases the blast radius of unauthenticated agent
-   RPCs.** Today an unauthenticated caller can inject a launch. After commit 5
-   (an asserted-empty ledger causes eviction) and commit 8 (an overlap refusal
-   causes the controller to cancel the named job), it can also cause releases,
-   evictions and cancellations — because this design elevates agent statements to
-   evidence the controller acts on. `auth.mode=required` is therefore a
-   precondition of the ladder, not an unrelated hardening item.
+4. **SECURITY — two new destructive actions must be gated on a proven caller.**
+   This design elevates agent statements to evidence the controller acts on, and
+   two of those actions destroy work: commit 5's direction B evicts on an
+   asserted-empty ledger, and commit 8's overlap row cancels the job the agent
+   names. Under `AuthMode::Permissive` — the **default** (`spur-core/config.rs:732`)
+   — `require_controller` admits an unauthenticated caller, so those would be
+   reachable without proving anything.
+   Gated by extending 754's existing rule rather than inventing one: it already
+   distinguishes `StepdReporter::Unproven` (`spurctld/server.rs:502`), accepting a
+   report so a live supervisor is not dropped while refusing to let an unproven
+   caller fence. See "Behaviour under permissive auth" below.
 5. **`finalized_obligations` is a read-time predicate, not an append-time gate**
    (`spurd/stepd.rs:892-912`). It orders only `ExitObserved → CompletionAcknowledged`;
    `EpilogCompleted` falls into an ignore arm and participates in neither the
@@ -240,6 +244,35 @@ are state-based.
 | Controller→agent pull concurrency | √(node count), min 8, max 64 |
 | Routine pull sweep | 1 h |
 | Per-node ledger message cap | 4 MiB, below the default gRPC limit |
+
+### Behaviour under permissive auth
+
+**A cluster with no authentication configured keeps working.** `AuthMode::Permissive`
+is the default because flipping an existing cluster to `Required` locks out every
+client at once, and nothing in this ladder needs a credential to *function*. What
+changes is that the two destructive reconcile actions require a proven caller,
+extending 754's `Unproven` rule rather than adding a new mechanism.
+
+| Action | Unproven (permissive) | Proven (token admission) |
+| --- | --- | --- |
+| Accept the ledger and record it | yes | yes |
+| Hold claims; take conflict holds | yes | yes |
+| Log and metric drift in directions A, B and C | yes | yes |
+| **Clear the reconcile gate** | **yes** | yes |
+| Evict on direction B (asserted-absent) | **no** — logged for an operator | yes |
+| Cancel on direction A | **no** — logged | yes |
+| Cancel the named job on commit 8's overlap | **no** — refuse the dispatch only | yes |
+| Release on a completion acknowledgement | yes — the agent releases its own claim | yes |
+
+The gate must clear under permissive, or a cluster with no authentication would
+deadlock every node at registration. Commit 7 adds no exposure of its own: it
+rides the existing completion-report path, whose trust properties are unchanged.
+
+**The degradation is the point.** Permissive gets *visibility* — drift is detected,
+logged and metriced instead of silently accumulating. Token admission additionally
+gets *automatic repair*. Both are strictly better than today, where the drift is
+invisible in either mode. `auth.mode=required` is the configuration under which
+this design does the most, not a gate on shipping it.
 
 ### `boot_id` scopes supervisor identity
 
@@ -687,7 +720,7 @@ missing.
 | §7 | Atomic rename + fsync; journal `fdatasync` | 1 |
 | §7 | Fail closed on unknown schema, corruption, identity mismatch, **residual runtime state** | 1 |
 | §7 | Fail closed *requests reconciliation* | 8 (contradiction trigger) + 6 (pull) |
-| §7 | Production requires `auth.mode=required` | **precondition of this ladder**, not out of scope — defect 4 |
+| §7 | Production requires `auth.mode=required` | 5, 8 — permissive keeps working; the two destructive reconcile actions are gated on a proven caller. See "Behaviour under permissive auth" |
 | §7 | Legacy `job<id>/` and `.spur_step_<id>` are scratch only; remove only when no obligation remains | 7 |
 | §7 | Open scripts before dropping privileges rather than widening trusted directories | 1 |
 | §7 | No local database unless measured node-scale workloads require it | 1 — file store, as specified |
@@ -759,6 +792,11 @@ Commit-specific:
 - `allocate_for_job` returns `CpusUnavailable` on shortfall and refuses memory
   over the node total; both callers surface it.
 - Every refusal reason maps to the correct controller action, one case per row.
+- Permissive auth: a cluster with no authentication configured registers,
+  reconciles, **clears the gate** and runs work; direction B does not evict and
+  commit 8's overlap does not cancel, both logging instead; the same cases under
+  token admission do act. The gate-clears case is the one that would deadlock a
+  default-configured cluster, so it is mutation-tested.
 
 **pytest e2e:** agent restart under a live two-node job restores the exact slice;
 cancel-then-late-launch is refused; a registering node does not take work before
@@ -801,9 +839,12 @@ crash replaying a newer log.
    constraint on this work. It is also the commit most likely to surface latent
    disagreements between the accumulator and the job records — which is the point,
    but the differential test is what carries it.
-5. **`auth.mode=required` is a precondition, not a follow-up** (defect 4). Shipping
-   this ladder onto an open-admission cluster widens what an unauthenticated
-   caller can do.
+5. **Under permissive auth the repair loop is open** (defect 4). A cluster with no
+   authentication configured keeps working and gains detection, but the two
+   destructive actions stay gated, so drift that token admission repairs
+   automatically waits on an operator. The risk is that the logs and metrics go
+   unwatched and the drift accumulates anyway — so the permissive path needs the
+   metric to be prominent, not buried.
 
 ## Process note
 
