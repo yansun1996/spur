@@ -594,10 +594,34 @@ agents that advertise it.
 
 Three things ship with it, all load-bearing:
 
-- **(a) The completion report becomes a durable, indefinitely retried obligation**,
-  driven from the obligations log and surviving agent restarts. Today's bounded
-  budget with immediate give-up on `not_found` / `invalid_argument` would strand a
-  node's resources permanently. The largest risk in the change.
+- **(a) The completion report becomes a durable, indefinitely retried obligation.**
+  This is the mitigation for the risk the change creates, not a nicety: after this
+  commit the report is the *only* thing that unlocks a slice, so any path that
+  drops it holds those CPUs, GPUs and memory forever, and the record that holds
+  them is on disk so a restart does not clear it. The node shrinks monotonically.
+  Today's `retry_controller_rpc` does drop it — a bounded attempt budget, and
+  `not_found` / `invalid_argument` give up on the first try
+  (`agent_server.rs:3436`, `:3990`). That is survivable now only because the agent
+  releases regardless.
+
+  Specifically:
+
+  - **The obligation is durable, and the record is the driver.** An outstanding
+    report is `ExitObserved` present in the obligations log without a following
+    `CompletionAcknowledged`, mirrored by `final_report.acknowledged == false` on
+    the participant. Discovery scans for that pair; there is no in-memory queue
+    whose loss matters.
+  - **Retry is unbounded in attempts, bounded in rate** — exponential backoff with
+    jitter, capped at 60 s, forever. No attempt budget.
+  - **It resumes at agent startup**, alongside the pending-start classification in
+    commit 2, satisfying §7's "resume pending starts and reports after restart".
+  - **No status ends the obligation except an acknowledgement.** `not_found` is an
+    acknowledgement by (c). Anything else — including `invalid_argument`, which
+    today gives up immediately — keeps retrying. A report the controller can never
+    accept therefore retries at the capped interval indefinitely while continuing
+    to hold, which is the correct fail-closed direction but must not be silent: it
+    emits a dedicated metric and a rate-limited error naming the job, so an
+    operator sees a stuck obligation rather than a slowly shrinking node.
 - **(b) The acknowledgement is idempotent** — re-reporting an already-committed
   completion returns success, so a lost *response* does not strand.
 - **(c) "I have no record of this job" is an acknowledgement**, reusing
@@ -822,6 +846,17 @@ Commit-specific:
   releases; the epilog is checked explicitly rather than assumed; idempotent
   re-report; `not_found` counts as acknowledgement; recovery completes an
   acked-but-unreleased session.
+- **Durable retry (7a), the highest-value tests in the ladder** — each one covers
+  a way the pre-7a code would have dropped the report:
+  - a report failing far past the old attempt budget still succeeds when the
+    controller returns;
+  - `invalid_argument` does **not** end the obligation, unlike today;
+  - the obligation survives an agent restart mid-retry, rediscovered from
+    `ExitObserved` without `CompletionAcknowledged` rather than from memory;
+  - backoff is capped, so a long outage does not become a hot loop;
+  - a permanently unacceptable report keeps holding **and** raises its metric —
+    mutation-test the metric, since a silent stuck obligation is the failure this
+    is meant to make visible.
 - `allocate_for_job` returns `CpusUnavailable` on shortfall and refuses memory
   over the node total; both callers surface it.
 - Every refusal reason maps to the correct controller action, one case per row.
@@ -905,8 +940,13 @@ has no value.
 
 ## Open risks
 
-1. **Durable retry (7a).** Get it wrong and a node bleeds capacity permanently
-   rather than transiently. Highest test priority.
+1. **Durable retry (7a) is the mitigation, so the risk is implementing it wrong.**
+   Commit 7 makes the completion report the only thing that unlocks a slice, and
+   7a is what makes that report un-droppable. Every gap in it — a surviving
+   attempt budget, a status treated as terminal, an in-memory queue lost on
+   restart — converts a transient failure into a node that bleeds capacity
+   permanently. Highest test priority, and the reason the 7a tests are enumerated
+   individually rather than folded into the release-after-ack case.
 2. **Gate deadlock.** Mitigated by not gating agents that send no ledger and by
    the diff being local synchronous work, but it needs an explicit test that a
    node always leaves the gate — and a herd test, since a controller restart gates
