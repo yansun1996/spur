@@ -95,9 +95,7 @@ struct RunAdmission {                     // admission/<job>.<attempt>/run.json
     job_id: u32, run_attempt: u32, node: String,      // node verified on load
     allocation: AdmittedResources,                     // cpu_ids, memory_mb, gpu_devices
     state: RunState,                                   // Admitted|Running|Cleaning|Cleaned
-    created_at_unix_ms: u64,                           // agent wall clock at admission
-    created_at_boot_ticks: u64,                        // boot-relative, as process_start_ticks
-    boot_id: String,                                   // whether boot_ticks are comparable
+    created_at_unix_ms: u64,                           // agent wall clock — GC age and audit
     reject_before_unix_ms: u64,
     max_launch_expiry_unix_ms: u64,
     clock_high_water_unix_ms: u64,                     // rollback guard
@@ -112,11 +110,8 @@ struct ParticipantAdmission {             // admission/<job>.<attempt>/participa
     job_id: u32, run_attempt: u32, step_id: StepId, node: String,
     command_digest: String,                            // sha256 of the resolved command
     allocation_subset: AdmittedResources,
-    issued_at_unix_ms: u64,                            // controller's, for cross-node agreement
-    admitted_at_unix_ms: u64,                          // agent's own
-    admitted_at_boot_ticks: u64,
-    expires_at_unix_ms: u64,                           // absolute, controller-computed
-    expire_after_ms: u64,                              // duration, agent-enforceable
+    issued_at_unix_ms: u64,                            // controller's
+    expires_at_unix_ms: u64,                           // controller's, respected as delivered
     admission_state: AdmissionState,
     pending_start: bool,                               // 754's start gate, not yet opened
     supervisor: Option<SupervisorRef>,                 // pid + start_ticks
@@ -127,26 +122,44 @@ struct ParticipantAdmission {             // admission/<job>.<attempt>/participa
 Only `spuid` is omitted relative to the spec; `controller_ack` is real because
 commit 7 makes the Raft log index available.
 
-### Time, and why every record carries three stamps
+### Time
 
-`issued_at` is the *controller's* clock but the agent enforces the deadline, so an
-absolute deadline alone spans two clocks with one guard. Each record therefore
-carries its own creation stamp in both wall and boot-relative form, plus the
-expiry as a **duration** alongside the absolute deadline.
+**The controller's deadline is respected as delivered.** Expiry exists to bound
+staleness *including transit*, so a duration measured from local admission would
+hand a launch delayed in the network a full fresh window — weakening the very
+guarantee expiry provides. One clock domain owns the decision.
 
-**Enforcement:** when `boot_id` matches the current boot, expire against
-`boot_ticks + expire_after_ms` — monotonic, and immune to NTP steps or VM
-restores. Otherwise fall back to wall clock guarded by `clock_high_water_unix_ms`.
-This demotes the clock-rollback guard from sole defence to fallback.
-`process_start_ticks` already uses boot-relative ticks, so the pattern is in-tree.
+The two checks are not equally exposed to clock skew, and an earlier revision of
+this document conflated them:
 
-**Named trap:** `boot_id` must never read as *changed* when it is merely *absent*.
-A missing string defaults to `""`, and `"" != previous` looks like a reboot, which
-would evict everything on the node. Absent means "no evidence", never "changed".
+| Check | Compares | Agent's clock involved? |
+| --- | --- | --- |
+| Fence (`reject_before`) | launch's `issued_at` vs `reject_before` — both controller-stamped | **no; clock-independent** |
+| Expiry | agent's now vs `expires_at` | yes, inherently cross-clock |
 
-A creation stamp also gives every record an age, which fixes run records that
-never received a launch expiry and so could never be collected, and lets 754's
-directory-`mtime` `ORPHAN_RETENTION` fallback go away.
+So an agent clock jump cannot un-fence a cancelled run. What remains is a backward
+jump letting a stale launch expire late — but that launch was issued by the
+controller and has not been fenced, so it is work the controller wants. Low harm.
+
+`clock_high_water_unix_ms` therefore stays as a cheap sanity guard rather than
+load-bearing machinery: a clock reading below the highest value ever recorded
+means something is badly wrong, and refusing to admit is the right failure.
+
+`created_at_unix_ms` exists for garbage collection and audit, not for expiry
+enforcement. It is what gives a run record an age even when its launch aborted
+before any expiry was set — such a record otherwise has no age at all and can
+never be collected. It replaces 754's directory-`mtime` `ORPHAN_RETENTION`
+fallback, which any touch resets.
+
+Boot-relative stamps and a `boot_id` were considered and rejected: boot ticks can
+only measure locally originated durations, so they cannot be compared against a
+controller-supplied absolute deadline, and they were only ever the mechanism for
+the duration-based expiry rejected above. `boot_id`'s one genuine use is reboot
+detection in the inventory, where `inventory_complete` already carries the
+assertion that made it useful — and it ships a footgun, since an absent value
+defaults to `""` and `"" != previous` reads as a reboot, which would evict
+everything on the node. If commit 5 or 6 needs it, it is added there on its own
+merits.
 
 **Admission order** (§7): hold the admission lock → persist `run.json` → persist
 the participant → update the in-memory claim index → acknowledge. Processes start
@@ -206,11 +219,11 @@ forever.
   allocation for the same identity is rejected rather than silently relaunched.
 - A higher `run_attempt` is a different run and is never fenced by a lower
   attempt's cutoff.
-- **Clock-rollback guard** (§9). Both fences are wall-clock, so a backward jump
-  (NTP step, VM restore, bad RTC) un-fences every cancelled run and un-expires
-  every stale launch at once — two guards with one shared failure mode. Persist
-  the highest wall-clock value ever observed in `run.json`; a reading below it is
-  untrusted and the launch is refused. Fail closed, consistent with §7.
+- **Clock-rollback guard** (§9). Only expiry is exposed to the agent's clock — the
+  fence compares two controller-stamped values and is clock-independent (see
+  "Time" above). Persist the highest wall-clock value ever observed in `run.json`;
+  a reading below it means something is badly wrong, so the launch is refused.
+  Fail closed, consistent with §7.
 
 Proto is append-only: `LaunchJobRequest` gains `issued_at_unix_ms`,
 `expires_at_unix_ms`, `command_digest`; a new `FenceRun` RPC is added. Nothing is
@@ -403,8 +416,8 @@ Every requirement in the spec gets a row. Deferred items get a reason, not silen
 | §2 | Restart / missing in-memory entry is not confirmation | 3 |
 | §2 | Cleanup is participant-scoped; release needs the final participant + epilog | 754, strengthened by 7 |
 | §2 | Exact participant and CPU/GPU committed before dispatch | 9 |
-| §9 | Clock-rollback guard demoted to fallback by boot-relative expiry | 1, 4 |
-| §9 | Garbage-collection delay — every record carries an age | 1 |
+| §9 | Clock-rollback guard — a sanity check; the fence is clock-independent by construction | 1, 4 |
+| §9 | Garbage-collection delay — the run record carries an age | 1 |
 | §5 | Conflicting identities, digests, deadlines, allocations rejected | 4 |
 | §5 | Claim index is a local safety check, not scheduler authority | 8 |
 | §5 | `reject_before` monotonic per run | 4 |
