@@ -334,7 +334,7 @@ SPUR-124 dispatch hot-loop shape.
 Depends on 4 (which creates the refusal reasons) and 1 (which supplies the
 conflicting entry).
 
-### 9 — `feat(spurctld)!: commit the placement before dispatching it`
+### 9 — `fix(spurctld): commit the placement before dispatching it`
 
 **Verified ordering today** (`scheduler_loop.rs:468-470`): `LaunchJob` is sent and
 the agent reserves and spawns *before* `cluster.start_job()` proposes
@@ -353,21 +353,45 @@ Commits 5, 6 and 8 **repair** that within 30 s. Commit 9 **prevents** it:
 reserve-before-launch, activate-after-confirm, plus an abort guard on every
 non-Activate exit from `process_assignment`.
 
-**This is the only commit that adds a `WalOperation` variant**, and that is a
-different severity from commit 7's `!`:
+**No new `WalOperation` variant, and no proto change.** An earlier revision of
+this document claimed both; that was asserted without reading the apply logic and
+is wrong. Verified:
 
-| | Effect |
+1. **Reserve is `JobStart`, moved earlier.** Its apply (`cluster.rs:6023`) is
+   `if let Some(job) = jobs.get_mut(job_id)` followed by an unconditional
+   `node.alloc_resources.add(&slice)`. There is **no job-state guard**, so
+   proposing it while the job is still Pending works with the apply unchanged.
+2. **Activate is the existing `JobStateChange(Pending→Running)`** — already legal,
+   already proposed today, simply moved after the dispatch.
+3. **Abort is the only new behaviour.** `JobDispatchBackoff`'s apply (`:5701`)
+   calls `reset_job_for_requeue` and never deallocates slices — correct today
+   because no charge exists at that point. Extend it to capture
+   `allocated_nodes` / `allocated_resources` / `per_node_alloc` and call
+   `deallocate_job_slices` *before* the reset (`clear_run_state_for_requeue`
+   wipes them), the pattern `JobPreemptRequeue` already uses at `:5714`.
+
+Replay compatibility:
+
+| Direction | Result |
 | --- | --- |
-| Commit 7 (behaviour break) | an old controller can still replay a new log; binary rollback works |
-| Commit 9 (state break) | an old controller crashes replaying a new log; no rollback without wiping state |
+| New controller, old log | `JobStateChange(→Running)` then `JobStart`; apply unchanged → identical state |
+| Old controller, new log | `JobStart` (no guard) charges, `JobStateChange` transitions → same final state; replays without crashing |
+| Old controller, new `JobDispatchBackoff` with a charge | does not deallocate → a leaked charge **on downgrade only**, caught by the widen/reconcile passes. Not corruption, not a crash |
 
-The mitigation is already paid for: 754 already mandates an empty cluster for
-upgrade ("Drain every node and let jobs finish or cancel them before swapping
-binaries"), so a state break rides a cutover window this branch already requires.
-It does not add a second one.
+`deallocate_job_slices` early-returns when `allocated_resources` is `None`
+(`:5482`), and every pre-upgrade `JobDispatchBackoff` entry has no charge, so the
+extended apply is a **no-op on old entries**.
 
-Sequenced last so the branch remains coherent and shippable if it stops at 8. The
-abort guard is the risky part and needs commit 8's refusal plumbing regardless.
+Two non-breaking but user-visible semantic shifts:
+
+- `JobStart`'s apply sets `job.start_time = Some(timestamp)`, so StartTime and the
+  accounting record move earlier by one dispatch round trip. The activate can
+  re-stamp if that matters.
+- It also calls `set_pending_reason(PendingReason::None)`, so a Pending job shows
+  no reason in `squeue` during the dispatch window.
+
+Sequenced last because the abort guard is the risky part and needs commit 8's
+refusal plumbing regardless.
 
 ## Spec traceability
 
@@ -448,17 +472,17 @@ Every requirement in the spec gets a row. Deferred items get a reason, not silen
 
 | Surface | Status |
 | --- | --- |
-| `WalOperation` | none renamed or removed. **Commits 1–8 add no variant; commit 9 adds one** |
+| `WalOperation` | **no new variant anywhere**; none renamed or removed. Commit 9 widens `JobDispatchBackoff`'s apply, which is a no-op on pre-upgrade entries |
 | Persisted state | `Node.reconcile_pending` additive with `#[serde(default)]` |
-| Proto | append-only tags plus new RPCs; nothing renumbered |
+| Proto | append-only tags plus new RPCs; nothing renumbered. Commit 9 changes no proto |
 | Config | no change |
-| CLI / REST | no change |
-| Release timing | **changed — commit 7 takes the `!`** (behaviour: rollback still works) |
-| Log replay | **changed — commit 9 takes the `!`** (state: an old controller crashes on a new log) |
-| 754 sessions | degrade to descriptor replay; in-place upgrade is lossless through commit 8 |
+| CLI / REST | `squeue` StartTime and the pending reason shift within the dispatch window (commit 9) |
+| Release timing | **changed — commit 7 takes the `!`** (behaviour; the log stays replayable) |
+| Log replay | unchanged in both directions; downgrade can leak a charge, which the reconcile passes catch |
+| 754 sessions | degrade to descriptor replay; in-place upgrade is lossless |
 
-Stopping at commit 8 keeps the log replayable by an older controller. Commit 9 is
-the line where that stops being true, which is why it is last and separable.
+**Commit 7 is the only `!` in the ladder.** Nothing here makes an older
+controller crash replaying a newer log.
 
 ## Open risks
 
