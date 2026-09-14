@@ -46,14 +46,20 @@ them.
 | Agent authz | `require_controller` refuses a *user* token but allows unauthenticated callers (`spurd/agent_server.rs:7424`) |
 | SIGTERM | with live supervisors, does not deregister (`spurd/main.rs:834`) — 754 already fixed the restart cascade |
 
-### The two structural holes
+### The two structural holes in `main` today
+
+Both describe current behaviour. Each names the commit that closes it.
 
 1. **The reporter reads `running`; the resource ledger is `allocation`.** Different
    maps. An entry present in `allocation` but absent from `running` is never
    reported, so it is invisible to the controller by construction. Not a race; a
-   design gap.
-2. **A registering node is schedulable immediately.** Reconciliation evidence
-   arrives later. Any dispatch into that window can double-book.
+   design gap. → **closed by commit 6**, which sources the ledger from
+   `admission/`.
+2. **A registering node is schedulable immediately.** `is_schedulable()` is only
+   `state.is_available()`, so a node is eligible for dispatch the moment it
+   registers, while reconciliation evidence arrives later. Any dispatch into that
+   window can double-book. → **closed by commit 5**, which holds the node
+   unschedulable until the controller has diffed its ledger and acted.
 
 ### Confirmed defects found while planning
 
@@ -504,6 +510,33 @@ schedulable.
   the effective-state display convention already used for planned nodes.
 - An agent that sends no ledger is **not** gated — a pre-upgrade agent registers
   without the field, treated as *no evidence*, preserving mixed-version rollout.
+  **Structural hole 2 therefore persists for un-upgraded agents**, and closes as
+  they are upgraded. That is the cost of not blocking a rolling upgrade, and it is
+  a cost rather than a non-issue.
+
+**The gate must be set on every registration that carries a ledger — including the
+one that proposes nothing today.** `evaluate_registration` returns `Skip` for a
+node whose resources are unchanged (`cluster.rs:7846`), and the `Skip` arm
+(`:2524`) proposes a `NodeUpdate` only when the address, hostname, port, WireGuard
+key or version changed. An agent restarting on a stable node hits exactly that
+path — which is the *primary* case this gate exists for — so hanging the gate off
+`evaluate_registration`'s action would leave it unset precisely when it is needed.
+Setting `reconcile_pending` is therefore unconditional for any registration
+carrying a ledger, proposed independently of the Register/Update/Skip decision.
+Registration is infrequent — agent restart and reconnect — so the extra WAL entry
+is not a cost worth optimising away.
+
+**Leadership gain pulls but does not gate**, and the asymmetry is deliberate.
+Registration gates because a restarting agent is asserting local state that may
+have changed while the controller was not watching. A leader change has no such
+property: the new leader loads the same replicated state the old one had, and no
+agent's state changed because of the failover. Gating every node on leadership
+gain would stall the whole cluster for the duration of a full sweep to remove
+exposure that the failover did not create. It triggers a background pull
+(commit 6) instead, and the pre-existing drift it might find is what the routine
+sweep is for. A controller that was genuinely *down* is covered by registration
+anyway, because a node the controller no longer knows has its heartbeat rejected
+and re-registers (`spurd/reporter.rs:239`).
 
 | Direction | Resolution |
 | --- | --- |
@@ -792,6 +825,11 @@ Commit-specific:
 - `allocate_for_job` returns `CpusUnavailable` on shortfall and refuses memory
   over the node total; both callers surface it.
 - Every refusal reason maps to the correct controller action, one case per row.
+- The gate is set on a **re-registration whose resources are unchanged** — the
+  `Skip` path, which proposes nothing today. Mutation-test it: if the gate is
+  hung off the Register/Update action it is silently absent in the agent-restart
+  case, which is the one it exists for.
+- Leadership gain pulls without gating, and does not stall dispatch cluster-wide.
 - Permissive auth: a cluster with no authentication configured registers,
   reconciles, **clears the gate** and runs work; direction B does not evict and
   commit 8's overlap does not cancel, both logging instead; the same cases under
