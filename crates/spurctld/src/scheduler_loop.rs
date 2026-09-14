@@ -42,6 +42,14 @@ fn node_comm_http_url(node: &Node) -> Option<String> {
     Some(spur_net::format_comm_http_url(host, node.port))
 }
 
+/// True on the tick a leadership term begins, so per-term setup runs once rather
+/// than on every tick or on a follower. Advances `was_leader` to the new value.
+fn entering_leadership(was_leader: &mut bool, is_leader: bool) -> bool {
+    let entering = is_leader && !*was_leader;
+    *was_leader = is_leader;
+    entering
+}
+
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
 pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let enforcer_cluster = cluster.clone();
@@ -111,6 +119,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
     let scheduler_notify = cluster.scheduler_notify.clone();
+    let mut was_leader = false;
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -121,13 +130,22 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             _ = interval.tick() => {}
         }
 
-        if !raft.is_leader() {
+        let is_leader = raft.is_leader();
+        let entering_term = entering_leadership(&mut was_leader, is_leader);
+
+        if !is_leader {
             // A former leader must not keep serving planned-reservation info
             // from before it lost leadership.
             cluster.set_planned_reservations(HashMap::new());
             cluster.set_planned_job_starts(HashMap::new());
             scheduler.clear_outcomes();
             continue;
+        }
+
+        // A promoted follower's totals were maintained across an unknown replay
+        // history; rebuild from the job records before this term's placements.
+        if entering_term {
+            cluster.recompute_node_allocations();
         }
 
         // Finalize never-satisfiable deps before pending_jobs() so they drop
@@ -2668,6 +2686,25 @@ mod tests {
         ResourceAllocations, ResourceSet,
     };
     use std::collections::HashMap;
+
+    #[test]
+    fn leadership_edge_fires_once_per_term() {
+        let mut was_leader = false;
+        assert!(!entering_leadership(&mut was_leader, false));
+        assert!(
+            entering_leadership(&mut was_leader, true),
+            "a promoted follower must rebuild derived state before placing"
+        );
+        assert!(
+            !entering_leadership(&mut was_leader, true),
+            "a steady-state tick must not rescan every job"
+        );
+        assert!(!entering_leadership(&mut was_leader, false));
+        assert!(
+            entering_leadership(&mut was_leader, true),
+            "re-promotion after a lost term must rebuild again"
+        );
+    }
 
     fn job_with_spec(mut spec: JobSpec) -> Job {
         spec.cpus_per_task = spec.cpus_per_task.max(1);

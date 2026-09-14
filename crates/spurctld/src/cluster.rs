@@ -480,6 +480,25 @@ fn health_job_target_node(name: &str) -> Option<&str> {
         .map(|(_, node)| node)
 }
 
+/// Summed count per `(gres, device_id)`, dropping zeroes. `subtract` prunes an
+/// emptied gres key while `add` creates it unconditionally, so presence differs.
+fn device_counts(alloc: &ResourceAllocations) -> HashMap<(&str, u32), u64> {
+    let mut counts: HashMap<(&str, u32), u64> = HashMap::new();
+    for (gres, devices) in &alloc.devices {
+        for dev in devices {
+            *counts.entry((gres.as_str(), dev.device_id)).or_default() += dev.count;
+        }
+    }
+    counts.retain(|_, count| *count > 0);
+    counts
+}
+
+/// Device order is not drift: the accumulator's per-gres `Vec` follows the
+/// add/subtract sequence while the derivation's follows job id.
+fn allocations_equivalent(a: &ResourceAllocations, b: &ResourceAllocations) -> bool {
+    a.cpus == b.cpus && a.memory_mb == b.memory_mb && device_counts(a) == device_counts(b)
+}
+
 struct PendingJobClassification {
     jobs: Vec<Job>,
     reason_updates: Vec<(JobId, PendingReason)>,
@@ -5479,9 +5498,9 @@ impl ClusterManager {
         already_deallocated: &[String],
         job_id: JobId,
     ) {
-        let Some(total) = allocated_resources else {
+        if allocated_resources.is_none() {
             return;
-        };
+        }
         let node_count = freed_nodes.len().max(1) as u32;
         for name in freed_nodes {
             if already_deallocated.iter().any(|n| n == name) {
@@ -5490,22 +5509,124 @@ impl ClusterManager {
             let Some(node) = nodes.get_mut(name) else {
                 continue;
             };
-            let slice = per_node_alloc.get(name).cloned().unwrap_or_else(|| {
-                warn!(job_id, node = %name, "per_node_alloc missing at deallocation, using scalar fallback");
-                ResourceAllocations::with_scalar(
-                    total.cpus / node_count,
-                    total.memory_mb / node_count as u64,
-                )
-            });
+            let Some(slice) = Self::job_node_slice(
+                per_node_alloc,
+                allocated_resources,
+                name,
+                node_count,
+                job_id,
+                "deallocate",
+            ) else {
+                continue;
+            };
             node.alloc_resources.subtract(&slice);
-            node.update_state_from_alloc();
-            if node.state == NodeState::Draining
-                && node.alloc_resources.cpus == 0
-                && !node.alloc_resources.has_devices()
-            {
-                node.state = NodeState::Drain;
+            Self::refresh_node_state_for_alloc(node);
+        }
+    }
+
+    /// A job's slice of one node: the recorded value, or an even split of the job
+    /// total when no per-node entry exists. `None` means nothing to charge or free.
+    fn job_node_slice(
+        per_node_alloc: &HashMap<String, ResourceAllocations>,
+        allocated_resources: Option<&ResourceAllocations>,
+        node_name: &str,
+        node_count: u32,
+        job_id: JobId,
+        phase: &'static str,
+    ) -> Option<ResourceAllocations> {
+        if let Some(slice) = per_node_alloc.get(node_name) {
+            return Some(slice.clone());
+        }
+        let total = allocated_resources?;
+        warn!(job_id, node = %node_name, phase, "per_node_alloc missing, using scalar fallback");
+        Some(ResourceAllocations::with_scalar(
+            total.cpus / node_count,
+            total.memory_mb / node_count as u64,
+        ))
+    }
+
+    /// Refresh node state after its allocation changed. `update_state_from_alloc`
+    /// leaves hold states alone, so a fully-released Draining node completes here.
+    fn refresh_node_state_for_alloc(node: &mut Node) {
+        node.update_state_from_alloc();
+        if node.state == NodeState::Draining
+            && node.alloc_resources.cpus == 0
+            && !node.alloc_resources.has_devices()
+        {
+            node.state = NodeState::Drain;
+        }
+    }
+
+    /// Rebuild the node allocation cache from the job records that own the slices,
+    /// for `only` or for every node. The WAL apply sites maintain it in between.
+    fn derive_node_allocations(
+        jobs: &HashMap<JobId, Job>,
+        nodes: &mut HashMap<String, Node>,
+        only: Option<&str>,
+    ) {
+        let wanted = |name: &str| only.is_none_or(|n| n == name);
+        let mut derived: HashMap<String, ResourceAllocations> = HashMap::new();
+        // Sorted so the derived value is the same on every replica.
+        let mut job_ids: Vec<JobId> = jobs.keys().copied().collect();
+        job_ids.sort_unstable();
+        for job_id in job_ids {
+            let Some(job) = jobs.get(&job_id) else {
+                continue;
+            };
+            // JobComplete and eviction clear node_completions while leaving
+            // allocated_nodes set, so without this a finished job stays charged.
+            if job.state.is_finalized() {
+                continue;
+            }
+            let node_count = job.allocated_nodes.len().max(1) as u32;
+            for name in &job.allocated_nodes {
+                if job.node_completions.contains_key(name)
+                    || !wanted(name)
+                    || !nodes.contains_key(name)
+                {
+                    continue;
+                }
+                let Some(slice) = Self::job_node_slice(
+                    &job.per_node_alloc,
+                    job.allocated_resources.as_ref(),
+                    name,
+                    node_count,
+                    job_id,
+                    "derive",
+                ) else {
+                    continue;
+                };
+                match derived.get_mut(name) {
+                    Some(acc) => acc.add(&slice),
+                    None => {
+                        derived.insert(name.clone(), slice);
+                    }
+                }
             }
         }
+
+        for (name, node) in nodes.iter_mut().filter(|(n, _)| wanted(n)) {
+            let next = derived.remove(name).unwrap_or_default();
+            if allocations_equivalent(&node.alloc_resources, &next) {
+                continue;
+            }
+            warn!(
+                node = %name,
+                was = ?node.alloc_resources,
+                now = ?next,
+                "node allocation totals drifted from job records, correcting"
+            );
+            node.alloc_resources = next;
+            Self::refresh_node_state_for_alloc(node);
+        }
+    }
+
+    /// Rebuild the node allocation cache from job records. Called where state has
+    /// just been built from durable records and before it drives placement.
+    pub fn recompute_node_allocations(&self) {
+        let jobs = self.jobs.read();
+        let mut nodes = self.nodes.write();
+        Self::derive_node_allocations(&jobs, &mut nodes, None);
     }
 
     /// Clear a job's run-state fields so it's schedulable again after requeue.
@@ -5918,30 +6039,24 @@ impl ClusterManager {
                     job.preempt_mode = Some("Cancel".to_string());
                     job.preempt_qos = preempt_qos.clone();
                 }
-                if let Some(ref total) = allocated_resources {
+                if allocated_resources.is_some() {
                     let node_count = freed_nodes.len().max(1) as u32;
                     for name in &freed_nodes {
-                        if let Some(node) = nodes.get_mut(name) {
-                            let slice = per_node_map.get(name).cloned().unwrap_or_else(|| {
-                                warn!(
-                                    job_id = *job_id,
-                                    node = %name,
-                                    "per_node_alloc missing at preempt-cancel deallocation, using scalar fallback"
-                                );
-                                ResourceAllocations::with_scalar(
-                                    total.cpus / node_count,
-                                    total.memory_mb / node_count as u64,
-                                )
-                            });
-                            node.alloc_resources.subtract(&slice);
-                            node.update_state_from_alloc();
-                            if node.state == NodeState::Draining
-                                && node.alloc_resources.cpus == 0
-                                && !node.alloc_resources.has_devices()
-                            {
-                                node.state = NodeState::Drain;
-                            }
-                        }
+                        let Some(node) = nodes.get_mut(name) else {
+                            continue;
+                        };
+                        let Some(slice) = Self::job_node_slice(
+                            &per_node_map,
+                            allocated_resources.as_ref(),
+                            name,
+                            node_count,
+                            *job_id,
+                            "preempt-cancel",
+                        ) else {
+                            continue;
+                        };
+                        node.alloc_resources.subtract(&slice);
+                        Self::refresh_node_state_for_alloc(node);
                     }
                 }
                 drop(jobs);
@@ -6049,17 +6164,21 @@ impl ClusterManager {
                 }
                 let node_count = node_names.len().max(1) as u32;
                 for name in node_names {
-                    if let Some(node) = nodes.get_mut(name) {
-                        let slice = per_node_alloc.get(name).cloned().unwrap_or_else(|| {
-                            warn!(job_id = *job_id, node = %name, "per_node_alloc missing at allocation, using scalar fallback");
-                            ResourceAllocations::with_scalar(
-                                resources.cpus / node_count,
-                                resources.memory_mb / node_count as u64,
-                            )
-                        });
-                        node.alloc_resources.add(&slice);
-                        node.update_state_from_alloc();
-                    }
+                    let Some(node) = nodes.get_mut(name) else {
+                        continue;
+                    };
+                    let Some(slice) = Self::job_node_slice(
+                        per_node_alloc,
+                        Some(resources),
+                        name,
+                        node_count,
+                        *job_id,
+                        "allocate",
+                    ) else {
+                        continue;
+                    };
+                    node.alloc_resources.add(&slice);
+                    node.update_state_from_alloc();
                 }
                 // Licenses are not mutated here: usage is derived on demand from
                 // running jobs (see available_licenses()), so the config total is
@@ -6090,25 +6209,19 @@ impl ClusterManager {
                         },
                     );
 
-                    if let Some(ref total) = job.allocated_resources {
-                        if !already_reported {
-                            let node_count = job.allocated_nodes.len().max(1) as u32;
-                            if let Some(node) = nodes.get_mut(node_name) {
-                                let slice = job.per_node_alloc.get(node_name).cloned().unwrap_or_else(|| {
-                                    warn!(job_id = *job_id, node = %node_name, "per_node_alloc missing at node deallocation, using scalar fallback");
-                                    ResourceAllocations::with_scalar(
-                                        total.cpus / node_count,
-                                        total.memory_mb / node_count as u64,
-                                    )
-                                });
+                    if job.allocated_resources.is_some() && !already_reported {
+                        let node_count = job.allocated_nodes.len().max(1) as u32;
+                        if let Some(node) = nodes.get_mut(node_name) {
+                            if let Some(slice) = Self::job_node_slice(
+                                &job.per_node_alloc,
+                                job.allocated_resources.as_ref(),
+                                node_name,
+                                node_count,
+                                *job_id,
+                                "node-complete",
+                            ) {
                                 node.alloc_resources.subtract(&slice);
-                                node.update_state_from_alloc();
-                                if node.state == NodeState::Draining
-                                    && node.alloc_resources.cpus == 0
-                                    && !node.alloc_resources.has_devices()
-                                {
-                                    node.state = NodeState::Drain;
-                                }
+                                Self::refresh_node_state_for_alloc(node);
                             }
                         }
                     }
@@ -6394,6 +6507,9 @@ impl ClusterManager {
 
                 let mut nodes = self.nodes.write();
                 nodes.insert(name.clone(), node);
+                // A fresh Node starts at zero, so this is the one apply that can
+                // silently discard a charge rather than adjust one.
+                Self::derive_node_allocations(&jobs, &mut nodes, Some(name));
                 self.next_job_id.store(next_id, Ordering::Relaxed);
                 return ClientResponse::default();
             }
@@ -6944,6 +7060,9 @@ impl StateMachineApply for ClusterManager {
         }
         self.k0s_role_counts
             .recompute_from(nodes.values().map(|n| n.k0s_role));
+        // The snapshot carries the cache, the job records carry the truth: drift
+        // written by a previous leader is corrected rather than inherited.
+        Self::derive_node_allocations(&jobs, &mut nodes, None);
 
         *self.reservations.write() = snap.reservations;
 
@@ -20591,6 +20710,519 @@ mod tests {
         let snap = cm2.k8s_cluster_metrics();
         assert_eq!(snap.nodes_total, 1);
         assert_eq!(snap.nodes_by_role[0], (K0sRole::Controller, 1));
+    }
+
+    /// Deterministic xorshift64* so a failing run reproduces from its seed alone.
+    struct DiffRng(u64);
+
+    impl DiffRng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next_u64() % n
+        }
+    }
+
+    fn gpu_slice(cpus: u32, memory_mb: u64, device_ids: &[u32]) -> ResourceAllocations {
+        let mut alloc = ResourceAllocations::with_scalar(cpus, memory_mb);
+        if !device_ids.is_empty() {
+            alloc.devices.insert(
+                "gpu".to_string(),
+                device_ids
+                    .iter()
+                    .map(|id| spur_core::resource::AllocatedDevice::injectable(*id))
+                    .collect(),
+            );
+        }
+        alloc
+    }
+
+    /// Drive a generated cluster through the real WAL apply path, then assert the
+    /// derivation reaches the totals the four incremental sites accumulated.
+    fn run_allocation_differential(
+        seed: u64,
+    ) -> (ClusterManager, Vec<(String, ResourceAllocations)>) {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let mut rng = DiffRng(seed);
+        let (mut partials, mut fallbacks) = (0u32, 0u32);
+
+        let node_names: Vec<String> = (0..6).map(|i| format!("n{i}")).collect();
+        for name in &node_names {
+            cm.apply_operation(&WalOperation::NodeRegister {
+                name: name.clone(),
+                hostname: name.clone(),
+                resources: ResourceSet {
+                    cpus: 32,
+                    memory_mb: 64000,
+                    ..Default::default()
+                },
+                address: "127.0.0.1".into(),
+                port: 6818,
+                wg_pubkey: String::new(),
+                version: String::new(),
+                labels: HashMap::new(),
+                source: spur_core::node::NodeSource::NativeHost,
+            });
+        }
+
+        for job_id in 1..=60u32 {
+            cm.apply_operation(&WalOperation::JobSubmit {
+                job_id,
+                spec: Box::new(basic_spec(&format!("j{job_id}"))),
+            });
+
+            // One in six never starts, so Pending jobs with no slice are covered.
+            if rng.below(6) == 0 {
+                continue;
+            }
+
+            let width = 1 + rng.below(3) as usize;
+            let first = rng.below(node_names.len() as u64) as usize;
+            let mut targets: Vec<String> = (0..width)
+                .map(|k| node_names[(first + k) % node_names.len()].clone())
+                .collect();
+            targets.dedup();
+
+            let cpus = 1 + rng.below(4) as u32;
+            let mem = 1000 * (1 + rng.below(4));
+            // One in five carries no per-node record, so both paths take the
+            // even-split fallback and must agree on the divisor.
+            let per_node: HashMap<String, ResourceAllocations> = if rng.below(5) == 0 {
+                fallbacks += 1;
+                HashMap::new()
+            } else {
+                targets
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, n)| {
+                        let devices: Vec<u32> = match rng.below(3) {
+                            0 => Vec::new(),
+                            1 => vec![(idx as u32) % 4],
+                            _ => vec![(idx as u32) % 4, ((idx as u32) + 1) % 4],
+                        };
+                        (n.clone(), gpu_slice(cpus, mem, &devices))
+                    })
+                    .collect()
+            };
+            let total = gpu_slice(
+                cpus * targets.len() as u32,
+                mem * targets.len() as u64,
+                &[0],
+            );
+
+            cm.apply_operation(&WalOperation::JobStateChange {
+                job_id,
+                old_state: JobState::Pending,
+                new_state: JobState::Running,
+                pending_reason: None,
+                pending_priority: None,
+                begin_time: None,
+                pending_reason_desc: None,
+            });
+            cm.apply_operation(&WalOperation::JobStart {
+                job_id,
+                nodes: targets.clone(),
+                resources: total,
+                per_node_alloc: per_node,
+                srun_step_dispatch: false,
+                run_attempt: 0,
+            });
+
+            match rng.below(7) {
+                // Still running: the slice must stay charged.
+                0 => {}
+                1 => {
+                    cm.apply_operation(&WalOperation::JobStateChange {
+                        job_id,
+                        old_state: JobState::Running,
+                        new_state: JobState::Suspended,
+                        pending_reason: None,
+                        pending_priority: None,
+                        begin_time: None,
+                        pending_reason_desc: None,
+                    });
+                }
+                // A single-node job would finalize here, duplicating branch 3.
+                2 if targets.len() > 1 => {
+                    cm.apply_operation(&WalOperation::JobNodeComplete {
+                        job_id,
+                        node_name: targets[0].clone(),
+                        exit_code: 0,
+                        signal: 0,
+                    });
+                    partials += 1;
+                    assert!(
+                        !cm.get_job(job_id).unwrap().state.is_finalized(),
+                        "branch 2 must leave the job live with a partial completion"
+                    );
+                }
+                3 => {
+                    for name in &targets {
+                        cm.apply_operation(&WalOperation::JobNodeComplete {
+                            job_id,
+                            node_name: name.clone(),
+                            exit_code: 0,
+                            signal: 0,
+                        });
+                    }
+                }
+                4 => {
+                    cm.apply_operation(&WalOperation::JobComplete {
+                        job_id,
+                        exit_code: 0,
+                        state: JobState::Completed,
+                    });
+                }
+                5 => {
+                    cm.apply_operation(&WalOperation::JobPreemptCancel {
+                        job_id,
+                        preempted_by: None,
+                        preempt_qos: None,
+                    });
+                }
+                _ => {
+                    cm.apply_operation(&WalOperation::JobPreemptRequeue {
+                        job_id,
+                        begin_time: Utc::now(),
+                        preempted_by: None,
+                        preempt_qos: None,
+                    });
+                }
+            }
+        }
+
+        assert!(
+            partials > 0 && fallbacks > 0,
+            "seed {seed:#x}: partial completions ({partials}) and even-split              fallbacks ({fallbacks}) must both be exercised"
+        );
+
+        let accumulated: Vec<(String, ResourceAllocations)> = {
+            let nodes = cm.nodes.read();
+            let mut v: Vec<_> = nodes
+                .values()
+                .map(|n| (n.name.clone(), n.alloc_resources.clone()))
+                .collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        (cm, accumulated)
+    }
+
+    #[test]
+    fn derived_allocations_match_the_accumulator() {
+        for seed in [0x5eed_1234_u64, 0xfeed_face, 0x0bad_c0de, 1, u64::MAX] {
+            let (cm, accumulated) = run_allocation_differential(seed);
+            assert!(
+                accumulated.iter().any(|(_, a)| a.cpus > 0),
+                "seed {seed:#x} generated no live allocation to compare"
+            );
+
+            cm.recompute_node_allocations();
+
+            let nodes = cm.nodes.read();
+            for (name, before) in &accumulated {
+                let after = &nodes.get(name).unwrap().alloc_resources;
+                assert!(
+                    allocations_equivalent(before, after),
+                    "seed {seed:#x} node {name}: accumulator {before:?} != derived {after:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn allocations_equivalent_compares_device_content_not_layout() {
+        let a = gpu_slice(4, 8000, &[3, 1]);
+        let b = gpu_slice(4, 8000, &[1, 3]);
+        assert!(allocations_equivalent(&a, &b), "order alone is not drift");
+
+        assert!(!allocations_equivalent(&a, &gpu_slice(4, 8000, &[1, 2])));
+        assert!(!allocations_equivalent(&a, &gpu_slice(5, 8000, &[3, 1])));
+        assert!(!allocations_equivalent(&a, &gpu_slice(4, 9000, &[3, 1])));
+
+        // `subtract` prunes an emptied gres key, `add` creates it unconditionally,
+        // so an empty Vec must compare equal to an absent key.
+        let mut empty_key = scalar_alloc(2, 1000);
+        empty_key.devices.insert("gpu".into(), Vec::new());
+        assert!(allocations_equivalent(&empty_key, &scalar_alloc(2, 1000)));
+
+        // Two entries for one id must not read as equivalent to two distinct ids.
+        let mut duplicated = scalar_alloc(2, 1000);
+        duplicated.devices.insert(
+            "gpu".into(),
+            vec![
+                spur_core::resource::AllocatedDevice::injectable(1),
+                spur_core::resource::AllocatedDevice::injectable(1),
+            ],
+        );
+        assert!(!allocations_equivalent(
+            &duplicated,
+            &gpu_slice(2, 1000, &[1, 2])
+        ));
+    }
+
+    #[test]
+    fn derivation_does_not_charge_finalized_jobs() {
+        // JobComplete leaves allocated_nodes set with node_completions cleared, so
+        // a derivation without the liveness clause recharges every finished job.
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("done")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        let slice = scalar_alloc(4, 8000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: per_node_for(&["n1"], slice),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+        });
+        cm.apply_operation(&WalOperation::JobComplete {
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Completed,
+        });
+
+        let job = cm.get_job(1).unwrap();
+        assert!(
+            !job.allocated_nodes.is_empty() && job.node_completions.is_empty(),
+            "the record shape this clause exists for must still hold"
+        );
+
+        cm.recompute_node_allocations();
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
+    }
+
+    #[test]
+    fn derivation_corrects_a_drifted_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("live")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        let slice = gpu_slice(4, 8000, &[2]);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: per_node_for(&["n1"], slice),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+        });
+
+        // Drift the cache the way a lost subtract or a double add would, then
+        // snapshot it: the job record still says 4 CPUs and GPU 2.
+        cm.nodes.write().get_mut("n1").unwrap().alloc_resources = scalar_alloc(7, 15000);
+        let data = cm.snapshot_state().unwrap();
+
+        let dst = TempDir::new().unwrap();
+        let cm2 = ClusterManager::new(test_config(), dst.path()).unwrap();
+        cm2.restore_from_snapshot(&data).unwrap();
+
+        let node = cm2.get_node("n1").unwrap();
+        assert_eq!(
+            node.alloc_resources.cpus, 4,
+            "restore must not inherit drift"
+        );
+        assert_eq!(node.alloc_resources.memory_mb, 8000);
+        assert_eq!(
+            node.alloc_resources.device_ids("gpu"),
+            vec![2],
+            "a derivation that drops gres must not pass"
+        );
+    }
+
+    #[test]
+    fn registering_a_node_recharges_it_from_live_job_records() {
+        // NodeRegister replaces the Node wholesale, so a fresh one starts at zero
+        // while a live job record still claims the slice.
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let register = WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        };
+        cm.apply_operation(&register);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("live")),
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        let slice = scalar_alloc(4, 8000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: per_node_for(&["n1"], slice),
+            srun_step_dispatch: false,
+            run_attempt: 0,
+        });
+
+        cm.apply_operation(&register);
+        assert_eq!(
+            cm.get_node("n1").unwrap().alloc_resources.cpus,
+            4,
+            "re-registration must not drop a live job's charge"
+        );
+    }
+
+    #[test]
+    fn registering_a_node_leaves_other_nodes_alone() {
+        // The rebuild on this path is scoped to the registering node: a wholesale
+        // one would restate unrelated nodes on an unrelated event.
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        let resources = ResourceSet {
+            cpus: 8,
+            memory_mb: 16000,
+            ..Default::default()
+        };
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: resources.clone(),
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        {
+            let mut nodes = cm.nodes.write();
+            let n1 = nodes.get_mut("n1").unwrap();
+            n1.alloc_resources = scalar_alloc(4, 8000);
+            n1.state = NodeState::Draining;
+        }
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n2".into(),
+            hostname: "n2".into(),
+            resources,
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+
+        let n1 = cm.get_node("n1").unwrap();
+        assert_eq!(n1.alloc_resources.cpus, 4);
+        assert_eq!(n1.state, NodeState::Draining);
+    }
+
+    #[test]
+    fn derivation_completes_a_drain_the_cache_left_hanging() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        {
+            let mut nodes = cm.nodes.write();
+            let node = nodes.get_mut("n1").unwrap();
+            node.alloc_resources = scalar_alloc(4, 8000);
+            node.state = NodeState::Draining;
+        }
+
+        cm.recompute_node_allocations();
+        let node = cm.get_node("n1").unwrap();
+        assert_eq!(node.alloc_resources.cpus, 0);
+        assert_eq!(
+            node.state,
+            NodeState::Drain,
+            "a drain whose last charge was phantom must complete, not hang"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
