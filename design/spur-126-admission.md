@@ -3,7 +3,8 @@
 Status: planned, not implemented
 Branch: `feat/spur-126-admission`, based at PR 754 (`feat/stepd-core`) head `a2bdd8d3`
 Spec: Confluence 1873281623 "SPUR-126 Allocation Reconciliation — Design Spec", v42
-Prior art: PR #681 (widen-only node-alloc reconcile), PR #492 (obligation ledger)
+Prior art: PR #681 (widen-only node-alloc reconcile) and #600, both **closed
+unmerged**; PR #492 (obligation ledger)
 
 ## The invariant
 
@@ -214,6 +215,65 @@ the record, hold the resources, log, and mark the inventory incomplete. A claim 
 never dropped.
 
 ## Commits
+
+### 0 — `fix(spurctld): derive node allocation totals from job records`
+
+**A prerequisite, not an addition.** The controller holds two durable records of
+one fact and never cross-checks them: `Job.per_node_alloc` is exact, while
+`Node.alloc_resources` is an independent accumulator mutated by `add`/`subtract`
+at four sites (`cluster.rs:5500, 5936, 6060, 6104`). PR #681 attempted this and
+is **closed, unmerged**; nothing in the tree derives or reconciles the two.
+
+Commits 5 and 8 both diff "Raft" against the agent's ledger. Without this, there
+is no single Raft answer to diff against: the agent's slice can match
+`Job.per_node_alloc` exactly, the node be declared reconciled and released from
+the gate, while `Node.alloc_resources` — **the value the scheduler actually reads
+for placement** (`node.rs:436`, `:441`, `:466`) — is still drifted. The node then
+passes reconcile and is immediately double-booked by the controller's own
+accounting.
+
+`Node.alloc_resources` therefore stops being durable authority and becomes a
+**derived cache**:
+
+```
+charged(node) = Σ over jobs j where
+      node ∈ j.allocated_nodes
+    ∧ node ∉ j.node_completions        // the existing per-node release signal
+```
+
+Both clauses are existing durable job state, and together they reproduce exactly
+what the accumulator should have held — `JobNodeComplete` inserts into
+`node_completions` as each node reports (`:6084`), and the requeue/evict paths
+clear `allocated_nodes`. Jobs whose `per_node_alloc` lacks an entry use the same
+scalar-split fallback `JobStart`'s apply already warns about.
+
+- **On load** (snapshot restore and replay) and **on leadership gain**, recompute
+  in full. The cache cannot drift durably, because truth rebuilds it at every
+  restart and every leadership change.
+- **In steady state**, the four existing sites keep updating it incrementally —
+  they become cache maintenance rather than authority, so scheduling stays O(1).
+
+**Why this is exact where #681 had to widen only.** #681 could not subtract,
+because the controller's durable state cannot distinguish a leaked charge from a
+release in flight. That distinction does not arise here: this derivation is exact
+**with respect to job records**, and a leak and an in-flight release are both
+states in which the slice *should* remain charged. Whether a job record is itself
+stale is a different question, answered by agent evidence in commits 5, 6 and 8.
+
+That is the layering this establishes:
+
+| Layer | One source of truth | Resolved by |
+| --- | --- | --- |
+| Node totals vs job records | `Job.per_node_alloc` | commit 0, by derivation |
+| Job records vs physical reality | the agent's admission ledger | commits 5, 6, 8 |
+
+**Not a breaking change.** The field stays in `Node` and keeps serializing, so a
+new controller reading an old snapshot recomputes and is correct, and an old
+controller reading a new snapshot reads the persisted value exactly as it does
+today. No proto change, no `WalOperation` change.
+
+*spurctld only. Lands before the agent work, since 2, 5 and 8 all depend on the
+controller having one answer.*
 
 ### 1 — `feat(spurd): persist a durable admission record per job-run`
 
@@ -498,6 +558,7 @@ Every requirement in the spec gets a row. Deferred items get a reason, not silen
 | §7 | Fail closed on unknown schema, corruption, identity mismatch | 1 |
 | §7 | Hook left `running` after its owner dies becomes `Unknown`, never auto-rerun | 1 |
 | — | Supervisor identity scoped to its boot (`process_start_ticks` is boot-relative) | 1, 2 — pre-existing hazard in 754 |
+| — | One durable record per fact: node totals derived from job records | 0 — prerequisite; PR #681 closed unmerged |
 | §7 | Separate agent state root | **deferred** — `admission/` is a disjoint sibling of `raft/`; deferring removes a config change from the diff |
 | §7 | `auth.mode=required` in production | **out of scope** — flagged; the fences are not authorization |
 | §8 | Launch expiry; participant-only Stop/Clean does not fence siblings | 4, partly 754 |
@@ -513,6 +574,15 @@ Every requirement in the spec gets a row. Deferred items get a reason, not silen
 
 **Unit**
 
+- Derivation is exact: a generated cluster of jobs across nodes, in every
+  lifecycle state, derives the same totals the accumulator reaches by
+  `add`/`subtract`. Differential and mutation-tested — #681 established that a
+  generator keyed on `HashMap` iteration order is not reproducible from its seed,
+  so sort before generating.
+- Derivation charges a node that has not reported completion for a terminal job,
+  and stops charging one that has.
+- A snapshot carrying a drifted `alloc_resources` is corrected on load; an old
+  snapshot without the benefit of derivation still loads.
 - Frozen-fixture round-trip per record, so a later field addition cannot break
   load (the #509 / #517 pattern).
 - Rebuild-from-run-records is exact where descriptor rebuild under-counts —
@@ -577,6 +647,11 @@ controller crash replaying a newer log.
    node always leaves the gate.
 3. **Commit 3 in isolation would leak.** It removes a release path that 5, 6 and 8
    replace. The ladder lands together; 3 is not pushed standalone.
+4. **Commit 0 touches `cluster.rs`,** the highest-churn file in the tree and the
+   one my own notes name as the binding constraint on this work. It is also the
+   commit most likely to surface latent disagreements between the accumulator and
+   the job records — which is the point, but it means the differential test is
+   what carries it, not review.
 
 ## Process note
 
