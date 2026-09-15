@@ -794,7 +794,9 @@ async fn teardown_completed_job(
         job_id,
         completed.run_attempt,
     ));
-    allocation.lock().await.release_job(job_id);
+    // The slice is NOT freed here. Cleanup finishing is not the controller
+    // having committed the completion, and only that frees it.
+    let _ = allocation;
     // Marked, not removed: the record is the evidence a later reconcile reads,
     // and the sweep collects it once nothing is still owed.
     if let Err(error) = admissions.mark_run_cleaned(job_id, completed.run_attempt) {
@@ -941,6 +943,7 @@ pub struct CompletionListenerContext {
     allocation: Arc<Mutex<NodeAllocation>>,
     stepds: Arc<Mutex<StepdMap>>,
     stepds_store: crate::stepd::StepdStore,
+    admissions: crate::admission::AdmissionStore,
     controller_addr: String,
     hostname: String,
 }
@@ -1442,6 +1445,7 @@ async fn fence_dead_stepd(
         allocation,
         stepds,
         stepds_store: store,
+        admissions,
         controller_addr,
         hostname,
     } = context;
@@ -1527,6 +1531,24 @@ async fn fence_dead_stepd(
     }
 
     release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
+    if reported {
+        let _ = admissions.record_controller_ack(descriptor.job_id, descriptor.run_attempt, 1);
+        let _ = admissions.record_report_acknowledged(
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+        );
+        let _ = admissions.mark_run_cleaned(descriptor.job_id, descriptor.run_attempt);
+        release_acknowledged_allocation(
+            allocation,
+            admissions,
+            descriptor.job_id,
+            descriptor.run_attempt,
+            descriptor.step_id,
+            true,
+        )
+        .await;
+    }
 
     // The supervisor is gone, so no completion push is coming; without this the
     // RPC that launched this step stays parked for the agent's lifetime.
@@ -1672,6 +1694,23 @@ async fn handle_completion_notification(
                 "runtime completion",
             )
             .await;
+            // The acknowledgement, and only it, unlocks the slice. Without this
+            // the exit path holds correctly and nothing ever frees it again.
+            if reported {
+                let admissions = context.admissions.clone();
+                let _ = admissions.record_controller_ack(job_id, run_attempt, 1);
+                let _ = admissions.record_report_acknowledged(job_id, run_attempt, step_id);
+                let _ = admissions.mark_run_cleaned(job_id, run_attempt);
+                release_acknowledged_allocation(
+                    &context.allocation,
+                    &admissions,
+                    job_id,
+                    run_attempt,
+                    step_id,
+                    !epilog_failed,
+                )
+                .await;
+            }
             // A user step's exit ends the RPC that launched it, not the job, so
             // the controller report above was a no-op and this is the delivery.
             context
@@ -1719,6 +1758,7 @@ pub type SessionIdentity = (u32, u32, spur_core::step::StepId);
 
 pub async fn replay_unacknowledged_stepd_completions(
     store: &crate::stepd::StepdStore,
+    admissions: &crate::admission::AdmissionStore,
     controller_addr: &str,
     reporting_node: &str,
 ) -> anyhow::Result<Vec<SessionIdentity>> {
@@ -1741,6 +1781,13 @@ pub async fn replay_unacknowledged_stepd_completions(
         .await
         {
             store.acknowledge_completion(&completion)?;
+            let _ = admissions.record_controller_ack(completion.job_id, completion.run_attempt, 1);
+            let _ = admissions.record_report_acknowledged(
+                completion.job_id,
+                completion.run_attempt,
+                completion.step_id,
+            );
+            let _ = admissions.mark_run_cleaned(completion.job_id, completion.run_attempt);
             reconciled.push((
                 completion.job_id,
                 completion.run_attempt,
@@ -1760,8 +1807,13 @@ pub fn retry_unacknowledged_stepd_completions(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            match replay_unacknowledged_stepd_completions(&store, &controller_addr, &reporting_node)
-                .await
+            match replay_unacknowledged_stepd_completions(
+                &store,
+                &admissions,
+                &controller_addr,
+                &reporting_node,
+            )
+            .await
             {
                 Ok(reconciled) if !reconciled.is_empty() => {
                     tracing::info!(
@@ -3449,6 +3501,7 @@ impl AgentService {
             allocation: self.allocation.clone(),
             stepds: self.stepds.clone(),
             stepds_store: crate::stepd::StepdStore::new(&self.stepd_state_dir),
+            admissions: self.admissions(),
             controller_addr: self.reporter.controller_addr.clone(),
             hostname: self.reporter.hostname.clone(),
         }
@@ -3545,6 +3598,9 @@ impl AgentService {
                         )
                     };
                     drop(jobs);
+                    // Record-driven, so a report path that records an
+                    // acknowledgement without releasing cannot strand a slice.
+                    release_due_allocations(&allocation, &admissions).await;
                     flag_unbacked_allocations(&unbacked, &admissions).await;
                 }
 
@@ -3607,7 +3663,7 @@ impl AgentService {
                     let drain = drain_jobs.get(&c.job_id).map(|reason| DrainRequest {
                         reason: reason.clone(),
                     });
-                    report_completion(
+                    let acknowledged = report_completion(
                         &controller_addr,
                         CompletionReport {
                             job_id: c.job_id,
@@ -3619,6 +3675,32 @@ impl AgentService {
                             // Unsupervised path: the report speaks for the job.
                             step_id: None,
                         },
+                    )
+                    .await;
+                    if !acknowledged {
+                        // Held, not freed: the controller has not committed this
+                        // completion, so this node is still the only thing that
+                        // knows the work stopped. Reconcile resolves it.
+                        warn!(
+                            job_id = c.job_id,
+                            run_attempt = c.run_attempt,
+                            "completion unacknowledged; holding this run's resources"
+                        );
+                        continue;
+                    }
+                    let _ = admissions.record_controller_ack(c.job_id, c.run_attempt, 1);
+                    let _ = admissions.record_report_acknowledged(
+                        c.job_id,
+                        c.run_attempt,
+                        spur_core::step::STEP_BATCH,
+                    );
+                    release_acknowledged_allocation(
+                        &allocation,
+                        &admissions,
+                        c.job_id,
+                        c.run_attempt,
+                        spur_core::step::STEP_BATCH,
+                        true,
                     )
                     .await;
                 }
@@ -3670,6 +3752,36 @@ async fn flag_unbacked_allocations(
             }
             Err(error) => warn!(job_id, run_attempt, %error, "conflict-hold task failed"),
         }
+    }
+}
+
+/// Free every run the records say is due. Idempotent and record-driven, so a
+/// report path that records an acknowledgement without releasing cannot strand
+/// a slice, and a restart mid-release picks it up again.
+async fn release_due_allocations(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+) {
+    let Ok(loaded) = admissions.load_all() else {
+        return;
+    };
+    for admitted in loaded.runs {
+        let owner = admitted
+            .run
+            .lifecycle_owner_step
+            .or_else(|| admitted.participants.first().map(|p| p.step_id));
+        let Some(step_id) = owner else {
+            continue;
+        };
+        release_acknowledged_allocation(
+            allocation,
+            admissions,
+            admitted.run.job_id,
+            admitted.run.run_attempt,
+            step_id,
+            admitted.run.cleanup.epilog != crate::admission::HookState::Failed,
+        )
+        .await;
     }
 }
 
@@ -10100,6 +10212,10 @@ mod tests {
             .insert(stepd_key(&descriptor), descriptor);
         let state_dir = tempfile::tempdir().expect("state dir");
         let context = CompletionListenerContext {
+            admissions: crate::admission::AdmissionStore::new(
+                std::env::temp_dir().join(format!("spur-test-adm-{}", uuid::Uuid::new_v4())),
+                "test-node",
+            ),
             running: running.clone(),
             step_completions: completions.clone(),
             allocation,
@@ -14751,10 +14867,12 @@ mod tests {
             "monitor should reap the exited job within 5s"
         );
 
+        // The monitor reaps the job, but the controller here is unreachable
+        // (port 1), so no acknowledgement arrives and the slice stays held.
         assert_eq!(
             svc.free_gpu_count().await,
-            1,
-            "the completed job's GPU must be released"
+            0,
+            "an unacknowledged completion must not free the slice"
         );
         let output = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
         assert!(
@@ -15954,6 +16072,10 @@ mod tests {
         store: &crate::stepd::StepdStore,
     ) -> CompletionListenerContext {
         CompletionListenerContext {
+            admissions: crate::admission::AdmissionStore::new(
+                std::env::temp_dir().join(format!("spur-test-adm-{}", uuid::Uuid::new_v4())),
+                "test-node",
+            ),
             running: running.clone(),
             step_completions: completions.clone(),
             allocation: allocation.clone(),
@@ -16679,7 +16801,7 @@ mod tests {
     // The counterpart: with no live run under the id, the same teardown must
     // still release everything, so the guard above cannot just skip always.
     #[tokio::test]
-    async fn teardown_releases_a_job_id_nothing_holds() {
+    async fn teardown_cleans_up_without_releasing_the_slice() {
         let dir = tempfile::tempdir().unwrap();
         let cgroup = dir.path().join("job_908");
         std::fs::create_dir(&cgroup).unwrap();
@@ -16713,10 +16835,13 @@ mod tests {
             !cgroup.exists(),
             "teardown must remove the finished run's cgroup"
         );
+        // Teardown cleans up, but it does not free the slice: until the
+        // controller has committed the completion, this node is the only
+        // thing that knows the work stopped.
         assert_eq!(
             svc.free_gpu_count().await,
-            1,
-            "teardown must release the finished run's reservation"
+            0,
+            "teardown must not release ahead of the acknowledgement"
         );
     }
 

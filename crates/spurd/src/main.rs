@@ -565,10 +565,15 @@ async fn main() -> anyhow::Result<()> {
         .map(session_identity)
         .collect();
     let reconciled_stepd_completions: std::collections::HashSet<_> =
-        agent_server::replay_unacknowledged_stepd_completions(&stepds, &args.controller, &hostname)
-            .await?
-            .into_iter()
-            .collect();
+        agent_server::replay_unacknowledged_stepd_completions(
+            &stepds,
+            &spurd::admission::AdmissionStore::new(&stepd_state_dir, &hostname),
+            &args.controller,
+            &hostname,
+        )
+        .await?
+        .into_iter()
+        .collect();
     // Runs for the daemon's life, not just when this scan found something —
     // a push notification deferred later needs the same reconciliation.
     agent_server::retry_unacknowledged_stepd_completions(

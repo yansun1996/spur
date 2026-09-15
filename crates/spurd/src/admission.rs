@@ -566,7 +566,10 @@ impl AdmissionStore {
             run.max_launch_expiry_unix_ms = run
                 .max_launch_expiry_unix_ms
                 .max(existing.max_launch_expiry_unix_ms);
-            run.conflict_hold = run.conflict_hold.or(existing.conflict_hold);
+            // Carried forward only while this write is not itself clearing it.
+            if run.conflict_hold.is_none() && run.controller_ack.release_raft_index.is_none() {
+                run.conflict_hold = existing.conflict_hold;
+            }
         }
         let dir = self.prepare_run_dir(run.job_id, run.run_attempt)?;
         publish_private(&dir, RUN_FILE, &encode(&run)?)
@@ -896,6 +899,9 @@ impl AdmissionStore {
             Err(error) => return Err(error),
         };
         run.controller_ack.release_raft_index = Some(release_raft_index);
+        // An acknowledged completion resolves exactly what a hold taken for an
+        // untracked claim was preserving, and nothing else would ever clear it.
+        run.conflict_hold = None;
         self.admit_run(&run)?;
         Ok(true)
     }
@@ -1481,6 +1487,22 @@ mod tests {
 
         store.admit_run(&run_with(7, 1, 9_000)).unwrap();
         assert_eq!(store.reject_before(7, 1), Some(5_000));
+    }
+
+    #[test]
+    fn an_acknowledged_completion_clears_the_hold_it_resolved() {
+        // A hold taken while the controller was unreachable would otherwise pin
+        // the record forever: it never settles and never ages out.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store
+            .take_conflict_hold(7, 1, "held with no tracked job")
+            .unwrap();
+        assert!(store.load_run(7, 1).unwrap().conflict_hold.is_some());
+
+        store.record_controller_ack(7, 1, 9).unwrap();
+        assert!(store.load_run(7, 1).unwrap().conflict_hold.is_none());
     }
 
     #[test]
