@@ -203,6 +203,7 @@ impl SlurmAccounting for AccountingService {
                 num_nodes: 1, // simplified
                 num_tasks: cpus,
                 cpus_per_task: 1,
+                total_gpus: 0,
                 memory_mb,
                 submit_time,
                 start_time,
@@ -822,13 +823,17 @@ impl SlurmAccounting for AccountingService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let account_weights: std::collections::HashMap<String, f64> = accounts
+        let associations = db::list_associations(pool)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let user_weights: std::collections::HashMap<(String, String), i32> = associations
             .into_iter()
-            .map(|a| (a.name, a.fairshare_weight as f64))
+            .map(|a| ((a.user_name, a.account), a.fairshare_weight))
             .collect();
 
         let raw_factors =
-            fairshare::compute_fairshare(&usage, &account_weights, halflife_days, now);
+            fairshare::compute_fairshare(&usage, &accounts, &user_weights, halflife_days, now);
 
         let entries = raw_factors
             .into_iter()
