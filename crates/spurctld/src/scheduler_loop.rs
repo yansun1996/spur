@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use tracing::{debug, error, info, warn};
 
+use spur_core::job::LAUNCH_LIFETIME_MS;
 use spur_core::node::{Node, NodeSource};
 use spur_core::partition::requested_partition_names;
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
@@ -41,10 +42,6 @@ fn node_comm_http_url(node: &Node) -> Option<String> {
     let host = node.comm_addr()?;
     Some(spur_net::format_comm_http_url(host, node.port))
 }
-
-/// How long a launch stays admissible. Well under the agent's record retention,
-/// or a cutoff could be collected while a launch it would refuse is in flight.
-const LAUNCH_LIFETIME_MS: u64 = 120_000;
 
 /// Milliseconds since the epoch, saturating rather than panicking on a clock
 /// set before 1970.
@@ -2608,6 +2605,11 @@ async fn fence_run_on_nodes(
     run_attempt: u32,
     node_names: &[String],
 ) {
+    // Attempt 0 is the "whichever is tracked" wildcard the cancel below accepts.
+    // A cutoff has no run to live on without an attempt, so there is none to set.
+    if run_attempt == 0 {
+        return;
+    }
     let cutoff = now_unix_ms();
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {

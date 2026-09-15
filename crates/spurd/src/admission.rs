@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use spur_core::job::LAUNCH_LIFETIME_MS;
 use spur_core::step::StepId;
 
 use crate::stepd::{create_private_dir_all, publish_private};
@@ -139,6 +140,10 @@ pub struct RunAdmission {
     pub conflict_hold: Option<ConflictHold>,
     #[serde(default)]
     pub controller_ack: ControllerAck,
+    /// The controller asked for this run to end. Its own word that the run is
+    /// over, which settles the record once teardown has finished.
+    #[serde(default)]
+    pub cancelled_by_controller: bool,
 }
 
 impl RunAdmission {
@@ -164,6 +169,7 @@ impl RunAdmission {
             cleanup: CleanupState::default(),
             conflict_hold: None,
             controller_ack: ControllerAck::default(),
+            cancelled_by_controller: false,
         }
     }
 
@@ -171,6 +177,16 @@ impl RunAdmission {
     fn ages_out_at(&self, retention_ms: u64) -> u64 {
         self.max_launch_expiry_unix_ms
             .max(self.created_at_unix_ms.saturating_add(retention_ms))
+    }
+
+    /// Whether the cutoff could still have to refuse a launch. Removing the
+    /// record un-fences it, so it must outlive every launch the cutoff covers.
+    fn fence_is_live(&self, now_unix_ms: u64) -> bool {
+        self.reject_before_unix_ms > 0
+            && now_unix_ms
+                < self
+                    .reject_before_unix_ms
+                    .saturating_add(LAUNCH_LIFETIME_MS)
     }
 }
 
@@ -832,6 +848,13 @@ impl AdmissionStore {
         run_attempt: u32,
         reject_before_unix_ms: u64,
     ) -> io::Result<u64> {
+        // Attempts start at 1, so zero is a caller's wildcard, not an identity.
+        // A record invented for it holds a claim nothing can ever settle.
+        if run_attempt == 0 {
+            return Err(invalid(
+                "run attempt 0 names no run and cannot be fenced".to_string(),
+            ));
+        }
         let mut run = match self.load_run(job_id, run_attempt) {
             Ok(run) => run,
             // Fencing a run this node has no record of still has to hold: the
@@ -915,6 +938,35 @@ impl AdmissionStore {
         Ok(true)
     }
 
+    /// Record the controller's cancel. Never creates a record: a cancel for a
+    /// run this node never admitted has nothing to settle.
+    pub fn mark_controller_cancelled(&self, job_id: u32, run_attempt: u32) -> io::Result<bool> {
+        let mut run = match self.load_run(job_id, run_attempt) {
+            Ok(run) => run,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if run.cancelled_by_controller {
+            return Ok(true);
+        }
+        run.cancelled_by_controller = true;
+        self.admit_run(&run)?;
+        Ok(true)
+    }
+
+    /// Settle a cancelled run: the cancel is the controller's own acknowledgement.
+    /// Owed reports go with it -- one owed forever is what makes a record immortal.
+    pub fn settle_cancelled_run(&self, job_id: u32, run_attempt: u32) -> io::Result<bool> {
+        if !self.record_controller_ack(job_id, run_attempt, 1)? {
+            return Ok(false);
+        }
+        let (participants, _) = self.participants(job_id, run_attempt)?;
+        for participant in participants {
+            self.record_report_acknowledged(job_id, run_attempt, participant.step_id)?;
+        }
+        self.mark_run_cleaned(job_id, run_attempt)
+    }
+
     /// Mark a participant's completion as acknowledged, so the durable retry
     /// stops rediscovering it.
     pub fn record_report_acknowledged(
@@ -971,7 +1023,7 @@ impl AdmissionStore {
         let loaded = self.load_all()?;
         for admitted in loaded.runs {
             let run = &admitted.run;
-            if run.conflict_hold.is_some() {
+            if run.conflict_hold.is_some() || run.fence_is_live(now_unix_ms) {
                 continue;
             }
             if admitted.is_settled() || admitted.aged_out(now_unix_ms, retention_ms) {
@@ -1286,6 +1338,58 @@ mod tests {
         assert_eq!(store.sweep(10_000, 1_000).unwrap(), 1);
         assert!(store.load_run(1, 1).is_err());
         assert!(store.load_run(2, 1).is_ok(), "an owed report must be kept");
+    }
+
+    #[test]
+    fn sweep_keeps_a_fenced_record_only_while_its_cutoff_could_refuse_a_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let mut fenced = run_with(7, 1, 1_000);
+        fenced.state = RunState::Cleaned;
+        store.admit_run(&fenced).unwrap();
+        store.fence_run(7, 1, 10_000).unwrap();
+
+        assert_eq!(
+            store.sweep(10_000 + LAUNCH_LIFETIME_MS - 1, 1).unwrap(),
+            0,
+            "collecting the record would re-admit the launch the cutoff refuses"
+        );
+        assert!(store.load_run(7, 1).is_ok());
+        assert_eq!(
+            store.sweep(10_000 + LAUNCH_LIFETIME_MS, 1).unwrap(),
+            1,
+            "an expired cutoff must not keep a settled record forever"
+        );
+    }
+
+    #[test]
+    fn settling_a_cancelled_run_discharges_the_report_that_would_outlive_it() {
+        // The controller answers no report for a run it has forgotten, so an
+        // owed one left behind by a cancel would make the record immortal.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1_000)).unwrap();
+        let mut owed = ParticipantAdmission::new(7, 1, STEP_BATCH, "n1", Default::default());
+        owed.final_report.required = true;
+        store.admit_participant(&owed).unwrap();
+
+        assert!(store.settle_cancelled_run(7, 1).unwrap());
+        assert_eq!(
+            store.sweep(u64::MAX, 1).unwrap(),
+            1,
+            "a settled cancel must leave nothing behind"
+        );
+    }
+
+    #[test]
+    fn a_fence_for_attempt_zero_leaves_no_phantom_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        assert!(store.fence_run(7, 0, 5_000).is_err());
+        assert!(
+            store.load_all().unwrap().runs.is_empty(),
+            "a wildcard attempt must not be given a record to hold a claim with"
+        );
     }
 
     #[test]

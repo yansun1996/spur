@@ -3600,6 +3600,7 @@ impl AgentService {
                     drop(jobs);
                     // Record-driven, so a report path that records an
                     // acknowledgement without releasing cannot strand a slice.
+                    settle_cancelled_runs(&allocation, &admissions).await;
                     release_due_allocations(&allocation, &admissions).await;
                     flag_unbacked_allocations(&unbacked, &admissions).await;
                 }
@@ -3752,6 +3753,57 @@ async fn flag_unbacked_allocations(
             }
             Err(error) => warn!(job_id, run_attempt, %error, "conflict-hold task failed"),
         }
+    }
+}
+
+/// Settle runs the controller cancelled, once their teardown has finished. A
+/// completion for a run it has forgotten is never acknowledged, so nothing frees it.
+async fn settle_cancelled_runs(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+) {
+    let Ok(loaded) = admissions.load_all() else {
+        return;
+    };
+    for admitted in loaded.runs {
+        let run = &admitted.run;
+        if !run.cancelled_by_controller
+            || run.state != crate::admission::RunState::Cleaned
+            || run.controller_ack.release_raft_index.is_some()
+        {
+            continue;
+        }
+        let (job_id, run_attempt) = (run.job_id, run.run_attempt);
+        let store = admissions.clone();
+        let settled =
+            tokio::task::spawn_blocking(move || store.settle_cancelled_run(job_id, run_attempt))
+                .await;
+        match settled {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(job_id, run_attempt, %error, "failed to settle a cancelled run");
+                continue;
+            }
+            Err(error) => {
+                warn!(job_id, run_attempt, %error, "settle task failed");
+                continue;
+            }
+        }
+        // Freed here, not on the next tick: settling makes the record collectable
+        // and the sweep may take it before another pass reads it.
+        let step_id = run
+            .lifecycle_owner_step
+            .or_else(|| admitted.participants.first().map(|p| p.step_id))
+            .unwrap_or(spur_core::step::STEP_BATCH);
+        release_acknowledged_allocation(
+            allocation,
+            admissions,
+            job_id,
+            run_attempt,
+            step_id,
+            run.cleanup.epilog != crate::admission::HookState::Failed,
+        )
+        .await;
     }
 }
 
@@ -5645,11 +5697,13 @@ impl SlurmAgent for AgentService {
             warn!(job_id, error = %err, "PMIx teardown on cancel failed");
         }
 
-        // A record with nothing tracked behind it is all that is left of the
-        // claim, and its slice was just let go above, so it owes nothing now.
-        if nothing_tracked {
-            if let Some(attempt) = doomed_attempt {
+        // Nothing tracked means the record is all that is left of the claim and
+        // its slice just went back; a tracked one is still tearing down.
+        if let Some(attempt) = doomed_attempt {
+            if nothing_tracked {
                 self.settle_cancelled_run(job_id, attempt).await;
+            } else {
+                self.mark_controller_cancelled(job_id, attempt).await;
             }
         }
 
@@ -7741,8 +7795,7 @@ impl AgentService {
     async fn settle_cancelled_run(&self, job_id: u32, run_attempt: u32) {
         let admissions = self.admissions();
         let settled = tokio::task::spawn_blocking(move || {
-            admissions.record_controller_ack(job_id, run_attempt, 1)?;
-            admissions.mark_run_cleaned(job_id, run_attempt)
+            admissions.settle_cancelled_run(job_id, run_attempt)
         })
         .await;
         match settled {
@@ -7751,6 +7804,23 @@ impl AgentService {
                 warn!(job_id, run_attempt, %error, "failed to settle a cancelled run's record")
             }
             Err(error) => warn!(job_id, run_attempt, %error, "settle task failed"),
+        }
+    }
+
+    /// Note the controller's cancel on a run still being torn down. Settling it
+    /// here would free the slice out from under processes that are still exiting.
+    async fn mark_controller_cancelled(&self, job_id: u32, run_attempt: u32) {
+        let admissions = self.admissions();
+        let marked = tokio::task::spawn_blocking(move || {
+            admissions.mark_controller_cancelled(job_id, run_attempt)
+        })
+        .await;
+        match marked {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(job_id, run_attempt, %error, "failed to record a run's cancellation")
+            }
+            Err(error) => warn!(job_id, run_attempt, %error, "cancel-record task failed"),
         }
     }
 
@@ -15737,6 +15807,65 @@ mod tests {
         admissions
             .admit_participant(&participant)
             .expect("admit participant");
+    }
+
+    // A controller that has forgotten a job never acknowledges its completion, so
+    // the cancel itself is what has to settle the run; nothing else ever will.
+    #[tokio::test]
+    async fn a_cancel_of_a_live_run_frees_its_slice_once_teardown_finishes() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        svc.insert_test_job(
+            7,
+            TrackedJob {
+                run_attempt: 1,
+                ..TrackedJob::dummy(0)
+            },
+        )
+        .await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(7, 1, 2, 1000, &[])
+                .expect("allocate");
+            alloc.commit_job(7, 1);
+        }
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            run_attempt: 1,
+            signal: 9,
+        }))
+        .await
+        .expect("cancel");
+
+        settle_cancelled_runs(&svc.allocation, &admissions).await;
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "a run still being torn down must keep its slice"
+        );
+
+        // What teardown finishing looks like: untracked, and the record cleaned.
+        svc.running.lock().await.remove(&7);
+        admissions.mark_run_cleaned(7, 1).expect("cleaned");
+        settle_cancelled_runs(&svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "a cancelled run's slice must go back once its teardown is done"
+        );
+        assert_eq!(
+            admissions
+                .sweep(crate::admission::now_unix_ms(), 1)
+                .expect("sweep"),
+            1,
+            "and nothing of it may be left to re-advertise as a claim"
+        );
     }
 
     // A reaped launch produced nothing, and its record would owe a report
