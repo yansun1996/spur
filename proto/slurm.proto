@@ -1044,6 +1044,30 @@ enum LaunchFailureKind {
   // and holds the job rather than retrying, since a prolog sees the job's own
   // context and so fails the same way everywhere.
   LAUNCH_FAILURE_PROLOG = 1;
+  // Older than the run's cutoff: the controller stopped this run after issuing
+  // the launch. Retrying this attempt cannot succeed.
+  LAUNCH_FAILURE_FENCED = 2;
+  // Past its own deadline. The controller's own latency; a fresh dispatch works.
+  LAUNCH_FAILURE_EXPIRED = 3;
+  // Same identity, different command. A bug somewhere; do not retry blindly.
+  LAUNCH_FAILURE_CONFLICTING_DIGEST = 4;
+  // The node already holds the requested resources for another job. The
+  // controller looks that job up and decides which of the two is stale.
+  LAUNCH_FAILURE_LOCAL_OVERLAP = 5;
+  // Runtime state with no admission record behind it: the node needs a full
+  // reconcile before it can be trusted with this.
+  LAUNCH_FAILURE_RESIDUAL_STATE = 6;
+  // The launch named a different node. A controller bug.
+  LAUNCH_FAILURE_TARGET_MISMATCH = 7;
+}
+
+// What the node was already holding when it refused, so the controller can act
+// in the same round trip instead of guessing.
+message LaunchConflict {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+  repeated uint32 cpu_ids = 3;
+  repeated uint32 gpu_devices = 4;
 }
 
 message PreparePmixRequest {
@@ -1069,6 +1093,9 @@ message LaunchJobResponse {
   string stdout_path = 3;  // absolute resolved output path on the launching node
   string stderr_path = 4;
   LaunchFailureKind failure_kind = 5;
+  // Populated with LAUNCH_FAILURE_LOCAL_OVERLAP: which job the node is holding
+  // the requested resources for.
+  optional LaunchConflict conflict = 6;
 }
 
 message AgentStartJobRequest {
