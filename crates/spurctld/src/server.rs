@@ -855,13 +855,23 @@ impl ControllerService {
     }
 }
 
+/// What one reconcile pass resolved. Settling is reported separately from
+/// cancelling because the apply layer drops a completion it considers stale.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReconcileOutcome {
+    /// Direction A: claims the node held that Raft did not record.
+    pub cancelled: Vec<u32>,
+    /// Direction B: records the node stopped holding, that the apply accepted.
+    pub settled: Vec<u32>,
+}
+
 /// Diff an agent's asserted ledger against Raft and resolve the differences. The
-/// node stays gated until this returns; the result is what Direction A cancelled.
+/// node stays gated until this returns.
 pub(crate) async fn reconcile_node_ledger(
     cluster: &Arc<ClusterManager>,
     node: &str,
     ledger: spur_proto::proto::NodeLedger,
-) -> Vec<u32> {
+) -> ReconcileOutcome {
     let held: std::collections::HashMap<u32, &spur_proto::proto::LedgerEntry> =
         ledger.entries.iter().map(|e| (e.job_id, e)).collect();
     let recorded = cluster.jobs_allocated_on_node(node);
@@ -875,7 +885,7 @@ pub(crate) async fn reconcile_node_ledger(
         .collect();
     let controller_ready =
         unrecorded.is_empty() || cluster.state_machine_ready(CONTROLLER_CATCH_UP_WAIT).await;
-    let mut cancelled = Vec::new();
+    let mut outcome = ReconcileOutcome::default();
     for entry in unrecorded {
         if !controller_ready {
             warn!(
@@ -899,12 +909,13 @@ pub(crate) async fn reconcile_node_ledger(
             9,
         )
         .await;
-        cancelled.push(entry.job_id);
+        outcome.cancelled.push(entry.job_id);
     }
 
     // Direction B: Raft records a job here the agent did not report. Only an
-    // asserted-complete ledger licenses acting on an absence.
-    for (job_id, run_attempt) in recorded {
+    // asserted-complete ledger licenses acting on an absence, and only for a run
+    // the agent confirmed -- a cut can predate a launch still being dispatched.
+    for (job_id, run_attempt) in cluster.jobs_confirmed_on_node(node) {
         if held.contains_key(&job_id) {
             continue;
         }
@@ -928,7 +939,7 @@ pub(crate) async fn reconcile_node_ledger(
                 node = %node,
                 job_id, "the report was not applied; this job stays recorded on the node"
             ),
-            Ok(_) => {}
+            Ok(_) => outcome.settled.push(job_id),
             Err(error) => {
                 warn!(node = %node, job_id, ?error, "could not settle a job the node no longer holds")
             }
@@ -948,7 +959,7 @@ pub(crate) async fn reconcile_node_ledger(
         }
     }
 
-    cancelled
+    outcome
 }
 
 impl ControllerService {
@@ -6842,6 +6853,37 @@ mod tests {
         (svc, cluster)
     }
 
+    /// Charge a slice to "n1" for a job that is still Pending: the window
+    /// `reserve_placement` opens, before any node has confirmed the launch.
+    fn reserve_pending_job_on_n1(cluster: &Arc<ClusterManager>, job_id: u32) {
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            job_id,
+            spec: Box::new(spur_core::job::JobSpec {
+                name: "reserved".into(),
+                user: "testuser".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        let slice = spur_core::resource::ResourceAllocations::with_scalar(2, 1000);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobStart {
+            job_id,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: [("n1".to_string(), slice)].into_iter().collect(),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+        });
+        assert_eq!(
+            cluster.get_job(job_id).map(|j| j.state),
+            Some(spur_core::job::JobState::Pending),
+            "the reservation must not have activated the job"
+        );
+    }
+
     fn ledger(complete: bool, entries: Vec<(u32, u32)>) -> spur_proto::proto::NodeLedger {
         spur_proto::proto::NodeLedger {
             agent_session_id: "session-a".into(),
@@ -6888,11 +6930,11 @@ mod tests {
             "this test is only meaningful against a controller that has replayed its log"
         );
 
-        let cancelled =
+        let outcome =
             reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1), (99, 1)])).await;
 
         assert_eq!(
-            cancelled,
+            outcome.cancelled,
             vec![99],
             "job 7 is recorded here; job 99 is a claim Raft never placed"
         );
@@ -6922,10 +6964,10 @@ mod tests {
         });
         assert!(!cluster.state_machine_ready(std::time::Duration::ZERO).await);
 
-        let cancelled = reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1)])).await;
+        let outcome = reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1)])).await;
 
         assert!(
-            cancelled.is_empty(),
+            outcome.cancelled.is_empty(),
             "the controller's own absence is not evidence until it has replayed its log"
         );
     }
@@ -6935,11 +6977,58 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
 
-        reconcile_node_ledger(&cluster, "n1", ledger(true, Vec::new())).await;
+        let outcome = reconcile_node_ledger(&cluster, "n1", ledger(true, Vec::new())).await;
 
+        assert_eq!(
+            outcome.settled,
+            vec![7],
+            "a complete ledger that omits a confirmed run is evidence the node let it go"
+        );
+        assert!(!cluster.jobs_allocated_on_node("n1").contains_key(&7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_complete_ledger_does_not_settle_a_job_still_being_dispatched() {
+        // The cut can predate the launch, so its silence about a reservation is
+        // not the agent letting go -- it is the agent not having been told yet.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        reserve_pending_job_on_n1(&cluster, 8);
+        assert!(cluster.jobs_allocated_on_node("n1").contains_key(&8));
+
+        let outcome = reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1)])).await;
+
+        assert_eq!(
+            outcome.settled,
+            Vec::<u32>::new(),
+            "an unconfirmed launch is not something the cut can disown"
+        );
         assert!(
-            !cluster.jobs_allocated_on_node("n1").contains_key(&7),
-            "a complete ledger that omits it is evidence the node let it go"
+            cluster.jobs_allocated_on_node("n1").contains_key(&8),
+            "the reservation must stay charged to the node"
+        );
+        assert_eq!(
+            cluster.get_job(8).map(|j| j.state),
+            Some(spur_core::job::JobState::Pending),
+            "settling would finalize a job that never ran"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_for_a_job_still_being_dispatched_is_not_cancelled() {
+        // Direction A needs no dispatch-window guard of its own: a reservation is
+        // a record, so the claim the agent just took is one the controller made.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        reserve_pending_job_on_n1(&cluster, 8);
+
+        let outcome =
+            reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1), (8, 1)])).await;
+
+        assert_eq!(
+            outcome,
+            super::ReconcileOutcome::default(),
+            "both jobs are placed here; neither direction has anything to resolve"
         );
     }
 
