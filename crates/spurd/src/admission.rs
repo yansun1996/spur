@@ -390,6 +390,60 @@ pub fn classify_run(evidence: &RunEvidence) -> RunDisposition {
     RunDisposition::Unknown
 }
 
+/// Why a launch was refused before anything was spawned for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchRefusal {
+    /// Issued at or before this run's cutoff: the controller stopped this run
+    /// after issuing the launch.
+    Fenced,
+    /// Arrived past its own deadline.
+    Expired,
+    /// Same identity, different command.
+    ConflictingDigest,
+}
+
+/// Checked before admitting a launch. These defend against stale, duplicated
+/// and reordered commands from the controller. They are not authorization.
+#[derive(Debug, Clone, Default)]
+pub struct LaunchFences {
+    pub issued_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub command_digest: String,
+}
+
+impl LaunchFences {
+    /// `None` to admit. A pre-upgrade controller sends zeroes, which disable the
+    /// check that field drives rather than refusing every launch.
+    pub fn check(
+        &self,
+        now_unix_ms: u64,
+        reject_before_unix_ms: u64,
+        admitted_digest: Option<&str>,
+    ) -> Option<LaunchRefusal> {
+        // Both sides are controller-stamped, so this comparison does not depend
+        // on the agent's clock and a clock jump cannot un-fence a stopped run.
+        if reject_before_unix_ms > 0
+            && self.issued_at_unix_ms > 0
+            && self.issued_at_unix_ms <= reject_before_unix_ms
+        {
+            return Some(LaunchRefusal::Fenced);
+        }
+        if self.expires_at_unix_ms > 0 && now_unix_ms > self.expires_at_unix_ms {
+            return Some(LaunchRefusal::Expired);
+        }
+        match admitted_digest {
+            Some(admitted)
+                if !admitted.is_empty()
+                    && !self.command_digest.is_empty()
+                    && admitted != self.command_digest =>
+            {
+                Some(LaunchRefusal::ConflictingDigest)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A record the agent could not adopt. Held rather than deleted, because the
 /// record is the only evidence that something here may still hold a claim.
 #[derive(Debug, Clone)]
@@ -449,9 +503,21 @@ impl AdmissionStore {
 
     /// Persist the entitlement before anything is spawned against it. A crash
     /// before this leaves no record and no process; a crash after leaves both.
+    /// Monotonic fields carry forward: a relaunch of the same attempt must not
+    /// reset a cutoff and re-admit what it fenced.
     pub fn admit_run(&self, run: &RunAdmission) -> io::Result<()> {
+        let mut run = run.clone();
+        if let Ok(existing) = self.load_run(run.job_id, run.run_attempt) {
+            run.reject_before_unix_ms = run
+                .reject_before_unix_ms
+                .max(existing.reject_before_unix_ms);
+            run.max_launch_expiry_unix_ms = run
+                .max_launch_expiry_unix_ms
+                .max(existing.max_launch_expiry_unix_ms);
+            run.conflict_hold = run.conflict_hold.or(existing.conflict_hold);
+        }
         let dir = self.prepare_run_dir(run.job_id, run.run_attempt)?;
-        publish_private(&dir, RUN_FILE, &encode(run)?)
+        publish_private(&dir, RUN_FILE, &encode(&run)?)
     }
 
     /// The write fsyncs twice. Callers hold locks every other job RPC needs, so
@@ -692,6 +758,48 @@ impl AdmissionStore {
         });
         self.admit_run(&run)?;
         Ok(HoldOutcome::Taken)
+    }
+
+    /// Raise a run's cutoff. Monotonic: a lower value is ignored, so a reordered
+    /// or replayed fence can never un-cancel a run.
+    pub fn fence_run(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        reject_before_unix_ms: u64,
+    ) -> io::Result<u64> {
+        let mut run = match self.load_run(job_id, run_attempt) {
+            Ok(run) => run,
+            // Fencing a run this node has no record of still has to hold: the
+            // record is created below so a launch already in flight is refused.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut fresh = RunAdmission::new(
+                    job_id,
+                    run_attempt,
+                    &self.node,
+                    AdmittedResources::default(),
+                    now_unix_ms(),
+                );
+                fresh.reject_before_unix_ms = reject_before_unix_ms;
+                self.admit_run(&fresh)?;
+                return Ok(reject_before_unix_ms);
+            }
+            Err(error) => return Err(error),
+        };
+        if reject_before_unix_ms <= run.reject_before_unix_ms {
+            return Ok(run.reject_before_unix_ms);
+        }
+        run.reject_before_unix_ms = reject_before_unix_ms;
+        self.admit_run(&run)?;
+        Ok(reject_before_unix_ms)
+    }
+
+    /// The cutoff this run enforces, or none if it has no record yet. Read on
+    /// every launch, so it must outlive the agent that recorded it.
+    pub fn reject_before(&self, job_id: u32, run_attempt: u32) -> Option<u64> {
+        self.load_run(job_id, run_attempt)
+            .ok()
+            .map(|run| run.reject_before_unix_ms)
     }
 
     pub fn remove_participant(
@@ -1133,6 +1241,137 @@ mod tests {
         let loaded = store.load_all().unwrap();
         assert_eq!(loaded.runs.len(), 1);
         assert_eq!(loaded.rejected.len(), 1);
+    }
+
+    #[test]
+    fn a_launch_issued_before_the_cutoff_is_fenced() {
+        let fences = LaunchFences {
+            issued_at_unix_ms: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            fences.check(9_999, 1_000, None),
+            Some(LaunchRefusal::Fenced),
+            "issued at the cutoff is fenced, not merely before it"
+        );
+        assert_eq!(fences.check(9_999, 999, None), None);
+    }
+
+    #[test]
+    fn the_fence_does_not_depend_on_the_agent_clock() {
+        // Both sides are controller-stamped, so no clock jump on this node can
+        // un-fence a run the controller already stopped.
+        let fences = LaunchFences {
+            issued_at_unix_ms: 500,
+            ..Default::default()
+        };
+        for agent_now in [0, 1, u64::MAX] {
+            assert_eq!(
+                fences.check(agent_now, 1_000, None),
+                Some(LaunchRefusal::Fenced)
+            );
+        }
+    }
+
+    #[test]
+    fn a_launch_past_its_deadline_is_refused() {
+        let fences = LaunchFences {
+            issued_at_unix_ms: 100,
+            expires_at_unix_ms: 1_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            fences.check(1_000, 0, None),
+            None,
+            "the deadline is inclusive"
+        );
+        assert_eq!(fences.check(1_001, 0, None), Some(LaunchRefusal::Expired));
+    }
+
+    #[test]
+    fn a_conflicting_command_under_one_identity_is_refused() {
+        let fences = LaunchFences {
+            issued_at_unix_ms: 100,
+            command_digest: "aaa".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fences.check(200, 0, Some("aaa")),
+            None,
+            "an exact repeat is idempotent"
+        );
+        assert_eq!(
+            fences.check(200, 0, Some("bbb")),
+            Some(LaunchRefusal::ConflictingDigest)
+        );
+    }
+
+    #[test]
+    fn a_pre_upgrade_launch_carrying_no_fences_is_admitted() {
+        // A controller that stamps nothing must not have every launch refused.
+        let fences = LaunchFences::default();
+        assert_eq!(fences.check(u64::MAX, 5_000, Some("aaa")), None);
+    }
+
+    #[test]
+    fn a_fence_never_moves_backwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+
+        assert_eq!(store.fence_run(7, 1, 5_000).unwrap(), 5_000);
+        // A reordered or replayed fence must not un-cancel a stopped run.
+        assert_eq!(store.fence_run(7, 1, 1_000).unwrap(), 5_000);
+        assert_eq!(store.reject_before(7, 1), Some(5_000));
+    }
+
+    #[test]
+    fn fencing_a_run_with_no_record_still_takes_effect() {
+        // The launch may be in flight right now; with no record the cutoff has
+        // nowhere to live and the launch would land after its own cancel.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        assert_eq!(store.fence_run(7, 1, 5_000).unwrap(), 5_000);
+        assert_eq!(store.reject_before(7, 1), Some(5_000));
+    }
+
+    #[test]
+    fn a_fence_preserves_what_the_run_already_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let mut run = run_with(7, 1, 42);
+        run.state = RunState::Running;
+        store.admit_run(&run).unwrap();
+
+        store.fence_run(7, 1, 5_000).unwrap();
+        let after = store.load_run(7, 1).unwrap();
+        assert_eq!(after.allocation, run.allocation);
+        assert_eq!(after.created_at_unix_ms, 42);
+        assert_eq!(after.state, RunState::Running);
+    }
+
+    #[test]
+    fn a_relaunch_of_the_same_attempt_cannot_reset_the_cutoff() {
+        // Otherwise the fence evaporates on any same-attempt redispatch and the
+        // stale launch it was meant to refuse is admitted.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.fence_run(7, 1, 5_000).unwrap();
+
+        store.admit_run(&run_with(7, 1, 9_000)).unwrap();
+        assert_eq!(store.reject_before(7, 1), Some(5_000));
+    }
+
+    #[test]
+    fn a_relaunch_cannot_drop_a_conflict_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.take_conflict_hold(7, 1, "contested").unwrap();
+
+        store.admit_run(&run_with(7, 1, 2)).unwrap();
+        assert!(store.load_run(7, 1).unwrap().conflict_hold.is_some());
     }
 
     #[test]

@@ -551,6 +551,20 @@ impl SlurmAgent for VirtualAgent {
         Ok(Response::new(()))
     }
 
+    /// A virtual node has no local ledger to fence: its pods are the only state,
+    /// and cancel deletes them outright.
+    async fn fence_run(
+        &self,
+        request: Request<spur_proto::proto::FenceRunRequest>,
+    ) -> Result<Response<spur_proto::proto::FenceRunResponse>, Status> {
+        let req = request.into_inner();
+        Ok(Response::new(spur_proto::proto::FenceRunResponse {
+            success: true,
+            error: String::new(),
+            reject_before_unix_ms: req.reject_before_unix_ms,
+        }))
+    }
+
     async fn cancel_job(
         &self,
         request: Request<AgentCancelJobRequest>,

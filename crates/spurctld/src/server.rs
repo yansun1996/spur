@@ -6674,6 +6674,17 @@ mod tests {
 
     #[tonic::async_trait]
     impl spur_proto::proto::slurm_agent_server::SlurmAgent for ProbeAgent {
+        async fn fence_run(
+            &self,
+            _request: Request<spur_proto::proto::FenceRunRequest>,
+        ) -> Result<Response<spur_proto::proto::FenceRunResponse>, Status> {
+            Ok(Response::new(spur_proto::proto::FenceRunResponse {
+                success: true,
+                error: String::new(),
+                reject_before_unix_ms: 0,
+            }))
+        }
+
         type StreamJobOutputStream =
             tonic::codegen::BoxStream<spur_proto::proto::StreamJobOutputChunk>;
         type InteractiveSessionStream =
