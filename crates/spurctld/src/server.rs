@@ -6202,6 +6202,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(spec),
             },
@@ -6236,6 +6237,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(JobSpec {
                     name: "alice-job".into(),
@@ -6328,6 +6330,7 @@ mod tests {
             Arc::new(crate::cluster::ClusterManager::new(test_slurm_config(), dir.path()).unwrap());
 
         let submit = |job_id: u32, name: &str| WalOperation::JobSubmit {
+            at: None,
             job_id,
             spec: Box::new(JobSpec {
                 name: name.into(),
@@ -6436,6 +6439,7 @@ mod tests {
         };
 
         apply(&WalOperation::JobSubmit {
+            at: None,
             job_id: 20,
             spec: Box::new(JobSpec {
                 name: "evicted".into(),
@@ -6489,6 +6493,7 @@ mod tests {
             <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
                 cluster.as_ref(),
                 &WalOperation::JobSubmit {
+                    at: None,
                     job_id: task_id,
                     spec: Box::new(JobSpec {
                         name: "array-task".into(),
@@ -6531,6 +6536,7 @@ mod tests {
         };
 
         apply(&WalOperation::JobSubmit {
+            at: None,
             job_id: 40,
             spec: Box::new(JobSpec {
                 name: "moved".into(),
@@ -6592,6 +6598,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 50,
                 spec: Box::new(JobSpec {
                     name: "launching".into(),
@@ -6631,6 +6638,7 @@ mod tests {
         <crate::cluster::ClusterManager as StateMachineApply>::apply_operation(
             cluster.as_ref(),
             &WalOperation::JobSubmit {
+                at: None,
                 job_id: 60,
                 spec: Box::new(JobSpec {
                     name: "starting".into(),
@@ -6678,6 +6686,7 @@ mod tests {
         };
 
         apply(&WalOperation::JobSubmit {
+            at: None,
             job_id: 77,
             spec: Box::new(JobSpec {
                 name: "interactive".into(),
@@ -6834,6 +6843,7 @@ mod tests {
             source: spur_core::node::NodeSource::NativeHost,
         });
         cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
             job_id: 7,
             spec: Box::new(spur_core::job::JobSpec {
                 name: "j".into(),
@@ -6871,6 +6881,7 @@ mod tests {
     /// `reserve_placement` opens, before any node has confirmed the launch.
     fn reserve_pending_job_on_n1(cluster: &Arc<ClusterManager>, job_id: u32) {
         cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
             job_id,
             spec: Box::new(spur_core::job::JobSpec {
                 name: "reserved".into(),

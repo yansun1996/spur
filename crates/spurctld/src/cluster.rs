@@ -811,6 +811,7 @@ impl ClusterManager {
             }
 
             self.propose(WalOperation::JobSubmit {
+                at: None,
                 job_id: task_id,
                 spec: Box::new(task_spec),
             })
@@ -1306,6 +1307,7 @@ impl ClusterManager {
         }
 
         let resp = self.propose(WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Deadline,
@@ -1345,6 +1347,7 @@ impl ClusterManager {
         // fires for any allocated nodes. For pending jobs, allocated_nodes is empty
         // so the deallocation loop is a no-op.
         let resp = self.propose(WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Cancelled,
@@ -1483,6 +1486,7 @@ impl ClusterManager {
         };
 
         let resp = self.propose(WalOperation::JobUserRequeue {
+            at: None,
             job_id,
             hold,
             begin_time,
@@ -1837,6 +1841,7 @@ impl ClusterManager {
 
         let resp = self
             .propose(WalOperation::JobNodeComplete {
+                at: None,
                 job_id,
                 node_name: node_name.to_string(),
                 exit_code,
@@ -1895,6 +1900,7 @@ impl ClusterManager {
         // propose() handles: state transition, exit_code, end_time,
         // resource deallocation, step completion, license return
         let resp = self.propose(WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code,
             state,
@@ -1966,6 +1972,7 @@ impl ClusterManager {
             }
             PreemptMode::Cancel => {
                 let resp = self.propose(WalOperation::JobPreemptCancel {
+                    at: None,
                     job_id,
                     preempted_by,
                     preempt_qos,
@@ -1996,6 +2003,7 @@ impl ClusterManager {
                     .and_then(|j| j.spec.begin_time)
                     .map_or(hold, |user_begin| user_begin.max(hold));
                 let resp = self.propose(WalOperation::JobPreemptRequeue {
+                    at: None,
                     job_id,
                     begin_time,
                     preempted_by,
@@ -2205,6 +2213,7 @@ impl ClusterManager {
         // Trusted internal submit: bypass the user-facing validation pipeline
         // (auth, account/QOS, submit limits) that does not apply to a system job.
         self.propose(WalOperation::JobSubmit {
+            at: None,
             job_id,
             spec: Box::new(spec),
         })?;
@@ -2461,6 +2470,7 @@ impl ClusterManager {
         // transition to Failed via JobComplete so node resources,
         // licenses, and steps are properly cleaned up.
         self.propose(WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Failed,
@@ -2579,7 +2589,11 @@ impl ClusterManager {
                 return Ok(());
             }
         }
-        let resp = self.propose(WalOperation::JobEvict { job_id, detail })?;
+        let resp = self.propose(WalOperation::JobEvict {
+            job_id,
+            detail,
+            at: None,
+        })?;
         self.run_all_finalized_side_effects(&resp);
         Ok(())
     }
@@ -2965,6 +2979,7 @@ impl ClusterManager {
 
         if state == JobState::Running {
             self.propose(WalOperation::JobComplete {
+                at: None,
                 job_id,
                 exit_code: -1,
                 state: JobState::Failed,
@@ -3233,6 +3248,7 @@ impl ClusterManager {
         let (reason_uid, reason_time) = reason_attribution(&reason, reason_uid);
 
         self.propose(WalOperation::NodeStateChange {
+            at: None,
             name: name.to_string(),
             old_state,
             new_state: effective_state,
@@ -3456,6 +3472,7 @@ impl ClusterManager {
                         None => (Some("Not responding".into()), Some(0), Some(Utc::now())),
                     };
                     match self.propose(WalOperation::NodeStateChange {
+                        at: None,
                         name: name.clone(),
                         old_state,
                         new_state: NodeState::Down,
@@ -3491,6 +3508,7 @@ impl ClusterManager {
                     };
                     info!(node = %name, state = ?recovered_state, "node recovered (heartbeat resumed)");
                     if let Err(e) = self.propose(WalOperation::NodeStateChange {
+                        at: None,
                         name,
                         old_state,
                         new_state: recovered_state,
@@ -3545,6 +3563,7 @@ impl ClusterManager {
         };
         let (reason_uid, reason_time) = reason_attribution(&reason, reason_uid);
         self.propose(WalOperation::NodeStateChange {
+            at: None,
             name: name.to_string(),
             old_state,
             new_state: target_state,
@@ -3592,6 +3611,7 @@ impl ClusterManager {
         }
 
         let resp = self.propose(WalOperation::NodeRemove {
+            at: None,
             name: name.to_string(),
             reason,
         })?;
@@ -3622,6 +3642,7 @@ impl ClusterManager {
         exit_code: i32,
     ) -> anyhow::Result<()> {
         self.propose(WalOperation::JobStepComplete {
+            at: None,
             job_id,
             step_id,
             exit_code,
@@ -4188,6 +4209,7 @@ impl ClusterManager {
                 continue;
             }
             match self.propose(WalOperation::JobComplete {
+                at: None,
                 job_id: id,
                 exit_code: -1,
                 state: JobState::Cancelled,
@@ -5590,7 +5612,10 @@ impl ClusterManager {
     }
 
     #[allow(clippy::result_large_err)]
-    fn propose(&self, op: WalOperation) -> anyhow::Result<ClientResponse> {
+    fn propose(&self, mut op: WalOperation) -> anyhow::Result<ClientResponse> {
+        // Stamped at the one chokepoint into the log rather than at each call
+        // site, so no operation can reach it undated and be re-dated on replay.
+        op.stamp_occurred_at(Utc::now());
         let raft = self
             .raft
             .read()
@@ -5903,11 +5928,16 @@ impl ClusterManager {
         let mut jobs = self.jobs.write();
         let mut nodes = self.nodes.write();
         let mut next_id = self.next_job_id.load(Ordering::Relaxed);
-        let timestamp = Utc::now();
+        // The leader's instant, so a replay dates the operation from when it
+        // happened. Only entries written before the field existed fall back.
+        let timestamp = op.occurred_at().unwrap_or_else(Utc::now);
 
         match op {
-            WalOperation::JobSubmit { job_id, spec } => {
+            WalOperation::JobSubmit { job_id, spec, .. } => {
                 let mut job = Job::new(*job_id, (**spec).clone());
+                // Job::new dates the submission from the local clock, which on a
+                // replay is the replay instant rather than the real submission.
+                job.submit_time = timestamp;
                 if let Some(het_group) = spec.het_group {
                     job.het_group = Some(het_group);
                     if het_group > 0 {
@@ -5997,6 +6027,7 @@ impl ClusterManager {
                 begin_time,
                 preempted_by,
                 preempt_qos,
+                ..
             } => {
                 // Only a running job is preempted; on replay the job is already
                 // Pending, so this is a NoOp (no re-dealloc, no double requeue).
@@ -6074,6 +6105,7 @@ impl ClusterManager {
                 job_id,
                 hold,
                 begin_time,
+                ..
             } => {
                 // A live job is finalized once (routed through Requeued so
                 // accounting/steps see a finished run) then re-pended; an
@@ -6165,6 +6197,7 @@ impl ClusterManager {
                 job_id,
                 preempted_by,
                 preempt_qos,
+                ..
             } => {
                 let freed_nodes;
                 let allocated_resources;
@@ -6276,7 +6309,7 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobEvict { job_id, detail } => {
+            WalOperation::JobEvict { job_id, detail, .. } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.launch_failure_detail = detail.clone();
                 }
@@ -6357,6 +6390,7 @@ impl ClusterManager {
                 node_name,
                 exit_code,
                 signal,
+                ..
             } => {
                 let finalized = {
                     let Some(job) = jobs.get_mut(job_id) else {
@@ -6475,6 +6509,7 @@ impl ClusterManager {
                 job_id,
                 exit_code,
                 state,
+                ..
             } => {
                 let freed_nodes;
                 let allocated_resources;
@@ -6543,6 +6578,7 @@ impl ClusterManager {
                 job_id,
                 step_id,
                 exit_code,
+                ..
             } => {
                 // Keyed on job state, not step state: the eviction sweep
                 // (complete_evicted_steps) runs leader-only, so steps can diverge.
@@ -6764,7 +6800,7 @@ impl ClusterManager {
                     self.apply_node_config_policy(node);
                 }
             }
-            WalOperation::NodeRemove { name, reason } => {
+            WalOperation::NodeRemove { name, reason, .. } => {
                 Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
                 if let Some(node) = nodes.get(name) {
                     if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
@@ -9706,6 +9742,7 @@ mod tests {
 
         let spec = basic_spec("test-job");
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(spec.clone()),
         });
@@ -10222,12 +10259,94 @@ mod tests {
         assert_eq!(job_id, 500);
     }
 
+    /// A committed log as the leader wrote it, stamped far enough in the past
+    /// that a replay clock could not coincide with it.
+    fn finished_job_log() -> (DateTime<Utc>, DateTime<Utc>, Vec<WalOperation>) {
+        let submitted = DateTime::parse_from_rfc3339("2026-03-04T18:45:52Z")
+            .expect("fixture instant")
+            .with_timezone(&Utc);
+        let started = submitted + chrono::Duration::seconds(46);
+        let ended = started + chrono::Duration::seconds(300);
+
+        let mut log = vec![
+            WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(basic_spec("finished")),
+                at: Some(submitted),
+            },
+            WalOperation::JobStart {
+                job_id: 1,
+                nodes: vec!["n1".into()],
+                resources: ResourceAllocations {
+                    cpus: 1,
+                    memory_mb: 1000,
+                    devices: HashMap::new(),
+                },
+                per_node_alloc: HashMap::new(),
+                srun_step_dispatch: false,
+                run_attempt: 1,
+                at: Some(started),
+            },
+            WalOperation::job_state_change(1, JobState::Pending, JobState::Running),
+            WalOperation::JobComplete {
+                job_id: 1,
+                exit_code: 0,
+                state: JobState::Completed,
+                at: Some(ended),
+            },
+        ];
+        // Re-proposing must not re-date an entry that already carries an instant.
+        for op in &mut log {
+            op.stamp_occurred_at(Utc::now());
+        }
+        (submitted, ended, log)
+    }
+
+    /// Dating a replayed entry from the replay clock inflates a finished job's
+    /// run time by the restart interval, and over-bills it in accounting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaying_a_finished_job_keeps_the_times_the_run_actually_had() {
+        let (submitted, ended, log) = finished_job_log();
+
+        let first_dir = TempDir::new().unwrap();
+        let first = test_cluster(&first_dir).await;
+        register_node(&first, "n1", 8, 16000);
+        for op in &log {
+            first.apply_operation(op);
+        }
+        let before = first.get_job(1).expect("the job survives its own apply");
+
+        let replay_dir = TempDir::new().unwrap();
+        let replayed = test_cluster(&replay_dir).await;
+        register_node(&replayed, "n1", 8, 16000);
+        for op in &log {
+            replayed.apply_operation(op);
+        }
+        let after = replayed.get_job(1).expect("the job survives replay");
+
+        assert_eq!(
+            after.submit_time, submitted,
+            "SubmitTime must not be re-dated"
+        );
+        assert_eq!(after.end_time, Some(ended), "EndTime must not be re-dated");
+        assert_eq!(after.submit_time, before.submit_time);
+        assert_eq!(after.end_time, before.end_time);
+        assert_eq!(after.start_time, before.start_time);
+        assert_eq!(
+            after.run_time().map(|d| d.num_seconds()),
+            Some(300),
+            "RunTime is derived from start and end, so a re-dated end corrupts it"
+        );
+        assert_eq!(after.run_time(), before.run_time());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_job_state_change() {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -10248,6 +10367,7 @@ mod tests {
 
         register_node(&cm, "node1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -10280,6 +10400,7 @@ mod tests {
         let resources = scalar_alloc(4, 8000);
         let log = [
             WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(basic_spec("j")),
             },
@@ -10329,6 +10450,7 @@ mod tests {
             at: None,
         };
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -10347,6 +10469,7 @@ mod tests {
 
         register_node(&cm, "node1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -10367,6 +10490,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -10388,10 +10512,12 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("done")),
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10401,6 +10527,7 @@ mod tests {
             "job 1 is terminal"
         );
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 2,
             spec: Box::new(basic_spec("running")),
         });
@@ -10410,12 +10537,14 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 3,
             spec: Box::new(basic_spec("pending")),
         });
         // A job stranded in Preempted (a rare requeue-strand): finalized with an
         // end_time, so it must be reapable even though it isn't is_terminal().
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 4,
             spec: Box::new(basic_spec("preempted")),
         });
@@ -10483,10 +10612,12 @@ mod tests {
 
         for cm in [&cm_a, &cm_b] {
             cm.apply_operation(&WalOperation::JobSubmit {
+                at: None,
                 job_id: 1,
                 spec: Box::new(basic_spec("done")),
             });
             cm.apply_operation(&WalOperation::JobComplete {
+                at: None,
                 job_id: 1,
                 exit_code: 0,
                 state: JobState::Cancelled,
@@ -10513,6 +10644,7 @@ mod tests {
         let dir_c = TempDir::new().unwrap();
         let cm_c = test_cluster(&dir_c).await;
         cm_c.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("requeued")),
         });
@@ -10537,10 +10669,12 @@ mod tests {
         cfg2.controller.terminal_job_retention_secs = 86_400;
         let cm2 = test_cluster_with_config(&dir2, cfg2).await;
         cm2.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("fresh")),
         });
         cm2.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10571,10 +10705,12 @@ mod tests {
         let cm = test_cluster_with_config(&dir, cfg).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("done")),
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10611,6 +10747,7 @@ mod tests {
 
         // Target runs, completes, and ages out of the window.
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 100,
             spec: Box::new(basic_spec("target")),
         });
@@ -10620,6 +10757,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 100,
             exit_code: 0,
             state: JobState::Completed,
@@ -10631,6 +10769,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:100".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 101,
             spec: Box::new(child),
         });
@@ -10643,6 +10782,7 @@ mod tests {
 
         // Once the child is gone, the target is evictable.
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 101,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10668,14 +10808,17 @@ mod tests {
         let id1 = cm.next_job_id.fetch_add(1, Ordering::SeqCst);
         let id2 = cm.next_job_id.fetch_add(1, Ordering::SeqCst);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: id1,
             spec: Box::new(basic_spec("survivor")),
         });
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: id2,
             spec: Box::new(basic_spec("high")),
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: id2,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -10706,6 +10849,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("s")),
         });
@@ -10875,6 +11019,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("acc")),
         });
@@ -10922,6 +11067,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("cancel-susp")),
         });
@@ -10939,6 +11085,7 @@ mod tests {
             preempt_qos: None,
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Cancelled,
@@ -11028,6 +11175,7 @@ mod tests {
 
         register_node(&cm, "n1", 4, 8000);
         cm.apply_operation(&WalOperation::NodeStateChange {
+            at: None,
             name: "n1".into(),
             old_state: NodeState::Idle,
             new_state: NodeState::Drain,
@@ -11048,6 +11196,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("j")),
         });
@@ -11402,6 +11551,7 @@ mod tests {
 
         register_node(&cm, "worker1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("single-completing")),
         });
@@ -11422,6 +11572,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "worker1".into(),
             exit_code: 0,
@@ -11444,6 +11595,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
         register_node(&cm, "worker1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("oom")),
         });
@@ -11464,6 +11616,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "worker1".into(),
             exit_code: 0,
@@ -11487,6 +11640,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("multi-completing")),
         });
@@ -11507,6 +11661,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -11519,6 +11674,7 @@ mod tests {
         assert!(cm.get_node("n2").unwrap().alloc_resources.cpus > 0);
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n2".into(),
             exit_code: 0,
@@ -11527,6 +11683,7 @@ mod tests {
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n3".into(),
             exit_code: 42,
@@ -11554,6 +11711,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("steps")),
         });
@@ -11575,12 +11733,14 @@ mod tests {
         // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
         // the running max live; ExitCode is unaffected (it is the batch exit).
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: 0,
             exit_code: 7,
         });
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: 1,
             exit_code: 3,
@@ -11588,6 +11748,7 @@ mod tests {
         // 3 < 7, running max stays 7.
         assert_eq!(cm.get_job(1).unwrap().derived_exit_code, 7);
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: 2,
             exit_code: 2,
@@ -11596,6 +11757,7 @@ mod tests {
 
         // Batch script exits 2 -> ExitCode=2:0, DerivedExitCode preserved at 7.
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 2,
@@ -11616,6 +11778,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("late-step")),
         });
@@ -11650,11 +11813,13 @@ mod tests {
             }),
         });
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: 0,
             exit_code: 3,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -11666,6 +11831,7 @@ mod tests {
             .expect("step survives job completion until eviction");
 
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: 0,
             exit_code: 9,
@@ -11700,6 +11866,7 @@ mod tests {
         };
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("requeued")),
         });
@@ -11710,11 +11877,13 @@ mod tests {
         ));
         cm.apply_operation(&start());
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: 0,
             exit_code: 5,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -11724,6 +11893,7 @@ mod tests {
         assert_eq!((job.derived_exit_code, job.exit_signal), (5, 9));
 
         cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
             job_id: 1,
             hold: false,
             begin_time: None,
@@ -11759,6 +11929,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("batch-only")),
         });
@@ -11769,6 +11940,7 @@ mod tests {
         ));
 
         cm.apply_operation(&WalOperation::JobStepComplete {
+            at: None,
             job_id: 1,
             step_id: STEP_BATCH,
             exit_code: 9,
@@ -11787,6 +11959,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("finalize-response")),
         });
@@ -11807,6 +11980,7 @@ mod tests {
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -11816,6 +11990,7 @@ mod tests {
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
         let r2 = cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n2".into(),
             exit_code: 0,
@@ -11838,6 +12013,7 @@ mod tests {
 
         register_node(&cm, "worker1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("job-complete-response")),
         });
@@ -11858,6 +12034,7 @@ mod tests {
         });
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -11878,6 +12055,7 @@ mod tests {
 
         register_node(&cm, "worker1", 8, 16000);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("double-complete")),
         });
@@ -11898,6 +12076,7 @@ mod tests {
         });
 
         let first = cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -11911,6 +12090,7 @@ mod tests {
         assert_eq!(node.alloc_resources.memory_mb, 0);
 
         let second = cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: -1,
             state: JobState::Cancelled,
@@ -11936,6 +12116,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("penultimate")),
         });
@@ -11955,6 +12136,7 @@ mod tests {
             at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -11974,6 +12156,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("signal-job")),
         });
@@ -12161,6 +12344,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("rpc-signal-job")),
         });
@@ -12197,6 +12381,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("exit-job")),
         });
@@ -12235,6 +12420,7 @@ mod tests {
         register_node(&cm, "n1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("stale-job")),
         });
@@ -12275,6 +12461,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("cancel-while-cg")),
         });
@@ -12295,6 +12482,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -12323,6 +12511,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n2".into(),
             exit_code: 0,
@@ -12343,6 +12532,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("nc-after-cancel")),
         });
@@ -12362,6 +12552,7 @@ mod tests {
             at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: 1,
             node_name: "n1".into(),
             exit_code: 0,
@@ -12990,6 +13181,7 @@ mod tests {
         // a completed job is never accounted twice.
         let live = run_job_on(&cm, "finalize-live", "worker1");
         let resp = cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
             job_id: live,
             hold: false,
             begin_time: None,
@@ -13001,6 +13193,7 @@ mod tests {
         cm.complete_job(done, 0, JobState::Completed).unwrap();
         settle(&cm, done, JobState::Completed);
         let resp = cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
             job_id: done,
             hold: false,
             begin_time: None,
@@ -13335,6 +13528,7 @@ mod tests {
         let job_id = run_job_on(&cm, "replay", "worker1");
 
         cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
             job_id,
             hold: false,
             begin_time: None,
@@ -13345,6 +13539,7 @@ mod tests {
         // Re-applying the same entry (follower catch-up / replay) is a NoOp:
         // the job is already Pending, so the counter must not double-bump.
         cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
             job_id,
             hold: false,
             begin_time: None,
@@ -13919,6 +14114,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("backoff-replay")),
         });
@@ -13928,6 +14124,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: -1,
             state: JobState::Failed,
@@ -13993,6 +14190,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("preempt-cancel-replay")),
         });
@@ -14015,6 +14213,7 @@ mod tests {
 
         // Apply with explicit provenance to verify field propagation.
         let resp = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            at: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
@@ -14036,6 +14235,7 @@ mod tests {
 
         // Replay: job is already Cancelled (not Running) → NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptCancel {
+            at: None,
             job_id: 1,
             preempted_by: Some(42),
             preempt_qos: Some("highprio".into()),
@@ -14278,6 +14478,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("replay")),
         });
@@ -14306,6 +14507,7 @@ mod tests {
             at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -14313,6 +14515,7 @@ mod tests {
 
         // Replaying the terminal complete: still Completed, resources still freed.
         let replayed = cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -14331,6 +14534,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("requeue-replay")),
         });
@@ -14340,6 +14544,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: -1,
             state: JobState::Preempted,
@@ -14375,6 +14580,7 @@ mod tests {
         register_node(&cm, "worker1", 8, 16000);
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("preempt-replay")),
         });
@@ -14399,6 +14605,7 @@ mod tests {
         // Apply without provenance fields — simulates a WAL entry written by an
         // older controller; new fields default to None and must not panic.
         let resp = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            at: None,
             job_id: 1,
             begin_time,
             preempted_by: None,
@@ -14421,6 +14628,7 @@ mod tests {
 
         // Replay the identical entry: job is already Pending -> NoOp.
         let replay = cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            at: None,
             job_id: 1,
             begin_time,
             preempted_by: None,
@@ -14504,6 +14712,7 @@ mod tests {
     fn preempted_job_on(cm: &ClusterManager, name: &str, node: &str) -> JobId {
         let job_id = run_job_on(cm, name, node);
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -14524,6 +14733,7 @@ mod tests {
         let job_id = preempted_job_on(&cm, "late-nodecomplete", "worker1");
 
         let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id,
             node_name: "worker1".into(),
             exit_code: 0,
@@ -14547,6 +14757,7 @@ mod tests {
         let job_id = preempted_job_on(&cm, "replay-complete", "worker1");
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: 0,
             state: JobState::Completed,
@@ -15010,6 +15221,7 @@ mod tests {
         spec.num_tasks = 2;
         let job_id = 1;
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id,
             spec: Box::new(spec),
         });
@@ -15054,6 +15266,7 @@ mod tests {
         under_nodes.num_nodes = 1; // below min_nodes=2
         let n_id = 999;
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: n_id,
             spec: Box::new(under_nodes),
         });
@@ -17021,6 +17234,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -17037,6 +17251,7 @@ mod tests {
                 JobState::Running,
             ));
             cm.apply_operation(&WalOperation::JobComplete {
+                at: None,
                 job_id,
                 exit_code: -1,
                 state: JobState::Preempted,
@@ -17071,6 +17286,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -17087,6 +17303,7 @@ mod tests {
                 JobState::Running,
             ));
             cm.apply_operation(&WalOperation::JobComplete {
+                at: None,
                 job_id,
                 exit_code: -1,
                 state: JobState::Preempted,
@@ -17478,6 +17695,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -17494,6 +17712,7 @@ mod tests {
                 JobState::Running,
             ));
             cm.apply_operation(&WalOperation::JobComplete {
+                at: None,
                 job_id,
                 exit_code: -1,
                 state: JobState::Preempted,
@@ -17528,6 +17747,7 @@ mod tests {
             JobState::Running,
         ));
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id,
             exit_code: -1,
             state: JobState::Preempted,
@@ -20413,6 +20633,7 @@ mod tests {
 
         // Parent running -> child's afterok dependency is Waiting (not satisfied).
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
@@ -20426,6 +20647,7 @@ mod tests {
         child.dependency = vec!["afterok:1".into()];
         child.reservation = Some("does-not-exist".into());
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 2,
             spec: Box::new(child),
         });
@@ -21745,6 +21967,7 @@ mod tests {
 
         for job_id in 1..=60u32 {
             cm.apply_operation(&WalOperation::JobSubmit {
+                at: None,
                 job_id,
                 spec: Box::new(basic_spec(&format!("j{job_id}"))),
             });
@@ -21824,6 +22047,7 @@ mod tests {
                 // A single-node job would finalize here, duplicating branch 3.
                 2 if targets.len() > 1 => {
                     cm.apply_operation(&WalOperation::JobNodeComplete {
+                        at: None,
                         job_id,
                         node_name: targets[0].clone(),
                         exit_code: 0,
@@ -21838,6 +22062,7 @@ mod tests {
                 3 => {
                     for name in &targets {
                         cm.apply_operation(&WalOperation::JobNodeComplete {
+                            at: None,
                             job_id,
                             node_name: name.clone(),
                             exit_code: 0,
@@ -21847,6 +22072,7 @@ mod tests {
                 }
                 4 => {
                     cm.apply_operation(&WalOperation::JobComplete {
+                        at: None,
                         job_id,
                         exit_code: 0,
                         state: JobState::Completed,
@@ -21854,6 +22080,7 @@ mod tests {
                 }
                 5 => {
                     cm.apply_operation(&WalOperation::JobPreemptCancel {
+                        at: None,
                         job_id,
                         preempted_by: None,
                         preempt_qos: None,
@@ -21861,6 +22088,7 @@ mod tests {
                 }
                 _ => {
                     cm.apply_operation(&WalOperation::JobPreemptRequeue {
+                        at: None,
                         job_id,
                         begin_time: Utc::now(),
                         preempted_by: None,
@@ -22037,6 +22265,7 @@ mod tests {
         let slice = scalar_alloc(2, 1000);
         for (job_id, finish) in [(1u32, false), (2, true)] {
             cm.apply_operation(&WalOperation::JobSubmit {
+                at: None,
                 job_id,
                 spec: Box::new(basic_spec("j")),
             });
@@ -22060,6 +22289,7 @@ mod tests {
             });
             if finish {
                 cm.apply_operation(&WalOperation::JobComplete {
+                    at: None,
                     job_id,
                     exit_code: 0,
                     state: JobState::Completed,
@@ -22129,6 +22359,7 @@ mod tests {
             source: spur_core::node::NodeSource::NativeHost,
         });
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("done")),
         });
@@ -22152,6 +22383,7 @@ mod tests {
             at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: 1,
             exit_code: 0,
             state: JobState::Completed,
@@ -22187,6 +22419,7 @@ mod tests {
             source: spur_core::node::NodeSource::NativeHost,
         });
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("live")),
         });
@@ -22255,6 +22488,7 @@ mod tests {
         };
         cm.apply_operation(&register);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("live")),
         });
@@ -23331,6 +23565,7 @@ mod tests {
         assert!(cm.get_job(id).unwrap().actual_stdout_path.is_some());
 
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: id,
             exit_code: -1,
             state: JobState::Timeout,
@@ -23525,6 +23760,7 @@ mod tests {
         );
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: job_a,
             node_name: "n1".into(),
             exit_code: 0,
@@ -24988,6 +25224,7 @@ mod tests {
         spec.array_job_id = Some(parent);
         spec.array_task_id = Some(task);
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: id,
             spec: Box::new(spec),
         });
@@ -25004,6 +25241,7 @@ mod tests {
             ));
         }
         cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
             job_id: id,
             exit_code,
             state,
@@ -25017,6 +25255,7 @@ mod tests {
 
         // Parent scalar job that fails.
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
@@ -25026,6 +25265,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 2,
             spec: Box::new(child),
         });
@@ -25043,6 +25283,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
@@ -25051,6 +25292,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 2,
             spec: Box::new(child),
         });
@@ -25073,6 +25315,7 @@ mod tests {
 
         // Parent still running; child waits, not cancelled.
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("parent")),
         });
@@ -25085,6 +25328,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:1".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 2,
             spec: Box::new(child),
         });
@@ -25114,6 +25358,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:10".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 20,
             spec: Box::new(child),
         });
@@ -25138,6 +25383,7 @@ mod tests {
         let mut child = basic_spec("child");
         child.dependency = vec!["afterok:10".into()];
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 20,
             spec: Box::new(child),
         });
@@ -25180,6 +25426,7 @@ mod tests {
         let cm = test_cluster(&dir).await;
 
         cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
             job_id: 1,
             spec: Box::new(basic_spec("scalar")),
         });
@@ -26067,6 +26314,7 @@ mod tests {
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Running);
 
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            at: None,
             name: "n1".into(),
             old_state: NodeState::Allocated,
             new_state: NodeState::Down,
@@ -26096,6 +26344,7 @@ mod tests {
         register_node(&cm, "n1", 4, 8000);
 
         let resp = cm.apply_operation(&WalOperation::NodeStateChange {
+            at: None,
             name: "n1".into(),
             old_state: NodeState::Idle,
             new_state: NodeState::Down,
@@ -26117,6 +26366,7 @@ mod tests {
         assert!(cm.get_node("n1").is_some());
 
         cm.apply_operation(&WalOperation::NodeRemove {
+            at: None,
             name: "n1".into(),
             reason: Some("decommission".into()),
         });
@@ -26133,6 +26383,7 @@ mod tests {
         start_job_on(&cm, id, "n1");
 
         let resp = cm.apply_operation(&WalOperation::NodeRemove {
+            at: None,
             name: "n1".into(),
             reason: None,
         });
@@ -26258,6 +26509,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            at: None,
             job_id: id,
             node_name: "n1".into(),
             exit_code: 0,
