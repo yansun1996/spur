@@ -346,6 +346,7 @@ async fn main() -> anyhow::Result<()> {
             .map(|c| c.controller.state_dir.clone())
             .unwrap_or_else(|| "/var/spool/spur".into())
     });
+    info!(state_dir = %stepd_state_dir, "resolved agent state root");
     let stepds = stepd::StepdStore::new(&stepd_state_dir);
     let discovered_sessions = stepds.discover_live()?;
     // A corrupted descriptor still names its (job_id, run_attempt) in the
@@ -560,6 +561,7 @@ async fn main() -> anyhow::Result<()> {
     // a push notification deferred later needs the same reconciliation.
     agent_server::retry_unacknowledged_stepd_completions(
         stepds.clone(),
+        spurd::admission::AdmissionStore::new(&stepd_state_dir, &hostname),
         args.controller.clone(),
         hostname.clone(),
     );
