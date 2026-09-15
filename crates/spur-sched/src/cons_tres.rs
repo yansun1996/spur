@@ -354,17 +354,18 @@ impl NodeAllocation {
     /// Release owned allocations whose job is neither live nor launching within
     /// `launching_ttl`, returning the reclaimed ids. Recovers a failed teardown
     /// or a dropped launch instead of stranding the node until spurd restart.
-    pub fn reconcile(
-        &mut self,
+    /// Claims with nothing tracked behind them. A query, not a reclaim: a
+    /// missing entry is not evidence that the job's work finished.
+    pub fn unbacked_claims(
+        &self,
         live: &HashSet<u32>,
         now: Instant,
         launching_ttl: Duration,
-    ) -> Vec<u32> {
-        let orphaned: Vec<u32> = self
+    ) -> Vec<(u32, u32)> {
+        let mut unbacked: Vec<(u32, u32)> = self
             .owners
-            .keys()
-            .copied()
-            .filter(|id| {
+            .iter()
+            .filter(|(id, _)| {
                 if live.contains(id) {
                     return false;
                 }
@@ -375,11 +376,10 @@ impl NodeAllocation {
                     None => true,
                 }
             })
+            .map(|(id, owned)| (*id, owned.run_attempt))
             .collect();
-        for &id in &orphaned {
-            self.release_job(id);
-        }
-        orphaned
+        unbacked.sort_unstable();
+        unbacked
     }
 }
 
@@ -642,18 +642,22 @@ mod tests {
 
         let live: HashSet<u32> = [1].into_iter().collect();
         let ttl = Duration::from_secs(120);
-        let mut reclaimed = node.reconcile(&live, Instant::now(), ttl);
-        reclaimed.sort();
-        assert_eq!(reclaimed, vec![2], "only the orphan (job 2) is reclaimed");
+        assert_eq!(
+            node.unbacked_claims(&live, Instant::now(), ttl),
+            vec![(2, 1)],
+            "only the untracked job is reported"
+        );
+        // Reporting is not reclaiming: the claim is still held afterwards.
+        assert_eq!(node.free_gpus(None), 1);
 
-        assert!(!node.release_job(2), "job 2 already reconciled");
+        assert!(node.release_job(2));
         assert!(node.release_job(1));
         assert!(node.release_job(3));
         assert_eq!(node.free_gpus(None), 4);
     }
 
     #[test]
-    fn test_reconcile_reclaims_launching_past_ttl() {
+    fn test_unbacked_claims_reports_launching_past_ttl_without_freeing_it() {
         let mut node = make_node_with_ids(64, 256_000, vec![0, 1, 2, 3], "mi300x");
         // A launch reserved but never committed must be reclaimed past the TTL.
         node.allocate_for_job(1, 1, 4, 8_000, &[0]).unwrap();
@@ -661,12 +665,16 @@ mod tests {
         let live: HashSet<u32> = HashSet::new();
         let ttl = Duration::from_secs(120);
 
-        assert!(node.reconcile(&live, Instant::now(), ttl).is_empty());
+        assert!(node.unbacked_claims(&live, Instant::now(), ttl).is_empty());
         assert_eq!(node.free_gpus(None), 3, "still reserved within TTL");
 
         let future = Instant::now() + Duration::from_secs(121);
-        assert_eq!(node.reconcile(&live, future, ttl), vec![1]);
-        assert_eq!(node.free_gpus(None), 4, "reclaimed after TTL");
+        assert_eq!(node.unbacked_claims(&live, future, ttl), vec![(1, 1)]);
+        assert_eq!(
+            node.free_gpus(None),
+            3,
+            "a timeout alone must not free a claim the agent cannot account for"
+        );
     }
 
     #[test]
@@ -678,21 +686,18 @@ mod tests {
             "commit of a live reservation returns true"
         );
 
-        // A launch whose reservation reconcile reclaimed before commit: the
-        // owner is gone, so commit must report false and stay a no-op. Keep
-        // job 1 in the live set so only the past-TTL launch (job 2) is reclaimed.
+        // A reservation explicitly released before commit: the owner is gone,
+        // so commit must report false and stay a no-op.
         node.allocate_for_job(2, 1, 4, 8_000, &[1]).unwrap();
-        let live: HashSet<u32> = [1].into_iter().collect();
-        let past = Instant::now() + Duration::from_secs(121);
-        node.reconcile(&live, past, Duration::from_secs(120));
+        node.release_job(2);
         assert!(
             !node.commit_job(2, 1),
-            "commit of a reclaimed reservation returns false"
+            "commit of a released reservation returns false"
         );
         assert_eq!(
             node.free_gpus(None),
             1,
-            "reclaimed GPU stays free after the no-op commit"
+            "the released GPU stays free after the no-op commit"
         );
     }
 
@@ -752,7 +757,7 @@ mod tests {
         assert!(!node.commit_job(7, 1), "a superseded attempt cannot commit");
 
         assert!(
-            node.reconcile(&HashSet::new(), Instant::now(), Duration::from_secs(120))
+            node.unbacked_claims(&HashSet::new(), Instant::now(), Duration::from_secs(120))
                 .is_empty(),
             "a stale commit must not strip the launching marker sparing attempt 2"
         );
@@ -838,7 +843,11 @@ mod tests {
         assert_eq!(node.conflicting_owners(&[0]), vec![4]);
         let live: HashSet<u32> = HashSet::new();
         let ttl = Duration::from_secs(600);
-        assert_eq!(node.reconcile(&live, Instant::now(), ttl), vec![4]);
+        assert_eq!(
+            node.unbacked_claims(&live, Instant::now(), ttl),
+            vec![(4, 1)]
+        );
+        node.release_job(4);
         assert_eq!(node.free_cpus(), 8);
 
         // A job still mid-launch when the agent restarted: adoption must clear

@@ -93,6 +93,15 @@ pub struct ConflictHold {
     pub observed_at_unix_ms: u64,
 }
 
+/// Whether a conflict hold was newly taken, so callers can log the transition
+/// rather than every tick of the sweep that observes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldOutcome {
+    Taken,
+    AlreadyHeld,
+    NoRecord,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControllerAck {
     #[serde(default)]
@@ -657,6 +666,32 @@ impl AdmissionStore {
         participant.lifecycle = ParticipantLifecycle::Running;
         self.admit_participant(&participant)?;
         Ok(true)
+    }
+
+    /// Mark a run as needing the controller's attention, preserving everything
+    /// already on it. Idempotent: the first reason recorded is the one kept.
+    pub fn take_conflict_hold(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        reason: &str,
+    ) -> io::Result<HoldOutcome> {
+        let mut run = match self.load_run(job_id, run_attempt) {
+            Ok(run) => run,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(HoldOutcome::NoRecord)
+            }
+            Err(error) => return Err(error),
+        };
+        if run.conflict_hold.is_some() {
+            return Ok(HoldOutcome::AlreadyHeld);
+        }
+        run.conflict_hold = Some(ConflictHold {
+            reason: reason.to_string(),
+            observed_at_unix_ms: now_unix_ms(),
+        });
+        self.admit_run(&run)?;
+        Ok(HoldOutcome::Taken)
     }
 
     pub fn remove_participant(
