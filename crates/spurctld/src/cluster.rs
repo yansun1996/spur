@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -426,6 +426,9 @@ pub struct ClusterManager {
     /// while a same-name racer can't act on a stale label diff (see `register_node`).
     node_registration_locks: parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<()>>>>,
     raft: RwLock<Option<SpurRaft>>,
+    /// Latch for `state_machine_ready`: a leader commits continuously, so an
+    /// instantaneous check would flap back off once replay had finished.
+    state_machine_ready: AtomicBool,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
     qos_cache: Arc<QosCache>,
@@ -580,6 +583,7 @@ impl ClusterManager {
             k0s_phase_accounting: parking_lot::Mutex::new(()),
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
             raft: RwLock::new(None),
+            state_machine_ready: AtomicBool::new(false),
             accounting: RwLock::new(None),
             fairshare_cache,
             qos_cache,
@@ -5134,6 +5138,29 @@ impl ClusterManager {
         *self.raft.write() = Some(raft);
     }
 
+    /// Whether this controller has applied its whole log, waiting up to `wait_for`.
+    /// Until then an absence in cluster state is no evidence; unknown reads false.
+    pub async fn state_machine_ready(&self, wait_for: std::time::Duration) -> bool {
+        if self.state_machine_ready.load(Ordering::Relaxed) {
+            return true;
+        }
+        let Some(raft) = self.raft.read().clone() else {
+            return false;
+        };
+        let caught_up = raft
+            .wait(Some(wait_for))
+            .metrics(
+                crate::raft::state_machine_caught_up,
+                "state machine applied its log",
+            )
+            .await
+            .is_ok();
+        if caught_up {
+            self.state_machine_ready.store(true, Ordering::Relaxed);
+        }
+        caught_up
+    }
+
     pub fn set_accounting(&self, notifier: AccountingNotifier) {
         *self.accounting.write() = Some(notifier);
     }
@@ -8840,6 +8867,67 @@ mod tests {
             .expect("single-node raft did not self-elect within 5s");
         cm.set_raft(handle.raft);
         cm
+    }
+
+    /// A raft needing two voters while only one runs, so it holds an entry it can
+    /// never apply. Returned already observed behind, so callers can wait zero.
+    async fn raft_that_cannot_apply(dir: &TempDir) -> crate::raft::RaftHandle {
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        let handle =
+            crate::raft::start_raft(1, &["[::1]:0".into(), "[::1]:1".into()], dir.path(), cm)
+                .await
+                .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(
+                |m| !crate::raft::state_machine_caught_up(m),
+                "an entry it cannot apply",
+            )
+            .await
+            .expect("a raft without a quorum must hold an unapplied entry");
+        handle
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_with_no_raft_handle_is_not_ready() {
+        let dir = TempDir::new().unwrap();
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+
+        assert!(
+            !cm.state_machine_ready(std::time::Duration::ZERO).await,
+            "readiness it cannot determine must not license a destructive action"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_behind_its_own_log_is_not_ready() {
+        let dir = TempDir::new().unwrap();
+        let raft_dir = TempDir::new().unwrap();
+        let cm = Arc::new(ClusterManager::new(test_config(), dir.path()).unwrap());
+        cm.set_raft(raft_that_cannot_apply(&raft_dir).await.raft);
+
+        assert!(!cm.state_machine_ready(std::time::Duration::ZERO).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readiness_latches_once_the_controller_has_caught_up() {
+        // A leader commits continuously, so an unlatched check would report the
+        // controller untrustworthy again the moment it accepted new work.
+        let dir = TempDir::new().unwrap();
+        let raft_dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        assert!(
+            cm.state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        cm.set_raft(raft_that_cannot_apply(&raft_dir).await.raft);
+
+        assert!(
+            cm.state_machine_ready(std::time::Duration::ZERO).await,
+            "the same raft reads as not ready when it is the first one seen"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

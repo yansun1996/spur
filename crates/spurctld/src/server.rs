@@ -283,6 +283,10 @@ pub(crate) fn resolve_startup_jwt_key(
 /// worse than one reconciled imperfectly: it is silently out of the cluster.
 const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long a reconcile waits for this controller to replay its own log. Well under
+/// `RECONCILE_BUDGET`, leaving time for the directions that do not depend on it.
+const CONTROLLER_CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Releases a node's reconcile gate however the reconcile ends, including a
 /// panic: a gate that only clears on success removes the node permanently.
 struct ReconcileGate {
@@ -851,20 +855,34 @@ impl ControllerService {
     }
 }
 
-/// Diff an agent's asserted ledger against Raft and resolve the differences.
-/// The node stays out of scheduling until this returns.
+/// Diff an agent's asserted ledger against Raft and resolve the differences. The
+/// node stays gated until this returns; the result is what Direction A cancelled.
 pub(crate) async fn reconcile_node_ledger(
     cluster: &Arc<ClusterManager>,
     node: &str,
     ledger: spur_proto::proto::NodeLedger,
-) {
+) -> Vec<u32> {
     let held: std::collections::HashMap<u32, &spur_proto::proto::LedgerEntry> =
         ledger.entries.iter().map(|e| (e.job_id, e)).collect();
     let recorded = cluster.jobs_allocated_on_node(node);
 
-    // Direction A: the agent holds a slice Raft does not record.
-    for entry in &ledger.entries {
-        if recorded.contains_key(&entry.job_id) {
+    // Direction A: the agent holds a slice Raft does not record. That absence is
+    // only evidence once this controller has applied its own log.
+    let unrecorded: Vec<&spur_proto::proto::LedgerEntry> = ledger
+        .entries
+        .iter()
+        .filter(|e| !recorded.contains_key(&e.job_id))
+        .collect();
+    let controller_ready =
+        unrecorded.is_empty() || cluster.state_machine_ready(CONTROLLER_CATCH_UP_WAIT).await;
+    let mut cancelled = Vec::new();
+    for entry in unrecorded {
+        if !controller_ready {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                "controller has not replayed its own log; leaving this claim alone"
+            );
             continue;
         }
         warn!(
@@ -881,6 +899,7 @@ pub(crate) async fn reconcile_node_ledger(
             9,
         )
         .await;
+        cancelled.push(entry.job_id);
     }
 
     // Direction B: Raft records a job here the agent did not report. Only an
@@ -928,6 +947,8 @@ pub(crate) async fn reconcile_node_ledger(
             );
         }
     }
+
+    cancelled
 }
 
 impl ControllerService {
@@ -6853,6 +6874,59 @@ mod tests {
         assert!(
             cluster.jobs_allocated_on_node("n1").contains_key(&7),
             "an absence in a partial ledger proves nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caught_up_controller_cancels_a_claim_it_has_no_record_of() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await,
+            "this test is only meaningful against a controller that has replayed its log"
+        );
+
+        let cancelled =
+            reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1), (99, 1)])).await;
+
+        assert_eq!(
+            cancelled,
+            vec![99],
+            "job 7 is recorded here; job 99 is a claim Raft never placed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_that_cannot_vouch_for_its_own_record_cancels_nothing() {
+        // A restart replays its log behind the gRPC server coming up, so a claim
+        // placed since the last snapshot reads as one the controller never made.
+        use crate::cluster::ClusterManager;
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = Arc::new(ClusterManager::new(step_test_config(), dir.path()).unwrap());
+        cluster.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: spur_core::resource::ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: std::collections::HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        assert!(!cluster.state_machine_ready(std::time::Duration::ZERO).await);
+
+        let cancelled = reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1)])).await;
+
+        assert!(
+            cancelled.is_empty(),
+            "the controller's own absence is not evidence until it has replayed its log"
         );
     }
 

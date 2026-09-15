@@ -752,6 +752,12 @@ impl openraft::RaftNetwork<SpurTypeConfig> for SpurNetworkConnection {
     }
 }
 
+/// Whether the state machine has applied every entry this node's log holds. False
+/// after a restart until RaftCore replays the entries logged past the snapshot.
+pub fn state_machine_caught_up(metrics: &openraft::RaftMetrics<NodeId, BasicNode>) -> bool {
+    metrics.last_applied.map(|id| id.index) >= metrics.last_log_index
+}
+
 /// Handle to the running Raft node — exposes leadership queries.
 pub struct RaftHandle {
     pub raft: SpurRaft,
@@ -1057,6 +1063,31 @@ mod tests {
 
     fn noop_applier() -> Arc<dyn StateMachineApply> {
         Arc::new(NoopApplier)
+    }
+
+    fn metrics_at(
+        last_log_index: Option<u64>,
+        last_applied: Option<u64>,
+    ) -> openraft::RaftMetrics<NodeId, BasicNode> {
+        let mut m = openraft::RaftMetrics::new_initial(1);
+        m.last_log_index = last_log_index;
+        m.last_applied =
+            last_applied.map(|index| LogId::new(openraft::CommittedLeaderId::new(1, 1), index));
+        m
+    }
+
+    #[test]
+    fn a_state_machine_behind_its_log_is_not_caught_up() {
+        // A restart restores the snapshot but leaves the entries after it
+        // unapplied, which is exactly this shape.
+        assert!(!state_machine_caught_up(&metrics_at(Some(9), Some(4))));
+        assert!(!state_machine_caught_up(&metrics_at(Some(0), None)));
+    }
+
+    #[test]
+    fn a_state_machine_level_with_its_log_is_caught_up() {
+        assert!(state_machine_caught_up(&metrics_at(Some(9), Some(9))));
+        assert!(state_machine_caught_up(&metrics_at(None, None)));
     }
 
     #[test]
