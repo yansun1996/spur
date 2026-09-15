@@ -552,8 +552,31 @@ async fn fence_displaced_stepd(
         .is_some_and(|current| stepd_is_current(current, &displaced))
     {
         sessions.remove(&(job_id, step_id));
+        discard_superseded_session(&displaced, run_attempt);
     }
     Ok(())
+}
+
+/// Drop a superseded attempt's session directory. The agent stopped this
+/// supervisor itself, so nothing will ever finalize the session.
+fn discard_superseded_session(displaced: &crate::stepd::StepdDescriptor, claiming_attempt: u32) {
+    // A relaunch of the same attempt reuses this very directory.
+    if displaced.run_attempt >= claiming_attempt {
+        return;
+    }
+    let Some(session_dir) = displaced.socket_path.parent() else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_dir_all(session_dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                job_id = displaced.job_id,
+                run_attempt = displaced.run_attempt,
+                %error,
+                "failed to discard a superseded runtime session"
+            );
+        }
+    }
 }
 
 fn displaced_runtime_attempt(
@@ -9486,6 +9509,69 @@ mod tests {
             .lock()
             .await
             .contains_key(&(42, spur_core::step::STEP_BATCH)));
+    }
+
+    /// A superseded attempt can never finalize, so without this reap a
+    /// relaunching job leaves one directory per attempt behind.
+    #[tokio::test]
+    async fn fence_displaced_stepd_reaps_a_superseded_attempts_session_dir() {
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let cgroup_root = tempfile::tempdir().expect("cgroup root");
+        let cgroup = TestCgroup::new(&cgroup_root);
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let session_dir = store
+            .prepare_session_dir(42, 1, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        std::fs::write(session_dir.join("launch.json"), b"{}").expect("seed session contents");
+
+        let displaced = crate::stepd::StepdDescriptor::new(
+            42,
+            1,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            session_dir.join("runtime.sock"),
+            cgroup.path().to_path_buf(),
+        );
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&displaced), displaced.clone());
+
+        fence_displaced_stepd(&sessions, 42, spur_core::step::STEP_BATCH, 2)
+            .await
+            .expect("fencing a dead supervisor succeeds");
+
+        assert!(
+            !session_dir.exists(),
+            "attempt 1's session directory must not outlive the attempt that displaced it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relaunch_of_the_same_attempt_keeps_the_session_dir_it_reuses() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let session_dir = store
+            .prepare_session_dir(42, 3, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        let displaced = crate::stepd::StepdDescriptor::new(
+            42,
+            3,
+            spur_core::step::STEP_BATCH,
+            0,
+            0,
+            session_dir.join("runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        discard_superseded_session(&displaced, 3);
+
+        assert!(
+            session_dir.exists(),
+            "the incoming attempt writes into this very directory"
+        );
     }
 
     // A successful unit stop must NOT substitute for cgroup confirmation: the
