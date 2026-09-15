@@ -541,6 +541,13 @@ async fn main() -> anyhow::Result<()> {
         &hostname,
     ));
 
+    // Bound before registering, not when the server starts serving. Registration
+    // makes the controller reconcile this node and call straight back; until the
+    // port is bound those calls are refused outright and never retried.
+    let listen_addr: std::net::SocketAddr = args.listen.parse()?;
+    let agent_listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    info!(addr = %listen_addr, "agent port bound");
+
     // Register with controller
     reporter.register().await?;
 
@@ -691,7 +698,7 @@ async fn main() -> anyhow::Result<()> {
 
     agent_service.start_monitor(args.controller.clone());
 
-    let addr = args.listen.parse()?;
+    let addr = listen_addr;
     info!(%addr, "agent gRPC server listening");
 
     // Authenticate callers of the agent surface: without this, reaching this port is enough to ask
@@ -727,7 +734,9 @@ async fn main() -> anyhow::Result<()> {
     let server_future = tonic::transport::Server::builder()
         .layer(auth_middleware::AgentAuthLayer::new(auth_mode, &jwt_key))
         .add_service(spur_proto::agent_server(agent_service))
-        .serve(addr);
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(
+            agent_listener,
+        ));
     let server_task = tokio::spawn(server_future);
 
     if !recovered_stepds.is_empty() {
