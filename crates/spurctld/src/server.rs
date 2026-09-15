@@ -853,7 +853,7 @@ impl ControllerService {
 
 /// Diff an agent's asserted ledger against Raft and resolve the differences.
 /// The node stays out of scheduling until this returns.
-async fn reconcile_node_ledger(
+pub(crate) async fn reconcile_node_ledger(
     cluster: &Arc<ClusterManager>,
     node: &str,
     ledger: spur_proto::proto::NodeLedger,
@@ -1847,6 +1847,10 @@ impl SlurmController for ControllerService {
 
         let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
         let req = request.into_inner();
+        if req.reconcile {
+            crate::scheduler_loop::pull_node_ledger(&self.cluster, &req.name, "operator audit")
+                .await;
+        }
         if let Some(state) = req.state {
             let node_state = spur_core::node::NodeState::from_proto_i32(state)
                 .ok_or_else(|| Status::invalid_argument("invalid node state"))?;
@@ -6841,6 +6845,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pulled_ledger_reconciles_the_same_way_a_registration_does() {
+        // The pull exists so a controller-side event -- a failover, an audit, a
+        // refused dispatch -- can reach evidence no agent pushed.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        reconcile_node_ledger(&cluster, "n1", ledger(true, Vec::new())).await;
+        assert!(!cluster.jobs_allocated_on_node("n1").contains_key(&7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pulling_from_an_unreachable_node_changes_nothing() {
+        // The node is not reporting, which is not evidence about what it holds.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        crate::scheduler_loop::pull_node_ledger(&cluster, "n1", "test").await;
+
+        assert!(
+            cluster.jobs_allocated_on_node("n1").contains_key(&7),
+            "a failed pull must not be read as an empty ledger"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pulling_from_a_node_that_does_not_exist_is_a_no_op() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        crate::scheduler_loop::pull_node_ledger(&cluster, "nowhere", "test").await;
+        assert!(cluster.jobs_allocated_on_node("n1").contains_key(&7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_gated_node_says_why_it_is_refusing_work() {
         let dir = tempfile::TempDir::new().unwrap();
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
@@ -6942,6 +6979,16 @@ mod tests {
 
     #[tonic::async_trait]
     impl spur_proto::proto::slurm_agent_server::SlurmAgent for ProbeAgent {
+        async fn request_node_ledger(
+            &self,
+            _request: tonic::Request<spur_proto::proto::RequestNodeLedgerRequest>,
+        ) -> Result<tonic::Response<spur_proto::proto::RequestNodeLedgerResponse>, tonic::Status>
+        {
+            Ok(tonic::Response::new(
+                spur_proto::proto::RequestNodeLedgerResponse { ledger: None },
+            ))
+        }
+
         async fn fence_run(
             &self,
             _request: Request<spur_proto::proto::FenceRunRequest>,

@@ -113,23 +113,13 @@ impl NodeReporter {
 
     fn ledger_cut(&self) -> Option<spur_proto::proto::NodeLedger> {
         let cut = self.admissions.get()?.ledger_cut(&self.agent_session_id);
-        Some(spur_proto::proto::NodeLedger {
-            agent_session_id: cut.agent_session_id,
-            inventory_complete: cut.inventory_complete,
-            entries: cut
-                .entries
-                .into_iter()
-                .map(|entry| spur_proto::proto::LedgerEntry {
-                    job_id: entry.job_id,
-                    run_attempt: entry.run_attempt,
-                    cpu_ids: entry.allocation.cpu_ids,
-                    memory_mb: entry.allocation.memory_mb,
-                    gpu_devices: entry.allocation.gpu_devices,
-                    disposition: entry.disposition,
-                    conflict_hold: entry.conflict_hold,
-                })
-                .collect(),
-        })
+        Some(ledger_to_proto(cut))
+    }
+
+    /// Identifies this agent process, so the controller can discard a cut taken
+    /// by a session that ended before it was read.
+    pub fn agent_session_id(&self) -> &str {
+        &self.agent_session_id
     }
 
     /// Job ids this heartbeat would report, from the shared running map.
@@ -527,6 +517,26 @@ pub fn resource_to_proto(r: &ResourceSet) -> ProtoResourceSet {
             })
             .collect(),
         generic: r.generic.clone(),
+    }
+}
+
+pub fn ledger_to_proto(cut: crate::admission::LedgerCut) -> spur_proto::proto::NodeLedger {
+    spur_proto::proto::NodeLedger {
+        agent_session_id: cut.agent_session_id,
+        inventory_complete: cut.inventory_complete,
+        entries: cut
+            .entries
+            .into_iter()
+            .map(|entry| spur_proto::proto::LedgerEntry {
+                job_id: entry.job_id,
+                run_attempt: entry.run_attempt,
+                cpu_ids: entry.allocation.cpu_ids,
+                memory_mb: entry.allocation.memory_mb,
+                gpu_devices: entry.allocation.gpu_devices,
+                disposition: entry.disposition,
+                conflict_hold: entry.conflict_hold,
+            })
+            .collect(),
     }
 }
 

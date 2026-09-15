@@ -872,12 +872,25 @@ silently skipped.
 **Update a job or node** with ``scontrol update`` and ``Key=Value`` pairs. Job
 updates need ``JobId=`` and accept ``Priority=``, ``TimeLimit=``, ``Partition=``,
 ``Account=``, ``Comment=``, and ``QOS=``. Node updates need ``NodeName=`` and
-accept ``State=`` and ``Reason=``.
+accept ``State=``, ``Reason=``, and ``Reconcile=``.
 
 .. code-block:: bash
 
    scontrol update JobId=1024 TimeLimit=2:00:00 Priority=100
    scontrol update NodeName=node01 State=drain Reason="maintenance"
+   scontrol update NodeName=node01 Reconcile=yes
+
+``Reconcile=yes`` asks the node for a fresh account of what it believes it is
+running and compares that against the controller's own record, resolving any
+difference. It changes nothing else about the node, so it is safe to run at any
+time. The controller already does this when a node registers, when a new
+controller takes over, and once an hour; this is the way to ask for it
+immediately — for instance after an incident, when you want to confirm a node
+is not still holding resources for a job that has finished.
+
+A node briefly reports a reason of ``reconciling with the controller`` while
+that comparison is in progress. It accepts no new work until it completes,
+which normally takes under a second.
 
 See Also
 --------

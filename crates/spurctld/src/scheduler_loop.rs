@@ -14,7 +14,7 @@ use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     AgentCancelJobRequest, AgentSuspendJobRequest, FenceRunRequest, JobSpec as ProtoJobSpec,
-    LaunchJobRequest, RegisterJobAllocationRequest, SubmitJobRequest,
+    LaunchJobRequest, RegisterJobAllocationRequest, RequestNodeLedgerRequest, SubmitJobRequest,
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
@@ -157,6 +157,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
     let scheduler_notify = cluster.scheduler_notify.clone();
     let mut was_leader = false;
+    // `None` until the first sweep of a term, so a new leader does not inherit
+    // the previous one's schedule.
+    let mut last_ledger_sweep: Option<Instant> = None;
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -183,6 +186,21 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // history; rebuild from the job records before this term's placements.
         if entering_term {
             cluster.recompute_node_allocations();
+            let pull_cluster = cluster.clone();
+            tokio::spawn(async move {
+                pull_all_node_ledgers(&pull_cluster, "leadership gain").await;
+            });
+        }
+
+        // Routine sweep: drift nothing reported is only found by looking.
+        if !entering_term
+            && last_ledger_sweep.is_none_or(|last| last.elapsed() >= LEDGER_SWEEP_INTERVAL)
+        {
+            last_ledger_sweep = Some(Instant::now());
+            let pull_cluster = cluster.clone();
+            tokio::spawn(async move {
+                pull_all_node_ledgers(&pull_cluster, "routine sweep").await;
+            });
         }
 
         // Finalize never-satisfiable deps before pending_jobs() so they drop
@@ -2473,6 +2491,51 @@ pub async fn send_cancel_to_nodes(
     }
 }
 
+/// How often the controller sweeps the cluster for drift nothing reported.
+const LEDGER_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Pull a fresh cut of one node's ledger and reconcile it. The heartbeat
+/// carries no inventory, so this is how a controller-side event gets one.
+pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason: &str) {
+    let Some(addr) = cluster.get_node(node).and_then(|n| node_comm_http_url(&n)) else {
+        return;
+    };
+    let Ok(mut client) = crate::agent_client::connect(addr).await else {
+        return;
+    };
+    let pulled = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.request_node_ledger(RequestNodeLedgerRequest {
+            reason: reason.to_string(),
+        }),
+    )
+    .await;
+    match pulled {
+        Ok(Ok(response)) => {
+            if let Some(ledger) = response.into_inner().ledger {
+                crate::server::reconcile_node_ledger(cluster, node, ledger).await;
+            }
+        }
+        // An agent that predates the pull keeps its pre-upgrade behaviour.
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {}
+        Ok(Err(status)) => warn!(node = %node, %status, "ledger pull refused"),
+        Err(_) => warn!(node = %node, "ledger pull timed out"),
+    }
+}
+
+/// Pull every node's ledger. Used where the controller has reason to distrust
+/// its own view rather than any one node's: a leader took over, or the sweep.
+pub async fn pull_all_node_ledgers(cluster: &Arc<ClusterManager>, reason: &str) {
+    let nodes: Vec<String> = cluster.get_nodes().into_iter().map(|n| n.name).collect();
+    let mut set = tokio::task::JoinSet::new();
+    for node in nodes {
+        let cluster = cluster.clone();
+        let reason = reason.to_string();
+        set.spawn(async move { pull_node_ledger(&cluster, &node, &reason).await });
+    }
+    while set.join_next().await.is_some() {}
+}
+
 /// Refuse any launch for this run issued before now. Sent before the cancel,
 /// which alone races an in-flight launch and loses.
 async fn fence_run_on_nodes(
@@ -3363,6 +3426,16 @@ mod tests {
 
         #[tonic::async_trait]
         impl spur_proto::proto::slurm_agent_server::SlurmAgent for MockAgent {
+            async fn request_node_ledger(
+                &self,
+                _request: tonic::Request<spur_proto::proto::RequestNodeLedgerRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::RequestNodeLedgerResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(
+                    spur_proto::proto::RequestNodeLedgerResponse { ledger: None },
+                ))
+            }
+
             async fn fence_run(
                 &self,
                 _request: tonic::Request<spur_proto::proto::FenceRunRequest>,
