@@ -2707,24 +2707,32 @@ pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
     matches!(fields.nth(18).and_then(|t| t.parse::<u64>().ok()), Some(ticks) if ticks == start_ticks)
 }
 
-pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
+/// Whether a recorded supervisor identity still names a running process. `Err`
+/// is undetermined, which no caller may read as a death.
+pub(crate) fn supervisor_liveness(
+    supervisor: &crate::admission::SupervisorRef,
+) -> io::Result<StepdLiveness> {
     // `process_start_ticks` counts from boot and the spool survives one, so a
     // pid and tick match across boots is a collision, not the same supervisor.
-    let scope = crate::admission::SupervisorRef {
-        pid: descriptor.pid,
-        start_ticks: descriptor.process_start_ticks,
-        boot_id: descriptor.boot_id.clone(),
-    }
-    .boot_scope(crate::admission::current_boot_id().as_deref());
-    if scope == crate::admission::BootScope::Different {
+    if supervisor.boot_scope(crate::admission::current_boot_id().as_deref())
+        == crate::admission::BootScope::Different
+    {
         return Ok(StepdLiveness::Stale);
     }
-    match process_start_ticks(descriptor.pid) {
-        Ok(start_ticks) if start_ticks == descriptor.process_start_ticks => Ok(StepdLiveness::Live),
+    match process_start_ticks(supervisor.pid) {
+        Ok(start_ticks) if start_ticks == supervisor.start_ticks => Ok(StepdLiveness::Live),
         Ok(_) => Ok(StepdLiveness::Stale),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StepdLiveness::Stale),
         Err(error) => Err(error),
     }
+}
+
+pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
+    supervisor_liveness(&crate::admission::SupervisorRef {
+        pid: descriptor.pid,
+        start_ticks: descriptor.process_start_ticks,
+        boot_id: descriptor.boot_id.clone(),
+    })
 }
 
 #[cfg(test)]
