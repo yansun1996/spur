@@ -457,6 +457,9 @@ pub struct ClusterManager {
     /// from the durable job store / node reasons instead, so they survive
     /// failover.
     health_last_check: parking_lot::Mutex<HashMap<(usize, String), std::time::Instant>>,
+    /// Launches this controller has on the wire, so a ledger cut taken while one
+    /// was in flight is not read as the node having let that job go.
+    dispatch_tracker: Arc<crate::dispatch_tracker::DispatchTracker>,
 }
 
 /// Reserved job-name prefix marking a controller-submitted health-check job, so
@@ -596,6 +599,7 @@ impl ClusterManager {
             interactive_last_seen: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
+            dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -1633,6 +1637,7 @@ impl ClusterManager {
             per_node_alloc,
             srun_step_dispatch,
             run_attempt,
+            at: Some(Utc::now()),
         })?;
         Ok(run_attempt)
     }
@@ -5730,6 +5735,11 @@ impl ClusterManager {
         }
     }
 
+    /// The launches this controller currently has on the wire.
+    pub(crate) fn dispatch_tracker(&self) -> &Arc<crate::dispatch_tracker::DispatchTracker> {
+        &self.dispatch_tracker
+    }
+
     /// Every non-finalized job Raft places on this node, with its attempt.
     pub fn jobs_allocated_on_node(&self, node: &str) -> HashMap<JobId, u32> {
         self.jobs
@@ -6286,9 +6296,17 @@ impl ClusterManager {
                 per_node_alloc,
                 srun_step_dispatch,
                 run_attempt,
+                at,
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
-                    job.start_time = Some(timestamp);
+                    // A requeue clears `start_time`, so keeping an existing one
+                    // only pins a run a pre-upgrade entry is being replayed for.
+                    match at {
+                        Some(at) => job.start_time = Some(*at),
+                        None => {
+                            job.start_time.get_or_insert(timestamp);
+                        }
+                    }
                     job.allocated_nodes = node_names.clone();
                     job.allocated_resources = Some(resources.clone());
                     job.per_node_alloc = per_node_alloc.clone();
@@ -10113,6 +10131,7 @@ mod tests {
             per_node_alloc: per_node_for(&["node1"], resources),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         let job = cm.get_job(1).unwrap();
@@ -10122,6 +10141,74 @@ mod tests {
         let node = cm.get_node("node1").unwrap();
         assert_eq!(node.alloc_resources.cpus, 4);
         assert_eq!(node.alloc_resources.memory_mb, 8000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaying_a_running_job_keeps_the_start_it_was_dispatched_with() {
+        // A replay runs this same apply path; dating the run from it shortens every
+        // RunTime spanning a restart, which with accounting on is what gets billed.
+        let dispatched_at = Utc::now() - chrono::Duration::seconds(45);
+        let resources = scalar_alloc(4, 8000);
+        let log = [
+            WalOperation::JobSubmit {
+                job_id: 1,
+                spec: Box::new(basic_spec("j")),
+            },
+            WalOperation::JobStart {
+                job_id: 1,
+                nodes: vec!["node1".into()],
+                resources: resources.clone(),
+                per_node_alloc: per_node_for(&["node1"], resources),
+                srun_step_dispatch: false,
+                run_attempt: 1,
+                at: Some(dispatched_at),
+            },
+            WalOperation::job_state_change(1, JobState::Pending, JobState::Running),
+        ];
+
+        let dir = TempDir::new().unwrap();
+        let replayed = test_cluster(&dir).await;
+        register_node(&replayed, "node1", 8, 16000);
+        for op in &log {
+            replayed.apply_operation(op);
+        }
+
+        let job = replayed.get_job(1).unwrap();
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(
+            job.start_time,
+            Some(dispatched_at),
+            "the replay must not move a started run's clock forward"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaying_a_pre_upgrade_start_leaves_a_running_job_where_it_was() {
+        // Entries written before the instant was recorded still replay on the
+        // first restart after an upgrade, with only the prior apply to go on.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "node1", 8, 16000);
+        let resources = scalar_alloc(4, 8000);
+        let legacy = WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["node1".into()],
+            resources: resources.clone(),
+            per_node_alloc: per_node_for(&["node1"], resources),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+            at: None,
+        };
+        cm.apply_operation(&WalOperation::JobSubmit {
+            job_id: 1,
+            spec: Box::new(basic_spec("j")),
+        });
+        cm.apply_operation(&legacy);
+        let first = cm.get_job(1).unwrap().start_time;
+
+        cm.apply_operation(&legacy);
+
+        assert_eq!(cm.get_job(1).unwrap().start_time, first);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10147,6 +10234,7 @@ mod tests {
             per_node_alloc: per_node_for(&["node1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.apply_operation(&WalOperation::JobComplete {
@@ -11201,6 +11289,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -11242,6 +11331,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -11284,6 +11374,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -11349,6 +11440,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         // Three srun steps exit 7, 3, 2 (in that order). DerivedExitCode tracks
@@ -11410,6 +11502,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobStepCreate {
             step: Box::new(spur_core::step::JobStep {
@@ -11474,6 +11567,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(4, 8000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         };
 
         cm.apply_operation(&WalOperation::JobSubmit {
@@ -11580,6 +11674,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -11630,6 +11725,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         let resp = cm.apply_operation(&WalOperation::JobComplete {
@@ -11669,6 +11765,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         let first = cm.apply_operation(&WalOperation::JobComplete {
@@ -11726,6 +11823,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -11762,6 +11860,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.node_complete(1, "n1", 0, 9, 0).unwrap();
@@ -11948,6 +12047,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         // Step 2: the call the RPC makes after validation (wire state dropped).
@@ -11983,6 +12083,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.node_complete(1, "n1", 42, 0, 0).unwrap();
@@ -12021,6 +12122,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 12000)),
             srun_step_dispatch: false,
             run_attempt: 2,
+            at: Some(chrono::Utc::now()),
         });
 
         // Stale SIGKILL report from epoch 1 must be ignored.
@@ -12060,6 +12162,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
@@ -12127,6 +12230,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1", "n2", "n3"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
             job_id: 1,
@@ -13776,6 +13880,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -14069,6 +14174,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
@@ -14156,6 +14262,7 @@ mod tests {
             per_node_alloc: per_node_for(&["worker1"], alloc),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         assert_eq!(cm.get_node("worker1").unwrap().alloc_resources.cpus, 2);
 
@@ -21042,6 +21149,7 @@ mod tests {
                 per_node_alloc: per_node,
                 srun_step_dispatch: false,
                 run_attempt: 0,
+                at: Some(chrono::Utc::now()),
             });
 
             match rng.below(7) {
@@ -21293,6 +21401,7 @@ mod tests {
                 per_node_alloc: per_node_for(&["n1"], slice.clone()),
                 srun_step_dispatch: false,
                 run_attempt: 3,
+                at: Some(chrono::Utc::now()),
             });
             if finish {
                 cm.apply_operation(&WalOperation::JobComplete {
@@ -21385,6 +21494,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], slice),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobComplete {
             job_id: 1,
@@ -21442,6 +21552,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], slice),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         // Drift the cache the way a lost subtract or a double add would, then
@@ -21509,6 +21620,7 @@ mod tests {
             per_node_alloc: per_node_for(&["n1"], slice),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
 
         cm.apply_operation(&register);
@@ -25268,6 +25380,7 @@ mod tests {
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
     }
 
@@ -25284,6 +25397,7 @@ mod tests {
             per_node_alloc: per_node_for(&[node], scalar_alloc(1, 1000)),
             srun_step_dispatch: true,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         });
     }
 

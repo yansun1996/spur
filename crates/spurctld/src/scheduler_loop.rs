@@ -1651,7 +1651,11 @@ async fn register_allocation_on_nodes(
             work_dir: spec.work_dir.clone(),
             run_attempt,
         };
+        // Same reason as the launch fan-out: this claim is one the node takes
+        // partway through the call, not one a cut can be asked about.
+        let in_flight = cluster.dispatch_tracker().begin(node_name, job_id);
         set.spawn(async move {
+            let _in_flight = in_flight;
             let register = register_allocation_to_agent(&agent_addr, &params);
             let result = match dispatch_timeout {
                 Some(limit) => match tokio::time::timeout(limit, register).await {
@@ -1963,7 +1967,11 @@ async fn confirm_dispatch_on_nodes(
         let allocated_nodelist = allocated_nodelist.clone();
         let pmix_tmpdir = pmix_tmpdir.clone();
         let agent_addr = agent_addr.clone();
+        // Held for the whole call: a cut taken before this lands is silent about
+        // the job for reasons that have nothing to do with the node dropping it.
+        let in_flight = cluster.dispatch_tracker().begin(node_name, job_id);
         set.spawn(async move {
+            let _in_flight = in_flight;
             let params = AgentDispatchParams {
                 job_id,
                 spec: &spec,
@@ -2564,6 +2572,9 @@ pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason:
     let Ok(mut client) = crate::agent_client::connect(addr).await else {
         return;
     };
+    // Opened before the cut is asked for, so any launch the cut could have
+    // missed is one this watch has seen.
+    let dispatched = cluster.dispatch_tracker().watch(node);
     let pulled = tokio::time::timeout(
         CANCEL_RPC_TIMEOUT,
         client.request_node_ledger(RequestNodeLedgerRequest {
@@ -2574,7 +2585,7 @@ pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason:
     match pulled {
         Ok(Ok(response)) => {
             if let Some(ledger) = response.into_inner().ledger {
-                crate::server::reconcile_node_ledger(cluster, node, ledger).await;
+                crate::server::reconcile_node_ledger(cluster, node, ledger, &dispatched).await;
             }
         }
         // An agent that predates the pull keeps its pre-upgrade behaviour.

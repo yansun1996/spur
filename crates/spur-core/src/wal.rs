@@ -57,6 +57,10 @@ pub enum WalOperation {
         /// Run epoch for this dispatch (0 for pre-upgrade entries).
         #[serde(default)]
         run_attempt: u32,
+        /// Stamped on the leader so a replay dates the run from the dispatch
+        /// rather than from its own clock. `None` in pre-upgrade entries.
+        #[serde(default)]
+        at: Option<chrono::DateTime<chrono::Utc>>,
     },
     JobComplete {
         job_id: JobId,
@@ -436,6 +440,7 @@ impl WalOperation {
             per_node_alloc,
             srun_step_dispatch: false,
             run_attempt: 0,
+            at: Some(chrono::Utc::now()),
         }
     }
 }
@@ -1029,6 +1034,20 @@ mod deregistration_wal_tests {
         match op {
             WalOperation::EvictTerminalJobs { job_ids } => {
                 assert_eq!(job_ids, vec![7, 42]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_start_frozen_payload_still_deserializes() {
+        const START: &str = r#"{"JobStart":{"job_id":7,"nodes":["n1"],"resources":{"cpus":2,"memory_mb":1000,"devices":{}}}}"#;
+        let op: WalOperation = serde_json::from_str(START)
+            .expect("frozen JobStart must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::JobStart { job_id, at, .. } => {
+                assert_eq!(job_id, 7);
+                assert!(at.is_none(), "a pre-upgrade entry carries no start instant");
             }
             _ => panic!("wrong variant"),
         }

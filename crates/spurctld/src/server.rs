@@ -865,12 +865,13 @@ pub(crate) struct ReconcileOutcome {
     pub settled: Vec<u32>,
 }
 
-/// Diff an agent's asserted ledger against Raft and resolve the differences. The
-/// node stays gated until this returns.
+/// Diff an agent's asserted ledger against Raft and resolve the differences.
+/// `dispatched` must predate the cut: it names launches that could postdate it.
 pub(crate) async fn reconcile_node_ledger(
     cluster: &Arc<ClusterManager>,
     node: &str,
     ledger: spur_proto::proto::NodeLedger,
+    dispatched: &crate::dispatch_tracker::DispatchWatch,
 ) -> ReconcileOutcome {
     let held: std::collections::HashMap<u32, &spur_proto::proto::LedgerEntry> =
         ledger.entries.iter().map(|e| (e.job_id, e)).collect();
@@ -914,9 +915,18 @@ pub(crate) async fn reconcile_node_ledger(
 
     // Direction B: Raft records a job here the agent did not report. Only an
     // asserted-complete ledger licenses acting on an absence, and only for a run
-    // the agent confirmed -- a cut can predate a launch still being dispatched.
+    // no launch of ours could have raced -- the cut may simply predate it.
+    let raced_the_cut = dispatched.observed();
     for (job_id, run_attempt) in cluster.jobs_confirmed_on_node(node) {
         if held.contains_key(&job_id) {
+            continue;
+        }
+        if raced_the_cut.contains(&job_id) {
+            warn!(
+                node = %node,
+                job_id,
+                "this cut could not have seen the launch we were dispatching; leaving it alone"
+            );
             continue;
         }
         if !ledger.inventory_complete {
@@ -2248,6 +2258,9 @@ impl SlurmController for ControllerService {
         // A node the controller has never seen has no record to carry the
         // gate yet, so a first registration sets it below instead.
         let ledger = req.ledger.clone();
+        // The agent took this cut before it called, so the watch can only cover
+        // launches still on the wire now -- the best this direction allows.
+        let dispatched = self.cluster.dispatch_tracker().watch(&req.hostname);
         let known_before = ledger.is_some() && self.cluster.get_node(&req.hostname).is_some();
         if known_before {
             self.cluster.set_reconcile_pending(&req.hostname, true);
@@ -2286,7 +2299,7 @@ impl SlurmController for ControllerService {
                 let _gate = ReconcileGate::new(cluster, node.clone());
                 if tokio::time::timeout(
                     RECONCILE_BUDGET,
-                    reconcile_node_ledger(&cluster_for_reconcile, &node, ledger),
+                    reconcile_node_ledger(&cluster_for_reconcile, &node, ledger, &dispatched),
                 )
                 .await
                 .is_err()
@@ -6849,6 +6862,7 @@ mod tests {
             per_node_alloc: [("n1".to_string(), slice)].into_iter().collect(),
             srun_step_dispatch: false,
             run_attempt: 1,
+            at: Some(chrono::Utc::now()),
         });
         (svc, cluster)
     }
@@ -6876,6 +6890,7 @@ mod tests {
             per_node_alloc: [("n1".to_string(), slice)].into_iter().collect(),
             srun_step_dispatch: false,
             run_attempt: 1,
+            at: Some(chrono::Utc::now()),
         });
         assert_eq!(
             cluster.get_job(job_id).map(|j| j.state),
@@ -6903,6 +6918,14 @@ mod tests {
         }
     }
 
+    /// A reconcile of a node this controller is not dispatching to.
+    fn no_launch_in_flight(
+        cluster: &Arc<ClusterManager>,
+        node: &str,
+    ) -> crate::dispatch_tracker::DispatchWatch {
+        cluster.dispatch_tracker().watch(node)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_incomplete_ledger_never_removes_a_job_the_controller_placed() {
         // Inverting this frees live allocations across the cluster whenever an
@@ -6911,7 +6934,13 @@ mod tests {
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
         assert!(cluster.jobs_allocated_on_node("n1").contains_key(&7));
 
-        reconcile_node_ledger(&cluster, "n1", ledger(false, Vec::new())).await;
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(false, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
 
         assert!(
             cluster.jobs_allocated_on_node("n1").contains_key(&7),
@@ -6930,8 +6959,13 @@ mod tests {
             "this test is only meaningful against a controller that has replayed its log"
         );
 
-        let outcome =
-            reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1), (99, 1)])).await;
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
 
         assert_eq!(
             outcome.cancelled,
@@ -6964,7 +6998,13 @@ mod tests {
         });
         assert!(!cluster.state_machine_ready(std::time::Duration::ZERO).await);
 
-        let outcome = reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1)])).await;
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
 
         assert!(
             outcome.cancelled.is_empty(),
@@ -6977,7 +7017,13 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
 
-        let outcome = reconcile_node_ledger(&cluster, "n1", ledger(true, Vec::new())).await;
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
 
         assert_eq!(
             outcome.settled,
@@ -6996,7 +7042,13 @@ mod tests {
         reserve_pending_job_on_n1(&cluster, 8);
         assert!(cluster.jobs_allocated_on_node("n1").contains_key(&8));
 
-        let outcome = reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1)])).await;
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
 
         assert_eq!(
             outcome.settled,
@@ -7015,6 +7067,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_taken_while_a_launch_was_on_the_wire_settles_nothing() {
+        // Only the cut's position relative to the launch separates this from a node
+        // that genuinely let go, and the cut's own contents cannot say which it is.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        let dispatched = cluster.dispatch_tracker().watch("n1");
+        let on_the_wire = Arc::new(tokio::sync::Notify::new());
+        let cut_taken = Arc::new(tokio::sync::Notify::new());
+
+        let launch = tokio::spawn({
+            let cluster = cluster.clone();
+            let on_the_wire = on_the_wire.clone();
+            let cut_taken = cut_taken.clone();
+            async move {
+                let in_flight = cluster.dispatch_tracker().begin("n1", 8);
+                on_the_wire.notify_one();
+                cut_taken.notified().await;
+                reserve_pending_job_on_n1(&cluster, 8);
+                cluster.apply_operation(&spur_core::wal::WalOperation::JobStateChange {
+                    job_id: 8,
+                    old_state: spur_core::job::JobState::Pending,
+                    new_state: spur_core::job::JobState::Running,
+                    pending_reason: None,
+                    pending_priority: None,
+                    begin_time: None,
+                    pending_reason_desc: None,
+                });
+                drop(in_flight);
+            }
+        });
+
+        on_the_wire.notified().await;
+        let cut = ledger(true, vec![(7, 1)]);
+        cut_taken.notify_one();
+        launch.await.unwrap();
+
+        let outcome = reconcile_node_ledger(&cluster, "n1", cut, &dispatched).await;
+
+        assert_eq!(
+            outcome.settled,
+            Vec::<u32>::new(),
+            "the cut was taken before the launch landed, so it cannot disown it"
+        );
+        assert_eq!(
+            cluster.get_job(8).map(|j| j.state),
+            Some(spur_core::job::JobState::Running),
+            "the agent ran this job to completion; failing it loses the real exit code"
+        );
+        assert!(cluster.jobs_allocated_on_node("n1").contains_key(&8));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_claim_for_a_job_still_being_dispatched_is_not_cancelled() {
         // Direction A needs no dispatch-window guard of its own: a reservation is
         // a record, so the claim the agent just took is one the controller made.
@@ -7022,8 +7127,13 @@ mod tests {
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
         reserve_pending_job_on_n1(&cluster, 8);
 
-        let outcome =
-            reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1), (8, 1)])).await;
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (8, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
 
         assert_eq!(
             outcome,
@@ -7037,7 +7147,13 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
 
-        reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1)])).await;
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
 
         assert!(cluster.jobs_allocated_on_node("n1").contains_key(&7));
     }
@@ -7049,7 +7165,13 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
 
-        reconcile_node_ledger(&cluster, "n1", ledger(true, Vec::new())).await;
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
         assert!(!cluster.jobs_allocated_on_node("n1").contains_key(&7));
     }
 
