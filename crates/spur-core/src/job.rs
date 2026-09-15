@@ -42,6 +42,10 @@ pub enum JobState {
 /// controller maps it to `JobState::OutOfMemory`; low bits keep the real signal.
 pub const OOM_SIGNAL_FLAG: i32 = 0x1000;
 
+/// How long a launch stays admissible. The controller stamps each launch's expiry
+/// with it; the agent keeps a cutoff this long so no launch it refuses outlives it.
+pub const LAUNCH_LIFETIME_MS: u64 = 120_000;
+
 impl JobState {
     /// Short code used in squeue output (matches Slurm).
     pub fn code(&self) -> &'static str {
