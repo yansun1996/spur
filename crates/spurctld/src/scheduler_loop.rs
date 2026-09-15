@@ -513,6 +513,20 @@ async fn process_assignment(
     };
 
     let dispatched = dispatch_spec.is_some();
+
+    // Reserved first: a leader change in the window that follows then finds the
+    // slice charged, so a new leader cannot place a second job on these cores.
+    if let Err(e) = cluster.reserve_placement(
+        job_id,
+        assignment.nodes.clone(),
+        resources.clone(),
+        assignment.per_node_alloc.clone(),
+        srun_step_dispatch,
+    ) {
+        debug!(job_id, error = %e, "could not reserve the placement");
+        return false;
+    }
+
     if let Some(dspec) = dispatch_spec {
         // The run epoch start_job_impl is about to persist for this
         // dispatch. Safe to read ahead of that call: this iteration is
@@ -533,7 +547,10 @@ async fn process_assignment(
         )
         .await
         {
-            DispatchConfirmOutcome::Aborted => return false,
+            DispatchConfirmOutcome::Aborted => {
+                abort_placement(&cluster, job_id);
+                return false;
+            }
             DispatchConfirmOutcome::Confirmed => {}
         }
     }
@@ -541,23 +558,16 @@ async fn process_assignment(
     // Transition job to Running. Reached only once every assigned node
     // has confirmed (LaunchJob for batch dispatch above, or
     // RegisterJobAllocation for the pure interactive case above that).
-    let start_result = if srun_step_dispatch {
-        cluster.start_job_impl(
-            job_id,
-            assignment.nodes.clone(),
-            resources,
-            assignment.per_node_alloc.clone(),
-            true,
-        )
-    } else {
-        cluster.start_job(
-            job_id,
-            assignment.nodes.clone(),
-            resources,
-            assignment.per_node_alloc.clone(),
-        )
-    };
+    let start_result = cluster.activate_job(
+        job_id,
+        prospective_run_attempt,
+        assignment.nodes.clone(),
+        resources,
+        assignment.per_node_alloc.clone(),
+        srun_step_dispatch,
+    );
     if let Err(e) = start_result {
+        abort_placement(&cluster, job_id);
         // Confirmation above already registered the allocation or
         // launched real processes on dispatch_nodes; stop them so a
         // start_job failure here (e.g. the job was cancelled out from
@@ -2534,6 +2544,14 @@ pub async fn send_cancel_to_nodes(
     fence_run_on_nodes(cluster, job_id, run_attempt, node_names).await;
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
         tokio::spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
+    }
+}
+
+/// Give up a reservation whose dispatch never confirmed. Every non-activating
+/// exit goes through this, or the slice stays charged to a requeued job.
+fn abort_placement(cluster: &Arc<ClusterManager>, job_id: spur_core::job::JobId) {
+    if let Err(error) = cluster.abort_placement(job_id) {
+        warn!(job_id, %error, "could not give up a reservation; it stays charged");
     }
 }
 
@@ -5471,8 +5489,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-        async fn process_assignment_cancels_dispatched_nodes_when_start_job_fails_after_confirmation(
-        ) {
+        async fn an_inconsistent_assignment_is_refused_before_anything_is_launched() {
             use spur_core::job::JobState;
 
             let dir = TempDir::new().unwrap();
@@ -5484,15 +5501,8 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("start-job-inconsistent", 2));
 
-            // A malformed assignment: confirm_dispatch_on_nodes tolerates a
-            // missing per_node_alloc entry (falls back to a default
-            // allocation), but start_job validates every assigned node has
-            // one and rejects the whole call otherwise. This is what a
-            // scheduler/assignment bug producing inconsistent data — or the
-            // job being touched by another path between assignment and this
-            // call — looks like from here: both nodes already launched real
-            // work by the time start_job is rejected, so both must be torn
-            // back down rather than left running under a job stuck Pending.
+            // The reservation validates the per-node data, and it now runs
+            // before the dispatch, so nothing is ever launched.
             let mut bad_assignment = assignment(job_id, &["n1", "n2"]);
             bad_assignment.per_node_alloc.remove("n2");
 
@@ -5500,20 +5510,25 @@ mod tests {
 
             assert!(
                 !started,
-                "start_job's own validation must still block on inconsistent per-node data"
+                "inconsistent per-node data must block the dispatch"
             );
             assert_eq!(
                 cm.get_job(job_id).unwrap().state,
                 JobState::Pending,
-                "a start_job failure must not leave the job Running with no confirmed nodes"
+                "a refused placement must leave the job queued"
             );
-            wait_for(
-                "n1 cancelled after start_job rejected the assignment",
-                || cancel1.load(Ordering::SeqCst) >= 1,
+            assert_eq!(
+                (
+                    cancel1.load(Ordering::SeqCst),
+                    cancel2.load(Ordering::SeqCst)
+                ),
+                (0, 0),
+                "nothing was launched, so there is nothing to tear down"
             );
-            wait_for(
-                "n2 cancelled after start_job rejected the assignment",
-                || cancel2.load(Ordering::SeqCst) >= 1,
+            assert_eq!(
+                cm.get_node("n1").unwrap().alloc_resources.cpus,
+                0,
+                "a refused placement charges nothing"
             );
         }
 

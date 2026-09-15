@@ -1595,6 +1595,47 @@ impl ClusterManager {
     /// Start a job on specific nodes.
     /// Transition a pending job to Running and record its allocation. Returns
     /// the run epoch assigned to this dispatch (threaded into the launch RPC).
+    /// Record a placement in Raft before dispatching against it, so a leader
+    /// change mid-dispatch finds the slice charged rather than free.
+    pub fn reserve_placement(
+        &self,
+        job_id: JobId,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+    ) -> anyhow::Result<u32> {
+        for name in &node_names {
+            if !per_node_alloc.contains_key(name) {
+                anyhow::bail!("job {job_id}: per_node_alloc missing entry for node '{name}'");
+            }
+        }
+        let run_attempt = {
+            let jobs = self.jobs.read();
+            let job = jobs
+                .get(&job_id)
+                .ok_or_else(|| anyhow::anyhow!("job {job_id} not found"))?;
+            if job.state != JobState::Pending {
+                anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
+            }
+            job.run_attempt.saturating_add(1)
+        };
+        // `JobStart`'s apply has no state guard, so it charges the slice while
+        // the job is still Pending; the transition follows once it is confirmed.
+        self.propose(WalOperation::JobStart {
+            job_id,
+            nodes: node_names,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch,
+            run_attempt,
+        })?;
+        Ok(run_attempt)
+    }
+
+    /// Reserve and activate together, for callers with nothing to dispatch in
+    /// between. Not the scheduler: the launch is what separates the two.
+    #[cfg(test)]
     pub fn start_job(
         &self,
         job_id: JobId,
@@ -1605,6 +1646,7 @@ impl ClusterManager {
         self.start_job_impl(job_id, node_names, resources, per_node_alloc, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn start_job_impl(
         &self,
         job_id: JobId,
@@ -1613,51 +1655,86 @@ impl ClusterManager {
         per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
         srun_step_dispatch: bool,
     ) -> anyhow::Result<u32> {
-        for name in &node_names {
-            if !per_node_alloc.contains_key(name) {
-                anyhow::bail!(
-                    "job {}: per_node_alloc missing entry for node '{}'",
-                    job_id,
-                    name
-                );
-            }
-        }
+        let run_attempt = self.reserve_placement(
+            job_id,
+            node_names.clone(),
+            resources.clone(),
+            per_node_alloc.clone(),
+            srun_step_dispatch,
+        )?;
+        self.activate_job(
+            job_id,
+            run_attempt,
+            node_names,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch,
+        )
+    }
 
-        // Validate job exists and can transition
-        let old_state;
-        let spec_for_notify;
-        let submit_time_for_notify;
-        let run_attempt;
-        {
+    /// Give up a reservation whose dispatch never confirmed, freeing the slice
+    /// it charged. A no-op on a job that never reserved one.
+    pub fn abort_placement(&self, job_id: JobId) -> anyhow::Result<()> {
+        let Some(job) = self.get_job(job_id) else {
+            return Ok(());
+        };
+        let begin_time = self.launch_backoff_until(&job);
+        self.propose(WalOperation::JobDispatchBackoff { job_id, begin_time })?;
+        Ok(())
+    }
+
+    /// Make a reserved job Running, once every node has confirmed its launch.
+    /// The placement is already in the log, so this is the transition only.
+    pub fn activate_job(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+    ) -> anyhow::Result<u32> {
+        let (old_state, spec_for_notify, submit_time_for_notify) = {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
-                .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
-            old_state = job.state;
-            spec_for_notify = job.spec.clone();
-            submit_time_for_notify = job.submit_time;
-            // Next run epoch (first dispatch = 1), threaded to the agents.
-            run_attempt = job.run_attempt.saturating_add(1);
+                .ok_or_else(|| anyhow::anyhow!("job {job_id} not found"))?;
             if job.state != JobState::Pending {
                 anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
             }
-        }
-
-        // propose() handles: state transition, resource allocation, license subtraction
+            (job.state, job.spec.clone(), job.submit_time)
+        };
         self.propose(WalOperation::job_state_change(
             job_id,
             old_state,
             JobState::Running,
         ))?;
-        self.propose(WalOperation::JobStart {
+        self.finish_job_start(
             job_id,
-            nodes: node_names.clone(),
-            resources: resources.clone(),
-            per_node_alloc: per_node_alloc.clone(),
-            srun_step_dispatch,
             run_attempt,
-        })?;
+            node_names,
+            resources,
+            per_node_alloc,
+            srun_step_dispatch,
+            spec_for_notify,
+            submit_time_for_notify,
+        )
+    }
 
+    /// The bookkeeping a started run needs once its transition is committed:
+    /// the batch step, the notification, and the accounting record.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_job_start(
+        &self,
+        job_id: JobId,
+        run_attempt: u32,
+        node_names: Vec<String>,
+        resources: ResourceAllocations,
+        per_node_alloc: std::collections::HashMap<String, ResourceAllocations>,
+        srun_step_dispatch: bool,
+        spec_for_notify: JobSpec,
+        submit_time_for_notify: DateTime<Utc>,
+    ) -> anyhow::Result<u32> {
         let node_count = node_names.len().max(1) as u32;
         let per_node = node_names
             .first()
@@ -5843,9 +5920,23 @@ impl ClusterManager {
                 if job.state != JobState::Pending {
                     return ClientResponse::default();
                 }
+                // Free what the reservation charged before the requeue wipes
+                // the fields that say where it went.
+                let freed_nodes = job.allocated_nodes.clone();
+                let allocated_resources = job.allocated_resources.clone();
+                let per_node_map = job.per_node_alloc.clone();
+                let already: Vec<String> = job.node_completions.keys().cloned().collect();
                 Self::reset_job_for_requeue(job);
                 job.spec.begin_time = Some(*begin_time);
                 job.set_pending_reason(PendingReason::JobLaunchFailure);
+                Self::deallocate_job_slices(
+                    &mut nodes,
+                    &freed_nodes,
+                    allocated_resources.as_ref(),
+                    &per_node_map,
+                    &already,
+                    *job_id,
+                );
             }
             WalOperation::JobPreemptRequeue {
                 job_id,
@@ -20954,6 +21045,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reserved_placement_is_charged_before_the_job_runs() {
+        // The window this closes: a leader change between placing a job and
+        // launching it used to find the slice free and place a second job here.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        let attempt = cm
+            .reserve_placement(
+                id,
+                vec!["n1".into()],
+                res.clone(),
+                per_node_for(&["n1"], res.clone()),
+                false,
+            )
+            .expect("reserve");
+        wait_for("charged", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 4
+        });
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Pending,
+            "a reservation is not a start"
+        );
+
+        cm.activate_job(
+            id,
+            attempt,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+        )
+        .expect("activate");
+        settle(&cm, id, JobState::Running);
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn giving_up_a_reservation_frees_what_it_charged() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+        let res = scalar_alloc(4, 8000);
+
+        cm.reserve_placement(
+            id,
+            vec!["n1".into()],
+            res.clone(),
+            per_node_for(&["n1"], res),
+            false,
+        )
+        .expect("reserve");
+        wait_for("charged", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 4
+        });
+
+        cm.abort_placement(id).expect("abort");
+        wait_for("freed", || {
+            cm.get_node("n1").unwrap().alloc_resources.cpus == 0
+        });
+        assert_eq!(
+            cm.get_job(id).unwrap().state,
+            JobState::Pending,
+            "the job goes back to the queue"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn giving_up_a_placement_that_never_charged_is_harmless() {
+        // A pre-upgrade backoff entry carries no allocation, and replaying one
+        // must not free anything.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("a"));
+
+        cm.abort_placement(id).expect("abort");
+        assert_eq!(cm.get_node("n1").unwrap().alloc_resources.cpus, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
