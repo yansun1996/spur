@@ -152,6 +152,10 @@ pub struct RunAdmission {
     /// over, which settles the record once teardown has finished.
     #[serde(default)]
     pub cancelled_by_controller: bool,
+    /// This run's slice has gone back to the node on an acknowledged release.
+    /// A record leaves the ledger cut only once this says it holds nothing.
+    #[serde(default)]
+    pub slice_released: bool,
 }
 
 impl RunAdmission {
@@ -178,6 +182,7 @@ impl RunAdmission {
             conflict_hold: None,
             controller_ack: ControllerAck::default(),
             cancelled_by_controller: false,
+            slice_released: false,
         }
     }
 
@@ -333,6 +338,30 @@ impl AdmittedRun {
                 .participants
                 .iter()
                 .all(|p| !p.final_report.required || p.final_report.acknowledged)
+    }
+
+    /// The step that speaks for the run's allocation, which is the one a release
+    /// and a run-level completion are keyed on.
+    pub fn lifecycle_step(&self) -> Option<StepId> {
+        self.run
+            .lifecycle_owner_step
+            .or_else(|| self.participants.first().map(|p| p.step_id))
+    }
+
+    /// Whether some participant still owes the controller a report. That debt is
+    /// what nothing but an acknowledgement can discharge.
+    pub fn owes_a_report(&self) -> bool {
+        self.participants
+            .iter()
+            .any(|p| p.final_report.required && !p.final_report.acknowledged)
+    }
+
+    /// Every supervisor this run ever recorded. Empty means none was recorded,
+    /// which is not the same as one being gone.
+    pub fn recorded_supervisors(&self) -> impl Iterator<Item = &SupervisorRef> {
+        self.participants
+            .iter()
+            .filter_map(|p| p.supervisor.as_ref())
     }
 
     /// Past every deadline with nothing left that could still act. Gating on a
@@ -510,9 +539,9 @@ impl AdmissionStore {
         let entries = loaded
             .runs
             .iter()
-            // A decided record is a dead predecessor, not a claim. Advertising one
-            // invites a cancel that cannot change it, so it re-fires on every cut.
-            .filter(|admitted| !admitted.run.is_over())
+            // The cut is what the node physically holds, so only a slice going
+            // back takes a record out of it. A lifecycle flag hides a live claim.
+            .filter(|admitted| !admitted.run.slice_released)
             .map(|admitted| LedgerCutEntry {
                 job_id: admitted.run.job_id,
                 run_attempt: admitted.run.run_attempt,
@@ -998,16 +1027,40 @@ impl AdmissionStore {
         Ok(true)
     }
 
+    /// Note that a run's slice has gone back to the node. Callers must have
+    /// released it against an acknowledgement, not merely intend to.
+    pub fn record_slice_released(&self, job_id: u32, run_attempt: u32) -> io::Result<bool> {
+        let mut run = match self.load_run(job_id, run_attempt) {
+            Ok(run) => run,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if run.slice_released {
+            return Ok(true);
+        }
+        run.slice_released = true;
+        self.admit_run(&run)?;
+        Ok(true)
+    }
+
+    /// Discharge every report a run still owes. Sound only once the controller
+    /// has taken the run's own completion: nothing answers a sibling's after that.
+    pub fn discharge_owed_reports(&self, job_id: u32, run_attempt: u32) -> io::Result<()> {
+        let (participants, _) = self.participants(job_id, run_attempt)?;
+        for participant in participants {
+            self.record_report_acknowledged(job_id, run_attempt, participant.step_id)?;
+        }
+        Ok(())
+    }
+
     /// Settle a cancelled run: the cancel is the controller's own acknowledgement.
     /// Owed reports go with it -- one owed forever is what makes a record immortal.
     pub fn settle_cancelled_run(&self, job_id: u32, run_attempt: u32) -> io::Result<bool> {
         if !self.record_controller_ack(job_id, run_attempt, 1)? {
             return Ok(false);
         }
-        let (participants, _) = self.participants(job_id, run_attempt)?;
-        for participant in participants {
-            self.record_report_acknowledged(job_id, run_attempt, participant.step_id)?;
-        }
+        self.discharge_owed_reports(job_id, run_attempt)?;
+        self.record_slice_released(job_id, run_attempt)?;
         self.mark_run_cleaned(job_id, run_attempt)
     }
 
@@ -1882,7 +1935,7 @@ mod tests {
     /// A cancel the cut does not register is re-issued on every later pass,
     /// forever, for a run that has already finished.
     #[test]
-    fn a_cancelled_claim_stops_being_advertised_to_the_controller() {
+    fn a_cancelled_claim_leaves_the_cut_once_its_slice_goes_back() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         // The two ways a cancel lands: on a run still tearing down, and on one
@@ -1890,11 +1943,13 @@ mod tests {
         store.admit_run(&run_with(7, 1, 1)).unwrap();
         store.admit_run(&run_with(8, 1, 1)).unwrap();
 
-        let mut cancels = 0;
-        for _ in 0..5 {
+        let mut cancels: BTreeMap<u32, u32> = BTreeMap::new();
+        for pass in 0..5 {
             for entry in store.ledger_cut("session-a").entries {
-                cancels += 1;
-                if entry.job_id == 7 {
+                *cancels.entry(entry.job_id).or_default() += 1;
+                // Job 7 is still tearing down on the first pass, so its cancel
+                // can only be noted; the rest give the slice back outright.
+                if entry.job_id == 7 && pass == 0 {
                     store
                         .mark_controller_cancelled(entry.job_id, entry.run_attempt)
                         .unwrap();
@@ -1907,12 +1962,103 @@ mod tests {
         }
 
         assert_eq!(
-            cancels, 2,
-            "each claim is cancelled once; the audit must converge, not re-fire per pass"
+            cancels.get(&7).copied(),
+            Some(2),
+            "a claim still being torn down is cancelled again, then converges"
         );
+        assert_eq!(cancels.get(&8).copied(), Some(1));
         assert!(
             store.ledger_cut("session-a").entries.is_empty(),
-            "a decided run is not a claim the controller should still be told about"
+            "a slice given back is not a claim the controller should still see"
+        );
+    }
+
+    #[test]
+    fn a_decided_run_that_still_holds_its_slice_stays_in_the_cut() {
+        // Hiding one is how a node came to report holding nothing while its
+        // records still charged every core on it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        for job_id in [7, 8, 9] {
+            store.admit_run(&run_with(job_id, 1, 1)).unwrap();
+        }
+        store.mark_run_cleaned(7, 1).unwrap();
+        store.mark_controller_cancelled(8, 1).unwrap();
+        store.record_controller_ack(9, 1, 42).unwrap();
+
+        assert_eq!(
+            store.ledger_cut("session-a").entries.len(),
+            3,
+            "every lifecycle state above still holds the cores it names"
+        );
+
+        store.record_slice_released(8, 1).unwrap();
+        let left: Vec<u32> = store
+            .ledger_cut("session-a")
+            .entries
+            .iter()
+            .map(|entry| entry.job_id)
+            .collect();
+        assert_eq!(left, vec![7, 9]);
+    }
+
+    #[test]
+    fn a_released_slice_does_not_discharge_the_report_still_owed_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1_000)).unwrap();
+        let mut owed = ParticipantAdmission::new(7, 1, STEP_BATCH, "n1", Default::default());
+        owed.final_report.required = true;
+        store.admit_participant(&owed).unwrap();
+
+        assert!(store.record_slice_released(7, 1).unwrap());
+        assert!(store.ledger_cut("session-a").entries.is_empty());
+        assert_eq!(
+            store.sweep(u64::MAX, 1, &HashSet::new()).unwrap(),
+            0,
+            "the report it owes outlives the cores it gave back"
+        );
+        assert!(store.load_run(7, 1).is_ok());
+    }
+
+    #[test]
+    fn releasing_a_slice_for_a_run_with_no_record_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!store(&dir).record_slice_released(9, 9).unwrap());
+    }
+
+    #[test]
+    fn a_runs_owed_reports_and_supervisors_are_readable_from_the_record_alone() {
+        // The report pass runs off the ledger, so what it keys on has to be
+        // there when the runtime session that produced it is long gone.
+        let mut admitted = AdmittedRun {
+            run: RunAdmission::new(7, 1, "n1", AdmittedResources::default(), 1),
+            participants: vec![ParticipantAdmission::new(
+                7,
+                1,
+                STEP_BATCH,
+                "n1",
+                Default::default(),
+            )],
+        };
+        assert!(!admitted.owes_a_report());
+        assert_eq!(admitted.recorded_supervisors().count(), 0);
+        assert_eq!(admitted.lifecycle_step(), Some(STEP_BATCH));
+
+        admitted.participants[0].final_report.required = true;
+        admitted.participants[0].supervisor = Some(SupervisorRef {
+            pid: 5,
+            start_ticks: 9,
+            boot_id: None,
+        });
+        assert!(admitted.owes_a_report());
+        assert_eq!(admitted.recorded_supervisors().count(), 1);
+
+        admitted.run.lifecycle_owner_step = Some(3);
+        assert_eq!(
+            admitted.lifecycle_step(),
+            Some(3),
+            "the owner outranks whichever participant happens to be first"
         );
     }
 

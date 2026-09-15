@@ -1823,7 +1823,133 @@ pub async fn replay_unacknowledged_stepd_completions(
             ));
         }
     }
+    // After the sessions above, which carry the real exit status: a run only
+    // reaches the pass below once nothing is left that could report one.
+    report_runs_nothing_can_speak_for(
+        store,
+        admissions,
+        allocation,
+        controller_addr,
+        reporting_node,
+    )
+    .await;
     Ok(reconciled)
+}
+
+/// Whether every read proves its supervisor gone. No reads at all proves
+/// nothing, and neither does one that could not be completed.
+fn all_supervisors_read_as_gone(reads: &[std::io::Result<crate::stepd::StepdLiveness>]) -> bool {
+    !reads.is_empty()
+        && reads
+            .iter()
+            .all(|read| matches!(read, Ok(crate::stepd::StepdLiveness::Stale)))
+}
+
+fn supervisors_are_all_gone(admitted: &crate::admission::AdmittedRun) -> bool {
+    let reads: Vec<std::io::Result<crate::stepd::StepdLiveness>> = admitted
+        .recorded_supervisors()
+        .map(crate::stepd::supervisor_liveness)
+        .collect();
+    for (supervisor, read) in admitted.recorded_supervisors().zip(reads.iter()) {
+        if let Err(error) = read {
+            warn!(
+                job_id = admitted.run.job_id,
+                run_attempt = admitted.run.run_attempt,
+                pid = supervisor.pid,
+                %error,
+                "could not tell whether a supervisor is alive; holding its slice"
+            );
+        }
+    }
+    all_supervisors_read_as_gone(&reads)
+}
+
+/// Whether some participant left an exit behind. One exists only on disk, so a
+/// session still holding it is what will report this run, with the real status.
+fn an_exit_is_still_on_disk(
+    store: &crate::stepd::StepdStore,
+    admitted: &crate::admission::AdmittedRun,
+) -> bool {
+    admitted.participants.iter().any(|participant| {
+        !matches!(
+            store.observed_exit(
+                admitted.run.job_id,
+                admitted.run.run_attempt,
+                participant.step_id,
+            ),
+            Ok(None)
+        )
+    })
+}
+
+/// Runs no session is left to speak for. Without this the agent never asks, is
+/// never acknowledged, and the record charges the node's cores for good.
+fn runs_nothing_can_speak_for(
+    store: &crate::stepd::StepdStore,
+    admissions: &crate::admission::AdmissionStore,
+) -> Vec<crate::admission::AdmittedRun> {
+    let Ok(loaded) = admissions.load_all() else {
+        return Vec::new();
+    };
+    loaded
+        .runs
+        .into_iter()
+        .filter(|admitted| {
+            admitted.run.controller_ack.release_raft_index.is_none()
+                && admitted.owes_a_report()
+                && supervisors_are_all_gone(admitted)
+                && !an_exit_is_still_on_disk(store, admitted)
+        })
+        .collect()
+}
+
+/// Report the loss of a run nothing is left to speak for, so its slice is freed
+/// on the controller's acknowledgement like every other completion.
+async fn report_runs_nothing_can_speak_for(
+    store: &crate::stepd::StepdStore,
+    admissions: &crate::admission::AdmissionStore,
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    controller_addr: &str,
+    reporting_node: &str,
+) {
+    for admitted in runs_nothing_can_speak_for(store, admissions) {
+        let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
+        let Some(step_id) = admitted.lifecycle_step() else {
+            continue;
+        };
+        let acknowledged = report_completion(
+            controller_addr,
+            CompletionReport {
+                job_id,
+                exit_code: 0,
+                signal: nix::sys::signal::Signal::SIGKILL as i32,
+                run_attempt,
+                reporting_node,
+                drain: None,
+                step_id: Some(step_id),
+            },
+        )
+        .await
+        .settled();
+        if !acknowledged {
+            debug!(
+                job_id,
+                run_attempt, "a lost run's completion is not acknowledged yet; holding its slice"
+            );
+            continue;
+        }
+        settle_acknowledged_completion(allocation, admissions, job_id, run_attempt, step_id).await;
+        // The run's completion is committed, so no sibling's report will ever be
+        // answered, and one left owed keeps the record forever.
+        if let Err(error) = admissions.discharge_owed_reports(job_id, run_attempt) {
+            warn!(job_id, run_attempt, %error, "failed to discharge a lost run's owed reports");
+        }
+        warn!(
+            job_id,
+            run_attempt,
+            "no supervisor was left for this run; reported its loss and freed its slice"
+        );
+    }
 }
 
 pub fn retry_unacknowledged_stepd_completions(
@@ -3128,8 +3254,13 @@ impl AgentService {
             });
         }
 
+        // A record whose supervisor is proven gone must not take a contested core
+        // from one still running: the loser of that race goes unprotected.
+        let mut ordered: Vec<&crate::admission::AdmittedRun> = loaded.runs.iter().collect();
+        ordered.sort_by_key(|admitted| supervisors_are_all_gone(admitted));
+
         let mut allocation = self.allocation.lock().await;
-        for admitted in &loaded.runs {
+        for admitted in ordered {
             let run = &admitted.run;
             let evidence =
                 self.gather_run_evidence(admitted, descriptors, &store, boot_id.as_deref());
@@ -3836,9 +3967,8 @@ async fn settle_cancelled_runs(
         }
         // Freed here, not on the next tick: settling makes the record collectable
         // and the sweep may take it before another pass reads it.
-        let step_id = run
-            .lifecycle_owner_step
-            .or_else(|| admitted.participants.first().map(|p| p.step_id))
+        let step_id = admitted
+            .lifecycle_step()
             .unwrap_or(spur_core::step::STEP_BATCH);
         release_acknowledged_allocation(allocation, admissions, job_id, run_attempt, step_id).await;
     }
@@ -3855,11 +3985,7 @@ async fn release_due_allocations(
         return;
     };
     for admitted in loaded.runs {
-        let owner = admitted
-            .run
-            .lifecycle_owner_step
-            .or_else(|| admitted.participants.first().map(|p| p.step_id));
-        let Some(step_id) = owner else {
+        let Some(step_id) = admitted.lifecycle_step() else {
             continue;
         };
         release_acknowledged_allocation(
@@ -3921,6 +4047,11 @@ async fn release_acknowledged_allocation(
         Ok(true) => {
             // Generation-checked: a redispatch may already own this job id.
             let released = allocation.lock().await.release_job_if(job_id, run_attempt);
+            // The cut is driven off this, so a slice given back without it
+            // recorded stays advertised as a claim the node no longer holds.
+            if let Err(error) = admissions.record_slice_released(job_id, run_attempt) {
+                warn!(job_id, run_attempt, %error, "failed to record a released slice");
+            }
             if released {
                 info!(
                     job_id,
@@ -10447,6 +10578,345 @@ mod tests {
         allocation
     }
 
+    /// This process's pid with the wrong start time, so the liveness check reads
+    /// it as gone without depending on any other pid.
+    fn a_gone_supervisor() -> crate::admission::SupervisorRef {
+        let pid = std::process::id();
+        crate::admission::SupervisorRef {
+            pid,
+            start_ticks: crate::stepd::process_start_ticks(pid).expect("start ticks") + 1,
+            boot_id: crate::admission::current_boot_id(),
+        }
+    }
+
+    fn a_live_supervisor() -> crate::admission::SupervisorRef {
+        let pid = std::process::id();
+        crate::admission::SupervisorRef {
+            pid,
+            start_ticks: crate::stepd::process_start_ticks(pid).expect("start ticks"),
+            boot_id: crate::admission::current_boot_id(),
+        }
+    }
+
+    /// A run holding the named cores, whose step owes a report and whose
+    /// supervisor is whatever the caller wants it to be.
+    fn admit_a_supervised_run(
+        admissions: &crate::admission::AdmissionStore,
+        node: &str,
+        job_id: u32,
+        cpu_ids: Vec<u32>,
+        supervisor: Option<crate::admission::SupervisorRef>,
+    ) {
+        let mut run = crate::admission::RunAdmission::new(
+            job_id,
+            1,
+            node,
+            crate::admission::AdmittedResources {
+                cpu_ids,
+                memory_mb: 1_000,
+                gpu_devices: Vec::new(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_BATCH);
+        admissions.admit_run(&run).expect("admit the run");
+        let mut participant = crate::admission::ParticipantAdmission::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            node,
+            run.allocation.clone(),
+        );
+        participant.final_report.required = true;
+        participant.lifecycle = crate::admission::ParticipantLifecycle::Running;
+        participant.supervisor = supervisor;
+        admissions
+            .admit_participant(&participant)
+            .expect("admit the participant");
+    }
+
+    fn four_core_node() -> Arc<Mutex<NodeAllocation>> {
+        Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 4,
+                memory_mb: 8_000,
+                ..Default::default()
+            },
+        )))
+    }
+
+    // A supervisor that died without reporting left nothing to report, so the
+    // agent never asked and the record charged cores across every restart.
+    #[tokio::test]
+    async fn a_run_nothing_can_speak_for_is_reported_and_its_slice_freed() {
+        let (controller_addr, reports) =
+            spawn_mock_controller_answering(Some(tonic::Code::NotFound));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        admit_a_supervised_run(
+            &admissions,
+            "test-node",
+            42,
+            vec![0, 1],
+            Some(a_gone_supervisor()),
+        );
+        allocation
+            .lock()
+            .await
+            .restore_for_job(42, 1, &[0, 1], 1_000, &[])
+            .expect("charge the recorded slice");
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
+        assert_eq!(
+            reports.lock().expect("completion reports").len(),
+            1,
+            "the loss has to be reported before anything is concluded"
+        );
+        assert_eq!(
+            allocation.lock().await.free_cpus(),
+            4,
+            "the slice goes back on the acknowledgement, as on every other path"
+        );
+        assert!(
+            admissions.ledger_cut("session-a").entries.is_empty(),
+            "and the cut stops advertising a claim the node no longer holds"
+        );
+        assert_eq!(
+            admissions
+                .sweep(crate::admission::now_unix_ms(), 1, &HashSet::new())
+                .expect("sweep"),
+            1,
+            "nothing is owed any more, so the record is collectable"
+        );
+    }
+
+    // Three of these covering the same cores took a four-core node to nothing
+    // usable, and a restart made it worse rather than better.
+    #[tokio::test]
+    async fn a_restart_holding_records_nothing_can_speak_for_recovers_the_pool() {
+        let (controller_addr, _reports) =
+            spawn_mock_controller_answering(Some(tonic::Code::NotFound));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        for job_id in [30_866, 30_867, 30_868] {
+            admit_a_supervised_run(
+                &admissions,
+                "test-node",
+                job_id,
+                vec![0, 1, 2, 3],
+                Some(a_gone_supervisor()),
+            );
+            let _ = allocation
+                .lock()
+                .await
+                .restore_for_job(job_id, 1, &[0, 1, 2, 3], 1_000, &[]);
+        }
+        assert_eq!(
+            allocation.lock().await.free_cpus(),
+            0,
+            "the restart charges every record, which is what wedged the node"
+        );
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
+        assert_eq!(
+            allocation.lock().await.free_cpus(),
+            4,
+            "every one of them is reported and acknowledged, so the pool comes back"
+        );
+        allocation
+            .lock()
+            .await
+            .allocate_for_job(99, 1, 4, 1_000, &[])
+            .expect("the node must be able to take work again");
+    }
+
+    // The failure that matters most: a report would have the controller free
+    // the cores of a job that is still running on them.
+    #[tokio::test]
+    async fn a_run_whose_supervisor_is_alive_is_never_reported_lost() {
+        let (controller_addr, reports) =
+            spawn_mock_controller_answering(Some(tonic::Code::NotFound));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        admit_a_supervised_run(
+            &admissions,
+            "test-node",
+            42,
+            vec![0, 1],
+            Some(a_live_supervisor()),
+        );
+        allocation
+            .lock()
+            .await
+            .restore_for_job(42, 1, &[0, 1], 1_000, &[])
+            .expect("charge the recorded slice");
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
+        assert!(reports.lock().expect("completion reports").is_empty());
+        assert_eq!(allocation.lock().await.free_cpus(), 2);
+    }
+
+    // A run still mid-launch has recorded no supervisor at all, and a missing
+    // one is not a dead one.
+    #[tokio::test]
+    async fn a_run_with_no_recorded_supervisor_is_never_reported_lost() {
+        let (controller_addr, reports) =
+            spawn_mock_controller_answering(Some(tonic::Code::NotFound));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        admit_a_supervised_run(&admissions, "test-node", 42, vec![0, 1], None);
+        allocation
+            .lock()
+            .await
+            .restore_for_job(42, 1, &[0, 1], 1_000, &[])
+            .expect("charge the recorded slice");
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
+        assert!(reports.lock().expect("completion reports").is_empty());
+        assert_eq!(allocation.lock().await.free_cpus(), 2);
+    }
+
+    // The session carries the real exit status; a synthetic loss reported over
+    // it would record the wrong outcome for the job.
+    #[tokio::test]
+    async fn a_run_whose_session_still_holds_an_exit_is_left_to_that_session() {
+        let (controller_addr, reports) =
+            spawn_mock_controller_answering(Some(tonic::Code::NotFound));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        admit_a_supervised_run(
+            &admissions,
+            "test-node",
+            42,
+            vec![0, 1],
+            Some(a_gone_supervisor()),
+        );
+        let gone = a_gone_supervisor();
+        store
+            .publish(&crate::stepd::StepdDescriptor::new(
+                42,
+                1,
+                spur_core::step::STEP_BATCH,
+                gone.pid,
+                gone.start_ticks,
+                store
+                    .session_dir(42, 1, spur_core::step::STEP_BATCH)
+                    .join("runtime.sock"),
+                std::path::PathBuf::new(),
+            ))
+            .expect("publish the session the supervisor left behind");
+        store
+            .obligations(42, 1, spur_core::step::STEP_BATCH)
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 3,
+                signal: 0,
+            })
+            .expect("record the exit the supervisor left behind");
+
+        report_runs_nothing_can_speak_for(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await;
+        assert!(
+            reports.lock().expect("completion reports").is_empty(),
+            "an exit left on disk belongs to the session that recorded it"
+        );
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
+        let sent = reports.lock().expect("completion reports").clone();
+        assert_eq!(sent.len(), 1, "the session reports it, and only once");
+        assert_eq!(
+            sent[0].exit_code, 3,
+            "the recorded status, not a synthetic loss"
+        );
+    }
+
+    #[test]
+    fn a_liveness_read_that_could_not_complete_never_proves_a_supervisor_gone() {
+        use crate::stepd::StepdLiveness;
+        assert!(all_supervisors_read_as_gone(&[Ok(StepdLiveness::Stale)]));
+        assert!(
+            !all_supervisors_read_as_gone(&[]),
+            "nothing read proves nothing"
+        );
+        assert!(!all_supervisors_read_as_gone(&[
+            Ok(StepdLiveness::Stale),
+            Ok(StepdLiveness::Live),
+        ]));
+        assert!(
+            !all_supervisors_read_as_gone(&[
+                Ok(StepdLiveness::Stale),
+                Err(std::io::Error::other("proc unreadable")),
+            ]),
+            "an unreadable process is not a gone one"
+        );
+    }
+
     /// A controller that lost its state answers NotFound forever. Treating that
     /// as unfinished business held the cores of a job nothing would ever ack.
     #[tokio::test]
@@ -16005,6 +16475,26 @@ mod tests {
         assert!(
             !alloc.allocated_cpus[0],
             "an unrecorded core must stay free"
+        );
+    }
+
+    // A stale record winning the race left a running job's cores unprotected
+    // for the rest of the agent's life: nothing restores a claim twice.
+    #[tokio::test]
+    async fn a_running_run_wins_a_core_a_gone_ones_record_also_names() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        // Named so the gone record sorts first, which is the order that lost it.
+        admit_a_supervised_run(&admissions, "n1", 1, vec![0, 1], Some(a_gone_supervisor()));
+        admit_a_supervised_run(&admissions, "n1", 2, vec![0, 1], Some(a_live_supervisor()));
+
+        svc.replay_admitted_allocations(&[]).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.charged_runs(),
+            HashSet::from([(2, 1)]),
+            "the run still on those cores must be the one holding them"
         );
     }
 
