@@ -152,6 +152,15 @@ impl SpurStore {
         let raft_dir = state_dir.join("raft");
         let log_dir = raft_dir.join("log");
         std::fs::create_dir_all(&log_dir)?;
+        // The log holds submitted scripts and job environments, and the default
+        // umask leaves these world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [&raft_dir, &log_dir] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            }
+        }
 
         let mut inner = StoreInner::default();
         let mut skipped_records = 0u64;

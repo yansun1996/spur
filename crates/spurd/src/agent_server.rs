@@ -756,6 +756,7 @@ async fn teardown_completed_job(
     running: &RunningJobs,
     allocation: &Arc<Mutex<NodeAllocation>>,
     mpi_host: &MpiPluginHost,
+    admissions: &crate::admission::AdmissionStore,
 ) {
     let job_id = completed.job_id;
     // Held across the check below and every release under it, so a re-dispatch either
@@ -786,6 +787,11 @@ async fn teardown_completed_job(
         completed.run_attempt,
     ));
     allocation.lock().await.release_job(job_id);
+    // Marked, not removed: the record is the evidence a later reconcile reads,
+    // and the sweep collects it once nothing is still owed.
+    if let Err(error) = admissions.mark_run_cleaned(job_id, completed.run_attempt) {
+        warn!(job_id, %error, "failed to settle the admission record after teardown");
+    }
     cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
 }
 
@@ -1680,6 +1686,7 @@ pub async fn replay_unacknowledged_stepd_completions(
 
 pub fn retry_unacknowledged_stepd_completions(
     store: crate::stepd::StepdStore,
+    admissions: crate::admission::AdmissionStore,
     controller_addr: String,
     reporting_node: String,
 ) {
@@ -1704,6 +1711,15 @@ pub fn retry_unacknowledged_stepd_completions(
             // a restart can still answer for it; nothing else sweeps it later.
             if let Err(error) = store.prune_finalized() {
                 tracing::warn!(%error, "failed to prune finalized runtime sessions");
+            }
+            // Without this the ledger grows by one directory per job, forever.
+            match admissions.sweep(
+                crate::admission::now_unix_ms(),
+                crate::admission::DEFAULT_RETENTION_SECS * 1000,
+            ) {
+                Ok(0) => {}
+                Ok(swept) => tracing::info!(swept, "swept settled admission records"),
+                Err(error) => tracing::warn!(%error, "failed to sweep admission records"),
             }
         }
     });
@@ -2717,6 +2733,13 @@ pub struct AgentService {
 }
 
 impl AgentService {
+    /// The entitlement ledger, keyed to the node this agent serves.
+    pub(crate) fn admissions(&self) -> crate::admission::AdmissionStore {
+        crate::admission::AdmissionStore::new(&self.stepd_state_dir, &self.reporter.hostname)
+    }
+}
+
+impl AgentService {
     /// Construct with default k0s settings (pinned version, `/usr/local/bin/k0s`). Test-only; the
     /// binary uses `with_cluster_config` to honor the operator's `[cluster]` settings.
     #[cfg(test)]
@@ -3168,6 +3191,7 @@ impl AgentService {
         let mpi_host = self.mpi_host.clone();
         let hooks = self.hooks.clone();
         let lifecycle = self.lifecycle.clone();
+        let admissions = self.admissions();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
             loop {
@@ -3225,7 +3249,15 @@ impl AgentService {
                 drop(jobs);
 
                 for c in &completed {
-                    teardown_completed_job(c, &lifecycle, &running, &allocation, &mpi_host).await;
+                    teardown_completed_job(
+                        c,
+                        &lifecycle,
+                        &running,
+                        &allocation,
+                        &mpi_host,
+                        &admissions,
+                    )
+                    .await;
                 }
 
                 // Self-heal backstop: reclaim allocations with no tracked,
@@ -3348,23 +3380,38 @@ fn reconcile_orphaned_allocations(
 /// Disarmed once the job is committed to the running set.
 struct LaunchReservationGuard {
     allocation: Arc<Mutex<NodeAllocation>>,
+    admissions: crate::admission::AdmissionStore,
     job_id: u32,
     run_attempt: u32,
     armed: bool,
+    spawned: bool,
 }
 
 impl LaunchReservationGuard {
-    fn new(allocation: Arc<Mutex<NodeAllocation>>, job_id: u32, run_attempt: u32) -> Self {
+    fn new(
+        allocation: Arc<Mutex<NodeAllocation>>,
+        admissions: crate::admission::AdmissionStore,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> Self {
         Self {
             allocation,
+            admissions,
             job_id,
             run_attempt,
             armed: true,
+            spawned: false,
         }
     }
 
     fn disarm(&mut self) {
         self.armed = false;
+    }
+
+    /// Past this point something is running, so an aborted launch must keep the
+    /// record: a live process with no ledger entry reads as free capacity.
+    fn mark_spawned(&mut self) {
+        self.spawned = true;
     }
 }
 
@@ -3375,6 +3422,13 @@ impl Drop for LaunchReservationGuard {
         }
         let job_id = self.job_id;
         let run_attempt = self.run_attempt;
+        // Not forgetfulness: this is the process that made the reservation,
+        // aborting before anything was spawned against it.
+        if !self.spawned {
+            if let Err(error) = self.admissions.remove_run(job_id, run_attempt) {
+                warn!(job_id, run_attempt, %error, "failed to drop the admission record of an aborted launch");
+            }
+        }
         // Generation-checked: a redispatch may have already superseded this
         // reservation, and releasing it here must not free the new one.
         if let Ok(mut alloc) = self.allocation.try_lock() {
@@ -4456,8 +4510,48 @@ impl SlurmAgent for AgentService {
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
-        let mut reservation_guard =
-            LaunchReservationGuard::new(self.allocation.clone(), job_id, run_attempt);
+        let admissions = self.admissions();
+        let mut reservation_guard = LaunchReservationGuard::new(
+            self.allocation.clone(),
+            admissions.clone(),
+            job_id,
+            run_attempt,
+        );
+
+        // Durable before anything is spawned against it: a crash before this
+        // leaves neither a record nor a process, a crash after leaves both.
+        let mut run_record = crate::admission::RunAdmission::new(
+            job_id,
+            run_attempt,
+            &self.reporter.hostname,
+            crate::admission::AdmittedResources {
+                cpu_ids: alloc_result.cpu_ids.clone(),
+                memory_mb: alloc_result.memory_mb,
+                gpu_devices: allocated_device_ids.clone(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        run_record.lifecycle_owner_step = Some(launch_step);
+        if let Err(error) = admissions.admit_run_async(run_record.clone()).await {
+            error!(job_id, run_attempt, %error, "failed to persist the run admission record");
+            return Err(Status::unavailable(format!(
+                "could not record the admission for job {job_id}: {error}"
+            )));
+        }
+        let mut participant_record = crate::admission::ParticipantAdmission::new(
+            job_id,
+            run_attempt,
+            launch_step,
+            &self.reporter.hostname,
+            run_record.allocation.clone(),
+        );
+        participant_record.final_report.required = true;
+        if let Err(error) = admissions.admit_participant_async(participant_record).await {
+            error!(job_id, run_attempt, %error, "failed to persist the participant admission record");
+            return Err(Status::unavailable(format!(
+                "could not record the admission for job {job_id}: {error}"
+            )));
+        }
 
         let injection = {
             let reg = self.device_registry.lock().await;
@@ -4625,6 +4719,7 @@ impl SlurmAgent for AgentService {
         match launch_result {
             Ok((mut result, runtime_descriptor)) => {
                 pmix_guard.as_mut().map(PmixLaunchGuard::disarm);
+                reservation_guard.mark_spawned();
 
                 // Claim the stepd slot before committing anything
                 // else. A concurrent LaunchJob for the same job (a retry
@@ -5209,8 +5304,34 @@ impl SlurmAgent for AgentService {
         };
         // Releases the allocation on any exit that does not record the job,
         // including a cancelled future; disarmed once it reaches `running`.
-        let mut reservation_guard =
-            LaunchReservationGuard::new(self.allocation.clone(), req.job_id, req.run_attempt);
+        let admissions = self.admissions();
+        let mut reservation_guard = LaunchReservationGuard::new(
+            self.allocation.clone(),
+            admissions.clone(),
+            req.job_id,
+            req.run_attempt,
+        );
+
+        // An srun allocation holds a slice with no launch of its own, so it
+        // needs the same record: the claim outlives whatever steps join it.
+        let run_record = crate::admission::RunAdmission::new(
+            req.job_id,
+            req.run_attempt,
+            &self.reporter.hostname,
+            crate::admission::AdmittedResources {
+                cpu_ids: alloc_result.cpu_ids.clone(),
+                memory_mb: alloc_result.memory_mb,
+                gpu_devices: controller_gpu_ids.clone(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        if let Err(error) = admissions.admit_run_async(run_record.clone()).await {
+            error!(job_id = req.job_id, %error, "failed to persist the run admission record");
+            return Err(Status::unavailable(format!(
+                "could not record the admission for job {}: {error}",
+                req.job_id
+            )));
+        }
 
         // This allocation launches nothing, so its cgroup has to be created
         // here or the first step arriving has none to join.
@@ -12578,8 +12699,15 @@ mod tests {
             );
             let flag = Arc::clone(&torn_down);
             async move {
-                teardown_completed_job(&completed, &lifecycle, &running, &allocation, &mpi_host)
-                    .await;
+                teardown_completed_job(
+                    &completed,
+                    &lifecycle,
+                    &running,
+                    &allocation,
+                    &mpi_host,
+                    &svc.admissions(),
+                )
+                .await;
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         });
@@ -14288,7 +14416,8 @@ mod tests {
             alloc.allocate_for_job(42, 1, 1, 0, &[0]).unwrap();
             alloc.commit_job(42, 1);
         }
-        let reservation = LaunchReservationGuard::new(svc.allocation.clone(), 42, 1);
+        let reservation =
+            LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), 42, 1);
         assert_eq!(svc.free_gpu_count().await, 0, "reservation holds the GPU");
 
         let status = {
@@ -14317,6 +14446,137 @@ mod tests {
 
     // The heartbeat's held-job source must report an allocation-only (srun/salloc)
     // job so the controller can reconcile it — the strand this fix addresses.
+    #[tokio::test]
+    async fn registering_an_allocation_records_its_entitlement() {
+        let running = new_running_jobs();
+        let reporter = Arc::new(NodeReporter::new(
+            "n1".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "n1".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            String::new(),
+            running.clone(),
+        ));
+        let svc = AgentService::with_cluster_config(
+            reporter.clone(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::JobLimits::default(),
+            CgroupConfig {
+                enabled: false,
+                ..CgroupConfig::default()
+            },
+            MpiConfig::default(),
+            running,
+            false,
+        );
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = svc.with_runtime_state_dir(state_dir.path());
+
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id: 77,
+            cpus: 2,
+            run_attempt: 9,
+            allocated: Some(ResourceAllocations {
+                cpus: 2,
+                memory_mb: 512,
+                devices: std::collections::HashMap::new(),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("register");
+
+        let run = svc
+            .admissions()
+            .load_run(77, 9)
+            .expect("the entitlement must outlive the process that claimed it");
+        assert_eq!(run.node, "n1");
+        assert_eq!(run.allocation.cpu_ids.len(), 2);
+        assert_eq!(run.allocation.memory_mb, 512);
+        assert!(
+            run.created_at_unix_ms > 0,
+            "a record with no age is uncollectable"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aborted_launch_leaves_no_entitlement_behind() {
+        let running = new_running_jobs();
+        let reporter = Arc::new(NodeReporter::new(
+            "n1".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "n1".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            String::new(),
+            running.clone(),
+        ));
+        let svc = AgentService::with_cluster_config(
+            reporter.clone(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            &spur_core::config::ClusterConfig::default(),
+            spur_core::config::JobLimits::default(),
+            CgroupConfig {
+                enabled: false,
+                ..CgroupConfig::default()
+            },
+            MpiConfig::default(),
+            running,
+            false,
+        );
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = svc.with_runtime_state_dir(state_dir.path());
+        let admissions = svc.admissions();
+
+        let run = crate::admission::RunAdmission::new(
+            5,
+            1,
+            "n1",
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        admissions.admit_run(&run).expect("admit");
+        assert!(admissions.load_run(5, 1).is_ok());
+
+        // Dropping while armed is the abort path: this process made the
+        // reservation and is giving up before spawning anything against it.
+        drop(LaunchReservationGuard::new(
+            svc.allocation.clone(),
+            admissions.clone(),
+            5,
+            1,
+        ));
+
+        assert!(
+            admissions.load_run(5, 1).is_err(),
+            "an aborted launch must not leave a claim nothing holds"
+        );
+    }
+
     #[tokio::test]
     async fn heartbeat_reports_held_allocation_only_job() {
         // One shared running map wired into both the reporter (heartbeat source)
@@ -14358,6 +14618,10 @@ mod tests {
             running,
             false, // allow_root_jobs
         );
+        // Registration now persists an admission record; keep it off the
+        // runner's real /var/spool.
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let svc = svc.with_runtime_state_dir(state_dir.path());
 
         assert!(
             reporter.held_job_ids().is_empty(),
@@ -14541,7 +14805,7 @@ mod tests {
                 .await
                 .allocate_for_job(9, 1, 1, 0, &[0])
                 .unwrap();
-            let guard = LaunchReservationGuard::new(svc.allocation.clone(), 9, 1);
+            let guard = LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), 9, 1);
             assert_eq!(svc.free_gpu_count().await, 0, "reserved under guard");
             drop(guard);
         }
@@ -14559,7 +14823,8 @@ mod tests {
                 .allocate_for_job(10, 1, 1, 0, &[0])
                 .unwrap();
             svc.allocation.lock().await.commit_job(10, 1);
-            let mut guard = LaunchReservationGuard::new(svc.allocation.clone(), 10, 1);
+            let mut guard =
+                LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), 10, 1);
             guard.disarm();
             drop(guard);
         }
@@ -14587,7 +14852,7 @@ mod tests {
             .await
             .allocate_for_job(11, 1, 1, 0, &[0])
             .unwrap();
-        let guard = LaunchReservationGuard::new(svc.allocation.clone(), 11, 1);
+        let guard = LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), 11, 1);
 
         // A cancel races the still-in-flight launch, releasing attempt 1's
         // reservation; the controller redispatches attempt 2, which reserves
@@ -15476,6 +15741,7 @@ mod tests {
             &svc.running,
             &svc.allocation,
             &svc.mpi_host,
+            &svc.admissions(),
         )
         .await;
 
@@ -15519,6 +15785,7 @@ mod tests {
             &svc.running,
             &svc.allocation,
             &svc.mpi_host,
+            &svc.admissions(),
         )
         .await;
 

@@ -830,6 +830,10 @@ pub struct StepdDescriptor {
     /// before removing it, so guessing the mode leaks the mounts.
     #[serde(default)]
     pub container_rootfs_mode: Option<crate::container::RootfsMode>,
+    /// `process_start_ticks` is measured from boot, and the spool outlives a
+    /// reboot, so identity is only comparable within the boot that recorded it.
+    #[serde(default)]
+    pub boot_id: Option<String>,
 }
 
 impl StepdDescriptor {
@@ -866,6 +870,7 @@ impl StepdDescriptor {
             stdout_path: String::new(),
             stderr_path: String::new(),
             container_rootfs_mode: None,
+            boot_id: crate::admission::current_boot_id(),
         }
     }
 }
@@ -975,6 +980,25 @@ fn prune_finalized_session(
         sweep_finalized_session(session_dir, obligations, step_id)?,
         SweptSession::Pruned
     ))
+}
+
+/// Write `name` into `dir` so a reader sees either the previous record or the
+/// whole new one: a torn record on the recovery path reads as corruption.
+pub fn publish_private(dir: &Path, name: &str, contents: &[u8]) -> io::Result<()> {
+    let temporary_path = dir.join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut temporary = options.open(&temporary_path)?;
+    temporary.write_all(contents)?;
+    temporary.sync_all()?;
+    drop(temporary);
+    fs::rename(&temporary_path, dir.join(name))?;
+    fs::File::open(dir)?.sync_all()
 }
 
 /// Session records carry the job's environment, so they are owner-only.
@@ -2268,28 +2292,13 @@ impl StepdStore {
             descriptor.run_attempt,
             descriptor.step_id,
         )?;
-        let temporary_path =
-            session_dir.join(format!("{DESCRIPTOR_FILE}.{}.tmp", uuid::Uuid::new_v4()));
-        let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
         let contents = serde_json::to_vec(descriptor).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("serialize runtime descriptor: {error}"),
             )
         })?;
-        let mut options = fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut temporary = options.open(&temporary_path)?;
-        temporary.write_all(&contents)?;
-        temporary.sync_all()?;
-        drop(temporary);
-        fs::rename(&temporary_path, descriptor_path)?;
-        fs::File::open(session_dir)?.sync_all()
+        publish_private(&session_dir, DESCRIPTOR_FILE, &contents)
     }
 
     /// Every session directory: runtime/<job>.<attempt>.<step>. The notification
@@ -2910,6 +2919,37 @@ mod launch_spec_compat {
         assert!(!spec.allocation_only);
         assert!(!spec.pmix_multi_task);
         assert_eq!(spec.run_attempt, 0);
+    }
+
+    /// Frozen at the shipped shape. Never regenerate it: a field added without
+    /// a default must fail here, not on an upgraded node mid-recovery.
+    const FROZEN_DESCRIPTOR_JSON: &str = r##"{
+        "format_version": 1,
+        "job_id": 42,
+        "run_attempt": 3,
+        "pid": 991,
+        "process_start_ticks": 7788,
+        "socket_path": "/var/spool/spur/runtime/42.3.4294967294/runtime.sock",
+        "cgroup_path": "/sys/fs/cgroup/spur/job_42"
+    }"##;
+
+    #[test]
+    fn a_descriptor_from_an_older_build_still_loads() {
+        let descriptor: crate::stepd::StepdDescriptor =
+            serde_json::from_str(FROZEN_DESCRIPTOR_JSON)
+                .expect("an older descriptor.json must still load");
+
+        assert_eq!(descriptor.job_id, 42);
+        assert_eq!(descriptor.run_attempt, 3);
+        assert_eq!(descriptor.pid, 991);
+        assert_eq!(descriptor.step_id, spur_core::step::default_step_id());
+        assert!(descriptor.owner.is_empty());
+        assert_eq!(descriptor.workload_pid, 0);
+        assert!(descriptor.container_rootfs_mode.is_none());
+        assert!(
+            descriptor.boot_id.is_none(),
+            "an older descriptor predates the boot scope and must read as unknown"
+        );
     }
 }
 
