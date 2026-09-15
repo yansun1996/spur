@@ -900,6 +900,12 @@ impl Job {
             && !self.node_completions.contains_key(node)
     }
 
+    /// Whether this node's agent has confirmed the launch, so its ledger can be
+    /// expected to name the job. A reservation is charged while still Pending.
+    pub fn is_confirmed_on(&self, node: &str) -> bool {
+        self.state.is_active() && self.is_held_on(node)
+    }
+
     pub fn new(job_id: JobId, spec: JobSpec) -> Self {
         let priority = if spec.hold {
             0

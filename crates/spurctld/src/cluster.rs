@@ -5740,6 +5740,17 @@ impl ClusterManager {
             .collect()
     }
 
+    /// Every job on this node whose launch an agent confirmed, with its attempt.
+    /// Narrower than [`Self::jobs_allocated_on_node`]: no in-flight dispatches.
+    pub fn jobs_confirmed_on_node(&self, node: &str) -> HashMap<JobId, u32> {
+        self.jobs
+            .read()
+            .values()
+            .filter(|job| job.is_confirmed_on(node))
+            .map(|job| (job.job_id, job.run_attempt))
+            .collect()
+    }
+
     /// Rebuild the node allocation cache from job records. Called where state has
     /// just been built from durable records and before it drives placement.
     pub fn recompute_node_allocations(&self) {
