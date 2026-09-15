@@ -2387,15 +2387,13 @@ impl SlurmController for ControllerService {
                 );
                 Ok(Response::new(()))
             }
-            // "No record of this job" is an acknowledgement: the agent holds
-            // the slice until one arrives, and this job is never coming back.
-            Some(Err(NodeCompleteError::JobNotFound { job_id }))
-                if job_id < self.cluster.peek_next_job_id() =>
-            {
+            // Not gated on the id watermark: a controller that lost its state
+            // restarts its counter, putting genuinely old ids above it.
+            Some(Err(NodeCompleteError::JobNotFound { job_id })) => {
                 warn!(
                     job_id,
                     node = %req.reporting_node,
-                    "completion for a job the controller no longer has; accepting it"
+                    "completion for a job the controller has no record of; accepting it"
                 );
                 Ok(Response::new(()))
             }
@@ -7138,6 +7136,34 @@ mod tests {
         let svc = test_service(&dir).await;
         let resp = svc.ping(Request::new(())).await.unwrap().into_inner();
         assert_eq!(resp.cluster_name, "test");
+    }
+
+    /// A NotFound here never reaches an acknowledgement, so the reporting node
+    /// holds that job's cpu slice forever and the node quietly loses capacity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completion_for_a_forgotten_job_is_accepted_above_the_id_watermark() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        // What a wiped state dir looks like: the counter restarted, so an id
+        // this cluster really did issue now sits at or above the watermark.
+        assert!(5 >= svc.cluster.peek_next_job_id());
+
+        let reported = svc
+            .report_job_status(Request::new(ReportJobStatusRequest {
+                job_id: 5,
+                state: spur_core::job::JobState::Completed.to_proto_i32(),
+                exit_code: 0,
+                reporting_node: "n1".into(),
+                run_attempt: 1,
+                ..Default::default()
+            }))
+            .await;
+
+        assert!(
+            reported.is_ok(),
+            "a job the controller has no record of is never coming back: {:?}",
+            reported.err()
+        );
     }
 
     /// A service with a configured node-identity signing key, for stepd

@@ -1319,6 +1319,7 @@ pub(crate) fn monitor_recovered_stepds(
                     },
                 )
                 .await
+                .settled()
                 {
                     if let Err(error) = store.acknowledge_completion(completion) {
                         warn!(
@@ -1514,7 +1515,8 @@ async fn fence_dead_stepd(
             step_id: Some(descriptor.step_id),
         },
     )
-    .await;
+    .await
+    .settled();
     if reported {
         if let Err(error) =
             obligations.append(&crate::stepd::StepdObligation::CompletionAcknowledged)
@@ -1685,7 +1687,8 @@ async fn handle_completion_notification(
                     step_id: Some(step_id),
                 },
             )
-            .await;
+            .await
+            .settled();
             release_stepd_tracking(
                 &context.running,
                 &context.allocation,
@@ -1779,6 +1782,7 @@ pub async fn replay_unacknowledged_stepd_completions(
             },
         )
         .await
+        .settled()
         {
             store.acknowledge_completion(&completion)?;
             let _ = admissions.record_controller_ack(completion.job_id, completion.run_attempt, 1);
@@ -2863,17 +2867,22 @@ impl AgentService {
     ) -> Option<crate::admission::LaunchRefusal> {
         let admissions = self.admissions();
         let recorded = admissions.load_run(job_id, run_attempt).ok();
-        let digest = recorded.as_ref().and_then(|_| {
-            admissions
-                .participants(job_id, run_attempt)
-                .ok()
-                .and_then(|(participants, _)| {
-                    participants
-                        .into_iter()
-                        .find(|p| p.step_id == launch_step && !p.command_digest.is_empty())
-                        .map(|p| p.command_digest)
-                })
-        });
+        // Only a live run can be asked to run a second command. A settled one's
+        // digest would refuse a fresh job that merely reuses its identity.
+        let digest = recorded
+            .as_ref()
+            .filter(|run| !run.is_over())
+            .and_then(|_| {
+                admissions
+                    .participants(job_id, run_attempt)
+                    .ok()
+                    .and_then(|(participants, _)| {
+                        participants
+                            .into_iter()
+                            .find(|p| p.step_id == launch_step && !p.command_digest.is_empty())
+                            .map(|p| p.command_digest)
+                    })
+            });
         fences.check(
             crate::admission::now_unix_ms(),
             recorded.map(|r| r.reject_before_unix_ms).unwrap_or(0),
@@ -3677,7 +3686,8 @@ impl AgentService {
                             step_id: None,
                         },
                     )
-                    .await;
+                    .await
+                    .settled();
                     if !acknowledged {
                         // Held, not freed: the controller has not committed this
                         // completion, so this node is still the only thing that
@@ -4050,6 +4060,30 @@ mod controller_rpc_tests {
     fn transient_errors_are_retryable() {
         assert!(controller_rpc_retryable(&Status::unavailable("x")));
         assert!(controller_rpc_retryable(&Status::internal("x")));
+    }
+
+    /// Only the controller's own "no such job" settles a run. Everything else,
+    /// including a rejection no retry can fix, leaves the slice held.
+    #[test]
+    fn only_a_definite_no_such_job_settles_a_completion() {
+        use super::CompletionOutcome;
+        assert!(
+            CompletionOutcome::for_error(&ControllerRpcError::Rpc(Status::not_found(
+                "job 5 not found"
+            )))
+            .settled()
+        );
+        for status in [
+            Status::invalid_argument("node n1 is not allocated to job 5"),
+            Status::unavailable("not the Raft leader"),
+            Status::internal("raft propose failed"),
+        ] {
+            let outcome = CompletionOutcome::for_error(&ControllerRpcError::Rpc(status.clone()));
+            assert!(
+                !outcome.settled(),
+                "{status:?} is not the controller saying it has no record"
+            );
+        }
     }
 
     /// Drive the retry loop with one scripted outcome per attempt, reporting how
@@ -4498,7 +4532,40 @@ pub(crate) struct CompletionReport<'a> {
     pub step_id: Option<spur_core::step::StepId>,
 }
 
-pub(crate) async fn report_completion(controller_addr: &str, report: CompletionReport<'_>) -> bool {
+/// What the controller said when handed one node's account of a finished run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionOutcome {
+    /// The controller committed the completion.
+    Acknowledged,
+    /// The controller answered that it has no record of the run.
+    NoSuchRun,
+    /// Nothing that settles the run; the report is still owed.
+    Undelivered,
+}
+
+impl CompletionOutcome {
+    /// A definite "no such job" is the controller's own word that it is not
+    /// accounting for the run; anything else leaves the report owed.
+    fn for_error(error: &ControllerRpcError) -> Self {
+        match error {
+            ControllerRpcError::Rpc(status) if status.code() == tonic::Code::NotFound => {
+                Self::NoSuchRun
+            }
+            _ => Self::Undelivered,
+        }
+    }
+
+    /// Whether the controller has settled this run, so its slice may go. A run
+    /// the controller has no record of will never be acknowledged by anything.
+    pub(crate) fn settled(self) -> bool {
+        matches!(self, Self::Acknowledged | Self::NoSuchRun)
+    }
+}
+
+pub(crate) async fn report_completion(
+    controller_addr: &str,
+    report: CompletionReport<'_>,
+) -> CompletionOutcome {
     let CompletionReport {
         job_id,
         exit_code,
@@ -4553,31 +4620,35 @@ pub(crate) async fn report_completion(controller_addr: &str, report: CompletionR
     })
     .await;
 
-    let acknowledged = result.is_ok();
-    match result {
-        Ok(_) => {
-            info!(
-                job_id,
-                exit_code,
-                controller = %controller_addr,
-                "reported completion to controller"
-            );
-        }
-        Err(e) if e.retryable() => error!(
+    let Err(error) = result else {
+        info!(
             job_id,
             exit_code,
-            attempts = CONTROLLER_RPC_ATTEMPTS,
-            error = %e,
-            "gave up reporting completion to controller"
-        ),
-        Err(e) => error!(
+            controller = %controller_addr,
+            "reported completion to controller"
+        );
+        return CompletionOutcome::Acknowledged;
+    };
+
+    let outcome = CompletionOutcome::for_error(&error);
+    if outcome == CompletionOutcome::NoSuchRun {
+        warn!(
             job_id,
             exit_code,
-            error = %e,
-            "ReportJobStatus failed with non-retryable error"
-        ),
+            controller = %controller_addr,
+            "controller has no record of this run; no acknowledgement will ever come for it"
+        );
+        return outcome;
     }
-    acknowledged
+    // Deliberately not called non-retryable: every caller replays or holds
+    // until the controller takes it, whatever the code says about one attempt.
+    error!(
+        job_id,
+        exit_code,
+        error = %error,
+        "controller did not accept this completion; the report stays owed"
+    );
+    outcome
 }
 
 fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String>) {
@@ -7818,6 +7889,15 @@ impl AgentService {
         cpus: u32,
         memory_mb: u64,
     ) -> Result<(AllocationResult, Vec<u32>), Status> {
+        // A zero request reserves an empty cpuset on a node with nothing free,
+        // which confirms as an allocation mismatch instead of refusing here.
+        if cpus == 0 {
+            warn!(job_id, "rejecting launch: it would reserve no cpu at all");
+            return Err(Status::resource_exhausted(
+                "a launch must reserve at least one cpu on this node",
+            ));
+        }
+
         let controller_gpu_ids: Vec<u32> = allocated
             .and_then(|a| a.devices.get("gpu"))
             .map(|d| d.devices.iter().map(|dev| dev.device_id).collect())
@@ -10138,6 +10218,122 @@ mod tests {
             0,
             "an acknowledged report leaves nothing for the replay loop"
         );
+    }
+
+    /// Fence a run that really holds two of this node's four cores, so the
+    /// assertion is about the slice and not only about the report.
+    async fn fence_a_slice_holding_run(
+        controller_addr: String,
+        store: &crate::stepd::StepdStore,
+        admissions: &crate::admission::AdmissionStore,
+    ) -> Arc<Mutex<NodeAllocation>> {
+        let descriptor = fenced_session(store);
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet {
+                cpus: 4,
+                memory_mb: 8_000,
+                ..Default::default()
+            },
+        )));
+        let reserved = allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 7, 2, 1_000, &[])
+            .expect("reserve the run's cores");
+        allocation.lock().await.commit_job(42, 7);
+
+        let mut run = crate::admission::RunAdmission::new(
+            42,
+            7,
+            "test-node",
+            crate::admission::AdmittedResources {
+                cpu_ids: reserved.cpu_ids.clone(),
+                memory_mb: reserved.memory_mb,
+                gpu_devices: Vec::new(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_BATCH);
+        admissions.admit_run(&run).expect("admit the run");
+        let mut participant = crate::admission::ParticipantAdmission::new(
+            42,
+            7,
+            spur_core::step::STEP_BATCH,
+            "test-node",
+            run.allocation.clone(),
+        );
+        participant.final_report.required = true;
+        admissions
+            .admit_participant(&participant)
+            .expect("admit the participant");
+
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut context = fence_context(
+            &new_running_jobs(),
+            &allocation,
+            &sessions,
+            &crate::step_completion::StepCompletions::new(),
+            store,
+        );
+        context.controller_addr = controller_addr;
+        context.admissions = admissions.clone();
+        fence_dead_stepd(&context, descriptor).await;
+        allocation
+    }
+
+    /// A controller that lost its state answers NotFound forever. Treating that
+    /// as unfinished business held the cores of a job nothing would ever ack.
+    #[tokio::test]
+    async fn a_completion_the_controller_has_no_record_of_frees_the_slice() {
+        let (controller_addr, reports) =
+            spawn_mock_controller_answering(Some(tonic::Code::NotFound));
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+
+        let allocation = fence_a_slice_holding_run(controller_addr, &store, &admissions).await;
+
+        assert_eq!(
+            reports.lock().expect("completion reports").len(),
+            1,
+            "the death still has to be reported before anything is concluded"
+        );
+        assert_eq!(
+            allocation.lock().await.free_cpus(),
+            4,
+            "a run the controller has no record of must not hold cores forever"
+        );
+        assert_eq!(
+            pending_replays(&store),
+            0,
+            "replaying a report to a controller that has no record of it is futile"
+        );
+    }
+
+    /// The other half of the invariant: only the controller's own definite "no
+    /// such job" settles a run. Silence must leave the slice exactly as it was.
+    #[tokio::test]
+    async fn an_unanswered_completion_still_holds_the_slice() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+
+        let allocation =
+            fence_a_slice_holding_run("http://127.0.0.1:1".into(), &store, &admissions).await;
+
+        assert_eq!(
+            allocation.lock().await.free_cpus(),
+            2,
+            "an unreachable controller is not evidence that it stopped tracking the run"
+        );
+        assert_eq!(pending_replays(&store), 1);
     }
 
     #[tokio::test]
@@ -14247,6 +14443,36 @@ mod tests {
         assert_eq!(result.cpu_ids, vec![0, 1, 2, 3]);
     }
 
+    // An empty cpuset reserves nothing, so it is admitted on a full node and
+    // only fails later, at dispatch confirmation, as a resource mismatch.
+    #[tokio::test]
+    async fn a_launch_that_would_reserve_no_cpu_is_refused_not_admitted() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let spec = JobSpec::default();
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(1, 1, 4, 0, &[])
+            .expect("fill the 4-cpu test node");
+
+        let refused = svc
+            .allocate_local_resources(7, 1, &spec, None, 0, 0)
+            .await
+            .expect_err("a launch reserving nothing must be refused");
+
+        assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+        let reserved_anything = svc.allocation.lock().await.release_job_if(7, 1);
+        assert!(
+            !reserved_anything,
+            "the refusal must not have reserved anything under job 7"
+        );
+    }
+
     // The allocation is authoritative even when it disagrees with the spec.
     #[tokio::test]
     async fn cpuset_follows_the_controller_allocation_over_the_spec() {
@@ -14814,6 +15040,96 @@ mod tests {
                 .expect("sweep"),
             1,
             "a settled record must be collectable rather than immortal"
+        );
+    }
+
+    /// Seed a record for `job_id` attempt 1 whose batch step ran `digest`,
+    /// settled or still live, so the digest fence has something to compare to.
+    fn seed_recorded_command(svc: &AgentService, job_id: u32, digest: &str, settled: bool) {
+        let admissions = svc.admissions();
+        let node = svc.reporter.hostname.clone();
+        let mut run = crate::admission::RunAdmission::new(
+            job_id,
+            1,
+            &node,
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        if settled {
+            run.state = crate::admission::RunState::Cleaned;
+            run.controller_ack.release_raft_index = Some(1);
+        }
+        admissions.admit_run(&run).expect("admit the run");
+        let mut participant = crate::admission::ParticipantAdmission::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            &node,
+            crate::admission::AdmittedResources::default(),
+        );
+        participant.command_digest = digest.into();
+        admissions
+            .admit_participant(&participant)
+            .expect("admit the participant");
+    }
+
+    fn launch_of(digest: &str) -> crate::admission::LaunchFences {
+        let now = crate::admission::now_unix_ms();
+        crate::admission::LaunchFences {
+            issued_at_unix_ms: now,
+            expires_at_unix_ms: now + 60_000,
+            command_digest: digest.into(),
+        }
+    }
+
+    /// A controller that lost its state reissues job id 1, which can land on a
+    /// node still holding the finished predecessor that wore that id.
+    #[tokio::test]
+    async fn a_settled_record_does_not_refuse_a_job_that_reuses_its_identity() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state.path());
+        seed_recorded_command(&svc, 1, "the-dead-predecessor", true);
+
+        assert_eq!(
+            svc.check_launch_fences(
+                1,
+                1,
+                spur_core::step::STEP_BATCH,
+                &launch_of("the-fresh-job")
+            ),
+            None,
+            "a dead predecessor's command says nothing about a new job's"
+        );
+    }
+
+    /// The check the exclusion must not cost us: one live identity being asked
+    /// to run two different commands is still a refusal.
+    #[tokio::test]
+    async fn a_live_record_still_refuses_a_second_command_for_one_identity() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state.path());
+        seed_recorded_command(&svc, 1, "the-running-command", false);
+
+        assert_eq!(
+            svc.check_launch_fences(
+                1,
+                1,
+                spur_core::step::STEP_BATCH,
+                &launch_of("a-different-command")
+            ),
+            Some(crate::admission::LaunchRefusal::ConflictingDigest)
         );
     }
 
@@ -16229,6 +16545,8 @@ mod tests {
     /// unimplemented, so drifting onto an unmocked call fails loudly.
     struct MockController {
         reports: Arc<std::sync::Mutex<Vec<spur_proto::proto::ReportJobStatusRequest>>>,
+        /// How completion reports are answered; `None` accepts them.
+        refusal: Option<tonic::Code>,
     }
 
     /// The `async_trait` attribute has to be applied by the macro: it rewrites
@@ -16241,11 +16559,13 @@ mod tests {
                     &self,
                     request: tonic::Request<spur_proto::proto::ReportJobStatusRequest>,
                 ) -> Result<tonic::Response<()>, tonic::Status> {
-                    self.reports
-                        .lock()
-                        .expect("completion reports")
-                        .push(request.into_inner());
-                    Ok(tonic::Response::new(()))
+                    let report = request.into_inner();
+                    let job_id = report.job_id;
+                    self.reports.lock().expect("completion reports").push(report);
+                    match self.refusal {
+                        Some(code) => Err(tonic::Status::new(code, format!("job {job_id} not found"))),
+                        None => Ok(tonic::Response::new(())),
+                    }
                 }
                 $(
                     async fn $method(
@@ -16315,6 +16635,12 @@ mod tests {
     type CompletionReports = Arc<std::sync::Mutex<Vec<spur_proto::proto::ReportJobStatusRequest>>>;
 
     fn spawn_mock_controller() -> (String, CompletionReports) {
+        spawn_mock_controller_answering(None)
+    }
+
+    fn spawn_mock_controller_answering(
+        refusal: Option<tonic::Code>,
+    ) -> (String, CompletionReports) {
         let incoming = tonic::transport::server::TcpIncoming::bind(
             "127.0.0.1:0".parse().expect("loopback address"),
         )
@@ -16323,6 +16649,7 @@ mod tests {
         let reports: CompletionReports = Arc::new(std::sync::Mutex::new(Vec::new()));
         let service = MockController {
             reports: reports.clone(),
+            refusal,
         };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
