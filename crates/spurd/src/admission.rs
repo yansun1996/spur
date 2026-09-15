@@ -510,6 +510,9 @@ impl AdmissionStore {
         let entries = loaded
             .runs
             .iter()
+            // A decided record is a dead predecessor, not a claim. Advertising one
+            // invites a cancel that cannot change it, so it re-fires on every cut.
+            .filter(|admitted| !admitted.run.is_over())
             .map(|admitted| LedgerCutEntry {
                 job_id: admitted.run.job_id,
                 run_attempt: admitted.run.run_attempt,
@@ -1874,6 +1877,43 @@ mod tests {
         assert_eq!(held.run_attempt, 2);
         assert!(held.conflict_hold);
         assert_eq!(held.allocation.cpu_ids, vec![0, 1]);
+    }
+
+    /// A cancel the cut does not register is re-issued on every later pass,
+    /// forever, for a run that has already finished.
+    #[test]
+    fn a_cancelled_claim_stops_being_advertised_to_the_controller() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        // The two ways a cancel lands: on a run still tearing down, and on one
+        // the agent no longer tracks.
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.admit_run(&run_with(8, 1, 1)).unwrap();
+
+        let mut cancels = 0;
+        for _ in 0..5 {
+            for entry in store.ledger_cut("session-a").entries {
+                cancels += 1;
+                if entry.job_id == 7 {
+                    store
+                        .mark_controller_cancelled(entry.job_id, entry.run_attempt)
+                        .unwrap();
+                } else {
+                    store
+                        .settle_cancelled_run(entry.job_id, entry.run_attempt)
+                        .unwrap();
+                }
+            }
+        }
+
+        assert_eq!(
+            cancels, 2,
+            "each claim is cancelled once; the audit must converge, not re-fire per pass"
+        );
+        assert!(
+            store.ledger_cut("session-a").entries.is_empty(),
+            "a decided run is not a claim the controller should still be told about"
+        );
     }
 
     #[test]
