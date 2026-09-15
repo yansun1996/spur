@@ -173,6 +173,14 @@ impl RunAdmission {
         }
     }
 
+    /// Whether this run's fate is already decided. What such a record still
+    /// says about a command describes a dead predecessor, not a live run.
+    pub fn is_over(&self) -> bool {
+        self.state == RunState::Cleaned
+            || self.cancelled_by_controller
+            || self.controller_ack.release_raft_index.is_some()
+    }
+
     /// When this run stops being interesting if nothing else ever happens to it.
     fn ages_out_at(&self, retention_ms: u64) -> u64 {
         self.max_launch_expiry_unix_ms
