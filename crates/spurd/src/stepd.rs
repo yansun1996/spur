@@ -2708,6 +2708,17 @@ pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
 }
 
 pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLiveness> {
+    // `process_start_ticks` counts from boot and the spool survives one, so a
+    // pid and tick match across boots is a collision, not the same supervisor.
+    let scope = crate::admission::SupervisorRef {
+        pid: descriptor.pid,
+        start_ticks: descriptor.process_start_ticks,
+        boot_id: descriptor.boot_id.clone(),
+    }
+    .boot_scope(crate::admission::current_boot_id().as_deref());
+    if scope == crate::admission::BootScope::Different {
+        return Ok(StepdLiveness::Stale);
+    }
     match process_start_ticks(descriptor.pid) {
         Ok(start_ticks) if start_ticks == descriptor.process_start_ticks => Ok(StepdLiveness::Live),
         Ok(_) => Ok(StepdLiveness::Stale),

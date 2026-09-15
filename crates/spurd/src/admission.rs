@@ -314,6 +314,73 @@ impl AdmittedRun {
     }
 }
 
+/// What the agent found on disk for one admitted run at startup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunEvidence {
+    /// A supervisor whose `(pid, start_ticks)` still matches a live process.
+    pub supervisor_matches_a_live_process: bool,
+    pub boot_scope_of_supervisor: Option<BootScope>,
+    pub recorded_exit: Option<(i32, i32)>,
+    /// Admitted but never spawned: no supervisor was ever recorded.
+    pub never_spawned: bool,
+    /// Runtime state with no admission record behind it, or an unreadable one.
+    pub residual_or_corrupt: bool,
+}
+
+/// What the evidence says happened to a run. It decides what the agent
+/// *reports*, never what it frees: only an acknowledgement frees a slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunDisposition {
+    Running,
+    SettledWithExit {
+        exit_code: i32,
+        signal: i32,
+    },
+    /// A reboot leaves nothing to be uncertain about, so this is the one
+    /// disposition that reports a definite death with no exit code.
+    DeadByReboot,
+    NeverStarted,
+    /// The supervisor is gone and recorded no exit. The agent does not know
+    /// what happened and must say so rather than guess either way.
+    Unknown,
+    Corrupt,
+}
+
+impl RunDisposition {
+    /// Always false. The agent may refuse and may hold, but a refusal is
+    /// evidence for the controller to reconcile, never licence to free a slice.
+    pub fn releases_locally(self) -> bool {
+        false
+    }
+
+    /// Whether the controller has to reconcile this run before the node is
+    /// trusted: the agent cannot resolve it from local evidence alone.
+    pub fn needs_reconciliation(self) -> bool {
+        matches!(self, Self::Corrupt | Self::Unknown)
+    }
+}
+
+pub fn classify_run(evidence: &RunEvidence) -> RunDisposition {
+    if evidence.residual_or_corrupt {
+        return RunDisposition::Corrupt;
+    }
+    // Checked before liveness: across a reboot a `(pid, start_ticks)` match is a
+    // coincidence, and adopting it would hold a phantom and report it running.
+    if evidence.boot_scope_of_supervisor == Some(BootScope::Different) {
+        return RunDisposition::DeadByReboot;
+    }
+    if evidence.supervisor_matches_a_live_process {
+        return RunDisposition::Running;
+    }
+    if let Some((exit_code, signal)) = evidence.recorded_exit {
+        return RunDisposition::SettledWithExit { exit_code, signal };
+    }
+    if evidence.never_spawned {
+        return RunDisposition::NeverStarted;
+    }
+    RunDisposition::Unknown
+}
+
 /// A record the agent could not adopt. Held rather than deleted, because the
 /// record is the only evidence that something here may still hold a claim.
 #[derive(Debug, Clone)]
@@ -569,6 +636,29 @@ impl AdmissionStore {
         Ok(true)
     }
 
+    /// Record the supervisor that now speaks for a participant. Read-modify-write
+    /// so it cannot discard the deadline or digest the launch was admitted under.
+    pub fn record_supervisor(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: StepId,
+        supervisor: SupervisorRef,
+    ) -> io::Result<bool> {
+        let path = self
+            .participants_dir(job_id, run_attempt)
+            .join(format!("{step_id}.json"));
+        let mut participant = match self.load_participant(&path, job_id, run_attempt) {
+            Ok(participant) => participant,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        participant.supervisor = Some(supervisor);
+        participant.lifecycle = ParticipantLifecycle::Running;
+        self.admit_participant(&participant)?;
+        Ok(true)
+    }
+
     pub fn remove_participant(
         &self,
         job_id: u32,
@@ -614,7 +704,7 @@ impl AdmissionStore {
     }
 }
 
-fn parse_run_dir_name(path: &Path) -> Option<(u32, u32)> {
+pub fn parse_run_dir_name(path: &Path) -> Option<(u32, u32)> {
     let name = path.file_name()?.to_str()?;
     let (job, attempt) = name.split_once('.')?;
     let (job_id, run_attempt): (u32, u32) = (job.parse().ok()?, attempt.parse().ok()?);
@@ -644,11 +734,17 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// The kernel's boot id, when the platform exposes one.
+/// The kernel's boot id, when the platform exposes one. Constant for the
+/// process, and read on every descriptor write, so it is read once.
 pub fn current_boot_id() -> Option<String> {
-    let raw = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
-    let trimmed = raw.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    static BOOT_ID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BOOT_ID
+        .get_or_init(|| {
+            let raw = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .clone()
 }
 
 #[cfg(test)]
@@ -1002,6 +1098,119 @@ mod tests {
         let loaded = store.load_all().unwrap();
         assert_eq!(loaded.runs.len(), 1);
         assert_eq!(loaded.rejected.len(), 1);
+    }
+
+    #[test]
+    fn no_disposition_ever_releases_locally() {
+        // The invariant the whole ladder rests on: evidence buys the content of
+        // a report, never permission to act on it.
+        for disposition in [
+            RunDisposition::Running,
+            RunDisposition::SettledWithExit {
+                exit_code: 0,
+                signal: 0,
+            },
+            RunDisposition::DeadByReboot,
+            RunDisposition::NeverStarted,
+            RunDisposition::Unknown,
+            RunDisposition::Corrupt,
+        ] {
+            assert!(
+                !disposition.releases_locally(),
+                "{disposition:?} must not free a slice on the agent's own judgement"
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_supervisor_is_adopted() {
+        assert_eq!(
+            classify_run(&RunEvidence {
+                supervisor_matches_a_live_process: true,
+                boot_scope_of_supervisor: Some(BootScope::Same),
+                ..Default::default()
+            }),
+            RunDisposition::Running
+        );
+    }
+
+    #[test]
+    fn a_reboot_outranks_a_matching_pid() {
+        // Across a reboot the pid and tick pair can collide. Adopting it holds a
+        // phantom and reports a dead job as running.
+        assert_eq!(
+            classify_run(&RunEvidence {
+                supervisor_matches_a_live_process: true,
+                boot_scope_of_supervisor: Some(BootScope::Different),
+                ..Default::default()
+            }),
+            RunDisposition::DeadByReboot
+        );
+    }
+
+    #[test]
+    fn an_unknown_boot_still_adopts_a_matching_live_supervisor() {
+        // A pre-upgrade record has no boot id. Reading that as a reboot would
+        // declare running jobs dead.
+        assert_eq!(
+            classify_run(&RunEvidence {
+                supervisor_matches_a_live_process: true,
+                boot_scope_of_supervisor: Some(BootScope::Unknown),
+                ..Default::default()
+            }),
+            RunDisposition::Running
+        );
+    }
+
+    #[test]
+    fn a_recorded_exit_settles_a_dead_supervisor() {
+        assert_eq!(
+            classify_run(&RunEvidence {
+                boot_scope_of_supervisor: Some(BootScope::Same),
+                recorded_exit: Some((3, 0)),
+                ..Default::default()
+            }),
+            RunDisposition::SettledWithExit {
+                exit_code: 3,
+                signal: 0
+            }
+        );
+    }
+
+    #[test]
+    fn a_dead_supervisor_with_no_exit_is_unknown_not_finished() {
+        // Treating this as finished is the inference that frees a slice the
+        // node may still be using.
+        assert_eq!(
+            classify_run(&RunEvidence {
+                boot_scope_of_supervisor: Some(BootScope::Same),
+                ..Default::default()
+            }),
+            RunDisposition::Unknown
+        );
+    }
+
+    #[test]
+    fn an_admitted_run_that_never_spawned_is_not_running_or_finished() {
+        assert_eq!(
+            classify_run(&RunEvidence {
+                never_spawned: true,
+                ..Default::default()
+            }),
+            RunDisposition::NeverStarted
+        );
+    }
+
+    #[test]
+    fn corruption_outranks_every_other_signal() {
+        let corrupt = classify_run(&RunEvidence {
+            supervisor_matches_a_live_process: true,
+            recorded_exit: Some((0, 0)),
+            residual_or_corrupt: true,
+            ..Default::default()
+        });
+        assert_eq!(corrupt, RunDisposition::Corrupt);
+        assert!(corrupt.needs_reconciliation());
     }
 
     #[test]
