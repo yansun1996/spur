@@ -854,6 +854,74 @@ impl AdmissionStore {
             .map(|run| run.reject_before_unix_ms)
     }
 
+    /// Whether this run's allocation may now be released: the owner step only,
+    /// its completion acknowledged, and its epilog actually finished.
+    pub fn release_is_due(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: StepId,
+        epilog_complete: bool,
+    ) -> io::Result<bool> {
+        let run = match self.load_run(job_id, run_attempt) {
+            Ok(run) => run,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        // Without this the release fires for whichever participant happens to be
+        // acknowledged first, which for a multi-step run is not the owner.
+        if run
+            .lifecycle_owner_step
+            .is_some_and(|owner| owner != step_id)
+        {
+            return Ok(false);
+        }
+        if !epilog_complete {
+            return Ok(false);
+        }
+        Ok(run.controller_ack.release_raft_index.is_some())
+    }
+
+    /// Record that the controller has committed this run's completion. The
+    /// index is what distinguishes an acknowledgement from an unanswered RPC.
+    pub fn record_controller_ack(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        release_raft_index: u64,
+    ) -> io::Result<bool> {
+        let mut run = match self.load_run(job_id, run_attempt) {
+            Ok(run) => run,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        run.controller_ack.release_raft_index = Some(release_raft_index);
+        self.admit_run(&run)?;
+        Ok(true)
+    }
+
+    /// Mark a participant's completion as acknowledged, so the durable retry
+    /// stops rediscovering it.
+    pub fn record_report_acknowledged(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: StepId,
+    ) -> io::Result<bool> {
+        let path = self
+            .participants_dir(job_id, run_attempt)
+            .join(format!("{step_id}.json"));
+        let mut participant = match self.load_participant(&path, job_id, run_attempt) {
+            Ok(participant) => participant,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        participant.final_report.acknowledged = true;
+        participant.lifecycle = ParticipantLifecycle::Exited;
+        self.admit_participant(&participant)?;
+        Ok(true)
+    }
+
     pub fn remove_participant(
         &self,
         job_id: u32,
@@ -1460,6 +1528,73 @@ mod tests {
             "the controller must not act on what is missing from a partial cut"
         );
         assert_eq!(cut.entries.len(), 1, "what could be read is still reported");
+    }
+
+    #[test]
+    fn nothing_is_released_without_an_acknowledgement() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let mut run = run_with(7, 1, 1);
+        run.lifecycle_owner_step = Some(STEP_BATCH);
+        store.admit_run(&run).unwrap();
+
+        assert!(
+            !store.release_is_due(7, 1, STEP_BATCH, true).unwrap(),
+            "an exit is not a completion"
+        );
+        store.record_controller_ack(7, 1, 42).unwrap();
+        assert!(store.release_is_due(7, 1, STEP_BATCH, true).unwrap());
+    }
+
+    #[test]
+    fn only_the_owner_step_releases_the_runs_slice() {
+        // Otherwise whichever participant is acknowledged first frees a slice
+        // its siblings are still drawing on.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let mut run = run_with(7, 1, 1);
+        run.lifecycle_owner_step = Some(STEP_BATCH);
+        store.admit_run(&run).unwrap();
+        store.record_controller_ack(7, 1, 42).unwrap();
+
+        assert!(!store.release_is_due(7, 1, 3, true).unwrap());
+        assert!(store.release_is_due(7, 1, STEP_BATCH, true).unwrap());
+    }
+
+    #[test]
+    fn an_unfinished_epilog_holds_the_slice() {
+        // The obligation ordering is a pruning gate, not a release gate, so the
+        // epilog has to be checked rather than assumed.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let mut run = run_with(7, 1, 1);
+        run.lifecycle_owner_step = Some(STEP_BATCH);
+        store.admit_run(&run).unwrap();
+        store.record_controller_ack(7, 1, 42).unwrap();
+
+        assert!(!store.release_is_due(7, 1, STEP_BATCH, false).unwrap());
+        assert!(store.release_is_due(7, 1, STEP_BATCH, true).unwrap());
+    }
+
+    #[test]
+    fn a_run_with_no_record_releases_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!store(&dir).release_is_due(9, 9, STEP_BATCH, true).unwrap());
+    }
+
+    #[test]
+    fn acknowledging_a_report_stops_the_retry_rediscovering_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        let mut participant = ParticipantAdmission::new(7, 1, STEP_BATCH, "n1", Default::default());
+        participant.final_report.required = true;
+        store.admit_participant(&participant).unwrap();
+
+        assert!(store.record_report_acknowledged(7, 1, STEP_BATCH).unwrap());
+        let (participants, _) = store.participants(7, 1).unwrap();
+        assert!(participants[0].final_report.acknowledged);
+        assert_eq!(participants[0].lifecycle, ParticipantLifecycle::Exited);
     }
 
     #[test]

@@ -2378,6 +2378,18 @@ impl SlurmController for ControllerService {
                 );
                 Ok(Response::new(()))
             }
+            // "No record of this job" is an acknowledgement: the agent holds
+            // the slice until one arrives, and this job is never coming back.
+            Some(Err(NodeCompleteError::JobNotFound { job_id }))
+                if job_id < self.cluster.peek_next_job_id() =>
+            {
+                warn!(
+                    job_id,
+                    node = %req.reporting_node,
+                    "completion for a job the controller no longer has; accepting it"
+                );
+                Ok(Response::new(()))
+            }
             Some(Err(e)) => {
                 warn!(
                     job_id = req.job_id,

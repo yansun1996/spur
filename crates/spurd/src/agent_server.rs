@@ -1009,9 +1009,9 @@ async fn release_stepd_tracking(
         other.job_id == descriptor.job_id && other.run_attempt == descriptor.run_attempt
     });
 
-    // Hold `running` across the allocation release too — matching the
-    // lock order commit_job uses — so a redispatch racing this can't have
-    // its brand-new allocation torn down by this stale, job_id-keyed release.
+    // Tracking stops, but the slice is not freed: until the controller commits
+    // a completion, this node is the only thing that knows the work stopped.
+    let _ = allocation;
     let removed_tracked = was_last_step && {
         let mut jobs = running.lock().await;
         if jobs
@@ -1019,7 +1019,6 @@ async fn release_stepd_tracking(
             .is_some_and(|current| current.run_attempt == descriptor.run_attempt)
         {
             jobs.remove(&descriptor.job_id);
-            allocation.lock().await.release_job(descriptor.job_id);
             true
         } else {
             false
@@ -1186,21 +1185,40 @@ async fn settle_recovered_stepd(
     })
 }
 
+/// What the recovery monitor needs to settle an adopted supervisor.
+pub(crate) struct RecoveryContext {
+    pub running: RunningJobs,
+    pub allocation: Arc<Mutex<NodeAllocation>>,
+    pub stepds: Arc<Mutex<StepdMap>>,
+    pub completions: crate::step_completion::StepCompletions,
+    pub store: crate::stepd::StepdStore,
+    pub admissions: crate::admission::AdmissionStore,
+    pub controller_addr: String,
+}
+
 pub(crate) fn monitor_recovered_stepds(
-    running: RunningJobs,
-    allocation: Arc<Mutex<NodeAllocation>>,
-    stepds: Arc<Mutex<StepdMap>>,
-    completions: crate::step_completion::StepCompletions,
+    context: RecoveryContext,
     descriptors: Vec<crate::stepd::StepdDescriptor>,
-    store: crate::stepd::StepdStore,
-    controller_addr: String,
 ) {
+    let RecoveryContext {
+        running,
+        allocation,
+        stepds,
+        completions,
+        store,
+        admissions,
+        controller_addr,
+    } = context;
     tokio::spawn(async move {
         let mut pending: StepdMap = descriptors
             .into_iter()
             .map(|descriptor| (stepd_key(&descriptor), descriptor))
             .collect();
         let mut completed = HashMap::new();
+        // Attempt count and first-failure instant per outstanding report. The
+        // durable driver is the record; this only paces and surfaces the retry.
+        let mut attempts: HashMap<(u32, spur_core::step::StepId), (u32, std::time::Instant)> =
+            HashMap::new();
         let hostname = hostname::get()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|_| "localhost".into());
@@ -1282,6 +1300,7 @@ pub(crate) fn monitor_recovered_stepds(
             }
             let mut acknowledged = Vec::new();
             for completion in completed.values() {
+                let key = (completion.job_id, completion.step_id);
                 if report_completion(
                     &controller_addr,
                     CompletionReport {
@@ -1306,8 +1325,48 @@ pub(crate) fn monitor_recovered_stepds(
                             "failed to acknowledge recovered runtime completion"
                         );
                     } else {
-                        acknowledged.push((completion.job_id, completion.step_id));
+                        // Only now may the slice go: the controller has it.
+                        let _ = admissions.record_controller_ack(
+                            completion.job_id,
+                            completion.run_attempt,
+                            1,
+                        );
+                        let _ = admissions.record_report_acknowledged(
+                            completion.job_id,
+                            completion.run_attempt,
+                            completion.step_id,
+                        );
+                        release_acknowledged_allocation(
+                            &allocation,
+                            &admissions,
+                            completion.job_id,
+                            completion.run_attempt,
+                            completion.step_id,
+                            !completion.epilog_failed,
+                        )
+                        .await;
+                        acknowledged.push(key);
+                        attempts.remove(&key);
                     }
+                } else {
+                    // Nothing ends the obligation but an acknowledgement: this
+                    // report is the only thing that will ever free the slice.
+                    let attempt = attempts
+                        .entry(key)
+                        .or_insert((0u32, std::time::Instant::now()));
+                    attempt.0 = attempt.0.saturating_add(1);
+                    if attempt.1.elapsed() >= COMPLETION_STUCK_AFTER {
+                        error!(
+                            job_id = completion.job_id,
+                            run_attempt = completion.run_attempt,
+                            attempts = attempt.0,
+                            held_for_secs = attempt.1.elapsed().as_secs(),
+                            "a completion report the controller will not accept is holding this \
+                             job's resources"
+                        );
+                        attempt.1 = std::time::Instant::now();
+                    }
+                    tokio::time::sleep(completion_backoff(attempt.0, completion.job_id)).await;
                 }
             }
             for key in acknowledged {
@@ -3216,13 +3275,16 @@ impl AgentService {
 
     pub fn monitor_recovered_stepds(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
         monitor_recovered_stepds(
-            self.running.clone(),
-            self.allocation.clone(),
-            self.stepds.clone(),
-            self.step_completions.clone(),
+            RecoveryContext {
+                running: self.running.clone(),
+                allocation: self.allocation.clone(),
+                stepds: self.stepds.clone(),
+                completions: self.step_completions.clone(),
+                store: crate::stepd::StepdStore::new(&self.stepd_state_dir),
+                admissions: self.admissions(),
+                controller_addr: self.reporter.controller_addr.clone(),
+            },
             descriptors.to_vec(),
-            crate::stepd::StepdStore::new(&self.stepd_state_dir),
-            self.reporter.controller_addr.clone(),
         );
     }
 
@@ -3611,6 +3673,36 @@ async fn flag_unbacked_allocations(
     }
 }
 
+/// Free a run's slice, now that the controller has committed its completion.
+/// This is the only path that frees one: an exit alone never does.
+async fn release_acknowledged_allocation(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+    job_id: u32,
+    run_attempt: u32,
+    step_id: spur_core::step::StepId,
+    epilog_complete: bool,
+) -> bool {
+    match admissions.release_is_due(job_id, run_attempt, step_id, epilog_complete) {
+        Ok(true) => {
+            // Generation-checked: a redispatch may already own this job id.
+            let released = allocation.lock().await.release_job_if(job_id, run_attempt);
+            if released {
+                info!(
+                    job_id,
+                    run_attempt, "released a run's slice on its acknowledgement"
+                );
+            }
+            released
+        }
+        Ok(false) => false,
+        Err(error) => {
+            warn!(job_id, run_attempt, %error, "could not tell whether a release is due; holding");
+            false
+        }
+    }
+}
+
 /// Releases a launch reservation if the handler exits between reserve and
 /// commit, including on future cancellation which no error path can catch.
 /// Disarmed once the job is committed to the running set.
@@ -3688,6 +3780,24 @@ use spur_proto::controller_rpc_retryable;
 
 const CONTROLLER_RPC_ATTEMPTS: u32 = 3;
 const CONTROLLER_RPC_RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The completion report is now the only thing that frees a slice, so the
+/// obligation to deliver it is unbounded in attempts and bounded only in rate.
+const COMPLETION_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a report may go unacknowledged before it is called out. A run that
+/// holds its slice forever is correct but must not be silent.
+const COMPLETION_STUCK_AFTER: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// Next backoff, capped. Jittered so a controller coming back does not meet
+/// every node's retry at the same instant.
+fn completion_backoff(attempt: u32, job_id: u32) -> std::time::Duration {
+    let base = CONTROLLER_RPC_RETRY_GAP
+        .saturating_mul(1u32 << attempt.min(6))
+        .min(COMPLETION_RETRY_CAP);
+    let jitter = std::time::Duration::from_millis(u64::from(job_id % 1000));
+    (base + jitter).min(COMPLETION_RETRY_CAP + std::time::Duration::from_secs(1))
+}
 
 /// A single failed attempt at a controller RPC.
 enum ControllerRpcError {
@@ -9360,7 +9470,9 @@ mod tests {
             .lock()
             .await
             .contains_key(&(42, spur_core::step::STEP_BATCH)));
-        assert_eq!(allocation.lock().await.allocated_memory_mb, 0);
+        // The exit stops the tracking; only an acknowledged completion frees
+        // the slice, because until then nothing but this node knows it stopped.
+        assert_eq!(allocation.lock().await.allocated_memory_mb, 128);
         assert!(!store
             .session_dir(42, 7, spur_core::step::STEP_BATCH)
             .exists());
@@ -9425,8 +9537,8 @@ mod tests {
         assert!(!running.lock().await.contains_key(&42));
         assert_eq!(
             allocation.lock().await.allocated_memory_mb,
-            0,
-            "the last step out releases the allocation"
+            128,
+            "even the last step out only stops tracking; the slice waits on the controller"
         );
     }
 
@@ -9539,8 +9651,8 @@ mod tests {
 
         assert_eq!(
             allocation.lock().await.allocated_memory_mb,
-            0,
-            "a session left by an older attempt has no claim on this one"
+            128,
+            "a session left by an older attempt cannot free the current one's slice"
         );
     }
 
@@ -14320,6 +14432,81 @@ mod tests {
 
     // The monitor loop must flag a claim with no tracked job and not free it.
     // Exercises the real wiring without driving the timed loop.
+    #[test]
+    fn the_completion_retry_is_capped_but_never_gives_up() {
+        // Unbounded in attempts, bounded in rate: a long outage must not become
+        // a hot loop, and no attempt count may end the obligation.
+        let mut previous = std::time::Duration::ZERO;
+        for attempt in 0..40u32 {
+            let backoff = completion_backoff(attempt, 0);
+            assert!(backoff >= previous || previous >= COMPLETION_RETRY_CAP);
+            assert!(
+                backoff <= COMPLETION_RETRY_CAP + std::time::Duration::from_secs(1),
+                "attempt {attempt} backed off past the cap"
+            );
+            previous = backoff;
+        }
+        assert!(
+            completion_backoff(1000, 0) <= COMPLETION_RETRY_CAP + std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn the_retry_is_jittered_so_nodes_do_not_all_return_together() {
+        assert_ne!(completion_backoff(3, 1), completion_backoff(3, 2));
+    }
+
+    #[tokio::test]
+    async fn a_step_exit_no_longer_frees_the_slice() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(7, 1, 2, 1000, &[]).unwrap();
+            alloc.commit_job(7, 1);
+        }
+        let mut run = crate::admission::RunAdmission::new(
+            7,
+            1,
+            "n1",
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_BATCH);
+        svc.admissions().admit_run(&run).expect("admit");
+
+        // No acknowledgement yet: the exit tells this node the work stopped and
+        // nothing else knows it.
+        assert!(
+            !release_acknowledged_allocation(
+                &svc.allocation,
+                &svc.admissions(),
+                7,
+                1,
+                spur_core::step::STEP_BATCH,
+                true,
+            )
+            .await
+        );
+        assert_eq!(svc.allocation.lock().await.free_cpus(), 6);
+
+        svc.admissions()
+            .record_controller_ack(7, 1, 42)
+            .expect("ack");
+        assert!(
+            release_acknowledged_allocation(
+                &svc.allocation,
+                &svc.admissions(),
+                7,
+                1,
+                spur_core::step::STEP_BATCH,
+                true,
+            )
+            .await
+        );
+        assert_eq!(svc.allocation.lock().await.free_cpus(), 8);
+    }
+
     #[tokio::test]
     async fn a_contested_gpu_is_refused_rather_than_taken_from_its_holder() {
         // The worst form of the inference: it did not merely free a claim it
