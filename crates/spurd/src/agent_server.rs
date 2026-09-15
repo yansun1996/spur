@@ -4369,6 +4369,28 @@ impl SlurmAgent for AgentService {
     type StreamJobOutputStream = ReceiverStream<Result<StreamJobOutputChunk, Status>>;
     type InteractiveSessionStream = ReceiverStream<Result<InteractiveOutput, Status>>;
 
+    async fn request_node_ledger(
+        &self,
+        request: Request<RequestNodeLedgerRequest>,
+    ) -> Result<Response<RequestNodeLedgerResponse>, Status> {
+        Self::require_controller(&request)?;
+        let reason = request.into_inner().reason;
+        let admissions = self.admissions();
+        let session = self.reporter.agent_session_id().to_string();
+        let cut = tokio::task::spawn_blocking(move || admissions.ledger_cut(&session))
+            .await
+            .map_err(|error| Status::internal(format!("ledger task failed: {error}")))?;
+        info!(
+            %reason,
+            entries = cut.entries.len(),
+            complete = cut.inventory_complete,
+            "answered a ledger pull"
+        );
+        Ok(Response::new(RequestNodeLedgerResponse {
+            ledger: Some(crate::reporter::ledger_to_proto(cut)),
+        }))
+    }
+
     async fn fence_run(
         &self,
         request: Request<FenceRunRequest>,

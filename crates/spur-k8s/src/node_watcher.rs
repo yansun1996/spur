@@ -68,6 +68,7 @@ async fn sync_taint_state(
     };
 
     let req = UpdateNodeRequest {
+        reconcile: false,
         name: name.into(),
         state: Some(state),
         reason,
@@ -172,6 +173,7 @@ pub async fn run(
                 hb.untrack(&name).await;
 
                 let req = UpdateNodeRequest {
+                    reconcile: false,
                     name: name.clone(),
                     state: Some(NodeState::NodeDown as i32),
                     reason: Some("K8s node removed".into()),
