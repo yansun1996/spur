@@ -3440,13 +3440,21 @@ impl AgentService {
                     .await;
                 }
 
-                // Self-heal backstop: reclaim allocations with no tracked,
-                // non-launching job. `running` is re-taken before `allocation`,
+                // Report allocations with no tracked, non-launching job. `running` is re-taken before `allocation`,
                 // the order commit_job uses, so the live set the reclaim reads
                 // can't race a committing launch.
                 {
                     let jobs = running.lock().await;
-                    reconcile_orphaned_allocations(&jobs, &mut *allocation.lock().await);
+                    let unbacked = {
+                        let alloc = allocation.lock().await;
+                        alloc.unbacked_claims(
+                            &jobs.keys().copied().collect(),
+                            std::time::Instant::now(),
+                            LAUNCHING_TTL,
+                        )
+                    };
+                    drop(jobs);
+                    flag_unbacked_allocations(&unbacked, &admissions).await;
                 }
 
                 let local_hostname = hostname::get()
@@ -3532,26 +3540,45 @@ pub(crate) struct DrainRequest {
     pub(crate) reason: String,
 }
 
-/// Reclaim a launch reservation that never commits within this bound. Sized
-/// above a typical image pull + fork so a normal launch is spared; one stalled
-/// past this bound is reclaimed.
+/// How long a reservation may sit mid-launch before the sweep reports it,
+/// sized above a typical image pull and fork.
 const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Reclaim allocations whose job is no longer tracked and is not mid-launch,
-/// using the running set as ground truth. Callers hold the `running` lock
-/// across building `running` and this call so the live set is a consistent
-/// snapshot (see the monitor loop). Returns nothing; logs what it reclaimed.
-fn reconcile_orphaned_allocations(
-    running: &HashMap<u32, TrackedJob>,
-    allocation: &mut NodeAllocation,
+/// Flag claims the agent has no tracked job for. It does **not** free them: the
+/// agent not remembering a job is not evidence its work finished, and no
+/// timeout makes it so. The release comes from the controller.
+async fn flag_unbacked_allocations(
+    unbacked: &[(u32, u32)],
+    admissions: &crate::admission::AdmissionStore,
 ) {
-    let live: std::collections::HashSet<u32> = running.keys().copied().collect();
-    let reclaimed = allocation.reconcile(&live, std::time::Instant::now(), LAUNCHING_TTL);
-    if !reclaimed.is_empty() {
-        warn!(
-            ?reclaimed,
-            "reconciled orphaned resource allocations with no tracked job"
-        );
+    for &(job_id, run_attempt) in unbacked {
+        let store = admissions.clone();
+        let taken = tokio::task::spawn_blocking(move || {
+            store.take_conflict_hold(
+                job_id,
+                run_attempt,
+                "held with no tracked job on this agent",
+            )
+        })
+        .await;
+        match taken {
+            // On the transition only: a claim held for the controller to
+            // resolve would otherwise warn on every tick, forever.
+            Ok(Ok(crate::admission::HoldOutcome::Taken)) => warn!(
+                job_id,
+                run_attempt, "holding a claim with no tracked job; it needs reconciliation"
+            ),
+            Ok(Ok(crate::admission::HoldOutcome::AlreadyHeld)) => {}
+            Ok(Ok(crate::admission::HoldOutcome::NoRecord)) => tracing::debug!(
+                job_id,
+                run_attempt,
+                "holding a claim with neither a tracked job nor a record"
+            ),
+            Ok(Err(error)) => {
+                warn!(job_id, run_attempt, %error, "failed to record a conflict hold")
+            }
+            Err(error) => warn!(job_id, run_attempt, %error, "conflict-hold task failed"),
+        }
     }
 }
 
@@ -3618,6 +3645,12 @@ impl Drop for LaunchReservationGuard {
             handle.spawn(async move {
                 allocation.lock().await.release_job_if(job_id, run_attempt);
             });
+        } else {
+            // Nothing sweeps this now, so it has to be visible.
+            warn!(
+                job_id,
+                run_attempt, "could not release an aborted launch's reservation; it stays held"
+            );
         }
     }
 }
@@ -7333,88 +7366,62 @@ impl AgentService {
 
         let mut alloc = self.allocation.lock().await;
 
-        let result = match alloc.allocate_for_job(
-            job_id,
-            run_attempt,
-            cpus,
-            memory_mb,
-            &controller_gpu_ids,
-        ) {
-            Ok(result) => result,
-            Err(AllocError::GpusUnavailable) => {
-                // A conflicting owner absent from the live set is stale (the
-                // controller only re-launches after freeing it); reclaim and retry.
-                let stale: Vec<u32> = alloc
-                    .conflicting_owners(&controller_gpu_ids)
-                    .into_iter()
-                    .filter(|owner| !live.contains(owner))
-                    .collect();
-                if !stale.is_empty() {
+        let result =
+            match alloc.allocate_for_job(job_id, run_attempt, cpus, memory_mb, &controller_gpu_ids)
+            {
+                Ok(result) => result,
+                Err(AllocError::GpusUnavailable) => {
+                    // An owner absent from the live set is unaccounted for, not
+                    // finished. Displacing it puts two jobs on one GPU.
+                    let unaccounted: Vec<u32> = alloc
+                        .conflicting_owners(&controller_gpu_ids)
+                        .into_iter()
+                        .filter(|owner| !live.contains(owner))
+                        .collect();
                     warn!(
                         job_id,
-                        reclaimed = ?stale,
                         requested = ?controller_gpu_ids,
-                        "reclaiming stale GPU owners no longer running, then retrying dispatch"
+                        ?unaccounted,
+                        already_allocated = ?alloc.allocated_gpu_ids(),
+                        "refusing dispatch: the allocated GPUs are held on this node"
                     );
-                    for owner in &stale {
-                        alloc.release_job(*owner);
-                    }
+                    return Err(Status::resource_exhausted(
+                        "controller-allocated GPUs unavailable on this node",
+                    ));
                 }
-                match alloc.allocate_for_job(
-                    job_id,
-                    run_attempt,
-                    cpus,
-                    memory_mb,
-                    &controller_gpu_ids,
-                ) {
-                    Ok(result) => result,
-                    Err(_) => {
-                        warn!(
-                            job_id,
-                            requested = ?controller_gpu_ids,
-                            already_allocated = ?alloc.allocated_gpu_ids(),
-                            "rejecting dispatch: controller-allocated GPUs already in use in the \
-                             local allocation table by a still-running or launching job"
-                        );
-                        return Err(Status::resource_exhausted(
-                            "controller-allocated GPUs unavailable on this node",
-                        ));
-                    }
+                Err(AllocError::DuplicateJob) => {
+                    // A launch is already in flight for this job id (reserved, not
+                    // yet committed or released). This is a concurrent duplicate,
+                    // not resource exhaustion.
+                    warn!(
+                        job_id,
+                        "rejecting duplicate launch: a launch is already in flight for this job"
+                    );
+                    return Err(Status::already_exists(format!(
+                        "job {job_id} already has a launch in flight on this node"
+                    )));
                 }
-            }
-            Err(AllocError::DuplicateJob) => {
-                // A launch is already in flight for this job id (reserved, not
-                // yet committed or released). This is a concurrent duplicate,
-                // not resource exhaustion.
-                warn!(
-                    job_id,
-                    "rejecting duplicate launch: a launch is already in flight for this job"
-                );
-                return Err(Status::already_exists(format!(
-                    "job {job_id} already has a launch in flight on this node"
-                )));
-            }
-            Err(AllocError::Superseded) => {
-                // A newer attempt already reserved/committed this job id; this
-                // is a late or duplicate LaunchJob for an older attempt.
-                warn!(
+                Err(AllocError::Superseded) => {
+                    // A newer attempt already reserved/committed this job id; this
+                    // is a late or duplicate LaunchJob for an older attempt.
+                    warn!(
                     job_id,
                     run_attempt,
                     "rejecting launch: superseded by a newer attempt already tracked on this node"
                 );
-                return Err(Status::failed_precondition(format!(
-                    "job {job_id} was superseded by a newer attempt on this node"
-                )));
-            }
-            // Only a replay of recorded cores can raise this; dispatch derives
-            // its own, so reaching here means the ledger disagrees with the node.
-            Err(AllocError::CpusUnavailable) => {
-                warn!(job_id, "rejecting launch: allocated cores unavailable");
-                return Err(Status::resource_exhausted(
-                    "allocated cores unavailable on this node",
-                ));
-            }
-        };
+                    return Err(Status::failed_precondition(format!(
+                        "job {job_id} was superseded by a newer attempt on this node"
+                    )));
+                }
+                // Only a replay of recorded cores can raise this; dispatch derives
+                // its own, so reaching here means the ledger disagrees with the node.
+                Err(AllocError::CpusUnavailable) => {
+                    warn!(job_id, "rejecting launch: allocated cores unavailable");
+                    return Err(Status::resource_exhausted(
+                        "allocated cores unavailable on this node",
+                    ));
+                }
+            };
 
         let gpu_ids = controller_gpu_ids;
         Ok((result, gpu_ids))
@@ -14176,18 +14183,75 @@ mod tests {
         );
     }
 
-    // The monitor loop's reconcile step must reclaim an
-    // allocation whose job is no longer tracked, while sparing a job that is
-    // still in `running`. Exercises the real reconcile_orphaned_allocations
-    // wiring the monitor loop calls, without driving the timed loop.
+    // The monitor loop must flag a claim with no tracked job and not free it.
+    // Exercises the real wiring without driving the timed loop.
     #[tokio::test]
-    async fn reconcile_reclaims_orphan_but_spares_tracked_job() {
+    async fn a_contested_gpu_is_refused_rather_than_taken_from_its_holder() {
+        // The worst form of the inference: it did not merely free a claim it
+        // could not account for, it handed the device to a different job.
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = AgentService::new(
+            test_reporter_with_gpus(&[0]),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(test_gpu_registry())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_runtime_state_dir(state.path());
+
+        // A committed holder of GPU 0 that the agent no longer tracks.
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(1, 1, 1, 0, &[0]).unwrap();
+            alloc.commit_job(1, 1);
+        }
+
+        let spec = JobSpec {
+            gres: vec!["gpu:1".into()],
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        let mut devices = std::collections::HashMap::new();
+        devices.insert(
+            "gpu".to_string(),
+            DeviceAllocations {
+                devices: vec![AllocatedDevice {
+                    device_id: 0,
+                    count: 1,
+                }],
+            },
+        );
+        let allocated = ResourceAllocations {
+            cpus: 1,
+            memory_mb: 0,
+            devices,
+        };
+
+        let refused = svc
+            .allocate_local_for_test(2, &spec, Some(&allocated))
+            .await;
+        assert!(refused.is_err(), "the dispatch must be refused");
+        assert_eq!(
+            svc.free_gpu_count().await,
+            0,
+            "the holder's GPU must still be held"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.conflicting_owners(&[0]),
+            vec![1],
+            "job 1 must still own it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_untracked_claim_is_flagged_and_still_held() {
+        let state = tempfile::tempdir().expect("state dir");
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0, 1]),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
-        );
+        )
+        .with_runtime_state_dir(state.path());
 
         // job 1: tracked (live) and committed.
         svc.insert_test_job(1, TrackedJob::dummy(0)).await;
@@ -14202,17 +14266,60 @@ mod tests {
         }
         assert_eq!(svc.free_gpu_count().await, 0);
 
-        {
-            let jobs = svc.running.lock().await;
-            reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
+        // Both get a record, so the tracked job's untouched hold is a real
+        // assertion rather than a file that was never written.
+        let admissions = svc.admissions();
+        for job_id in [1, 2] {
+            admissions
+                .admit_run(&crate::admission::RunAdmission::new(
+                    job_id,
+                    1,
+                    &svc.reporter.hostname,
+                    crate::admission::AdmittedResources::default(),
+                    crate::admission::now_unix_ms(),
+                ))
+                .expect("admit");
         }
 
-        // Orphan (job 2) reclaimed; live job 1 still holds its GPU.
+        let unbacked = {
+            let jobs = svc.running.lock().await;
+            let alloc = svc.allocation.lock().await;
+            alloc.unbacked_claims(
+                &jobs.keys().copied().collect(),
+                std::time::Instant::now(),
+                LAUNCHING_TTL,
+            )
+        };
+        assert_eq!(unbacked, vec![(2, 1)]);
+        flag_unbacked_allocations(&unbacked, &admissions).await;
+
         assert_eq!(
             svc.free_gpu_count().await,
-            1,
-            "exactly the orphan's GPU must be reclaimed; the tracked job's is spared"
+            0,
+            "a claim with no tracked job must be held, not reclaimed"
         );
+        let flagged = admissions.load_run(2, 1).expect("record");
+        assert!(
+            flagged.conflict_hold.is_some(),
+            "it must be flagged for the controller to resolve"
+        );
+        assert!(
+            admissions
+                .load_run(1, 1)
+                .expect("record")
+                .conflict_hold
+                .is_none(),
+            "the tracked job must not be flagged"
+        );
+
+        // A held claim is never released, so a second pass must not rewrite the
+        // record and bury the reason the first one recorded.
+        flag_unbacked_allocations(&unbacked, &admissions).await;
+        assert_eq!(
+            admissions.load_run(2, 1).expect("record").conflict_hold,
+            flagged.conflict_hold
+        );
+        assert_eq!(svc.free_gpu_count().await, 0);
     }
 
     #[derive(Clone, Default)]
@@ -14288,7 +14395,7 @@ mod tests {
     // A conflicting owner no longer in `running` is stale and must be reclaimed
     // so the dispatch succeeds instead of stranding the node.
     #[tokio::test]
-    async fn dispatch_reclaims_stale_gpu_owner_not_running() {
+    async fn dispatch_is_refused_when_an_untracked_owner_holds_the_gpu() {
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0]),
             HooksConfig::default(),
@@ -14330,9 +14437,10 @@ mod tests {
             .allocate_local_for_test(100, &spec, Some(&allocated))
             .await;
         assert!(
-            res.is_ok(),
-            "dispatch must reclaim the stale owner's GPU and succeed, got {res:?}"
+            res.is_err(),
+            "the agent cannot tell a finished owner from an unobserved one, so it must refuse"
         );
+        assert_eq!(svc.free_gpu_count().await, 0, "the holder keeps its GPU");
     }
 
     // A conflicting owner still in `running` must never be reclaimed (that would
@@ -14454,7 +14562,7 @@ mod tests {
     // A dispatch spanning two GPUs each held by a distinct stale owner must
     // reclaim both and succeed.
     #[tokio::test]
-    async fn dispatch_reclaims_multiple_stale_owners() {
+    async fn dispatch_is_refused_when_several_untracked_owners_hold_the_gpus() {
         let svc = AgentService::new(
             test_reporter_with_gpus(&[0, 1]),
             HooksConfig::default(),
@@ -14479,14 +14587,11 @@ mod tests {
         let res = svc
             .allocate_local_for_test(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
             .await;
-        assert!(
-            res.is_ok(),
-            "both stale owners must be reclaimed, got {res:?}"
-        );
+        assert!(res.is_err(), "neither holder may be displaced");
+        assert_eq!(svc.free_gpu_count().await, 0);
     }
 
-    // A dispatch spanning a stale GPU and a still-running GPU must reject: the
-    // running owner cannot be reclaimed, so the retry still fails.
+    // A dispatch spanning an untracked GPU and a running one must reject.
     #[tokio::test]
     async fn dispatch_rejects_partial_overlap_with_running_owner() {
         let svc = AgentService::new(
@@ -14560,15 +14665,22 @@ mod tests {
             "registered allocation holds the GPU"
         );
 
-        // The job is in `running`, so reconcile must spare it (not orphan-reclaim).
+        // The job is in `running`, so the sweep must not report it at all.
         {
             let jobs = svc.running.lock().await;
-            reconcile_orphaned_allocations(&jobs, &mut *svc.allocation.lock().await);
+            let alloc = svc.allocation.lock().await;
+            assert!(alloc
+                .unbacked_claims(
+                    &jobs.keys().copied().collect(),
+                    std::time::Instant::now(),
+                    LAUNCHING_TTL
+                )
+                .is_empty());
         }
         assert_eq!(
             svc.free_gpu_count().await,
             0,
-            "committed+tracked allocation must survive reconcile"
+            "a committed and tracked allocation must survive the sweep"
         );
     }
 
