@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -1330,23 +1330,17 @@ pub(crate) fn monitor_recovered_stepds(
                         );
                     } else {
                         // Only now may the slice go: the controller has it.
-                        let _ = admissions.record_controller_ack(
+                        let _ = admissions.record_epilog(
                             completion.job_id,
                             completion.run_attempt,
-                            1,
+                            epilog_outcome(completion.epilog_failed),
                         );
-                        let _ = admissions.record_report_acknowledged(
-                            completion.job_id,
-                            completion.run_attempt,
-                            completion.step_id,
-                        );
-                        release_acknowledged_allocation(
+                        settle_acknowledged_completion(
                             &allocation,
                             &admissions,
                             completion.job_id,
                             completion.run_attempt,
                             completion.step_id,
-                            !completion.epilog_failed,
                         )
                         .await;
                         acknowledged.push(key);
@@ -1534,20 +1528,19 @@ async fn fence_dead_stepd(
 
     release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
     if reported {
-        let _ = admissions.record_controller_ack(descriptor.job_id, descriptor.run_attempt, 1);
-        let _ = admissions.record_report_acknowledged(
+        // The supervisor died, so whether its epilog ran is unknowable. Recorded
+        // as such rather than left reading as one that never started.
+        let _ = admissions.record_epilog(
             descriptor.job_id,
             descriptor.run_attempt,
-            descriptor.step_id,
+            crate::admission::HookState::Unknown,
         );
-        let _ = admissions.mark_run_cleaned(descriptor.job_id, descriptor.run_attempt);
-        release_acknowledged_allocation(
+        settle_acknowledged_completion(
             allocation,
             admissions,
             descriptor.job_id,
             descriptor.run_attempt,
             descriptor.step_id,
-            true,
         )
         .await;
     }
@@ -1697,20 +1690,19 @@ async fn handle_completion_notification(
                 "runtime completion",
             )
             .await;
+            // Recorded whatever the controller said: the record must describe
+            // the hook that ran, not the delivery of the report about it.
+            let admissions = context.admissions.clone();
+            let _ = admissions.record_epilog(job_id, run_attempt, epilog_outcome(epilog_failed));
             // The acknowledgement, and only it, unlocks the slice. Without this
             // the exit path holds correctly and nothing ever frees it again.
             if reported {
-                let admissions = context.admissions.clone();
-                let _ = admissions.record_controller_ack(job_id, run_attempt, 1);
-                let _ = admissions.record_report_acknowledged(job_id, run_attempt, step_id);
-                let _ = admissions.mark_run_cleaned(job_id, run_attempt);
-                release_acknowledged_allocation(
+                settle_acknowledged_completion(
                     &context.allocation,
                     &admissions,
                     job_id,
                     run_attempt,
                     step_id,
-                    !epilog_failed,
                 )
                 .await;
             }
@@ -1762,6 +1754,7 @@ pub type SessionIdentity = (u32, u32, spur_core::step::StepId);
 pub async fn replay_unacknowledged_stepd_completions(
     store: &crate::stepd::StepdStore,
     admissions: &crate::admission::AdmissionStore,
+    allocation: &Arc<Mutex<NodeAllocation>>,
     controller_addr: &str,
     reporting_node: &str,
 ) -> anyhow::Result<Vec<SessionIdentity>> {
@@ -1785,13 +1778,21 @@ pub async fn replay_unacknowledged_stepd_completions(
         .settled()
         {
             store.acknowledge_completion(&completion)?;
-            let _ = admissions.record_controller_ack(completion.job_id, completion.run_attempt, 1);
-            let _ = admissions.record_report_acknowledged(
+            let _ = admissions.record_epilog(
+                completion.job_id,
+                completion.run_attempt,
+                epilog_outcome(completion.epilog_failed),
+            );
+            // A late delivery frees the slice here, like every other settled
+            // report: leaving it to a later sweep frees it with nothing said.
+            settle_acknowledged_completion(
+                allocation,
+                admissions,
                 completion.job_id,
                 completion.run_attempt,
                 completion.step_id,
-            );
-            let _ = admissions.mark_run_cleaned(completion.job_id, completion.run_attempt);
+            )
+            .await;
             reconciled.push((
                 completion.job_id,
                 completion.run_attempt,
@@ -1805,6 +1806,7 @@ pub async fn replay_unacknowledged_stepd_completions(
 pub fn retry_unacknowledged_stepd_completions(
     store: crate::stepd::StepdStore,
     admissions: crate::admission::AdmissionStore,
+    allocation: Arc<Mutex<NodeAllocation>>,
     controller_addr: String,
     reporting_node: String,
 ) {
@@ -1814,6 +1816,7 @@ pub fn retry_unacknowledged_stepd_completions(
             match replay_unacknowledged_stepd_completions(
                 &store,
                 &admissions,
+                &allocation,
                 &controller_addr,
                 &reporting_node,
             )
@@ -3350,6 +3353,11 @@ impl AgentService {
         self.stepds.clone()
     }
 
+    /// A handle to this node's ledger of charged slices.
+    pub fn allocation_handle(&self) -> Arc<Mutex<NodeAllocation>> {
+        self.allocation.clone()
+    }
+
     /// The job's own process, asked of its supervisor over the control socket —
     /// live state, so it is not kept in the durable descriptor.
     async fn supervised_state(&self, job_id: u32) -> Option<crate::stepd::StepdSnapshot> {
@@ -3633,7 +3641,20 @@ impl AgentService {
                             cpus: c.cpus,
                             memory_mb: c.memory_mb,
                         };
-                        if let Err(e) = spur_core::hooks::run_hook(epilog_script, &ctx).await {
+                        // Marked before the hook: an agent that dies inside one
+                        // leaves a `Running` that reloads as unknowable.
+                        let _ = admissions.record_epilog(
+                            c.job_id,
+                            c.run_attempt,
+                            crate::admission::HookState::Running,
+                        );
+                        let outcome = spur_core::hooks::run_hook(epilog_script, &ctx).await;
+                        let _ = admissions.record_epilog(
+                            c.job_id,
+                            c.run_attempt,
+                            epilog_outcome(outcome.is_err()),
+                        );
+                        if let Err(e) = outcome {
                             error!(
                                 job_id = c.job_id,
                                 error = %e,
@@ -3693,19 +3714,12 @@ impl AgentService {
                         );
                         continue;
                     }
-                    let _ = admissions.record_controller_ack(c.job_id, c.run_attempt, 1);
-                    let _ = admissions.record_report_acknowledged(
-                        c.job_id,
-                        c.run_attempt,
-                        spur_core::step::STEP_BATCH,
-                    );
-                    release_acknowledged_allocation(
+                    settle_acknowledged_completion(
                         &allocation,
                         &admissions,
                         c.job_id,
                         c.run_attempt,
                         spur_core::step::STEP_BATCH,
-                        true,
                     )
                     .await;
                 }
@@ -3747,6 +3761,10 @@ async fn flag_unbacked_allocations(
                 run_attempt, "holding a claim with no tracked job; it needs reconciliation"
             ),
             Ok(Ok(crate::admission::HoldOutcome::AlreadyHeld)) => {}
+            Ok(Ok(crate::admission::HoldOutcome::AlreadyReleased)) => debug!(
+                job_id,
+                run_attempt, "a claim released since the sweep read it needs no hold"
+            ),
             Ok(Ok(crate::admission::HoldOutcome::NoRecord)) => tracing::debug!(
                 job_id,
                 run_attempt,
@@ -3799,15 +3817,7 @@ async fn settle_cancelled_runs(
             .lifecycle_owner_step
             .or_else(|| admitted.participants.first().map(|p| p.step_id))
             .unwrap_or(spur_core::step::STEP_BATCH);
-        release_acknowledged_allocation(
-            allocation,
-            admissions,
-            job_id,
-            run_attempt,
-            step_id,
-            run.cleanup.epilog != crate::admission::HookState::Failed,
-        )
-        .await;
+        release_acknowledged_allocation(allocation, admissions, job_id, run_attempt, step_id).await;
     }
 }
 
@@ -3835,7 +3845,6 @@ async fn release_due_allocations(
             admitted.run.job_id,
             admitted.run.run_attempt,
             step_id,
-            admitted.run.cleanup.epilog != crate::admission::HookState::Failed,
         )
         .await;
     }
@@ -3884,9 +3893,8 @@ async fn release_acknowledged_allocation(
     job_id: u32,
     run_attempt: u32,
     step_id: spur_core::step::StepId,
-    epilog_complete: bool,
 ) -> bool {
-    match admissions.release_is_due(job_id, run_attempt, step_id, epilog_complete) {
+    match admissions.release_is_due(job_id, run_attempt, step_id) {
         Ok(true) => {
             // Generation-checked: a redispatch may already own this job id.
             let released = allocation.lock().await.release_job_if(job_id, run_attempt);
@@ -3894,6 +3902,13 @@ async fn release_acknowledged_allocation(
                 info!(
                     job_id,
                     run_attempt, "released a run's slice on its acknowledgement"
+                );
+            } else {
+                // The audit reads the line above as the release; without this
+                // one, a slice freed elsewhere is indistinguishable from a leak.
+                debug!(
+                    job_id,
+                    run_attempt, "a run's slice was already free at its acknowledgement"
                 );
             }
             released
@@ -3903,6 +3918,30 @@ async fn release_acknowledged_allocation(
             warn!(job_id, run_attempt, %error, "could not tell whether a release is due; holding");
             false
         }
+    }
+}
+
+/// Settle a run the controller has taken the completion of, and free its slice.
+/// The one path from an acknowledgement to a released core, so none goes unsaid.
+pub(crate) async fn settle_acknowledged_completion(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+    job_id: u32,
+    run_attempt: u32,
+    step_id: spur_core::step::StepId,
+) -> bool {
+    let _ = admissions.record_controller_ack(job_id, run_attempt, 1);
+    let _ = admissions.record_report_acknowledged(job_id, run_attempt, step_id);
+    let _ = admissions.mark_run_cleaned(job_id, run_attempt);
+    release_acknowledged_allocation(allocation, admissions, job_id, run_attempt, step_id).await
+}
+
+/// How a run's epilog ended, as the record spells it.
+pub(crate) fn epilog_outcome(failed: bool) -> crate::admission::HookState {
+    if failed {
+        crate::admission::HookState::Failed
+    } else {
+        crate::admission::HookState::Succeeded
     }
 }
 
@@ -15004,7 +15043,6 @@ mod tests {
                 7,
                 1,
                 spur_core::step::STEP_BATCH,
-                true,
             )
             .await
         );
@@ -15020,7 +15058,6 @@ mod tests {
                 7,
                 1,
                 spur_core::step::STEP_BATCH,
-                true,
             )
             .await
         );
@@ -15077,21 +15114,27 @@ mod tests {
             "an unacknowledged completion must not free anything"
         );
 
-        // The controller returns and the retry loop delivers, settling the record.
-        admissions.record_controller_ack(77, 1, 42).expect("ack");
-        admissions
-            .record_report_acknowledged(77, 1, spur_core::step::STEP_BATCH)
-            .expect("report acknowledged");
-        admissions.mark_run_cleaned(77, 1).expect("cleaned");
-
-        collect_settled_admissions(&svc.allocation, &admissions).await;
-        release_due_allocations(&svc.allocation, &admissions).await;
+        // The controller returns and the retry loop delivers. The slice comes
+        // back here, on the path that settled it, not on some later sweep.
+        assert!(
+            settle_acknowledged_completion(
+                &svc.allocation,
+                &admissions,
+                77,
+                1,
+                spur_core::step::STEP_BATCH,
+            )
+            .await,
+            "the late delivery must free the slice it settled"
+        );
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
             while_held + 2,
-            "the slice must come back whichever of the two runs first"
+            "the slice must come back on the delivery that settled the record"
         );
 
+        // The record-driven safety net finds nothing left to do, and collects.
+        release_due_allocations(&svc.allocation, &admissions).await;
         collect_settled_admissions(&svc.allocation, &admissions).await;
         assert!(
             admissions.load_run(77, 1).is_err(),

@@ -66,6 +66,12 @@ impl HookState {
             other => other,
         }
     }
+
+    /// Whether the hook may still be touching the run's resources. Holding for a
+    /// failed or unknowable one strands the slice: nothing ever re-runs a hook.
+    pub fn is_in_flight(self) -> bool {
+        self == Self::Running
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +107,8 @@ pub enum HoldOutcome {
     Taken,
     AlreadyHeld,
     NoRecord,
+    /// The run's slice is already released, so there is nothing left to preserve.
+    AlreadyReleased,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -837,6 +845,11 @@ impl AdmissionStore {
             }
             Err(error) => return Err(error),
         };
+        // A release landing after the caller read its snapshot would otherwise
+        // leave a record claiming to hold a core it has already given back.
+        if run.controller_ack.release_raft_index.is_some() {
+            return Ok(HoldOutcome::AlreadyReleased);
+        }
         if run.conflict_hold.is_some() {
             return Ok(HoldOutcome::AlreadyHeld);
         }
@@ -897,14 +910,13 @@ impl AdmissionStore {
             .map(|run| run.reject_before_unix_ms)
     }
 
-    /// Whether this run's allocation may now be released: the owner step only,
-    /// its completion acknowledged, and its epilog actually finished.
+    /// Whether this run's allocation may now be released: the owner step only, its
+    /// completion acknowledged, and, per the record, no epilog still in flight.
     pub fn release_is_due(
         &self,
         job_id: u32,
         run_attempt: u32,
         step_id: StepId,
-        epilog_complete: bool,
     ) -> io::Result<bool> {
         let run = match self.load_run(job_id, run_attempt) {
             Ok(run) => run,
@@ -919,10 +931,31 @@ impl AdmissionStore {
         {
             return Ok(false);
         }
-        if !epilog_complete {
+        if run.cleanup.epilog.is_in_flight() {
             return Ok(false);
         }
         Ok(run.controller_ack.release_raft_index.is_some())
+    }
+
+    /// Record how this run's epilog is going. The gate reads this, so a hook
+    /// whose outcome never lands here is a gate that cannot bite.
+    pub fn record_epilog(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        state: HookState,
+    ) -> io::Result<bool> {
+        let mut run = match self.load_run(job_id, run_attempt) {
+            Ok(run) => run,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if run.cleanup.epilog == state {
+            return Ok(true);
+        }
+        run.cleanup.epilog = state;
+        self.admit_run(&run)?;
+        Ok(true)
     }
 
     /// Record that the controller has committed this run's completion. The
@@ -1797,6 +1830,24 @@ mod tests {
     }
 
     #[test]
+    fn a_released_run_takes_no_conflict_hold() {
+        // The unbacked set is a snapshot, so a release can land between reading
+        // it and acting on it. The record must not then claim to hold a free core.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.record_controller_ack(7, 1, 9).unwrap();
+
+        assert_eq!(
+            store
+                .take_conflict_hold(7, 1, "held with no tracked job")
+                .unwrap(),
+            HoldOutcome::AlreadyReleased
+        );
+        assert!(store.load_run(7, 1).unwrap().conflict_hold.is_none());
+    }
+
+    #[test]
     fn a_relaunch_cannot_drop_a_conflict_hold() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
@@ -1852,11 +1903,11 @@ mod tests {
         store.admit_run(&run).unwrap();
 
         assert!(
-            !store.release_is_due(7, 1, STEP_BATCH, true).unwrap(),
+            !store.release_is_due(7, 1, STEP_BATCH).unwrap(),
             "an exit is not a completion"
         );
         store.record_controller_ack(7, 1, 42).unwrap();
-        assert!(store.release_is_due(7, 1, STEP_BATCH, true).unwrap());
+        assert!(store.release_is_due(7, 1, STEP_BATCH).unwrap());
     }
 
     #[test]
@@ -1870,14 +1921,14 @@ mod tests {
         store.admit_run(&run).unwrap();
         store.record_controller_ack(7, 1, 42).unwrap();
 
-        assert!(!store.release_is_due(7, 1, 3, true).unwrap());
-        assert!(store.release_is_due(7, 1, STEP_BATCH, true).unwrap());
+        assert!(!store.release_is_due(7, 1, 3).unwrap());
+        assert!(store.release_is_due(7, 1, STEP_BATCH).unwrap());
     }
 
     #[test]
-    fn an_unfinished_epilog_holds_the_slice() {
-        // The obligation ordering is a pruning gate, not a release gate, so the
-        // epilog has to be checked rather than assumed.
+    fn an_epilog_still_running_holds_the_slice() {
+        // The gate reads the record, so an outcome that never reaches it is a
+        // gate that never bites -- which is how a live hook lost its guard.
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         let mut run = run_with(7, 1, 1);
@@ -1885,14 +1936,57 @@ mod tests {
         store.admit_run(&run).unwrap();
         store.record_controller_ack(7, 1, 42).unwrap();
 
-        assert!(!store.release_is_due(7, 1, STEP_BATCH, false).unwrap());
-        assert!(store.release_is_due(7, 1, STEP_BATCH, true).unwrap());
+        store.record_epilog(7, 1, HookState::Running).unwrap();
+        assert!(!store.release_is_due(7, 1, STEP_BATCH).unwrap());
+        store.record_epilog(7, 1, HookState::Succeeded).unwrap();
+        assert!(store.release_is_due(7, 1, STEP_BATCH).unwrap());
+    }
+
+    #[test]
+    fn a_settled_epilog_never_holds_the_slice_forever() {
+        // Nothing ever re-runs a hook, so holding on either of these would be a
+        // slice with no path back. A failed epilog drains the node instead.
+        for settled in [HookState::Failed, HookState::Unknown, HookState::NotStarted] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(&dir);
+            let mut run = run_with(7, 1, 1);
+            run.lifecycle_owner_step = Some(STEP_BATCH);
+            store.admit_run(&run).unwrap();
+            store.record_controller_ack(7, 1, 42).unwrap();
+            store.record_epilog(7, 1, settled).unwrap();
+
+            assert!(
+                store.release_is_due(7, 1, STEP_BATCH).unwrap(),
+                "{settled:?} left the slice held"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recorded_epilog_outcome_survives_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+
+        store.record_epilog(7, 1, HookState::Failed).unwrap();
+        store.mark_run_cleaned(7, 1).unwrap();
+
+        assert_eq!(
+            store.load_run(7, 1).unwrap().cleanup.epilog,
+            HookState::Failed
+        );
+    }
+
+    #[test]
+    fn an_epilog_outcome_for_an_unknown_run_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!store(&dir).record_epilog(9, 9, HookState::Failed).unwrap());
     }
 
     #[test]
     fn a_run_with_no_record_releases_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!store(&dir).release_is_due(9, 9, STEP_BATCH, true).unwrap());
+        assert!(!store(&dir).release_is_due(9, 9, STEP_BATCH).unwrap());
     }
 
     #[test]

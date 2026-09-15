@@ -571,31 +571,6 @@ async fn main() -> anyhow::Result<()> {
         .into_iter()
         .map(session_identity)
         .collect();
-    let reconciled_stepd_completions: std::collections::HashSet<_> =
-        agent_server::replay_unacknowledged_stepd_completions(
-            &stepds,
-            &spurd::admission::AdmissionStore::new(&stepd_state_dir, &hostname),
-            &args.controller,
-            &hostname,
-        )
-        .await?
-        .into_iter()
-        .collect();
-    // Runs for the daemon's life, not just when this scan found something —
-    // a push notification deferred later needs the same reconciliation.
-    agent_server::retry_unacknowledged_stepd_completions(
-        stepds.clone(),
-        spurd::admission::AdmissionStore::new(&stepd_state_dir, &hostname),
-        args.controller.clone(),
-        hostname.clone(),
-    );
-    // Housekeeping, and the periodic sweeper retries it; failing to read the
-    // runtime root is not a reason to refuse to start.
-    match stepds.prune_finalized() {
-        Ok(pruned) if pruned > 0 => info!(sessions = pruned, "pruned finalized stepd state"),
-        Ok(_) => {}
-        Err(error) => warn!(%error, "failed to prune finalized stepd state"),
-    }
 
     // Start agent gRPC server (receives job launches + cluster-component RPCs from spurctld).
     // Pass the [cluster] config so the K0sAgent uses the operator's k0s version + install path.
@@ -664,6 +639,35 @@ async fn main() -> anyhow::Result<()> {
                 "this run cannot be resolved from local evidence"
             );
         }
+    }
+    // After the ledger rebuild above: a completion delivered late frees the
+    // slice it settles, and there is nothing to free until the claims are back.
+    let reconciled_stepd_completions: std::collections::HashSet<_> =
+        agent_server::replay_unacknowledged_stepd_completions(
+            &stepds,
+            &spurd::admission::AdmissionStore::new(&stepd_state_dir, &hostname),
+            &agent_service.allocation_handle(),
+            &args.controller,
+            &hostname,
+        )
+        .await?
+        .into_iter()
+        .collect();
+    // Runs for the daemon's life, not just when this scan found something —
+    // a push notification deferred later needs the same reconciliation.
+    agent_server::retry_unacknowledged_stepd_completions(
+        stepds.clone(),
+        spurd::admission::AdmissionStore::new(&stepd_state_dir, &hostname),
+        agent_service.allocation_handle(),
+        args.controller.clone(),
+        hostname.clone(),
+    );
+    // Housekeeping, and the periodic sweeper retries it; failing to read the
+    // runtime root is not a reason to refuse to start.
+    match stepds.prune_finalized() {
+        Ok(pruned) if pruned > 0 => info!(sessions = pruned, "pruned finalized stepd state"),
+        Ok(_) => {}
+        Err(error) => warn!(%error, "failed to prune finalized stepd state"),
     }
     // After the replay above, so an exit it has already reported is still on
     // disk to be read here, and before the server accepts its first re-attach.
