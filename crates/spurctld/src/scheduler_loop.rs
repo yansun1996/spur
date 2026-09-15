@@ -1209,6 +1209,18 @@ enum DispatchError {
     /// The agent explicitly rejected the launch for a reason it does not have
     /// a `LaunchFailureKind` for yet.
     AgentRejected(String),
+    /// The node refuses this attempt because the controller already stopped it.
+    /// Retrying the same attempt cannot succeed; the controller's view is stale.
+    Fenced(String),
+    /// The launch aged out in flight. The controller's own latency, so a fresh
+    /// dispatch is the whole fix.
+    Expired(String),
+    /// Same identity, different command. Something is wrong on one side or the
+    /// other; retrying blindly would run the wrong thing.
+    ConflictingDigest(String),
+    /// The node holds something the controller cannot account for. Retrying
+    /// here is pointless until the two have been reconciled.
+    NeedsReconcile(String),
     Other(anyhow::Error),
 }
 
@@ -1222,6 +1234,10 @@ impl DispatchError {
             Self::Unreachable(_) => "agent unreachable",
             Self::TimedOut(_) => "agent timed out",
             Self::AgentRejected(_) => "agent rejected launch",
+            Self::Fenced(_) => "run already stopped",
+            Self::Expired(_) => "launch expired in flight",
+            Self::ConflictingDigest(_) => "conflicting command for one identity",
+            Self::NeedsReconcile(_) => "node holds unaccounted resources",
             Self::Other(_) => "dispatch error",
         }
     }
@@ -1239,6 +1255,10 @@ impl std::fmt::Display for DispatchError {
                 write!(f, "agent did not answer within {}s", limit.as_secs())
             }
             Self::AgentRejected(reason) => write!(f, "agent rejected job: {reason}"),
+            Self::Fenced(reason)
+            | Self::Expired(reason)
+            | Self::ConflictingDigest(reason)
+            | Self::NeedsReconcile(reason) => write!(f, "agent refused job: {reason}"),
             Self::Other(e) => write!(f, "{e:#}"),
         }
     }
@@ -1428,15 +1448,25 @@ async fn dispatch_to_agent(
     if !inner.success {
         // An agent predating the classification sends UNSPECIFIED, which falls
         // through to the generic requeue this has always done.
-        return Err(
-            if inner.failure_kind
-                == spur_proto::proto::LaunchFailureKind::LaunchFailureProlog as i32
-            {
-                DispatchError::PrologFailed(inner.error)
-            } else {
+        use spur_proto::proto::LaunchFailureKind as Kind;
+        // A named reason lets the controller act in this round trip. An older
+        // agent sends UNSPECIFIED and falls through to the generic requeue.
+        return Err(match Kind::try_from(inner.failure_kind) {
+            Ok(Kind::LaunchFailureProlog) => DispatchError::PrologFailed(inner.error),
+            Ok(Kind::LaunchFailureFenced) => DispatchError::Fenced(inner.error),
+            Ok(Kind::LaunchFailureExpired) => DispatchError::Expired(inner.error),
+            Ok(Kind::LaunchFailureConflictingDigest) => {
+                DispatchError::ConflictingDigest(inner.error)
+            }
+            // Runtime state with no record behind it, or a claim the controller
+            // does not know about: both need a full look at the node.
+            Ok(Kind::LaunchFailureLocalOverlap | Kind::LaunchFailureResidualState) => {
+                DispatchError::NeedsReconcile(inner.error)
+            }
+            Ok(Kind::LaunchFailureTargetMismatch) | Ok(Kind::LaunchFailureUnspecified) | Err(_) => {
                 DispatchError::AgentRejected(inner.error)
-            },
-        );
+            }
+        });
     }
     info!(
         job_id = params.job_id,
@@ -1981,7 +2011,23 @@ async fn confirm_dispatch_on_nodes(
                     // Held for the deadline it actually burned: while assignments are processed
                     // serially, re-picking this node stalls every job behind it, not just this one.
                     DispatchError::TimedOut(limit) => cluster.cool_down_node_for(&node_name, limit),
-                    DispatchError::AgentRejected(_) | DispatchError::Other(_) => {}
+                    // The node holds something Raft cannot explain: look before
+                    // sending it anything else.
+                    DispatchError::NeedsReconcile(_) => {
+                        cluster.cool_down_node(&node_name);
+                        let cluster = cluster.clone();
+                        let node = node_name.clone();
+                        tokio::spawn(async move {
+                            pull_node_ledger(&cluster, &node, "dispatch refused").await;
+                        });
+                    }
+                    // Retrying this attempt cannot succeed, and a fresh dispatch
+                    // costs nothing; neither says anything about the node.
+                    DispatchError::Fenced(_)
+                    | DispatchError::Expired(_)
+                    | DispatchError::ConflictingDigest(_)
+                    | DispatchError::AgentRejected(_)
+                    | DispatchError::Other(_) => {}
                 }
             }
             Err(e) => {
@@ -2845,6 +2891,23 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn every_refusal_maps_to_one_controller_action() {
+        // Each kind exists because the controller does something different with
+        // it; two collapsing into one silently loses that distinction.
+        let categories: Vec<&str> = vec![
+            DispatchError::PrologFailed(String::new()).category(),
+            DispatchError::Fenced(String::new()).category(),
+            DispatchError::Expired(String::new()).category(),
+            DispatchError::ConflictingDigest(String::new()).category(),
+            DispatchError::NeedsReconcile(String::new()).category(),
+            DispatchError::ResourcesUnavailable.category(),
+            DispatchError::AgentRejected(String::new()).category(),
+        ];
+        let unique: std::collections::HashSet<&str> = categories.iter().copied().collect();
+        assert_eq!(unique.len(), categories.len(), "got: {categories:?}");
+    }
+
+    #[test]
     fn leadership_edge_fires_once_per_term() {
         let mut was_leader = false;
         assert!(!entering_leadership(&mut was_leader, false));
@@ -3486,6 +3549,7 @@ mod tests {
                 }
                 if let Some(kind) = self.reject_launch_as {
                     return Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
+                        conflict: None,
                         success: false,
                         error: "prolog failed: prolog_slurmd script exited with exit status: 1"
                             .into(),
@@ -3501,6 +3565,7 @@ mod tests {
                 }
                 let path = format!("/spool/off{}/spur.out", req.task_offset);
                 Ok(tonic::Response::new(spur_proto::proto::LaunchJobResponse {
+                    conflict: None,
                     success: true,
                     error: String::new(),
                     stdout_path: path.clone(),

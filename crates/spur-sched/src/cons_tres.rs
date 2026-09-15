@@ -700,6 +700,29 @@ mod tests {
     }
 
     #[test]
+    fn a_runs_own_steps_never_conflict_with_each_other() {
+        // The claim points at the run, not at one step, so a run's steps share
+        // its devices. A conflict here would cancel an entitled job.
+        let mut node = make_node_with_ids(8, 64_000, vec![0, 1], "mi300x");
+        node.allocate_for_job(7, 1, 2, 1_000, &[0]).unwrap();
+        node.commit_job(7, 1);
+
+        assert_eq!(
+            node.conflicting_owners(&[0]),
+            vec![7],
+            "the run itself holds it"
+        );
+        // Re-allocating for the same run succeeds rather than conflicting.
+        assert!(node.allocate_for_job(7, 1, 2, 1_000, &[0]).is_ok());
+        // A different job is a genuine conflict.
+        node.commit_job(7, 1);
+        assert_eq!(
+            node.allocate_for_job(8, 1, 2, 1_000, &[0]),
+            Err(AllocError::GpusUnavailable)
+        );
+    }
+
+    #[test]
     fn allocate_refuses_a_cpu_shortfall_instead_of_under_serving() {
         // It used to fill what it could and return Ok with a short list, which
         // both callers read as a full allocation.

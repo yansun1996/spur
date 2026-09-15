@@ -3673,6 +3673,17 @@ async fn flag_unbacked_allocations(
     }
 }
 
+/// A refusal the controller can resolve: it names the job already holding the
+/// resources, so it can decide which of the two is stale.
+fn overlap_status(holder: Option<u32>) -> Status {
+    match holder {
+        Some(job_id) => Status::resource_exhausted(format!(
+            "allocated resources are held on this node by job {job_id}"
+        )),
+        None => Status::resource_exhausted("allocated resources unavailable on this node"),
+    }
+}
+
 /// Free a run's slice, now that the controller has committed its completion.
 /// This is the only path that frees one: an exit alone never does.
 async fn release_acknowledged_allocation(
@@ -4564,9 +4575,24 @@ impl SlurmAgent for AgentService {
                 ?refusal,
                 "refusing a launch"
             );
-            return Err(Status::failed_precondition(format!(
-                "launch for job {job_id} refused: {refusal:?}"
-            )));
+            return Ok(Response::new(LaunchJobResponse {
+                conflict: None,
+                success: false,
+                error: format!("launch refused: {refusal:?}"),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                failure_kind: match refusal {
+                    crate::admission::LaunchRefusal::Fenced => {
+                        LaunchFailureKind::LaunchFailureFenced as i32
+                    }
+                    crate::admission::LaunchRefusal::Expired => {
+                        LaunchFailureKind::LaunchFailureExpired as i32
+                    }
+                    crate::admission::LaunchRefusal::ConflictingDigest => {
+                        LaunchFailureKind::LaunchFailureConflictingDigest as i32
+                    }
+                },
+            }));
         }
 
         let peer_nodes = req.peer_nodes;
@@ -4637,6 +4663,7 @@ impl SlurmAgent for AgentService {
                     "stepd already tracked for this attempt; treating retried launch as success"
                 );
                 return Ok(Response::new(LaunchJobResponse {
+                    conflict: None,
                     success: true,
                     error: String::new(),
                     stdout_path: paths.0,
@@ -5024,6 +5051,7 @@ impl SlurmAgent for AgentService {
                 let err_msg = format!("prolog failed: {e:#}");
                 error!(job_id, error = %err_msg, "prolog hook failed before launch");
                 return Ok(Response::new(LaunchJobResponse {
+                    conflict: None,
                     success: false,
                     error: err_msg,
                     stdout_path: String::new(),
@@ -5187,6 +5215,7 @@ impl SlurmAgent for AgentService {
                         let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                         tokio::spawn(reap_killed_job(result.job));
                         return Ok(Response::new(LaunchJobResponse {
+                            conflict: None,
                             success: false,
                             error: "stepd superseded by a newer attempt".into(),
                             stdout_path: String::new(),
@@ -5248,6 +5277,7 @@ impl SlurmAgent for AgentService {
                         }
                     });
                     return Ok(Response::new(LaunchJobResponse {
+                        conflict: None,
                         success: false,
                         error: "reservation reclaimed during launch".into(),
                         stdout_path: String::new(),
@@ -5308,6 +5338,7 @@ impl SlurmAgent for AgentService {
                     }
                 }
                 Ok(Response::new(LaunchJobResponse {
+                    conflict: None,
                     success: true,
                     error: String::new(),
                     stdout_path,
@@ -5336,6 +5367,7 @@ impl SlurmAgent for AgentService {
                 }
 
                 Ok(Response::new(LaunchJobResponse {
+                    conflict: None,
                     success: false,
                     error: err_msg,
                     stdout_path: String::new(),
@@ -7605,8 +7637,13 @@ impl AgentService {
                         already_allocated = ?alloc.allocated_gpu_ids(),
                         "refusing dispatch: the allocated GPUs are held on this node"
                     );
-                    return Err(Status::resource_exhausted(
-                        "controller-allocated GPUs unavailable on this node",
+                    // Named so the controller can look the holder up rather than
+                    // guess which of the two is stale.
+                    return Err(overlap_status(
+                        alloc
+                            .conflicting_owners(&controller_gpu_ids)
+                            .first()
+                            .copied(),
                     ));
                 }
                 Err(AllocError::DuplicateJob) => {
@@ -14413,6 +14450,18 @@ mod tests {
 
     // The monitor loop must flag a claim with no tracked job and not free it.
     // Exercises the real wiring without driving the timed loop.
+    #[test]
+    fn an_overlap_refusal_names_the_job_holding_the_resources() {
+        // Without the id the controller cannot tell which of the two is stale,
+        // and its only option is to guess or give up.
+        let named = overlap_status(Some(42));
+        assert!(named.message().contains("42"), "got: {}", named.message());
+        assert_eq!(named.code(), tonic::Code::ResourceExhausted);
+
+        let anonymous = overlap_status(None);
+        assert_eq!(anonymous.code(), tonic::Code::ResourceExhausted);
+    }
+
     #[test]
     fn the_completion_retry_is_capped_but_never_gives_up() {
         // Unbounded in attempts, bounded in rate: a long outage must not become
