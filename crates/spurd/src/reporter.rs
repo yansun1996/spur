@@ -50,6 +50,12 @@ pub struct NodeReporter {
     held_jobs: Arc<dyn HeldJobs>,
     /// k0s node status the heartbeat carries; wired once after the K0sAgent is built.
     k0s_status: std::sync::OnceLock<Arc<crate::cluster::K0sNodeState>>,
+    /// The entitlement ledger, wired once the state root is known. Without one
+    /// the agent registers with no ledger, which asserts nothing.
+    admissions: std::sync::OnceLock<crate::admission::AdmissionStore>,
+    /// Identifies this agent process, so a cut from a session that ended before
+    /// the controller read it is discarded rather than applied as current.
+    agent_session_id: String,
 }
 
 impl NodeReporter {
@@ -77,6 +83,8 @@ impl NodeReporter {
             node_token: RwLock::new(String::new()),
             held_jobs,
             k0s_status: std::sync::OnceLock::new(),
+            admissions: std::sync::OnceLock::new(),
+            agent_session_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -90,6 +98,33 @@ impl NodeReporter {
     /// Read live from the interface so a key that appears or changes after startup is picked up.
     fn wg_pubkey(&self) -> String {
         spur_net::wireguard::interface_public_key(&self.wg_iface).unwrap_or_default()
+    }
+
+    /// Wire the ledger once the state root is resolved. Registration before this
+    /// sends no ledger, which the controller reads as no evidence.
+    pub fn set_admissions(&self, admissions: crate::admission::AdmissionStore) {
+        let _ = self.admissions.set(admissions);
+    }
+
+    fn ledger_cut(&self) -> Option<spur_proto::proto::NodeLedger> {
+        let cut = self.admissions.get()?.ledger_cut(&self.agent_session_id);
+        Some(spur_proto::proto::NodeLedger {
+            agent_session_id: cut.agent_session_id,
+            inventory_complete: cut.inventory_complete,
+            entries: cut
+                .entries
+                .into_iter()
+                .map(|entry| spur_proto::proto::LedgerEntry {
+                    job_id: entry.job_id,
+                    run_attempt: entry.run_attempt,
+                    cpu_ids: entry.allocation.cpu_ids,
+                    memory_mb: entry.allocation.memory_mb,
+                    gpu_devices: entry.allocation.gpu_devices,
+                    disposition: entry.disposition,
+                    conflict_hold: entry.conflict_hold,
+                })
+                .collect(),
+        })
     }
 
     /// Job ids this heartbeat would report, from the shared running map.
@@ -117,6 +152,7 @@ impl NodeReporter {
                 wg_pubkey: self.wg_pubkey(),
                 labels,
                 join_token: self.join_token.clone(),
+                ledger: self.ledger_cut(),
             })
             .await
             .context("registration failed")?;

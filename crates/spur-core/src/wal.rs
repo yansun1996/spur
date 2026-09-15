@@ -225,6 +225,12 @@ pub enum WalOperation {
         #[serde(default)]
         source: NodeSource,
     },
+    /// Hold a node out of scheduling until its asserted state has been diffed
+    /// against Raft, or release it. An old log has no such entries.
+    NodeReconcilePending {
+        name: String,
+        pending: bool,
+    },
     NodeStateChange {
         name: String,
         old_state: NodeState,

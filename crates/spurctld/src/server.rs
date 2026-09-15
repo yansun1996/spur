@@ -279,6 +279,29 @@ pub(crate) fn resolve_startup_jwt_key(
     Ok("spur-default-key".to_string())
 }
 
+/// How long a node may stay gated for one reconcile. A node held past this is
+/// worse than one reconciled imperfectly: it is silently out of the cluster.
+const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Releases a node's reconcile gate however the reconcile ends, including a
+/// panic: a gate that only clears on success removes the node permanently.
+struct ReconcileGate {
+    cluster: Arc<ClusterManager>,
+    node: String,
+}
+
+impl ReconcileGate {
+    fn new(cluster: Arc<ClusterManager>, node: String) -> Self {
+        Self { cluster, node }
+    }
+}
+
+impl Drop for ReconcileGate {
+    fn drop(&mut self) {
+        self.cluster.set_reconcile_pending(&self.node, false);
+    }
+}
+
 impl ControllerService {
     // tonic::Status is 176 bytes (over clippy's 128-byte threshold); fixed upstream in tonic 0.13+
     #[allow(clippy::result_large_err)]
@@ -826,7 +849,88 @@ impl ControllerService {
     fn caller_is_privileged(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
         identity.is_none() || self.caller_is_admin(identity)
     }
+}
 
+/// Diff an agent's asserted ledger against Raft and resolve the differences.
+/// The node stays out of scheduling until this returns.
+async fn reconcile_node_ledger(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    ledger: spur_proto::proto::NodeLedger,
+) {
+    let held: std::collections::HashMap<u32, &spur_proto::proto::LedgerEntry> =
+        ledger.entries.iter().map(|e| (e.job_id, e)).collect();
+    let recorded = cluster.jobs_allocated_on_node(node);
+
+    // Direction A: the agent holds a slice Raft does not record.
+    for entry in &ledger.entries {
+        if recorded.contains_key(&entry.job_id) {
+            continue;
+        }
+        warn!(
+            node = %node,
+            job_id = entry.job_id,
+            run_attempt = entry.run_attempt,
+            "agent holds a claim the controller has no record of; cancelling it"
+        );
+        crate::scheduler_loop::cancel_job_on_nodes(
+            cluster,
+            entry.job_id,
+            entry.run_attempt,
+            std::slice::from_ref(&node.to_string()),
+            9,
+        )
+        .await;
+    }
+
+    // Direction B: Raft records a job here the agent did not report. Only an
+    // asserted-complete ledger licenses acting on an absence.
+    for (job_id, run_attempt) in recorded {
+        if held.contains_key(&job_id) {
+            continue;
+        }
+        if !ledger.inventory_complete {
+            warn!(
+                node = %node,
+                job_id,
+                "agent could not enumerate its state; leaving this job's record alone"
+            );
+            continue;
+        }
+        warn!(
+            node = %node,
+            job_id, run_attempt, "node no longer holds a job the controller placed on it"
+        );
+        match cluster.node_complete(job_id, node, -1, 0, run_attempt) {
+            Ok(
+                crate::cluster::NodeCompleteResult::AlreadyTerminal
+                | crate::cluster::NodeCompleteResult::StaleReport,
+            ) => warn!(
+                node = %node,
+                job_id, "the report was not applied; this job stays recorded on the node"
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                warn!(node = %node, job_id, ?error, "could not settle a job the node no longer holds")
+            }
+        }
+    }
+
+    // Direction C: both agree the job exists but the slices differ. Correcting
+    // means rewriting the record the controller derives its totals from.
+    for entry in &ledger.entries {
+        if entry.conflict_hold {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                disposition = %entry.disposition,
+                "agent is holding evidence it cannot resolve on its own"
+            );
+        }
+    }
+}
+
+impl ControllerService {
     /// Stricter form of [`Self::require_admin`] for reservations: the admin bar, or the
     /// root-or-`sudo`/`wheel` rule the CLI states, resolved from the caller's name on this host.
     /// `require_admin` alone would be inert under the default `permissive` mode, since it waves an
@@ -2103,6 +2207,13 @@ impl SlurmController for ControllerService {
 
         let node_token_response = self.validate_admission(&req.join_token, &req.hostname)?;
 
+        // Unconditional, and before the node becomes available: the Skip path
+        // an agent restart takes proposes nothing to hang this off.
+        let ledger = req.ledger.clone();
+        if ledger.is_some() {
+            self.cluster.set_reconcile_pending(&req.hostname, true);
+        }
+
         let source = spur_core::node::node_source_from_registration(&req.version, &req.labels);
         self.cluster
             .register_node(
@@ -2119,6 +2230,26 @@ impl SlurmController for ControllerService {
                 caller_privileged,
             )
             .map_err(register_node_rpc_status)?;
+
+        if let Some(ledger) = ledger {
+            let node = req.hostname.clone();
+            let cluster = self.cluster.clone();
+            let cluster_for_reconcile = self.cluster.clone();
+            // On its own task: tonic drops a handler future when the client
+            // disconnects, and a gate left set removes the node for good.
+            tokio::spawn(async move {
+                let _gate = ReconcileGate::new(cluster, node.clone());
+                if tokio::time::timeout(
+                    RECONCILE_BUDGET,
+                    reconcile_node_ledger(&cluster_for_reconcile, &node, ledger),
+                )
+                .await
+                .is_err()
+                {
+                    warn!(node = %node, "reconcile did not finish within its budget");
+                }
+            });
+        }
 
         Ok(Response::new(RegisterAgentResponse {
             accepted: true,
@@ -5081,7 +5212,13 @@ fn node_to_proto(node: &spur_core::node::Node) -> NodeInfo {
     NodeInfo {
         name: node.name.clone(),
         state: node.state.to_proto_i32(),
-        state_reason: node.state_reason.clone().unwrap_or_default(),
+        // A gated node is idle but refuses work; without a reason an operator
+        // sees only a node that will not take jobs.
+        state_reason: match (&node.state_reason, node.reconcile_pending) {
+            (Some(reason), _) => reason.clone(),
+            (None, true) => "reconciling with the controller".into(),
+            (None, false) => String::new(),
+        },
         partitions: node.partitions.clone(),
         total_resources: Some(resource_to_proto(&node.total_resources)),
         alloc_resources: Some(allocations_to_proto(&node.alloc_resources)),
@@ -6589,6 +6726,137 @@ mod tests {
              [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n",
         )
         .unwrap()
+    }
+
+    /// A node holding one running job, as Raft records it.
+    async fn service_with_a_job_on_a_node(
+        dir: &tempfile::TempDir,
+    ) -> (ControllerService, Arc<ClusterManager>) {
+        let svc = test_service(dir).await;
+        let cluster = svc.cluster.clone();
+        cluster.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: spur_core::resource::ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: std::collections::HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            job_id: 7,
+            spec: Box::new(spur_core::job::JobSpec {
+                name: "j".into(),
+                user: "testuser".into(),
+                num_nodes: 1,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                work_dir: "/tmp".into(),
+                ..Default::default()
+            }),
+        });
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobStateChange {
+            job_id: 7,
+            old_state: spur_core::job::JobState::Pending,
+            new_state: spur_core::job::JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        let slice = spur_core::resource::ResourceAllocations::with_scalar(2, 1000);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobStart {
+            job_id: 7,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: [("n1".to_string(), slice)].into_iter().collect(),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+        });
+        (svc, cluster)
+    }
+
+    fn ledger(complete: bool, entries: Vec<(u32, u32)>) -> spur_proto::proto::NodeLedger {
+        spur_proto::proto::NodeLedger {
+            agent_session_id: "session-a".into(),
+            inventory_complete: complete,
+            entries: entries
+                .into_iter()
+                .map(|(job_id, run_attempt)| spur_proto::proto::LedgerEntry {
+                    job_id,
+                    run_attempt,
+                    cpu_ids: vec![0, 1],
+                    memory_mb: 1000,
+                    gpu_devices: Vec::new(),
+                    disposition: String::new(),
+                    conflict_hold: false,
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incomplete_ledger_never_removes_a_job_the_controller_placed() {
+        // Inverting this frees live allocations across the cluster whenever an
+        // agent cannot read its own spool.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(cluster.jobs_allocated_on_node("n1").contains_key(&7));
+
+        reconcile_node_ledger(&cluster, "n1", ledger(false, Vec::new())).await;
+
+        assert!(
+            cluster.jobs_allocated_on_node("n1").contains_key(&7),
+            "an absence in a partial ledger proves nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_complete_ledger_settles_a_job_the_node_no_longer_holds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        reconcile_node_ledger(&cluster, "n1", ledger(true, Vec::new())).await;
+
+        assert!(
+            !cluster.jobs_allocated_on_node("n1").contains_key(&7),
+            "a complete ledger that omits it is evidence the node let it go"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ledger_that_reports_the_job_leaves_it_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        reconcile_node_ledger(&cluster, "n1", ledger(true, vec![(7, 1)])).await;
+
+        assert!(cluster.jobs_allocated_on_node("n1").contains_key(&7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gated_node_says_why_it_is_refusing_work() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        cluster.set_reconcile_pending("n1", true);
+        for _ in 0..200 {
+            if cluster.get_node("n1").unwrap().reconcile_pending {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let info = node_to_proto(&cluster.get_node("n1").unwrap());
+        assert!(
+            !info.state_reason.is_empty(),
+            "an idle node that silently refuses work is the outcome this rules out"
+        );
     }
 
     async fn test_service(dir: &tempfile::TempDir) -> ControllerService {

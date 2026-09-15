@@ -95,6 +95,7 @@ mod tests {
 
     fn make_req(hostname: &str) -> RegisterAgentRequest {
         RegisterAgentRequest {
+            ledger: None,
             hostname: hostname.into(),
             resources: None,
             version: "test".into(),

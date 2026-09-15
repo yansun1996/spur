@@ -859,6 +859,34 @@ message RegisterAgentRequest {
   string wg_pubkey = 6;      // WireGuard public key (for mesh setup)
   map<string, string> labels = 7;  // Node labels for partition routing (pool, rack, etc.)
   string join_token = 8;     // Admission token for token-based admission
+  // One immutable cut of this agent's ledger, taken at registration. Absent
+  // from an agent that predates it, which asserts no evidence and is not gated.
+  optional NodeLedger ledger = 9;
+}
+
+// What an agent believes it is entitled to. Absence and emptiness differ: only
+// a complete ledger licenses acting on what is missing from it.
+message NodeLedger {
+  // Identifies the agent process. A cut from a session that ended before the
+  // controller read it is discarded rather than applied as current.
+  string agent_session_id = 1;
+  // False when the agent could not enumerate its own state. The controller may
+  // then add claims it did not know about, but must never remove any.
+  bool inventory_complete = 2;
+  repeated LedgerEntry entries = 3;
+}
+
+message LedgerEntry {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+  repeated uint32 cpu_ids = 3;
+  uint64 memory_mb = 4;
+  repeated uint32 gpu_devices = 5;
+  // What the agent's local evidence says about this run, so the controller can
+  // tell "still running" from "finished, unreported" from "cannot tell".
+  string disposition = 6;
+  // The agent is preserving this run's evidence and cannot resolve it alone.
+  bool conflict_hold = 7;
 }
 
 message RegisterAgentResponse {

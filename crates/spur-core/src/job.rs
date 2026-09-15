@@ -888,6 +888,14 @@ pub struct Job {
 }
 
 impl Job {
+    /// Whether this node is still charged for this job. One definition, so the
+    /// derived totals and the reconciled set cannot drift apart.
+    pub fn is_held_on(&self, node: &str) -> bool {
+        !self.state.is_finalized()
+            && self.allocated_nodes.iter().any(|n| n == node)
+            && !self.node_completions.contains_key(node)
+    }
+
     pub fn new(job_id: JobId, spec: JobSpec) -> Self {
         let priority = if spec.hold {
             0
