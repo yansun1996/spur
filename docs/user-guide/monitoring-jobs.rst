@@ -286,6 +286,29 @@ to a name, or a node whose reason predates provenance tracking, renders as
 ``Reason=<text> [<user>@<timestamp>]`` when a set-time is recorded, and the REST
 node object carries ``reason_uid`` and ``reason_time`` fields.
 
+Not every reason comes from an admin. A node still reporting ``idle`` or ``mix``
+may nonetheless be skipped by the scheduler, and says so in the same field
+(``Reason=`` in ``scontrol show node``, ``%E`` in ``sinfo``):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 42 58
+
+   * - Reason
+     - Meaning
+   * - ``reconciling with the controller``
+     - The agent has just registered and declared what it holds; the node takes
+       no new work until the controller has compared that against its own
+       records. Normally lasts milliseconds.
+   * - ``dispatch cooldown after a failed launch (<n>s remaining)``
+     - A launch failed on this node, so the scheduler skips it for
+       ``controller.dispatch_reject_cooldown_secs`` instead of re-picking it
+       every cycle. It returns to service on its own when the countdown ends;
+       the launch failure itself is reported on the affected job.
+
+A reason an admin set with ``scontrol update`` takes precedence over both: a
+drained node reports the drain, not the transient skip.
+
 Node states are shown as short abbreviations: ``idle`` (free), ``alloc`` (fully
 allocated), ``mix`` (partly allocated), ``down``, ``drain`` (offline, not
 accepting jobs), ``drng`` (draining), ``err`` (error), ``unk``

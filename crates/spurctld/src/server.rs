@@ -1784,6 +1784,7 @@ impl SlurmController for ControllerService {
         let reservations = self.cluster.get_reservations();
         annotate_nodes_with_reservations(&mut proto_nodes, &reservations, Utc::now());
         annotate_nodes_with_planned_reservations(&mut proto_nodes, &self.cluster);
+        annotate_nodes_with_dispatch_cooldown(&mut proto_nodes, &self.cluster);
         Ok(Response::new(GetNodesResponse { nodes: proto_nodes }))
     }
 
@@ -1822,6 +1823,7 @@ impl SlurmController for ControllerService {
             std::slice::from_mut(&mut proto_node),
             &self.cluster,
         );
+        annotate_nodes_with_dispatch_cooldown(std::slice::from_mut(&mut proto_node), &self.cluster);
         Ok(Response::new(proto_node))
     }
 
@@ -2211,10 +2213,11 @@ impl SlurmController for ControllerService {
 
         let node_token_response = self.validate_admission(&req.join_token, &req.hostname)?;
 
-        // Unconditional, and before the node becomes available: the Skip path
-        // an agent restart takes proposes nothing to hang this off.
+        // A node the controller has never seen has no record to carry the
+        // gate yet, so a first registration sets it below instead.
         let ledger = req.ledger.clone();
-        if ledger.is_some() {
+        let known_before = ledger.is_some() && self.cluster.get_node(&req.hostname).is_some();
+        if known_before {
             self.cluster.set_reconcile_pending(&req.hostname, true);
         }
 
@@ -2234,6 +2237,12 @@ impl SlurmController for ControllerService {
                 caller_privileged,
             )
             .map_err(register_node_rpc_status)?;
+
+        // A first registration builds the node record from scratch, which is
+        // also the earliest moment the gate has anything to be recorded on.
+        if ledger.is_some() && !known_before {
+            self.cluster.set_reconcile_pending(&req.hostname, true);
+        }
 
         if let Some(ledger) = ledger {
             let node = req.hostname.clone();
@@ -5450,6 +5459,22 @@ fn apply_planned_reservations(
     }
 }
 
+/// A node the scheduler is skipping otherwise reports Idle/Mixed with no
+/// reason. A durable reason wins: a drain outranks a transient skip.
+fn annotate_nodes_with_dispatch_cooldown(nodes: &mut [NodeInfo], cluster: &ClusterManager) {
+    for node_info in nodes.iter_mut() {
+        if !node_info.state_reason.is_empty() {
+            continue;
+        }
+        let Some(remaining) = cluster.dispatch_cooldown_remaining(&node_info.name) else {
+            continue;
+        };
+        let secs = (remaining.as_millis() as u64).div_ceil(1000);
+        node_info.state_reason =
+            format!("dispatch cooldown after a failed launch ({secs}s remaining)");
+    }
+}
+
 fn annotate_nodes_with_planned_reservations(nodes: &mut [NodeInfo], cluster: &ClusterManager) {
     for node_info in nodes.iter_mut() {
         // Only meaningful while idle, matching how sinfo displays "plnd" —
@@ -6908,6 +6933,162 @@ mod tests {
         );
     }
 
+    async fn await_reconcile_gate(svc: &ControllerService, name: &str, expected: bool) {
+        for _ in 0..600 {
+            if svc
+                .cluster
+                .get_node(name)
+                .is_some_and(|node| node.reconcile_pending == expected)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("node {name} never reached reconcile_pending={expected}");
+    }
+
+    fn registration(hostname: &str, addr: std::net::SocketAddr) -> RegisterAgentRequest {
+        RegisterAgentRequest {
+            hostname: hostname.into(),
+            address: addr.ip().to_string(),
+            port: u32::from(addr.port()),
+            ..Default::default()
+        }
+    }
+
+    // The gate's live window is milliseconds wide, far too narrow to catch by
+    // sampling, so its contract is pinned here instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registering_with_a_ledger_holds_the_node_out_until_the_reconcile_finishes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (addr, release) = spawn_gated_probe_agent().await;
+
+        // A claim the controller has no record of, so the reconcile has to
+        // cancel it — and the cancel fences through the agent held open here.
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            ledger: Some(ledger(true, vec![(99, 1)])),
+            ..registration("n1", addr)
+        }))
+        .await
+        .expect("register");
+
+        await_reconcile_gate(&svc, "n1", true).await;
+        assert!(
+            !svc.cluster.get_node("n1").expect("node").is_schedulable(),
+            "a node whose evidence is undiffed may already hold work it has not declared"
+        );
+        assert!(
+            !node_reason(&svc, "n1").await.is_empty(),
+            "an operator must be able to see why the node is taking nothing"
+        );
+
+        release.notify_one();
+
+        await_reconcile_gate(&svc, "n1", false).await;
+        assert!(
+            svc.cluster.get_node("n1").expect("node").is_schedulable(),
+            "the gate must open again once the reconcile is done"
+        );
+        assert!(node_reason(&svc, "n1").await.is_empty());
+    }
+
+    // The agent-restart case: the node is already in the cluster, so the gate
+    // has to land before the registration makes it available again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_re_registering_node_is_gated_too() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (addr, release) = spawn_gated_probe_agent().await;
+
+        svc.register_agent(Request::new(registration("n1", addr)))
+            .await
+            .expect("first registration");
+        await_registered_node(&svc, "n1").await;
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            ledger: Some(ledger(true, vec![(99, 1)])),
+            ..registration("n1", addr)
+        }))
+        .await
+        .expect("re-registration");
+
+        await_reconcile_gate(&svc, "n1", true).await;
+        release.notify_one();
+        await_reconcile_gate(&svc, "n1", false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registering_without_a_ledger_never_gates_the_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (addr, _release) = spawn_gated_probe_agent().await;
+
+        svc.register_agent(Request::new(registration("n1", addr)))
+            .await
+            .expect("register");
+        await_registered_node(&svc, "n1").await;
+
+        let node = svc.cluster.get_node("n1").expect("node");
+        assert!(
+            !node.reconcile_pending,
+            "an agent that asserts no evidence must not be held out of the cluster"
+        );
+        assert!(node.is_schedulable());
+        assert!(node_reason(&svc, "n1").await.is_empty());
+    }
+
+    async fn node_reason(svc: &ControllerService, name: &str) -> String {
+        svc.get_node(Request::new(GetNodeRequest { name: name.into() }))
+            .await
+            .expect("get_node")
+            .into_inner()
+            .state_reason
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_on_dispatch_cooldown_says_why_it_is_being_skipped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(node_reason(&svc, "n1").await.is_empty());
+
+        cluster.cool_down_node("n1");
+
+        assert!(
+            node_reason(&svc, "n1").await.contains("cooldown"),
+            "a node the scheduler is skipping must not report an empty reason"
+        );
+        let listed = svc
+            .get_nodes(Request::new(GetNodesRequest::default()))
+            .await
+            .expect("get_nodes")
+            .into_inner()
+            .nodes;
+        assert!(
+            listed
+                .iter()
+                .any(|n| n.name == "n1" && n.state_reason.contains("cooldown")),
+            "sinfo reads the same field and must see the same reason"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_drain_reason_outranks_a_dispatch_cooldown() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        cluster
+            .drain_node("n1", Some("operator maintenance".into()), Some(0))
+            .expect("drain");
+
+        cluster.cool_down_node("n1");
+
+        assert_eq!(
+            node_reason(&svc, "n1").await,
+            "operator maintenance",
+            "a transient skip must not overwrite the durable reason an operator set"
+        );
+    }
+
     async fn test_service(dir: &tempfile::TempDir) -> ControllerService {
         test_service_with(dir, step_test_config()).await
     }
@@ -6987,6 +7168,9 @@ mod tests {
 
     struct ProbeAgent {
         active: bool,
+        /// Holds `fence_run` until the test releases it, so a test can keep a
+        /// reconcile open rather than race the window in which it runs.
+        fence_gate: Option<Arc<tokio::sync::Notify>>,
     }
 
     #[tonic::async_trait]
@@ -7005,6 +7189,9 @@ mod tests {
             &self,
             _request: Request<spur_proto::proto::FenceRunRequest>,
         ) -> Result<Response<spur_proto::proto::FenceRunResponse>, Status> {
+            if let Some(gate) = &self.fence_gate {
+                gate.notified().await;
+            }
             Ok(Response::new(spur_proto::proto::FenceRunResponse {
                 success: true,
                 error: String::new(),
@@ -7163,10 +7350,25 @@ mod tests {
 
     /// Spawn a real `ProbeAgent` gRPC server on an OS-assigned localhost port.
     async fn spawn_probe_agent(active: bool) -> std::net::SocketAddr {
+        spawn_probe_agent_with(active, None).await
+    }
+
+    /// A probe agent whose `FenceRun` blocks until the returned handle is
+    /// notified, which holds any reconcile that cancels a claim through it.
+    async fn spawn_gated_probe_agent() -> (std::net::SocketAddr, Arc<tokio::sync::Notify>) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let addr = spawn_probe_agent_with(false, Some(gate.clone())).await;
+        (addr, gate)
+    }
+
+    async fn spawn_probe_agent_with(
+        active: bool,
+        fence_gate: Option<Arc<tokio::sync::Notify>>,
+    ) -> std::net::SocketAddr {
         let incoming =
             tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = incoming.local_addr().unwrap();
-        let agent = ProbeAgent { active };
+        let agent = ProbeAgent { active, fence_gate };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent))
