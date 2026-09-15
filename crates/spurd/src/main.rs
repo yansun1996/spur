@@ -631,9 +631,21 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_runtime_state_dir(stepd_state_dir.clone());
     agent_service.adopt_stepds(&recovered_stepds).await;
-    agent_service
-        .replay_adopted_allocations(&recovered_stepds)
+    // The admission records are exact where a descriptor rebuild under-counts;
+    // sessions predating them fall back to the descriptor path inside this.
+    let adopted = agent_service
+        .replay_admitted_allocations(&recovered_stepds)
         .await;
+    for outcome in &adopted {
+        if outcome.disposition.needs_reconciliation() {
+            warn!(
+                job_id = outcome.job_id,
+                run_attempt = outcome.run_attempt,
+                disposition = ?outcome.disposition,
+                "this run cannot be resolved from local evidence"
+            );
+        }
+    }
     // After the replay above, so an exit it has already reported is still on
     // disk to be read here, and before the server accepts its first re-attach.
     agent_service.settle_stale_stepds(&stale_stepds).await;
