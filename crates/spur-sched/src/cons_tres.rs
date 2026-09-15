@@ -424,6 +424,15 @@ impl NodeAllocation {
         unbacked.sort_unstable();
         unbacked
     }
+
+    /// Every run this node still charges resources to, including launches in
+    /// flight: anything the ledger must keep a record for until it is released.
+    pub fn charged_runs(&self) -> HashSet<(u32, u32)> {
+        self.owners
+            .iter()
+            .map(|(job_id, owned)| (*job_id, owned.run_attempt))
+            .collect()
+    }
 }
 
 /// An owned reservation, tagged with the attempt that created it so a later

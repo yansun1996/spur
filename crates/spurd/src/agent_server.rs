@@ -1835,15 +1835,6 @@ pub fn retry_unacknowledged_stepd_completions(
             if let Err(error) = store.prune_finalized() {
                 tracing::warn!(%error, "failed to prune finalized runtime sessions");
             }
-            // Without this the ledger grows by one directory per job, forever.
-            match admissions.sweep(
-                crate::admission::now_unix_ms(),
-                crate::admission::DEFAULT_RETENTION_SECS * 1000,
-            ) {
-                Ok(0) => {}
-                Ok(swept) => tracing::info!(swept, "swept settled admission records"),
-                Err(error) => tracing::warn!(%error, "failed to sweep admission records"),
-            }
         }
     });
 }
@@ -3612,6 +3603,9 @@ impl AgentService {
                     settle_cancelled_runs(&allocation, &admissions).await;
                     release_due_allocations(&allocation, &admissions).await;
                     flag_unbacked_allocations(&unbacked, &admissions).await;
+                    // Strictly after the releases above: collecting a record
+                    // before its slice is freed destroys the instruction to free it.
+                    collect_settled_admissions(&allocation, &admissions).await;
                 }
 
                 let local_hostname = hostname::get()
@@ -3844,6 +3838,30 @@ async fn release_due_allocations(
             admitted.run.cleanup.epilog != crate::admission::HookState::Failed,
         )
         .await;
+    }
+}
+
+/// Collect records nothing is owed on, sparing every run the allocator still
+/// charges: its record is the only thing that can still order that release.
+async fn collect_settled_admissions(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+) {
+    let charged = allocation.lock().await.charged_runs();
+    let store = admissions.clone();
+    let swept = tokio::task::spawn_blocking(move || {
+        store.sweep(
+            crate::admission::now_unix_ms(),
+            crate::admission::DEFAULT_RETENTION_SECS * 1000,
+            &charged,
+        )
+    })
+    .await;
+    match swept {
+        Ok(Ok(0)) => {}
+        Ok(Ok(swept)) => info!(swept, "swept settled admission records"),
+        Ok(Err(error)) => warn!(%error, "failed to sweep admission records"),
+        Err(error) => warn!(%error, "admission sweep task failed"),
     }
 }
 
@@ -9084,6 +9102,7 @@ impl AgentService {
 mod tests {
     use super::*;
     use spur_core::resource::ResourceSet;
+    use std::collections::HashSet;
     use tonic::Request;
 
     #[test]
@@ -14989,6 +15008,78 @@ mod tests {
         assert_eq!(svc.allocation.lock().await.free_cpus(), 8);
     }
 
+    // A completion the controller acknowledges late settles the record away from
+    // the release. The sweep must not collect the slice's only instruction.
+    #[tokio::test]
+    async fn a_late_acknowledgement_still_gets_its_slice_back() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(77, 1, 2, 1000, &[])
+                .expect("allocate");
+            alloc.commit_job(77, 1);
+        }
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        let mut run = crate::admission::RunAdmission::new(
+            77,
+            1,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_BATCH);
+        admissions.admit_run(&run).expect("admit");
+        let mut participant = crate::admission::ParticipantAdmission::new(
+            77,
+            1,
+            spur_core::step::STEP_BATCH,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources::default(),
+        );
+        participant.final_report.required = true;
+        admissions
+            .admit_participant(&participant)
+            .expect("participant");
+
+        // The controller is unreachable, so the report stays owed.
+        collect_settled_admissions(&svc.allocation, &admissions).await;
+        release_due_allocations(&svc.allocation, &admissions).await;
+        assert!(
+            admissions.load_run(77, 1).is_ok(),
+            "an owed report must keep its record"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "an unacknowledged completion must not free anything"
+        );
+
+        // The controller returns and the retry loop delivers, settling the record.
+        admissions.record_controller_ack(77, 1, 42).expect("ack");
+        admissions
+            .record_report_acknowledged(77, 1, spur_core::step::STEP_BATCH)
+            .expect("report acknowledged");
+        admissions.mark_run_cleaned(77, 1).expect("cleaned");
+
+        collect_settled_admissions(&svc.allocation, &admissions).await;
+        release_due_allocations(&svc.allocation, &admissions).await;
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "the slice must come back whichever of the two runs first"
+        );
+
+        collect_settled_admissions(&svc.allocation, &admissions).await;
+        assert!(
+            admissions.load_run(77, 1).is_err(),
+            "and the released record must not become immortal"
+        );
+    }
+
     // A cancel is the controller resolving the hold. Nothing else clears one,
     // so without this the record outlives the claim it preserved.
     #[tokio::test]
@@ -15036,7 +15127,7 @@ mod tests {
         );
         assert_eq!(
             admissions
-                .sweep(crate::admission::now_unix_ms(), 3_600_000)
+                .sweep(crate::admission::now_unix_ms(), 3_600_000, &HashSet::new())
                 .expect("sweep"),
             1,
             "a settled record must be collectable rather than immortal"
@@ -16158,7 +16249,7 @@ mod tests {
         );
         assert_eq!(
             admissions
-                .sweep(crate::admission::now_unix_ms(), 1)
+                .sweep(crate::admission::now_unix_ms(), 1, &HashSet::new())
                 .expect("sweep"),
             1,
             "and nothing of it may be left to re-advertise as a claim"
@@ -16175,7 +16266,9 @@ mod tests {
         admit_a_launch(&svc, 13);
         admit_a_launch(&svc, 14);
         assert_eq!(
-            admissions.sweep(u64::MAX, 1).expect("sweep"),
+            admissions
+                .sweep(u64::MAX, 1, &HashSet::new())
+                .expect("sweep"),
             0,
             "an owed report is what makes a leftover launch record immortal"
         );

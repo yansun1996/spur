@@ -4,7 +4,7 @@
 //! The node's entitlement ledger. `runtime/` answers "is it alive"; this answers
 //! "what is it entitled to", and survives the supervisor that earned it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -1021,9 +1021,14 @@ impl AdmissionStore {
         }
     }
 
-    /// Three removal rules, and nothing else may delete a record: settled because
-    /// it owes nothing, aged out because it never can, unreadable because only age can.
-    pub fn sweep(&self, now_unix_ms: u64, retention_ms: u64) -> io::Result<usize> {
+    /// Three removal rules, and nothing else may delete a record: settled because it
+    /// owes nothing, aged out because it never can, unreadable because only age can.
+    pub fn sweep(
+        &self,
+        now_unix_ms: u64,
+        retention_ms: u64,
+        charged: &HashSet<(u32, u32)>,
+    ) -> io::Result<usize> {
         // A zero floor would collect a run the instant it is admitted, which is
         // before its launch has even spawned.
         let retention_ms = retention_ms.max(1);
@@ -1034,12 +1039,17 @@ impl AdmissionStore {
             if run.conflict_hold.is_some() || run.fence_is_live(now_unix_ms) {
                 continue;
             }
+            // The record is the only instruction to release a slice, so taking
+            // one still charged strands it with nothing left to say so.
+            if charged.contains(&(run.job_id, run.run_attempt)) {
+                continue;
+            }
             if admitted.is_settled() || admitted.aged_out(now_unix_ms, retention_ms) {
                 self.remove_run(run.job_id, run.run_attempt)?;
                 removed += 1;
             }
         }
-        removed += self.sweep_rejected(&loaded.rejected, now_unix_ms, retention_ms)?;
+        removed += self.sweep_rejected(&loaded.rejected, now_unix_ms, retention_ms, charged)?;
         Ok(removed)
     }
 
@@ -1050,12 +1060,17 @@ impl AdmissionStore {
         rejected: &[RejectedAdmission],
         now_unix_ms: u64,
         retention_ms: u64,
+        charged: &HashSet<(u32, u32)>,
     ) -> io::Result<usize> {
         let mut removed = 0;
         for entry in rejected {
             // A damaged participant lives under a run that loaded fine; taking
             // the whole directory would discard a claim that reads perfectly.
             if entry.path.parent() != Some(self.root.as_path()) {
+                continue;
+            }
+            // Unreadable is not evidence the slice it names came back.
+            if parse_run_dir_name(&entry.path).is_some_and(|run| charged.contains(&run)) {
                 continue;
             }
             if entry.modified_unix_ms == 0
@@ -1280,13 +1295,18 @@ mod tests {
         publish_private(&broken, RUN_FILE, b"{ not json").unwrap();
 
         assert_eq!(
-            store.sweep(now_unix_ms(), 60_000).unwrap(),
+            store.sweep(now_unix_ms(), 60_000, &HashSet::new()).unwrap(),
             0,
             "an unreadable record may still describe a live claim"
         );
         assert!(broken.exists());
 
-        assert_eq!(store.sweep(now_unix_ms() + 60_001, 60_000).unwrap(), 1);
+        assert_eq!(
+            store
+                .sweep(now_unix_ms() + 60_001, 60_000, &HashSet::new())
+                .unwrap(),
+            1
+        );
         assert!(!broken.exists());
     }
 
@@ -1297,8 +1317,16 @@ mod tests {
         let junk = store.root().join("not-a-run");
         create_private_dir_all(&junk).unwrap();
 
-        assert_eq!(store.sweep(now_unix_ms(), 60_000).unwrap(), 0);
-        assert_eq!(store.sweep(now_unix_ms() + 60_001, 60_000).unwrap(), 1);
+        assert_eq!(
+            store.sweep(now_unix_ms(), 60_000, &HashSet::new()).unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .sweep(now_unix_ms() + 60_001, 60_000, &HashSet::new())
+                .unwrap(),
+            1
+        );
         assert!(!junk.exists());
     }
 
@@ -1314,7 +1342,7 @@ mod tests {
         store.admit_participant(&owed).unwrap();
         publish_private(&store.run_dir(7, 1).join("participants"), "5.json", b"{ x").unwrap();
 
-        assert_eq!(store.sweep(u64::MAX, 60_000).unwrap(), 0);
+        assert_eq!(store.sweep(u64::MAX, 60_000, &HashSet::new()).unwrap(), 0);
         assert!(store.load_run(7, 1).is_ok());
     }
 
@@ -1343,9 +1371,39 @@ mod tests {
         };
         store.admit_participant(&unacked).unwrap();
 
-        assert_eq!(store.sweep(10_000, 1_000).unwrap(), 1);
+        assert_eq!(store.sweep(10_000, 1_000, &HashSet::new()).unwrap(), 1);
         assert!(store.load_run(1, 1).is_err());
         assert!(store.load_run(2, 1).is_ok(), "an owed report must be kept");
+    }
+
+    #[test]
+    fn sweep_keeps_a_settled_run_whose_slice_is_still_charged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+
+        let mut settled = run_with(1, 1, 1);
+        settled.state = RunState::Cleaned;
+        store.admit_run(&settled).unwrap();
+
+        let charged = HashSet::from([(1, 1)]);
+        assert_eq!(store.sweep(u64::MAX, 1_000, &charged).unwrap(), 0);
+        assert!(
+            store.load_run(1, 1).is_ok(),
+            "the record is the only thing that can still order the release"
+        );
+        assert_eq!(store.sweep(u64::MAX, 1_000, &HashSet::new()).unwrap(), 1);
+    }
+
+    #[test]
+    fn sweep_keeps_an_unreadable_record_whose_slice_is_still_charged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let broken = store.prepare_run_dir(1, 1).unwrap();
+        publish_private(&broken, RUN_FILE, b"{ not json").unwrap();
+
+        let charged = HashSet::from([(1, 1)]);
+        assert_eq!(store.sweep(u64::MAX, 1, &charged).unwrap(), 0);
+        assert_eq!(store.sweep(u64::MAX, 1, &HashSet::new()).unwrap(), 1);
     }
 
     #[test]
@@ -1358,13 +1416,17 @@ mod tests {
         store.fence_run(7, 1, 10_000).unwrap();
 
         assert_eq!(
-            store.sweep(10_000 + LAUNCH_LIFETIME_MS - 1, 1).unwrap(),
+            store
+                .sweep(10_000 + LAUNCH_LIFETIME_MS - 1, 1, &HashSet::new())
+                .unwrap(),
             0,
             "collecting the record would re-admit the launch the cutoff refuses"
         );
         assert!(store.load_run(7, 1).is_ok());
         assert_eq!(
-            store.sweep(10_000 + LAUNCH_LIFETIME_MS, 1).unwrap(),
+            store
+                .sweep(10_000 + LAUNCH_LIFETIME_MS, 1, &HashSet::new())
+                .unwrap(),
             1,
             "an expired cutoff must not keep a settled record forever"
         );
@@ -1383,7 +1445,7 @@ mod tests {
 
         assert!(store.settle_cancelled_run(7, 1).unwrap());
         assert_eq!(
-            store.sweep(u64::MAX, 1).unwrap(),
+            store.sweep(u64::MAX, 1, &HashSet::new()).unwrap(),
             1,
             "a settled cancel must leave nothing behind"
         );
@@ -1408,8 +1470,12 @@ mod tests {
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1_000)).unwrap();
 
-        assert_eq!(store.sweep(1_500, 1_000).unwrap(), 0, "not yet aged out");
-        assert_eq!(store.sweep(2_001, 1_000).unwrap(), 1);
+        assert_eq!(
+            store.sweep(1_500, 1_000, &HashSet::new()).unwrap(),
+            0,
+            "not yet aged out"
+        );
+        assert_eq!(store.sweep(2_001, 1_000, &HashSet::new()).unwrap(), 1);
     }
 
     #[test]
@@ -1434,7 +1500,7 @@ mod tests {
         aged.conflict_hold = hold();
         store.admit_run(&aged).unwrap();
 
-        assert_eq!(store.sweep(u64::MAX, 0).unwrap(), 0);
+        assert_eq!(store.sweep(u64::MAX, 0, &HashSet::new()).unwrap(), 0);
         assert!(store.load_run(7, 1).is_ok());
         assert!(store.load_run(8, 1).is_ok());
     }
@@ -1448,7 +1514,7 @@ mod tests {
         started.lifecycle = ParticipantLifecycle::Running;
         store.admit_participant(&started).unwrap();
 
-        assert_eq!(store.sweep(u64::MAX, 0).unwrap(), 0);
+        assert_eq!(store.sweep(u64::MAX, 0, &HashSet::new()).unwrap(), 0);
     }
 
     #[test]
@@ -1463,8 +1529,8 @@ mod tests {
         assert_eq!(participant.expires_at_unix_ms, 0);
         store.admit_participant(&participant).unwrap();
 
-        assert_eq!(store.sweep(1_500, 1_000).unwrap(), 0);
-        assert_eq!(store.sweep(2_001, 1_000).unwrap(), 1);
+        assert_eq!(store.sweep(1_500, 1_000, &HashSet::new()).unwrap(), 0);
+        assert_eq!(store.sweep(2_001, 1_000, &HashSet::new()).unwrap(), 1);
     }
 
     #[test]
@@ -1476,8 +1542,8 @@ mod tests {
         participant.expires_at_unix_ms = 9_000;
         store.admit_participant(&participant).unwrap();
 
-        assert_eq!(store.sweep(5_000, 1_000).unwrap(), 0);
-        assert_eq!(store.sweep(9_001, 1_000).unwrap(), 1);
+        assert_eq!(store.sweep(5_000, 1_000, &HashSet::new()).unwrap(), 0);
+        assert_eq!(store.sweep(9_001, 1_000, &HashSet::new()).unwrap(), 1);
     }
 
     #[test]
@@ -1493,8 +1559,8 @@ mod tests {
         exited.lifecycle = ParticipantLifecycle::Exited;
         store.admit_participant(&exited).unwrap();
 
-        assert_eq!(store.sweep(1_500, 1_000).unwrap(), 0);
-        assert_eq!(store.sweep(2_001, 1_000).unwrap(), 1);
+        assert_eq!(store.sweep(1_500, 1_000, &HashSet::new()).unwrap(), 0);
+        assert_eq!(store.sweep(2_001, 1_000, &HashSet::new()).unwrap(), 1);
     }
 
     #[test]
@@ -1505,7 +1571,7 @@ mod tests {
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 0)).unwrap();
 
-        assert_eq!(store.sweep(u64::MAX, 1_000).unwrap(), 0);
+        assert_eq!(store.sweep(u64::MAX, 1_000, &HashSet::new()).unwrap(), 0);
         assert!(store.load_run(7, 1).is_ok());
     }
 
@@ -1515,7 +1581,7 @@ mod tests {
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 5_000)).unwrap();
 
-        assert_eq!(store.sweep(5_000, 0).unwrap(), 0);
+        assert_eq!(store.sweep(5_000, 0, &HashSet::new()).unwrap(), 0);
         assert!(store.load_run(7, 1).is_ok());
     }
 
