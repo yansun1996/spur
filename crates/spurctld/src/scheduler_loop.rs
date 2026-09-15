@@ -3878,7 +3878,6 @@ mod tests {
         }
 
         fn register_node_without_comm_addr(cm: &ClusterManager, name: &str) {
-            use crate::raft::StateMachineApply;
             use spur_core::wal::WalOperation;
 
             cm.apply_operation(&WalOperation::NodeRegister {

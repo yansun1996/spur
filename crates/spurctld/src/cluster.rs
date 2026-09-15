@@ -5579,17 +5579,11 @@ impl ClusterManager {
             let Some(job) = jobs.get(&job_id) else {
                 continue;
             };
-            // JobComplete and eviction clear node_completions while leaving
-            // allocated_nodes set, so without this a finished job stays charged.
-            if job.state.is_finalized() {
-                continue;
-            }
             let node_count = job.allocated_nodes.len().max(1) as u32;
             for name in &job.allocated_nodes {
-                if job.node_completions.contains_key(name)
-                    || !wanted(name)
-                    || !nodes.contains_key(name)
-                {
+                // `is_held_on` carries the liveness clause: JobComplete and
+                // eviction clear node_completions but leave allocated_nodes set.
+                if !job.is_held_on(name) || !wanted(name) || !nodes.contains_key(name) {
                     continue;
                 }
                 let Some(slice) = Self::job_node_slice(
@@ -5625,6 +5619,27 @@ impl ClusterManager {
             node.alloc_resources = next;
             Self::refresh_node_state_for_alloc(node);
         }
+    }
+
+    /// Hold a node out of scheduling, or release it. Proposed rather than set
+    /// locally so a follower promoted mid-reconcile does not schedule onto it.
+    pub fn set_reconcile_pending(&self, name: &str, pending: bool) {
+        if let Err(error) = self.propose(WalOperation::NodeReconcilePending {
+            name: name.to_string(),
+            pending,
+        }) {
+            warn!(node = %name, %error, "could not record the reconcile gate");
+        }
+    }
+
+    /// Every non-finalized job Raft places on this node, with its attempt.
+    pub fn jobs_allocated_on_node(&self, node: &str) -> HashMap<JobId, u32> {
+        self.jobs
+            .read()
+            .values()
+            .filter(|job| job.is_held_on(node))
+            .map(|job| (job.job_id, job.run_attempt))
+            .collect()
     }
 
     /// Rebuild the node allocation cache from job records. Called where state has
@@ -5758,7 +5773,7 @@ impl ClusterManager {
 
     /// Apply a WalOperation to in-memory state.
     /// Called by Raft's `apply_to_state_machine` on commit.
-    fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
+    pub(crate) fn apply_operation(&self, op: &WalOperation) -> ClientResponse {
         let mut response = ClientResponse::default();
         let mut jobs = self.jobs.write();
         let mut nodes = self.nodes.write();
@@ -6456,6 +6471,11 @@ impl ClusterManager {
                     if *clear_reservation {
                         job.spec.reservation = None;
                     }
+                }
+            }
+            WalOperation::NodeReconcilePending { name, pending } => {
+                if let Some(node) = nodes.get_mut(name) {
+                    node.reconcile_pending = *pending;
                 }
             }
             WalOperation::NodeRegister {
@@ -21589,6 +21609,87 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reconcile_gate_is_independent_of_the_registration_decision() {
+        // An agent restarting on an unchanged node takes the Skip path, which
+        // proposes nothing -- and that is exactly the case the gate exists for.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        assert!(cm.get_node("n1").unwrap().is_schedulable());
+
+        cm.set_reconcile_pending("n1", true);
+        wait_for("gated", || cm.get_node("n1").unwrap().reconcile_pending);
+        assert!(
+            !cm.get_node("n1").unwrap().is_schedulable(),
+            "a node mid-reconcile must not be dispatched to"
+        );
+
+        cm.set_reconcile_pending("n1", false);
+        wait_for("released", || !cm.get_node("n1").unwrap().reconcile_pending);
+        assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn jobs_allocated_on_node_reports_what_the_agent_must_account_for() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::NodeRegister {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            labels: HashMap::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+        });
+        let slice = scalar_alloc(2, 1000);
+        for (job_id, finish) in [(1u32, false), (2, true)] {
+            cm.apply_operation(&WalOperation::JobSubmit {
+                job_id,
+                spec: Box::new(basic_spec("j")),
+            });
+            cm.apply_operation(&WalOperation::JobStateChange {
+                job_id,
+                old_state: JobState::Pending,
+                new_state: JobState::Running,
+                pending_reason: None,
+                pending_priority: None,
+                begin_time: None,
+                pending_reason_desc: None,
+            });
+            cm.apply_operation(&WalOperation::JobStart {
+                job_id,
+                nodes: vec!["n1".into()],
+                resources: slice.clone(),
+                per_node_alloc: per_node_for(&["n1"], slice.clone()),
+                srun_step_dispatch: false,
+                run_attempt: 3,
+            });
+            if finish {
+                cm.apply_operation(&WalOperation::JobComplete {
+                    job_id,
+                    exit_code: 0,
+                    state: JobState::Completed,
+                });
+            }
+        }
+
+        let placed = cm.jobs_allocated_on_node("n1");
+        assert_eq!(placed.get(&1), Some(&3), "a live job must be accounted for");
+        assert!(
+            !placed.contains_key(&2),
+            "a finished job is not something the agent still owes"
+        );
+        assert!(cm.jobs_allocated_on_node("other").is_empty());
     }
 
     #[test]

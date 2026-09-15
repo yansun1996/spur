@@ -444,6 +444,58 @@ impl LaunchFences {
     }
 }
 
+/// One immutable cut of this node's ledger. Built whole, so absence and
+/// emptiness stay distinguishable to the controller.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LedgerCut {
+    pub agent_session_id: String,
+    /// False when the agent could not enumerate its own state, which forbids the
+    /// controller from acting on anything missing from `entries`.
+    pub inventory_complete: bool,
+    pub entries: Vec<LedgerCutEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerCutEntry {
+    pub job_id: u32,
+    pub run_attempt: u32,
+    pub allocation: AdmittedResources,
+    pub disposition: String,
+    pub conflict_hold: bool,
+}
+
+impl AdmissionStore {
+    /// One cut of everything this node believes it holds. A read failure yields
+    /// an incomplete cut: an empty one asserts "I hold nothing".
+    pub fn ledger_cut(&self, agent_session_id: &str) -> LedgerCut {
+        let Ok(loaded) = self.load_all() else {
+            return LedgerCut {
+                agent_session_id: agent_session_id.to_string(),
+                inventory_complete: false,
+                entries: Vec::new(),
+            };
+        };
+        let entries = loaded
+            .runs
+            .iter()
+            .map(|admitted| LedgerCutEntry {
+                job_id: admitted.run.job_id,
+                run_attempt: admitted.run.run_attempt,
+                allocation: admitted.run.allocation.clone(),
+                disposition: String::new(),
+                conflict_hold: admitted.run.conflict_hold.is_some(),
+            })
+            .collect();
+        LedgerCut {
+            agent_session_id: agent_session_id.to_string(),
+            // A record that could not be read may still hold a claim, so the
+            // controller must not treat its absence as proof of anything.
+            inventory_complete: loaded.rejected.is_empty(),
+            entries,
+        }
+    }
+}
+
 /// A record the agent could not adopt. Held rather than deleted, because the
 /// record is the only evidence that something here may still hold a claim.
 #[derive(Debug, Clone)]
@@ -1372,6 +1424,42 @@ mod tests {
 
         store.admit_run(&run_with(7, 1, 2)).unwrap();
         assert!(store.load_run(7, 1).unwrap().conflict_hold.is_some());
+    }
+
+    #[test]
+    fn a_ledger_cut_reports_every_held_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.admit_run(&run_with(8, 2, 1)).unwrap();
+        store.take_conflict_hold(8, 2, "contested").unwrap();
+
+        let cut = store.ledger_cut("session-a");
+        assert_eq!(cut.agent_session_id, "session-a");
+        assert!(cut.inventory_complete);
+        assert_eq!(cut.entries.len(), 2);
+        let held = cut.entries.iter().find(|e| e.job_id == 8).unwrap();
+        assert_eq!(held.run_attempt, 2);
+        assert!(held.conflict_hold);
+        assert_eq!(held.allocation.cpu_ids, vec![0, 1]);
+    }
+
+    #[test]
+    fn an_unreadable_record_makes_the_cut_incomplete_not_empty() {
+        // An empty ledger asserts "I hold nothing", which licenses the
+        // controller to free everything it placed here.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        let broken = store.prepare_run_dir(8, 1).unwrap();
+        publish_private(&broken, RUN_FILE, b"{ not json").unwrap();
+
+        let cut = store.ledger_cut("session-a");
+        assert!(
+            !cut.inventory_complete,
+            "the controller must not act on what is missing from a partial cut"
+        );
+        assert_eq!(cut.entries.len(), 1, "what could be read is still reported");
     }
 
     #[test]
