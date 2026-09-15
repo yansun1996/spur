@@ -502,6 +502,20 @@ impl AdmissionStore {
 pub struct RejectedAdmission {
     pub path: PathBuf,
     pub reason: String,
+    /// Filesystem mtime, the only age an unparseable record has. Zero leaves it
+    /// uncollectable rather than measuring its age from 1970.
+    pub modified_unix_ms: u64,
+}
+
+impl RejectedAdmission {
+    fn new(path: PathBuf, reason: impl Into<String>) -> Self {
+        let modified_unix_ms = modified_unix_ms(&path);
+        Self {
+            path,
+            reason: reason.into(),
+            modified_unix_ms,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -661,10 +675,7 @@ impl AdmissionStore {
                 }
                 // One damaged file must not discard an otherwise-good run: that
                 // would forget a claim the node may still be holding.
-                Err(error) => rejected.push(RejectedAdmission {
-                    path,
-                    reason: error.to_string(),
-                }),
+                Err(error) => rejected.push(RejectedAdmission::new(path, error.to_string())),
             }
         }
         Ok((found.into_values().collect(), rejected))
@@ -717,19 +728,18 @@ impl AdmissionStore {
         let mut loaded = LoadedAdmissions::default();
         for dir in self.run_dirs()? {
             let Some((job_id, run_attempt)) = parse_run_dir_name(&dir) else {
-                loaded.rejected.push(RejectedAdmission {
-                    path: dir,
-                    reason: "run directory name is not <job>.<attempt>".into(),
-                });
+                loaded.rejected.push(RejectedAdmission::new(
+                    dir,
+                    "run directory name is not <job>.<attempt>",
+                ));
                 continue;
             };
             let run = match self.load_run(job_id, run_attempt) {
                 Ok(run) => run,
                 Err(error) => {
-                    loaded.rejected.push(RejectedAdmission {
-                        path: dir,
-                        reason: error.to_string(),
-                    });
+                    loaded
+                        .rejected
+                        .push(RejectedAdmission::new(dir, error.to_string()));
                     continue;
                 }
             };
@@ -738,10 +748,9 @@ impl AdmissionStore {
                     loaded.rejected.extend(rejected);
                     loaded.runs.push(AdmittedRun { run, participants });
                 }
-                Err(error) => loaded.rejected.push(RejectedAdmission {
-                    path: dir,
-                    reason: error.to_string(),
-                }),
+                Err(error) => loaded
+                    .rejected
+                    .push(RejectedAdmission::new(dir, error.to_string())),
             }
         }
         Ok(loaded)
@@ -952,14 +961,15 @@ impl AdmissionStore {
         }
     }
 
-    /// Two removal rules, and nothing else may delete a record. A settled run is
-    /// removed because it owes nothing; an aged-out one because it never can.
+    /// Three removal rules, and nothing else may delete a record: settled because
+    /// it owes nothing, aged out because it never can, unreadable because only age can.
     pub fn sweep(&self, now_unix_ms: u64, retention_ms: u64) -> io::Result<usize> {
         // A zero floor would collect a run the instant it is admitted, which is
         // before its launch has even spawned.
         let retention_ms = retention_ms.max(1);
         let mut removed = 0;
-        for admitted in self.load_all()?.runs {
+        let loaded = self.load_all()?;
+        for admitted in loaded.runs {
             let run = &admitted.run;
             if run.conflict_hold.is_some() {
                 continue;
@@ -969,8 +979,63 @@ impl AdmissionStore {
                 removed += 1;
             }
         }
+        removed += self.sweep_rejected(&loaded.rejected, now_unix_ms, retention_ms)?;
         Ok(removed)
     }
+
+    /// An unreadable record can never settle, so only age collects it -- and only
+    /// run directories, since it may still describe a live claim.
+    fn sweep_rejected(
+        &self,
+        rejected: &[RejectedAdmission],
+        now_unix_ms: u64,
+        retention_ms: u64,
+    ) -> io::Result<usize> {
+        let mut removed = 0;
+        for entry in rejected {
+            // A damaged participant lives under a run that loaded fine; taking
+            // the whole directory would discard a claim that reads perfectly.
+            if entry.path.parent() != Some(self.root.as_path()) {
+                continue;
+            }
+            if entry.modified_unix_ms == 0
+                || now_unix_ms < entry.modified_unix_ms.saturating_add(retention_ms)
+            {
+                continue;
+            }
+            tracing::warn!(
+                path = %entry.path.display(),
+                reason = %entry.reason,
+                "collecting an unreadable admission record past its retention"
+            );
+            remove_path(&entry.path)?;
+            removed += 1;
+        }
+        Ok(removed)
+    }
+}
+
+/// Removes a run directory or a stray file left in the ledger root; a record
+/// the scan could not parse may be either.
+fn remove_path(path: &Path) -> io::Result<()> {
+    let outcome = if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    match outcome {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+fn modified_unix_ms(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
 }
 
 pub fn parse_run_dir_name(path: &Path) -> Option<(u32, u32)> {
@@ -1143,6 +1208,54 @@ mod tests {
         let loaded = store.load_all().unwrap();
         assert_eq!(loaded.runs.len(), 1, "the good run must still load");
         assert_eq!(loaded.rejected.len(), 1);
+    }
+
+    #[test]
+    fn sweep_collects_an_unreadable_record_once_it_is_past_retention() {
+        // Nothing can ever settle it, so without an age the scan rediscovers
+        // the same broken directory on every tick, forever.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let broken = store.prepare_run_dir(8, 1).unwrap();
+        publish_private(&broken, RUN_FILE, b"{ not json").unwrap();
+
+        assert_eq!(
+            store.sweep(now_unix_ms(), 60_000).unwrap(),
+            0,
+            "an unreadable record may still describe a live claim"
+        );
+        assert!(broken.exists());
+
+        assert_eq!(store.sweep(now_unix_ms() + 60_001, 60_000).unwrap(), 1);
+        assert!(!broken.exists());
+    }
+
+    #[test]
+    fn sweep_collects_a_run_directory_it_cannot_even_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let junk = store.root().join("not-a-run");
+        create_private_dir_all(&junk).unwrap();
+
+        assert_eq!(store.sweep(now_unix_ms(), 60_000).unwrap(), 0);
+        assert_eq!(store.sweep(now_unix_ms() + 60_001, 60_000).unwrap(), 1);
+        assert!(!junk.exists());
+    }
+
+    #[test]
+    fn sweeping_a_damaged_participant_never_takes_its_run_with_it() {
+        // The run reads perfectly and still owes a report; collecting it on a
+        // sibling file's behalf would forget a claim the node holds.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        let mut owed = ParticipantAdmission::new(7, 1, STEP_BATCH, "n1", Default::default());
+        owed.final_report.required = true;
+        store.admit_participant(&owed).unwrap();
+        publish_private(&store.run_dir(7, 1).join("participants"), "5.json", b"{ x").unwrap();
+
+        assert_eq!(store.sweep(u64::MAX, 60_000).unwrap(), 0);
+        assert!(store.load_run(7, 1).is_ok());
     }
 
     #[test]

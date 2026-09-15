@@ -3864,6 +3864,12 @@ impl LaunchReservationGuard {
     fn mark_spawned(&mut self) {
         self.spawned = true;
     }
+
+    /// The workload was killed and reaped before the launch returned, so the
+    /// record describes nothing again and must not outlive the call.
+    fn mark_reaped(&mut self) {
+        self.spawned = false;
+    }
 }
 
 impl Drop for LaunchReservationGuard {
@@ -5326,6 +5332,7 @@ impl SlurmAgent for AgentService {
                         discard_stepd_session(&descriptor).await;
                         let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
                         tokio::spawn(reap_killed_job(result.job));
+                        reservation_guard.mark_reaped();
                         return Ok(Response::new(LaunchJobResponse {
                             conflict: None,
                             success: false,
@@ -5343,7 +5350,9 @@ impl SlurmAgent for AgentService {
                 // first so a job is never briefly absent from BOTH `running` and
                 // `launching` (which would let reconcile reclaim it).
                 let committed = self.allocation.lock().await.commit_job(job_id, run_attempt);
-                reservation_guard.disarm();
+                if committed {
+                    reservation_guard.disarm();
+                }
 
                 // reconcile reclaimed the reservation mid-launch (launch exceeded
                 // the TTL). Don't track a job with no backing allocation — kill,
@@ -5352,6 +5361,7 @@ impl SlurmAgent for AgentService {
                 // job never enters `running`), then fail the launch.
                 if !committed {
                     drop(jobs);
+                    reservation_guard.mark_reaped();
                     warn!(
                         job_id,
                         "reservation reclaimed during launch; aborting to avoid running unbacked"
@@ -5598,7 +5608,8 @@ impl SlurmAgent for AgentService {
         // reserved a newer attempt survives a cancel for the old one.
         let jobs = self.running.lock().await;
         let tracked_attempt = jobs.get(&job_id).map(|tracked| tracked.run_attempt);
-        if !jobs.contains_key(&job_id) {
+        let nothing_tracked = !jobs.contains_key(&job_id);
+        if nothing_tracked {
             let mut alloc = self.allocation.lock().await;
             if req.run_attempt == 0 {
                 alloc.release_job(job_id);
@@ -5632,6 +5643,14 @@ impl SlurmAgent for AgentService {
 
         if let Err(err) = self.mpi_host.stop_pmix_job(job_id) {
             warn!(job_id, error = %err, "PMIx teardown on cancel failed");
+        }
+
+        // A record with nothing tracked behind it is all that is left of the
+        // claim, and its slice was just let go above, so it owes nothing now.
+        if nothing_tracked {
+            if let Some(attempt) = doomed_attempt {
+                self.settle_cancelled_run(job_id, attempt).await;
+            }
         }
 
         Ok(Response::new(()))
@@ -7676,6 +7695,9 @@ impl AgentService {
         if !removed {
             return;
         }
+        // The slice went back above, so the record describes nothing now. The
+        // attempt is known here; a cancel that named none cannot infer it later.
+        self.settle_cancelled_run(job_id, run_attempt).await;
         let stale_sessions = {
             let mut sessions = self.stepds.lock().await;
             let stale: Vec<_> = stepds_for_job(&sessions, job_id)
@@ -7694,6 +7716,24 @@ impl AgentService {
         }
         if let Err(e) = self.mpi_host.stop_pmix_job(job_id) {
             warn!(job_id, error = %e, "PMIx stop failed on job drop");
+        }
+    }
+
+    /// Settle a cancelled run's record, as an acknowledged completion settles one.
+    /// Only sound once the slice is let go: earlier frees it from under the teardown.
+    async fn settle_cancelled_run(&self, job_id: u32, run_attempt: u32) {
+        let admissions = self.admissions();
+        let settled = tokio::task::spawn_blocking(move || {
+            admissions.record_controller_ack(job_id, run_attempt, 1)?;
+            admissions.mark_run_cleaned(job_id, run_attempt)
+        })
+        .await;
+        match settled {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(job_id, run_attempt, %error, "failed to settle a cancelled run's record")
+            }
+            Err(error) => warn!(job_id, run_attempt, %error, "settle task failed"),
         }
     }
 
@@ -14653,6 +14693,60 @@ mod tests {
         assert_eq!(svc.allocation.lock().await.free_cpus(), 8);
     }
 
+    // A cancel is the controller resolving the hold. Nothing else clears one,
+    // so without this the record outlives the claim it preserved.
+    #[tokio::test]
+    async fn cancelling_an_untracked_claim_settles_the_record_it_leaves_behind() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(6, 1, 2, 1000, &[]).unwrap();
+            alloc.commit_job(6, 1);
+        }
+        let mut run = crate::admission::RunAdmission::new(
+            6,
+            1,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_BATCH);
+        admissions.admit_run(&run).expect("admit");
+        flag_unbacked_allocations(&[(6, 1)], &admissions).await;
+        assert!(admissions
+            .load_run(6, 1)
+            .expect("record")
+            .conflict_hold
+            .is_some());
+
+        let mut req = Request::new(AgentCancelJobRequest {
+            job_id: 6,
+            signal: 9,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        svc.cancel_job(req).await.expect("cancel");
+
+        assert!(
+            admissions
+                .load_run(6, 1)
+                .expect("record")
+                .conflict_hold
+                .is_none(),
+            "a hold the controller has resolved must not outlive the cancel"
+        );
+        assert_eq!(
+            admissions
+                .sweep(crate::admission::now_unix_ms(), 3_600_000)
+                .expect("sweep"),
+            1,
+            "a settled record must be collectable rather than immortal"
+        );
+    }
+
     #[tokio::test]
     async fn a_contested_gpu_is_refused_rather_than_taken_from_its_holder() {
         // The worst form of the inference: it did not merely free a claim it
@@ -15594,6 +15688,72 @@ mod tests {
             admissions.load_run(5, 1).is_err(),
             "an aborted launch must not leave a claim nothing holds"
         );
+    }
+
+    /// Writes the pair `launch_job` writes before it spawns: a run and an owner
+    /// step that owes a report. That owed report is what no retention collects.
+    fn admit_a_launch(svc: &AgentService, job_id: u32) {
+        let admissions = svc.admissions();
+        admissions
+            .admit_run(&crate::admission::RunAdmission::new(
+                job_id,
+                1,
+                &svc.reporter.hostname,
+                crate::admission::AdmittedResources {
+                    cpu_ids: vec![0, 1],
+                    memory_mb: 1000,
+                    gpu_devices: Vec::new(),
+                },
+                crate::admission::now_unix_ms(),
+            ))
+            .expect("admit run");
+        let mut participant = crate::admission::ParticipantAdmission::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            &svc.reporter.hostname,
+            Default::default(),
+        );
+        participant.final_report.required = true;
+        admissions
+            .admit_participant(&participant)
+            .expect("admit participant");
+    }
+
+    // A reaped launch produced nothing, and its record would owe a report
+    // nothing will acknowledge -- so no sweep could ever collect it.
+    #[tokio::test]
+    async fn a_launch_whose_workload_was_reaped_leaves_no_record() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 13);
+        admit_a_launch(&svc, 14);
+        assert_eq!(
+            admissions.sweep(u64::MAX, 1).expect("sweep"),
+            0,
+            "an owed report is what makes a leftover launch record immortal"
+        );
+
+        let mut reaped =
+            LaunchReservationGuard::new(svc.allocation.clone(), admissions.clone(), 13, 1);
+        reaped.mark_spawned();
+        reaped.mark_reaped();
+        drop(reaped);
+
+        assert!(
+            admissions.load_run(13, 1).is_err(),
+            "a launch that produced nothing must leave no claim behind"
+        );
+
+        // The other side of the rule: a launch that really did leave something
+        // running must keep its record, or the live process reads as free capacity.
+        let mut running =
+            LaunchReservationGuard::new(svc.allocation.clone(), admissions.clone(), 14, 1);
+        running.mark_spawned();
+        drop(running);
+
+        assert!(admissions.load_run(14, 1).is_ok());
     }
 
     #[tokio::test]
