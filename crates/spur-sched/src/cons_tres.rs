@@ -28,6 +28,8 @@ pub enum AllocError {
     /// A core being replayed does not exist on this node (the node's CPU count
     /// shrank since the allocation was made), or another job still holds it.
     CpusUnavailable,
+    /// The request would take the node past its total memory.
+    MemoryUnavailable,
 }
 
 /// Per-node resource allocation state.
@@ -171,6 +173,31 @@ impl NodeAllocation {
                 return Err(AllocError::Superseded);
             }
         }
+        // Feasibility is judged against what this job would free, so a refusal
+        // never drops the reservation it was about to supersede.
+        let reclaimable = self
+            .owners
+            .get(&job_id)
+            .map(|owned| owned.result.clone())
+            .unwrap_or_else(|| AllocationResult {
+                cpu_ids: Vec::new(),
+                gpu_ids: Vec::new(),
+                memory_mb: 0,
+            });
+        let free_cpus =
+            self.allocated_cpus.iter().filter(|a| !**a).count() + reclaimable.cpu_ids.len();
+        if free_cpus < cpus as usize {
+            return Err(AllocError::CpusUnavailable);
+        }
+        if self.total_memory_mb > 0
+            && self
+                .allocated_memory_mb
+                .saturating_sub(reclaimable.memory_mb)
+                .saturating_add(memory_mb)
+                > self.total_memory_mb
+        {
+            return Err(AllocError::MemoryUnavailable);
+        }
         self.release_job(job_id);
 
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
@@ -186,14 +213,30 @@ impl NodeAllocation {
             gpu_indices.push(idx);
         }
 
-        let mut cpu_ids = Vec::new();
-        for (i, allocated) in self.allocated_cpus.iter_mut().enumerate() {
-            if !*allocated && cpu_ids.len() < cpus as usize {
-                *allocated = true;
-                cpu_ids.push(i as u32);
-            }
+        // Chosen before anything is marked, so a shortfall refuses instead of
+        // serving a short list the caller reads as a full allocation.
+        let cpu_ids: Vec<u32> = self
+            .allocated_cpus
+            .iter()
+            .enumerate()
+            .filter(|(_, allocated)| !**allocated)
+            .map(|(i, _)| i as u32)
+            .take(cpus as usize)
+            .collect();
+        if cpu_ids.len() < cpus as usize {
+            return Err(AllocError::CpusUnavailable);
+        }
+        // A node that could not read its own memory reports 0. Unknown is not
+        // zero: enforcing a ceiling there refuses every job on the node.
+        if self.total_memory_mb > 0
+            && self.allocated_memory_mb.saturating_add(memory_mb) > self.total_memory_mb
+        {
+            return Err(AllocError::MemoryUnavailable);
         }
 
+        for &id in &cpu_ids {
+            self.allocated_cpus[id as usize] = true;
+        }
         self.allocated_memory_mb += memory_mb;
         for &idx in &gpu_indices {
             self.gpu_allocated[idx] = true;
@@ -654,6 +697,71 @@ mod tests {
         assert!(node.release_job(1));
         assert!(node.release_job(3));
         assert_eq!(node.free_gpus(None), 4);
+    }
+
+    #[test]
+    fn allocate_refuses_a_cpu_shortfall_instead_of_under_serving() {
+        // It used to fill what it could and return Ok with a short list, which
+        // both callers read as a full allocation.
+        let mut node = make_node(4, 64_000, 0, "");
+        node.allocate_for_job(1, 1, 3, 1_000, &[]).unwrap();
+
+        assert_eq!(
+            node.allocate_for_job(2, 1, 3, 1_000, &[]),
+            Err(AllocError::CpusUnavailable)
+        );
+        assert_eq!(node.free_cpus(), 1, "the refusal must not consume cores");
+        assert!(node.allocate_for_job(2, 1, 1, 1_000, &[]).is_ok());
+    }
+
+    #[test]
+    fn allocate_refuses_to_take_the_node_past_its_memory() {
+        let mut node = make_node(8, 10_000, 0, "");
+        node.allocate_for_job(1, 1, 1, 6_000, &[]).unwrap();
+
+        assert_eq!(
+            node.allocate_for_job(2, 1, 1, 5_000, &[]),
+            Err(AllocError::MemoryUnavailable)
+        );
+        assert_eq!(
+            node.allocated_memory_mb, 6_000,
+            "the refusal must not commit"
+        );
+        assert!(node.allocate_for_job(2, 1, 1, 4_000, &[]).is_ok());
+        assert_eq!(node.allocated_memory_mb, 10_000);
+    }
+
+    #[test]
+    fn a_node_that_never_read_its_memory_is_not_treated_as_having_none() {
+        // A node reports 0 when /proc/meminfo is unreadable. Enforcing a ceiling
+        // against that refuses every job the node is asked to run.
+        let mut node = make_node(8, 0, 0, "");
+        assert!(node.allocate_for_job(1, 1, 1, 4_000, &[]).is_ok());
+    }
+
+    #[test]
+    fn a_refused_reallocation_does_not_drop_the_owner_it_would_supersede() {
+        let mut node = make_node(4, 10_000, 0, "");
+        node.allocate_for_job(1, 1, 2, 4_000, &[]).unwrap();
+        node.commit_job(1, 1);
+        node.allocate_for_job(2, 1, 2, 4_000, &[]).unwrap();
+        node.commit_job(2, 1);
+
+        // Job 1 re-allocating beyond what it could free must refuse without
+        // having already released what it holds.
+        assert_eq!(
+            node.allocate_for_job(1, 2, 4, 4_000, &[]),
+            Err(AllocError::CpusUnavailable)
+        );
+        assert_eq!(
+            node.free_cpus(),
+            0,
+            "the refusal must not have released job 1"
+        );
+        assert_eq!(node.allocated_memory_mb, 8_000);
+
+        // It may still grow into exactly what it can free.
+        assert!(node.allocate_for_job(1, 2, 2, 6_000, &[]).is_ok());
     }
 
     #[test]

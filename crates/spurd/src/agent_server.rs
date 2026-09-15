@@ -2741,6 +2741,35 @@ pub struct AgentService {
 }
 
 impl AgentService {
+    /// Whether this launch must be refused. A run with no record has no cutoff
+    /// and no admitted digest, so only its own deadline can refuse it.
+    fn check_launch_fences(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        launch_step: spur_core::step::StepId,
+        fences: &crate::admission::LaunchFences,
+    ) -> Option<crate::admission::LaunchRefusal> {
+        let admissions = self.admissions();
+        let recorded = admissions.load_run(job_id, run_attempt).ok();
+        let digest = recorded.as_ref().and_then(|_| {
+            admissions
+                .participants(job_id, run_attempt)
+                .ok()
+                .and_then(|(participants, _)| {
+                    participants
+                        .into_iter()
+                        .find(|p| p.step_id == launch_step && !p.command_digest.is_empty())
+                        .map(|p| p.command_digest)
+                })
+        });
+        fences.check(
+            crate::admission::now_unix_ms(),
+            recorded.map(|r| r.reject_before_unix_ms).unwrap_or(0),
+            digest.as_deref(),
+        )
+    }
+
     /// The entitlement ledger, keyed to the node this agent serves.
     pub(crate) fn admissions(&self) -> crate::admission::AdmissionStore {
         crate::admission::AdmissionStore::new(&self.stepd_state_dir, &self.reporter.hostname)
@@ -4340,6 +4369,37 @@ impl SlurmAgent for AgentService {
     type StreamJobOutputStream = ReceiverStream<Result<StreamJobOutputChunk, Status>>;
     type InteractiveSessionStream = ReceiverStream<Result<InteractiveOutput, Status>>;
 
+    async fn fence_run(
+        &self,
+        request: Request<FenceRunRequest>,
+    ) -> Result<Response<FenceRunResponse>, Status> {
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        let admissions = self.admissions();
+        let (job_id, run_attempt, cutoff) =
+            (req.job_id, req.run_attempt, req.reject_before_unix_ms);
+        let fenced =
+            tokio::task::spawn_blocking(move || admissions.fence_run(job_id, run_attempt, cutoff))
+                .await
+                .map_err(|error| Status::internal(format!("fence task failed: {error}")))?;
+        match fenced {
+            Ok(reject_before_unix_ms) => {
+                info!(
+                    job_id,
+                    run_attempt, reject_before_unix_ms, "fenced a run against in-flight launches"
+                );
+                Ok(Response::new(FenceRunResponse {
+                    success: true,
+                    error: String::new(),
+                    reject_before_unix_ms,
+                }))
+            }
+            Err(error) => Err(Status::unavailable(format!(
+                "could not persist the fence for job {job_id}: {error}"
+            ))),
+        }
+    }
+
     async fn launch_job(
         &self,
         request: Request<LaunchJobRequest>,
@@ -4355,6 +4415,28 @@ impl SlurmAgent for AgentService {
                 req.target_node, self.reporter.hostname
             )));
         }
+        // Before anything is reserved or spawned. These refuse a stale command
+        // from the controller; they authenticate nobody.
+        let fences = crate::admission::LaunchFences {
+            issued_at_unix_ms: req.issued_at_unix_ms,
+            expires_at_unix_ms: req.expires_at_unix_ms,
+            command_digest: req.command_digest.clone(),
+        };
+        let launch_step = launch_step_id(req.spec.as_ref().map(|spec| spec.pty).unwrap_or(false));
+        if let Some(refusal) =
+            self.check_launch_fences(job_id, req.run_attempt, launch_step, &fences)
+        {
+            warn!(
+                job_id,
+                run_attempt = req.run_attempt,
+                ?refusal,
+                "refusing a launch"
+            );
+            return Err(Status::failed_precondition(format!(
+                "launch for job {job_id} refused: {refusal:?}"
+            )));
+        }
+
         let peer_nodes = req.peer_nodes;
         let task_offset = req.task_offset;
         // Per-task array identity is controller-assigned on the launch request,
@@ -4759,6 +4841,9 @@ impl SlurmAgent for AgentService {
             run_record.allocation.clone(),
         );
         participant_record.final_report.required = true;
+        participant_record.command_digest = req.command_digest.clone();
+        participant_record.issued_at_unix_ms = req.issued_at_unix_ms;
+        participant_record.expires_at_unix_ms = req.expires_at_unix_ms;
         if let Err(error) = admissions.admit_participant_async(participant_record).await {
             error!(job_id, run_attempt, %error, "failed to persist the participant admission record");
             return Err(Status::unavailable(format!(
@@ -5525,6 +5610,9 @@ impl SlurmAgent for AgentService {
                     )),
                     AllocError::CpusUnavailable => {
                         Status::resource_exhausted("allocated cores unavailable on this node")
+                    }
+                    AllocError::MemoryUnavailable => {
+                        Status::resource_exhausted("allocated memory unavailable on this node")
                     }
                 })?;
             result
@@ -7413,12 +7501,18 @@ impl AgentService {
                         "job {job_id} was superseded by a newer attempt on this node"
                     )));
                 }
-                // Only a replay of recorded cores can raise this; dispatch derives
-                // its own, so reaching here means the ledger disagrees with the node.
+                // Reachable on dispatch now that a shortfall refuses rather than
+                // serving a short list the caller reads as a full allocation.
                 Err(AllocError::CpusUnavailable) => {
                     warn!(job_id, "rejecting launch: allocated cores unavailable");
                     return Err(Status::resource_exhausted(
                         "allocated cores unavailable on this node",
+                    ));
+                }
+                Err(AllocError::MemoryUnavailable) => {
+                    warn!(job_id, "rejecting launch: no room for the requested memory");
+                    return Err(Status::resource_exhausted(
+                        "allocated memory unavailable on this node",
                     ));
                 }
             };

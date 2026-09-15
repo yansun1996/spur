@@ -474,6 +474,7 @@ service SlurmController {
 
 service SlurmAgent {
   rpc LaunchJob(LaunchJobRequest) returns (LaunchJobResponse);
+  rpc FenceRun(FenceRunRequest) returns (FenceRunResponse);
   // Start PMIx server and verify multi-node peers before rank exec (multi-node pmix only).
   rpc PreparePmix(PreparePmixRequest) returns (PreparePmixResponse);
   // Tear down a prepared-but-not-launched PMIx server (prepare rollback).
@@ -968,6 +969,28 @@ message LaunchJobRequest {
   bool task_fanout = 11;
   // When true, PMIx was prepared via PreparePmix; LaunchJob must not re-init the server.
   bool pmix_prepared = 12;
+  // Controller-stamped and respected as delivered. Issued at or before the
+  // run's cutoff is refused; past the deadline is refused. 0 = unset (legacy).
+  uint64 issued_at_unix_ms = 13;
+  uint64 expires_at_unix_ms = 14;
+  // Digest of the resolved command. An exact repeat is idempotent; a different
+  // command under the same identity is refused rather than silently relaunched.
+  string command_digest = 15;
+}
+
+// Refuse every launch for this run attempt issued at or before the cutoff, so
+// one already in flight cannot land after the decision that cancelled it.
+message FenceRunRequest {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+  uint64 reject_before_unix_ms = 3;
+}
+
+message FenceRunResponse {
+  bool success = 1;
+  string error = 2;
+  // What the agent now enforces, which never moves backwards.
+  uint64 reject_before_unix_ms = 3;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.

@@ -13,8 +13,8 @@ use spur_core::partition::requested_partition_names;
 use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
-    AgentCancelJobRequest, AgentSuspendJobRequest, JobSpec as ProtoJobSpec, LaunchJobRequest,
-    RegisterJobAllocationRequest, SubmitJobRequest,
+    AgentCancelJobRequest, AgentSuspendJobRequest, FenceRunRequest, JobSpec as ProtoJobSpec,
+    LaunchJobRequest, RegisterJobAllocationRequest, SubmitJobRequest,
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
@@ -40,6 +40,43 @@ fn node_comm_socket(node: &Node) -> Option<String> {
 fn node_comm_http_url(node: &Node) -> Option<String> {
     let host = node.comm_addr()?;
     Some(spur_net::format_comm_http_url(host, node.port))
+}
+
+/// How long a launch stays admissible. Well under the agent's record retention,
+/// or a cutoff could be collected while a launch it would refuse is in flight.
+const LAUNCH_LIFETIME_MS: u64 = 120_000;
+
+/// Milliseconds since the epoch, saturating rather than panicking on a clock
+/// set before 1970.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+/// Identifies what a launch asks the node to run, so an exact repeat stays
+/// idempotent and a different command under the same identity is refused.
+fn command_digest(params: &AgentDispatchParams<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    let spec = params.spec;
+    let mut hasher = Sha256::new();
+    hasher.update(params.job_id.to_le_bytes());
+    hasher.update(params.run_attempt.to_le_bytes());
+    hasher.update(params.task_offset.to_le_bytes());
+    hasher.update(spec.script.as_deref().unwrap_or_default().as_bytes());
+    for arg in spec.argv.iter().chain(spec.script_args.iter()) {
+        hasher.update([0u8]);
+        hasher.update(arg.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::new(), |mut out, byte| {
+            use std::fmt::Write;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 /// True on the tick a leadership term begins, so per-term setup runs once rather
@@ -1340,6 +1377,7 @@ async fn dispatch_to_agent(
         submit_line: spec.submit_line.clone().unwrap_or_default(),
     };
 
+    let issued_at = now_unix_ms();
     let response = client
         .launch_job(LaunchJobRequest {
             job_id: params.job_id,
@@ -1355,6 +1393,9 @@ async fn dispatch_to_agent(
             pmix_plan,
             task_fanout: params.task_fanout,
             pmix_prepared: params.pmix_prepared,
+            issued_at_unix_ms: issued_at,
+            expires_at_unix_ms: issued_at.saturating_add(LAUNCH_LIFETIME_MS),
+            command_digest: command_digest(params),
         })
         .await
         .map_err(|s| match s.code() {
@@ -2417,9 +2458,8 @@ pub async fn send_cancel_to_agents(
 /// isn't at the mercy of `job.allocated_nodes` having been mutated in the
 /// meantime (e.g. cleared by a requeue-on-eviction side effect).
 ///
-/// Fire-and-forget: each node's cancel runs on its own task and this returns
-/// immediately. Use `cancel_job_on_nodes` when the cancel must be delivered
-/// before subsequent work (e.g. a requeue that could re-dispatch the job).
+/// The fence is awaited; each node's cancel then runs on its own task. Use
+/// `cancel_job_on_nodes` when the cancel itself must land before later work.
 pub async fn send_cancel_to_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
@@ -2427,8 +2467,61 @@ pub async fn send_cancel_to_nodes(
     node_names: &[String],
     signal: i32,
 ) {
+    fence_run_on_nodes(cluster, job_id, run_attempt, node_names).await;
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
         tokio::spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
+    }
+}
+
+/// Refuse any launch for this run issued before now. Sent before the cancel,
+/// which alone races an in-flight launch and loses.
+async fn fence_run_on_nodes(
+    cluster: &Arc<ClusterManager>,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    node_names: &[String],
+) {
+    let cutoff = now_unix_ms();
+    let mut set = tokio::task::JoinSet::new();
+    for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
+        set.spawn(fence_one_agent(agent_addr, job_id, run_attempt, cutoff));
+    }
+    while set.join_next().await.is_some() {}
+}
+
+async fn fence_one_agent(
+    agent_addr: String,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+    reject_before_unix_ms: u64,
+) {
+    let mut client = match crate::agent_client::connect(agent_addr.clone()).await {
+        Ok(client) => client,
+        // An unreachable node runs nothing the controller can see; its
+        // registration reconcile covers it when it returns.
+        Err(error) => {
+            debug!(job_id, agent = %agent_addr, %error, "could not reach an agent to fence a run");
+            return;
+        }
+    };
+    let fenced = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.fence_run(FenceRunRequest {
+            job_id,
+            run_attempt,
+            reject_before_unix_ms,
+        }),
+    )
+    .await;
+    match fenced {
+        Ok(Ok(_)) => {}
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+            debug!(job_id, agent = %agent_addr, "agent predates run fencing")
+        }
+        Ok(Err(status)) => {
+            warn!(job_id, agent = %agent_addr, %status, "agent refused a run fence")
+        }
+        Err(_) => warn!(job_id, agent = %agent_addr, "timed out fencing a run"),
     }
 }
 
@@ -2443,6 +2536,7 @@ pub async fn cancel_job_on_nodes(
     node_names: &[String],
     signal: i32,
 ) {
+    fence_run_on_nodes(cluster, job_id, run_attempt, node_names).await;
     let mut set = tokio::task::JoinSet::new();
     for agent_addr in cancel_agent_addrs(cluster, job_id, node_names) {
         set.spawn(cancel_one_agent(agent_addr, job_id, run_attempt, signal));
@@ -3269,6 +3363,18 @@ mod tests {
 
         #[tonic::async_trait]
         impl spur_proto::proto::slurm_agent_server::SlurmAgent for MockAgent {
+            async fn fence_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::FenceRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::FenceRunResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(spur_proto::proto::FenceRunResponse {
+                    success: true,
+                    error: String::new(),
+                    reject_before_unix_ms: 0,
+                }))
+            }
+
             type StreamJobOutputStream =
                 tonic::codegen::BoxStream<spur_proto::proto::StreamJobOutputChunk>;
             type InteractiveSessionStream =
