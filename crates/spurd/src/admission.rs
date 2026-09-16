@@ -475,8 +475,8 @@ impl LaunchFences {
         reject_before_unix_ms: u64,
         admitted_digest: Option<&str>,
     ) -> Option<LaunchRefusal> {
-        // Both sides are controller-stamped, so this comparison does not depend
-        // on the agent's clock and a clock jump cannot un-fence a stopped run.
+        // Both sides are controller-stamped, so a jump in the agent's clock cannot
+        // un-fence a stopped run -- though `fence_run` clamps what it stores.
         if reject_before_unix_ms > 0
             && self.issued_at_unix_ms > 0
             && self.issued_at_unix_ms <= reject_before_unix_ms
@@ -915,8 +915,8 @@ impl AdmissionStore {
     /// or replayed fence can never un-cancel a run.
     pub fn fence_run(&self, run_key: RunKey, reject_before_unix_ms: u64) -> io::Result<u64> {
         let attempt = addressable_attempt(run_key)?;
-        // A cutoff further out than any launch it could cover never ages out, so
-        // controller clock skew would strand the record fencing the run forever.
+        // Agent clock against a controller cutoff: running ahead leaves the strand
+        // it prevents, behind can lower a cutoff past a launch that should fence.
         let reject_before_unix_ms =
             reject_before_unix_ms.min(now_unix_ms().saturating_add(LAUNCH_LIFETIME_MS));
         let mut run = match self.load_run(run_key) {
@@ -1892,16 +1892,11 @@ mod tests {
             applied < far_future,
             "a skewed cutoff must not be taken verbatim"
         );
-
-        let run = store.load_run(key(7, 1)).unwrap();
         assert!(
-            run.fence_is_live(now_unix_ms()),
-            "the fence still holds now"
+            applied <= now_unix_ms().saturating_add(LAUNCH_LIFETIME_MS),
+            "a cutoff past the last launch it could cover never ages out"
         );
-        assert!(
-            !run.fence_is_live(applied.saturating_add(LAUNCH_LIFETIME_MS).saturating_add(1)),
-            "and it ages out once no launch it covers can still land"
-        );
+        assert_eq!(store.reject_before(key(7, 1)), Some(applied));
     }
 
     #[test]

@@ -872,8 +872,8 @@ pub(crate) struct ReconcileOutcome {
     pub settled: Vec<u32>,
 }
 
-/// How the controller came by a cut. A pull reaches an address the controller
-/// chose from its own record; a registration is whoever asserted the hostname.
+/// How the controller came by a cut. Under open admission neither one attests
+/// the node: a caller that can register may repoint the address a pull dials.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CutProvenance {
     Pulled,
@@ -909,9 +909,9 @@ struct ReconcileLicense<'a> {
     /// Whether something missing from `held` is evidence that the node let it
     /// go. A cut the agent could not complete says nothing about what is absent.
     absence_is_evidence: bool,
-    /// Whether the controller can attest whoever produced this cut. A caller it
-    /// cannot place may add what it missed, but never destroy what it holds.
-    teardown_is_licensed: bool,
+    /// How the controller came by this cut, which is what decides whether it may
+    /// license an act or only be read for drift.
+    provenance: CutProvenance,
     /// The agent lifetime that took the cut, so a direction acting over several
     /// awaits can tell whether it is still the one this node is running.
     session: &'a str,
@@ -928,6 +928,20 @@ impl ReconcileLicense<'_> {
             return Some("a later registration replaced the lifetime that took this cut");
         }
         None
+    }
+
+    /// Whether the controller can attest whoever produced this cut. Read per act
+    /// rather than fixed at the open: a mode revoked mid-pass licenses no more.
+    fn teardown_is_licensed(&self, cluster: &ClusterManager) -> bool {
+        match self.provenance {
+            CutProvenance::Pulled => true,
+            // Open admission lets any reachable host assert any hostname, so the
+            // cut names a node the controller has no way to place the caller at.
+            CutProvenance::Registered => matches!(
+                cluster.config().admission.mode,
+                spur_core::config::AdmissionMode::Token
+            ),
+        }
     }
 }
 
@@ -979,19 +993,10 @@ async fn open_reconcile_license<'a>(
             }
         }
     }
-    let teardown_is_licensed = match provenance {
-        CutProvenance::Pulled => true,
-        // Open admission lets any reachable host assert any hostname, so the cut
-        // names a node the controller has no way to place the caller at.
-        CutProvenance::Registered => matches!(
-            cluster.config().admission.mode,
-            spur_core::config::AdmissionMode::Token
-        ),
-    };
     Some(ReconcileLicense {
         held,
         absence_is_evidence: ledger.inventory_complete && every_entry_named_a_run,
-        teardown_is_licensed,
+        provenance,
         session: &ledger.agent_session_id,
     })
 }
@@ -1032,7 +1037,7 @@ async fn cancel_unrecorded_claims(
         }
         // Reported either way: an operator sees the drift even where the caller
         // proved too little for the controller to act on it.
-        if !license.teardown_is_licensed {
+        if !license.teardown_is_licensed(cluster) {
             warn!(
                 node = %node,
                 job_id = entry.job_id,
@@ -1084,6 +1089,12 @@ async fn reconcile_node_ledger_after(
     let raced_the_cut = dispatched.observed();
     for run in cluster.jobs_confirmed_on_node(node) {
         let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
+        // Direction A awaits a round trip per kill, so by here the premises this
+        // pass opened on are at least that stale and have to be taken again.
+        if let Some(reason) = license.lapsed(cluster, node) {
+            warn!(node = %node, reason, "leaving the rest of this node's records alone");
+            break;
+        }
         if license.held.contains_key(&run) {
             continue;
         }
@@ -1109,7 +1120,7 @@ async fn reconcile_node_ledger_after(
         );
         // Reported either way: an operator sees the drift even where the caller
         // proved too little for the controller to act on it.
-        if !license.teardown_is_licensed {
+        if !license.teardown_is_licensed(cluster) {
             warn!(
                 node = %node,
                 job_id,
@@ -7324,6 +7335,170 @@ mod tests {
         assert_eq!(outcome.cancelled, vec![99]);
     }
 
+    // A revoked licence has to stop the pass it opened. Reconfigure swaps the
+    // whole config, so admission can reopen while a reconcile is still killing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admission_reopened_under_a_pass_licenses_no_more_of_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let conf_path = dir.path().join("spur.conf");
+        let conf = |mode| format!("cluster_name = \"test\"\n[admission]\nmode = \"{mode}\"\n");
+        std::fs::write(&conf_path, conf("token")).unwrap();
+
+        let config = spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap();
+        let cluster = Arc::new(
+            ClusterManager::new_with_config_path(config, dir.path(), Some(conf_path.clone()))
+                .unwrap(),
+        );
+        let handle = crate::raft::start_raft(1, &["[::1]:0".into()], dir.path(), cluster.clone())
+            .await
+            .unwrap();
+        handle
+            .raft
+            .wait(Some(std::time::Duration::from_secs(5)))
+            .metrics(|m| m.current_leader == Some(1), "leader elected")
+            .await
+            .unwrap();
+        cluster.set_raft(handle.raft);
+
+        let (agent, release, mut fences) = spawn_gated_probe_agent_watching_fences().await;
+        seed_a_job_on_a_node(&cluster);
+        cluster
+            .register_node(
+                "n1".into(),
+                "n1".into(),
+                spur_core::resource::ResourceSet {
+                    cpus: 8,
+                    memory_mb: 16000,
+                    ..Default::default()
+                },
+                "127.0.0.1".into(),
+                agent.port(),
+                String::new(),
+                String::new(),
+                spur_core::node::NodeSource::NativeHost,
+                std::collections::HashMap::new(),
+                true,
+            )
+            .expect("point the node at its probe agent");
+
+        let cut = ledger(true, vec![(98, 1), (99, 1)]);
+        let dispatched = no_launch_in_flight(&cluster, "n1");
+        let reconcile = {
+            let cluster = cluster.clone();
+            tokio::spawn(async move {
+                reconcile_node_ledger(&cluster, "n1", cut, &dispatched, CutProvenance::Registered)
+                    .await
+            })
+        };
+
+        // The pass is provably mid-flight: one kill is held on the agent.
+        let first = fences.recv().await.expect("a fence reaches the agent");
+        std::fs::write(&conf_path, conf("open")).unwrap();
+        cluster.reconfigure().expect("reopen admission");
+        release.notify_one();
+        release.notify_one();
+        let outcome = reconcile.await.expect("reconcile");
+
+        assert_eq!(
+            outcome.cancelled,
+            vec![first],
+            "a mode that no longer attests the caller licenses no further kill"
+        );
+    }
+
+    // The only production caller that hands reconciliation a registration's own
+    // cut. Pinned through the handler: the provenance is set there, not by a test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_registered_cut_settles_nothing_under_open_admission() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (addr, _release) = spawn_gated_probe_agent().await;
+        seed_a_job_on_a_node(&svc.cluster);
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            ledger: Some(ledger(true, Vec::new())),
+            ..registration("n1", addr)
+        }))
+        .await
+        .expect("register");
+
+        await_reconcile_gate(&svc, "n1", false).await;
+        assert!(
+            holds_job(&svc.cluster.jobs_allocated_on_node("n1"), 7),
+            "an empty cut from a caller open admission cannot place must not end a run"
+        );
+    }
+
+    // The attested half of the same wiring, and the settle this suite otherwise
+    // only ever proves by cancelling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_registered_cut_settles_a_job_the_node_let_go_under_token_admission() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with_token_admission(&dir).await;
+        let (addr, _release) = spawn_gated_probe_agent().await;
+        seed_a_job_on_a_node(&svc.cluster);
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
+
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            ledger: Some(ledger(true, Vec::new())),
+            join_token,
+            ..registration("n1", addr)
+        }))
+        .await
+        .expect("register");
+
+        await_reconcile_gate(&svc, "n1", false).await;
+        assert!(
+            !holds_job(&svc.cluster.jobs_allocated_on_node("n1"), 7),
+            "a caller that proved admission may settle what its complete cut omits"
+        );
+    }
+
+    // Cancelling awaits a round trip per claim, so a registration can land mid-pass
+    // -- and settling under the cut it replaced is as destructive as cancelling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_registration_landing_mid_pass_stops_settling_too() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with_token_admission(&dir).await;
+        let cluster = svc.cluster.clone();
+        seed_a_job_on_a_node(&cluster);
+        let (agent, release, mut fences) = spawn_gated_probe_agent_watching_fences().await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+        cluster
+            .agent_sessions()
+            .observe_registration("n1", "session-a");
+
+        // Two unrecorded claims to cancel and, by omission, job 7 to settle.
+        let cut = ledger(true, vec![(98, 1), (99, 1)]);
+        let dispatched = no_launch_in_flight(&cluster, "n1");
+        let reconcile = {
+            let cluster = cluster.clone();
+            tokio::spawn(async move {
+                reconcile_node_ledger(&cluster, "n1", cut, &dispatched, CutProvenance::Registered)
+                    .await
+            })
+        };
+
+        // The pass is provably mid-flight: one fence is held on the agent.
+        fences.recv().await.expect("a fence reaches the agent");
+        cluster
+            .agent_sessions()
+            .observe_registration("n1", "session-b");
+        release.notify_one();
+        release.notify_one();
+        let outcome = reconcile.await.expect("reconcile");
+
+        assert_eq!(
+            outcome.settled,
+            Vec::<u32>::new(),
+            "a cut a later registration replaced is not evidence the node let go"
+        );
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
+            "the job must still be recorded on the node"
+        );
+    }
+
     // A leaked claim the node can name is capacity lost until someone looks. The
     // routine sweep is an hour away, so the heartbeat has to be what brings it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8102,22 +8277,34 @@ mod tests {
         }
     }
 
+    /// Token admission, so the cut licenses the cancel that holds the reconcile
+    /// open on the gated agent; under open admission nothing would block.
+    async fn register_with_a_blocking_cut(
+        svc: &ControllerService,
+        addr: std::net::SocketAddr,
+    ) -> Result<tonic::Response<RegisterAgentResponse>, Status> {
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            // A claim the controller has no record of, so the reconcile has to
+            // cancel it -- and the cancel fences through the agent held open.
+            ledger: Some(ledger(true, vec![(99, 1)])),
+            join_token,
+            ..registration("n1", addr)
+        }))
+        .await
+    }
+
     // The gate's live window is milliseconds wide, far too narrow to catch by
     // sampling, so its contract is pinned here instead.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn registering_with_a_ledger_holds_the_node_out_until_the_reconcile_finishes() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = test_service_with_token_admission(&dir).await;
         let (addr, release) = spawn_gated_probe_agent().await;
 
-        // A claim the controller has no record of, so the reconcile has to
-        // cancel it — and the cancel fences through the agent held open here.
-        svc.register_agent(Request::new(RegisterAgentRequest {
-            ledger: Some(ledger(true, vec![(99, 1)])),
-            ..registration("n1", addr)
-        }))
-        .await
-        .expect("register");
+        register_with_a_blocking_cut(&svc, addr)
+            .await
+            .expect("register");
 
         await_reconcile_gate(&svc, "n1", true).await;
         assert!(
@@ -8144,20 +8331,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_re_registering_node_is_gated_too() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = test_service_with_token_admission(&dir).await;
         let (addr, release) = spawn_gated_probe_agent().await;
 
-        svc.register_agent(Request::new(registration("n1", addr)))
-            .await
-            .expect("first registration");
-        await_registered_node(&svc, "n1").await;
-
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
         svc.register_agent(Request::new(RegisterAgentRequest {
-            ledger: Some(ledger(true, vec![(99, 1)])),
+            join_token,
             ..registration("n1", addr)
         }))
         .await
-        .expect("re-registration");
+        .expect("first registration");
+        await_registered_node(&svc, "n1").await;
+
+        register_with_a_blocking_cut(&svc, addr)
+            .await
+            .expect("re-registration");
 
         await_reconcile_gate(&svc, "n1", true).await;
         release.notify_one();
@@ -8349,6 +8537,9 @@ mod tests {
         /// Reports each ledger pull's reason, so a test can await the pull it
         /// expects instead of guessing how long the controller takes to make it.
         ledger_pulls: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        /// Reports each fence's job as it arrives and before `fence_gate` holds
+        /// it, so a test can act while a reconcile is provably mid-pass.
+        fence_arrivals: Option<tokio::sync::mpsc::UnboundedSender<u32>>,
     }
 
     #[tonic::async_trait]
@@ -8368,8 +8559,11 @@ mod tests {
 
         async fn fence_run(
             &self,
-            _request: Request<spur_proto::proto::FenceRunRequest>,
+            request: Request<spur_proto::proto::FenceRunRequest>,
         ) -> Result<Response<spur_proto::proto::FenceRunResponse>, Status> {
+            if let Some(arrivals) = &self.fence_arrivals {
+                let _ = arrivals.send(request.into_inner().job_id);
+            }
             if let Some(gate) = &self.fence_gate {
                 gate.notified().await;
             }
@@ -8542,26 +8736,43 @@ mod tests {
         (addr, gate)
     }
 
+    /// A gated agent that also says when a fence reached it, so a test can act at
+    /// a point the reconcile has provably started and not yet finished.
+    async fn spawn_gated_probe_agent_watching_fences() -> (
+        std::net::SocketAddr,
+        Arc<tokio::sync::Notify>,
+        tokio::sync::mpsc::UnboundedReceiver<u32>,
+    ) {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let addr = spawn_probe_agent_full(false, Some(gate.clone()), None, Some(tx)).await;
+        (addr, gate, rx)
+    }
+
     /// A probe agent that reports every ledger pull the controller makes to it.
     async fn spawn_probe_agent_watching_pulls() -> (
         std::net::SocketAddr,
         tokio::sync::mpsc::UnboundedReceiver<String>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (spawn_probe_agent_full(false, None, Some(tx)).await, rx)
+        (
+            spawn_probe_agent_full(false, None, Some(tx), None).await,
+            rx,
+        )
     }
 
     async fn spawn_probe_agent_with(
         active: bool,
         fence_gate: Option<Arc<tokio::sync::Notify>>,
     ) -> std::net::SocketAddr {
-        spawn_probe_agent_full(active, fence_gate, None).await
+        spawn_probe_agent_full(active, fence_gate, None, None).await
     }
 
     async fn spawn_probe_agent_full(
         active: bool,
         fence_gate: Option<Arc<tokio::sync::Notify>>,
         ledger_pulls: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+        fence_arrivals: Option<tokio::sync::mpsc::UnboundedSender<u32>>,
     ) -> std::net::SocketAddr {
         let incoming =
             tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -8570,6 +8781,7 @@ mod tests {
             active,
             fence_gate,
             ledger_pulls,
+            fence_arrivals,
         };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()

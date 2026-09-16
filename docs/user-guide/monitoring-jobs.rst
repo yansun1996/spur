@@ -320,6 +320,33 @@ specific pending job's upcoming start. The idle gate is checked live, but the
 job and start time shown for ``plnd`` reflect the most recent scheduling
 cycle (``scheduler.interval_secs``), not the current instant.
 
+When a node's resources come back
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A job's CPUs, GPUs and memory go back to the node when the controller has
+committed the job's completion — not when the job's processes exit. The agent
+reports the exit, waits for the controller to acknowledge it, and only then frees
+the slice.
+
+The visible effect is a short lag: for a moment after a job finishes, ``sinfo``
+and ``scontrol show node`` still count its resources as allocated on a node where
+nothing is running. Normally this is one round trip and you will rarely catch it.
+
+If the controller is unreachable, the lag lasts as long as the outage. The agent
+keeps retrying the completion report — backing off to at most a minute between
+attempts, indefinitely, across an agent restart as well — and keeps the resources
+booked until one is acknowledged. Nothing frees them locally on a timer: the
+agent having lost track of a job is not evidence the job's work finished, so a
+node nobody can speak for holds its claims rather than reissuing them. Held
+resources on an unreachable node are not schedulable anyway, since the node goes
+``down`` once its heartbeat times out, and they are resolved when it reconnects
+and reconciles.
+
+A report the controller will not accept holds that job's resources for good. The
+agent calls this out in its log every fifteen minutes, naming the job and how
+long it has been held — worth an alert, because the node shrinks silently
+otherwise.
+
 Accounting History — ``sacct``
 -------------------------------
 
@@ -907,11 +934,33 @@ accept ``State=``, ``Reason=``, and ``Reconcile=``.
 ``Reconcile=yes`` asks the node for a fresh account of what it believes it is
 running and compares that against the controller's own record, resolving any
 difference. This is not a read-only audit: work the node is holding that the
-controller has no record of is cancelled on that node with ``SIGKILL``. The
-controller already does this when a node registers, when a new controller takes
-over, and once an hour; this is the way to ask for it immediately — for
-instance after an incident, when you want to confirm a node is not still
-holding resources for a job that has finished.
+controller has no record of is cancelled on that node with ``SIGKILL``.
+
+The controller already reconciles a node on its own:
+
+- when the node registers;
+- when a new controller takes over;
+- once an hour, across every node;
+- when the node refuses a launch because it is holding something the controller
+  cannot explain;
+- when the node asks for one on its heartbeat, having found evidence it cannot
+  resolve alone. A node that keeps asking is answered at most once a minute.
+
+``Reconcile=yes`` is the way to ask for one immediately — for instance after an
+incident, when you want to confirm a node is not still holding resources for a
+job that has finished.
+
+The two halves do not degrade together. If the node could not read all of its own
+records, it says so, and the controller stops settling jobs the node did not
+mention — it cannot tell absence from a gap in the account. It still cancels the
+claims the node *did* report that it cannot explain, because a claim the node
+named is evidence whether or not the rest of the account is complete. So a node
+with a damaged spool is not uniformly left alone: expect cancellations from it,
+but no settlements.
+
+Whether a reconcile may cancel and settle, or only report what it found, depends
+on ``[admission] mode`` for the registration case; see
+:doc:`/admin-guide/configuration`. Every other trigger above acts in either mode.
 
 The reconcile a node runs as part of registering gates that node: it reports a
 reason of ``reconciling with the controller`` and accepts no new work until the
