@@ -116,6 +116,16 @@ impl NodeReporter {
         Some(ledger_to_proto(cut))
     }
 
+    /// Re-read each heartbeat rather than latched, so it clears when the reconcile
+    /// lands and survives an agent restart until then.
+    pub(crate) fn needs_reconcile(&self) -> bool {
+        self.admissions.get().is_some_and(|admissions| {
+            admissions
+                .ledger_cut(&self.agent_session_id)
+                .needs_reconcile()
+        })
+    }
+
     /// Identifies this agent process, so the controller can discard a cut taken
     /// by a session that ended before it was read.
     pub fn agent_session_id(&self) -> &str {
@@ -228,6 +238,10 @@ impl NodeReporter {
             self.cpu_load.store(load as u64, Ordering::Relaxed);
             self.free_memory_mb.store(free_mem, Ordering::Relaxed);
             let current_token = self.node_token.read().unwrap().clone();
+            let needs_reconcile = self.needs_reconcile();
+            if needs_reconcile {
+                warn!("holding evidence only the controller can resolve; asking it to reconcile");
+            }
             let running_jobs: Vec<RunningJobStatus> = self
                 .held_job_ids()
                 .into_iter()
@@ -257,6 +271,7 @@ impl NodeReporter {
                                     install_duration_seconds: install_secs,
                                 }
                             }),
+                            needs_reconcile,
                         })
                         .await
                     {

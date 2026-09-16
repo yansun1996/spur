@@ -911,6 +911,8 @@ message HeartbeatRequest {
   string wg_pubkey = 6;
   // k0s supervision status; present only when the node runs a k0s unit ([cluster].enabled).
   optional K0sNodeStatus k0s_status = 7;
+  // Node holds evidence it cannot resolve alone; asks for a ledger pull.
+  bool needs_reconcile = 8;
 }
 
 // Per-node k0s supervision status, reported on the heartbeat for spur_k8s_node_* metrics.

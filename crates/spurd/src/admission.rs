@@ -560,6 +560,14 @@ impl AdmissionStore {
     }
 }
 
+impl LedgerCut {
+    /// Holding something only the controller can settle: a claim with no job
+    /// behind it, or an unreadable record. Saying so is all the agent may do.
+    pub fn needs_reconcile(&self) -> bool {
+        !self.inventory_complete || self.entries.iter().any(|entry| entry.conflict_hold)
+    }
+}
+
 /// A record the agent could not adopt. Held rather than deleted, because the
 /// record is the only evidence that something here may still hold a claim.
 #[derive(Debug, Clone)]
