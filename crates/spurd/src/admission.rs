@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use spur_core::job::{RunKey, LAUNCH_LIFETIME_MS};
+use spur_core::job::{LedgerDisposition, RunKey, LAUNCH_LIFETIME_MS};
 use spur_core::step::StepId;
 use spur_sched::cons_tres::ReleaseWarrant;
 
@@ -519,36 +519,14 @@ pub struct LedgerCutEntry {
     pub conflict_hold: bool,
 }
 
-/// What a record says about a claim the node still holds. Only what the record
-/// itself can answer for: runtime evidence is a separate question.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LedgerDisposition {
-    /// A live claim with nothing decided about it yet.
-    Held,
-    /// The record says the run is over, but its slice has not gone back.
-    OverButCharged,
-    /// The agent is preserving evidence it cannot resolve on its own.
-    Unresolved,
-}
-
-impl LedgerDisposition {
-    fn of(admitted: &AdmittedRun) -> Self {
-        if admitted.run.conflict_hold.is_some() {
-            return Self::Unresolved;
-        }
-        if admitted.run.is_over() {
-            return Self::OverButCharged;
-        }
-        Self::Held
+fn disposition_of(admitted: &AdmittedRun) -> LedgerDisposition {
+    if admitted.run.conflict_hold.is_some() {
+        return LedgerDisposition::Unresolved;
     }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Held => "held",
-            Self::OverButCharged => "over_but_charged",
-            Self::Unresolved => "unresolved",
-        }
+    if admitted.run.is_over() {
+        return LedgerDisposition::OverButCharged;
     }
+    LedgerDisposition::Held
 }
 
 impl AdmissionStore {
@@ -572,7 +550,7 @@ impl AdmissionStore {
                 job_id: admitted.run.job_id,
                 run_attempt: admitted.run.run_attempt,
                 allocation: admitted.run.allocation.clone(),
-                disposition: LedgerDisposition::of(admitted),
+                disposition: disposition_of(admitted),
                 conflict_hold: admitted.run.conflict_hold.is_some(),
             })
             .collect();

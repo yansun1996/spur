@@ -2761,10 +2761,11 @@ pub(crate) fn supervisor_liveness(
 /// What a published descriptor says about a session's workload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkloadLiveness {
+    /// The recorded `(pid, start_ticks)` still names a running process.
     Live,
     Gone,
-    /// The descriptor could not be read, so nothing is proven either way. Never
-    /// read as gone: only positive proof may end a run.
+    /// Neither the descriptor nor the process behind it could be read, so
+    /// nothing is proven. Never read as gone, and never as licence to kill.
     Unknown,
 }
 
@@ -2772,8 +2773,7 @@ pub(crate) enum WorkloadLiveness {
 /// completion gate and the teardown fence must not disagree about one process.
 pub(crate) fn workload_liveness(published: &io::Result<StepdDescriptor>) -> WorkloadLiveness {
     match published {
-        Ok(descriptor) if workload_may_be_live(descriptor) => WorkloadLiveness::Live,
-        Ok(_) => WorkloadLiveness::Gone,
+        Ok(descriptor) => workload_process_liveness(descriptor),
         // No session on disk: nothing published a workload, so there is none.
         Err(error) if error.kind() == io::ErrorKind::NotFound => WorkloadLiveness::Gone,
         Err(_) => WorkloadLiveness::Unknown,
@@ -2801,11 +2801,11 @@ pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLi
     })
 }
 
-/// Undetermined counts as executing; an unrecorded workload (`0`) holds nothing
-/// up. Unlike a supervisor, a zombie counts as gone -- it holds none of the slice.
-pub(crate) fn workload_may_be_live(descriptor: &StepdDescriptor) -> bool {
+/// An unrecorded workload (`0`) holds nothing up. Unlike a supervisor, a zombie
+/// counts as gone -- it holds none of the slice.
+pub(crate) fn workload_process_liveness(descriptor: &StepdDescriptor) -> WorkloadLiveness {
     if descriptor.workload_pid == 0 {
-        return false;
+        return WorkloadLiveness::Gone;
     }
     let recorded = crate::admission::SupervisorRef {
         pid: descriptor.workload_pid,
@@ -2815,11 +2815,56 @@ pub(crate) fn workload_may_be_live(descriptor: &StepdDescriptor) -> bool {
     if recorded.boot_scope(crate::admission::current_boot_id().as_deref())
         == crate::admission::BootScope::Different
     {
-        return false;
+        return WorkloadLiveness::Gone;
     }
-    match process_liveness(descriptor.workload_pid, descriptor.workload_start_ticks) {
-        Ok(liveness) => liveness == StepdLiveness::Live,
-        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    workload_liveness_of_reading(process_liveness(
+        descriptor.workload_pid,
+        descriptor.workload_start_ticks,
+    ))
+}
+
+/// A `/proc` read that failed for anything but absence proves nothing: the pid
+/// may be anyone's, so it holds the slice without ever licensing a kill.
+pub(crate) fn workload_liveness_of_reading(reading: io::Result<StepdLiveness>) -> WorkloadLiveness {
+    match reading {
+        Ok(StepdLiveness::Live) => WorkloadLiveness::Live,
+        Ok(_) => WorkloadLiveness::Gone,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WorkloadLiveness::Gone,
+        Err(_) => WorkloadLiveness::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod workload_liveness_tests {
+    use super::{workload_liveness_of_reading, StepdLiveness, WorkloadLiveness};
+    use std::io;
+
+    #[test]
+    fn an_unreadable_process_is_undetermined_rather_than_live_or_gone() {
+        for kind in [
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+            io::ErrorKind::InvalidData,
+        ] {
+            assert_eq!(
+                workload_liveness_of_reading(Err(io::Error::from(kind))),
+                WorkloadLiveness::Unknown,
+                "an undetermined {kind:?} read must not pass as proof of either state"
+            );
+        }
+        assert_eq!(
+            workload_liveness_of_reading(Err(io::Error::from(io::ErrorKind::NotFound))),
+            WorkloadLiveness::Gone,
+            "an absent process is the one positive proof of death"
+        );
+        assert_eq!(
+            workload_liveness_of_reading(Ok(StepdLiveness::Live)),
+            WorkloadLiveness::Live
+        );
+        assert_eq!(
+            workload_liveness_of_reading(Ok(StepdLiveness::Stale)),
+            WorkloadLiveness::Gone
+        );
     }
 }
 

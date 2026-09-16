@@ -68,6 +68,16 @@ impl ReleaseWarrant {
     }
 }
 
+impl std::fmt::Display for ReleaseGround {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Acknowledged(index) => write!(f, "acknowledged at raft index {index}"),
+            Self::ControllerCancelled => f.write_str("controller cancelled"),
+            Self::NeverSpawned => f.write_str("never spawned"),
+        }
+    }
+}
+
 /// Why a reservation could not be made. Distinguished so the caller can map
 /// each to the right gRPC status instead of reporting every failure as GPU
 /// exhaustion.

@@ -352,11 +352,14 @@ async fn workload_confirmed_gone(descriptor: &crate::stepd::StepdDescriptor) -> 
     let freshest = crate::stepd::freshest_session(descriptor);
     match crate::stepd::workload_liveness(&freshest) {
         crate::stepd::WorkloadLiveness::Gone => return true,
+        // Holding is all an undetermined reading licenses; a root SIGKILL on a
+        // pid whose identity it never confirmed is not.
         crate::stepd::WorkloadLiveness::Unknown => {
             warn!(
                 job_id = descriptor.job_id,
                 step_id = descriptor.step_id,
-                "could not read a session to prove its workload is gone; it stays held"
+                "could not prove this workload is gone, nor that its pid is still its own; it \
+                 stays held"
             );
             return false;
         }
@@ -516,6 +519,12 @@ fn stepds_for_job(sessions: &StepdMap, job_id: u32) -> Vec<crate::stepd::StepdDe
 /// process in the tree, so a supervised teardown must serve its grace period first.
 fn cgroup_to_reap_on_cancel(doomed_attempt: Option<u32>, supervised: bool) -> Option<u32> {
     doomed_attempt.filter(|_| !supervised)
+}
+
+/// PMIx namespaces are keyed by job, not by attempt, so tearing one down on
+/// behalf of a doomed attempt would strand a sibling still running under it.
+fn pmix_teardown_is_due(doomed_attempt: Option<u32>, tracked_attempt: Option<u32>) -> bool {
+    tracked_attempt.is_none_or(|tracked| doomed_attempt == Some(tracked))
 }
 
 /// The job's supervisors for one epoch. Attempt 0 means "whichever attempt this
@@ -4058,6 +4067,9 @@ async fn release_acknowledged_allocation(
             return false;
         }
     };
+    // Recorded on the release line below: the decision a slice rests on is the
+    // whole of the rule that only a committed acknowledgement may free one.
+    let ground = warrant.ground();
     let released = allocation.lock().await.release_job(warrant);
     // The cut is driven off this, so a slice given back without it recorded
     // stays advertised as a claim the node no longer holds.
@@ -4065,11 +4077,11 @@ async fn release_acknowledged_allocation(
         warn!(%run, %error, "failed to record a released slice");
     }
     if released {
-        info!(%run, "released a run's slice on its acknowledgement");
+        info!(%run, %ground, "released a run's slice on its acknowledgement");
     } else {
         // The audit reads the line above as the release; without this one, a
         // slice freed elsewhere is indistinguishable from a leak.
-        debug!(%run, "a run's slice was already free at its acknowledgement");
+        debug!(%run, %ground, "a run's slice was already free at its acknowledgement");
     }
     released
 }
@@ -5981,16 +5993,14 @@ impl SlurmAgent for AgentService {
             self.graceful_cancel(job_id, req.run_attempt).await;
         }
 
-        // The signal paths only act on a running job; release a still-launching
-        // reservation so a cancel-during-eviction doesn't strand it until the
-        // TTL. Hold the running lock across the release (matching launch_job's
-        // commit order) so this can't free a job that just became running, and
-        // generation-check the release itself so a redispatch that already
-        // reserved a newer attempt survives a cancel for the old one.
+        // Frees a still-launching reservation the signal paths never reach; held
+        // across the release, as launch_job commits, so a job that just started is safe.
         let jobs = self.running.lock().await;
         let tracked_attempt = jobs.get(&job_id).map(|tracked| tracked.run_attempt);
         let nothing_tracked = !jobs.contains_key(&job_id);
         if nothing_tracked {
+            // Generation-checked, so a redispatch's newer reservation survives —
+            // except a cancel naming no attempt, whose widened key skips that.
             let cancelled =
                 named_run(job_id, req.run_attempt).unwrap_or_else(|| RunKey::any_attempt(job_id));
             self.allocation
@@ -6022,7 +6032,14 @@ impl SlurmAgent for AgentService {
             ));
         }
 
-        if let Err(err) = self.mpi_host.stop_pmix_job(job_id) {
+        if !pmix_teardown_is_due(doomed_attempt, tracked_attempt) {
+            info!(
+                job_id,
+                doomed_attempt,
+                tracked_attempt,
+                "leaving PMIx alone; this job's namespaces belong to a live attempt"
+            );
+        } else if let Err(err) = self.mpi_host.stop_pmix_job(job_id) {
             warn!(job_id, error = %err, "PMIx teardown on cancel failed");
         }
 
@@ -6508,8 +6525,8 @@ impl SlurmAgent for AgentService {
                 memory_mb,
                 nodelist: req.nodelist,
                 mpi: req.mpi,
-                // Matches the epoch the allocation table was keyed with; 0 from an
-                // older controller keeps the previous stale-report-disabled behavior.
+                // Matches the epoch the allocation table was keyed with, which
+                // the attempt-0 refusal above has already made a real one.
                 run_attempt: req.run_attempt,
                 cgroup_path,
             },
@@ -8069,8 +8086,8 @@ impl AgentService {
     /// attempt between the caller's peek and this call, and that entry must
     /// survive.
     async fn drop_tracked_job(&self, job_id: u32, run_attempt: u32) {
-        // A pre-upgrade allocation may still be tracked under attempt 0. The
-        // equality check below is what scopes the release; the key only names it.
+        // Both admission paths refuse attempt 0, so nothing production tracks
+        // widens here; the equality check below is what scopes the release.
         let run = RunKey::new(job_id, run_attempt).unwrap_or(RunKey::any_attempt(job_id));
         // The cgroup removal and the release below both key off the id, so a launch
         // reusing it must not interleave with them.
@@ -10670,7 +10687,7 @@ mod tests {
     // The gate that keeps a slice from being freed under a running payload. It
     // is the report that must not go: an acknowledgement is what frees cores.
     #[tokio::test]
-    async fn a_run_whose_payload_is_still_executing_reports_nothing_and_frees_nothing() {
+    async fn a_run_whose_payload_is_still_executing_reports_nothing() {
         let (controller_addr, reports) = spawn_mock_controller();
         let state = tempfile::tempdir().expect("runtime state directory");
         let store = crate::stepd::StepdStore::new(state.path());
@@ -10679,14 +10696,6 @@ mod tests {
             .spawn()
             .expect("spawn a stand-in workload");
         let descriptor = fenced_session_holding(&store, child.id());
-
-        let allocation = four_core_node();
-        allocation
-            .lock()
-            .await
-            .allocate_for_job(descriptor.job_id, descriptor.run_attempt, 2, 0, &[])
-            .expect("reserve");
-        let free_before = allocation.lock().await.free_cpus();
 
         let outcome = report_completion(
             &controller_addr,
@@ -10708,11 +10717,6 @@ mod tests {
             reports.lock().expect("completion reports").len(),
             0,
             "a report the controller would acknowledge is a slice freed under a live payload"
-        );
-        assert_eq!(
-            allocation.lock().await.free_cpus(),
-            free_before,
-            "nothing may hand the cores back while the payload is still on them"
         );
         let _ = child.kill();
         let _ = child.wait();
@@ -17405,6 +17409,61 @@ mod tests {
                 .expect("sweep"),
             1,
             "and nothing of it may be left to re-advertise as a claim"
+        );
+    }
+
+    // Reconciling cancels a leaked attempt beside a live one, and PMIx
+    // namespaces are keyed by job alone, so the sibling's would go with it.
+    #[tokio::test]
+    async fn cancelling_a_stale_attempt_leaves_a_live_siblings_pmix_alone() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let namespace = (7, spur_core::step::STEP_BATCH);
+        svc.insert_test_job(
+            7,
+            TrackedJob {
+                run_attempt: 2,
+                ..TrackedJob::dummy(0)
+            },
+        )
+        .await;
+        let hosted = || {
+            svc.mpi_host
+                .active_namespaces
+                .lock()
+                .expect("namespaces")
+                .contains_key(&namespace)
+        };
+        svc.mpi_host
+            .active_namespaces
+            .lock()
+            .expect("namespaces")
+            .insert(namespace, "spur.7.2".into());
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            run_attempt: 1,
+            signal: 9,
+        }))
+        .await
+        .expect("cancel the stale attempt");
+
+        assert!(
+            hosted(),
+            "attempt 2 is still running under this job id and still needs its namespace"
+        );
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            run_attempt: 2,
+            signal: 9,
+        }))
+        .await
+        .expect("cancel the tracked attempt");
+
+        assert!(
+            !hosted(),
+            "the attempt that owns the namespace must still take it down"
         );
     }
 
