@@ -2163,16 +2163,24 @@ mod tests {
     }
 
     // A token with no `=` reaches no branch in the param loops, so accepting it
-    // silently applies nothing and reports success.
-    #[test]
-    fn a_token_that_is_not_a_pair_is_refused_rather_than_dropped() {
-        let error = reject_non_pairs(&["NodeName=n1".into(), "Reconcile".into()])
+    // silently applies nothing and reports success. Driven through the dispatch,
+    // so dropping the check from a verb is what this notices.
+    #[tokio::test]
+    async fn a_token_that_is_not_a_pair_is_refused_rather_than_dropped() {
+        for verb in ["update", "create", "delete"] {
+            let error = main_with_args(
+                ["scontrol", verb, "NodeName=n1", "Reconcile"]
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect(),
+            )
+            .await
             .expect_err("a bare token names no key to set");
-        assert!(
-            error.to_string().contains("Reconcile"),
-            "the message must name the token: {error}"
-        );
-        reject_non_pairs(&["NodeName=n1".into()]).expect("a well-formed pair is accepted");
+            assert!(
+                error.to_string().contains("Reconcile"),
+                "{verb} must name the token it refused: {error}"
+            );
+        }
     }
 
     fn pending_pinned_job() -> spur_proto::proto::JobInfo {
