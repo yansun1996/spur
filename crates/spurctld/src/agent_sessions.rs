@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! An agent restart between a ledger pull and its reply leaves the controller
-//! holding a picture of a lifetime that has ended. Registration says which is current.
+//! A cut can outlive the agent lifetime that took it. Registration names the
+//! current one -- agent-supplied, so this settles a race and proves no identity.
 
 use std::collections::HashMap;
 
@@ -30,11 +30,8 @@ impl AgentSessions {
     /// Whether a cut carrying `session` can still be read as this node's current
     /// state. Nothing recorded means no registration has replaced what it names.
     pub(crate) fn vouches_for(&self, node: &str, session: &str) -> bool {
-        // Naming no lifetime is symmetric with not recording one: a cut that
-        // cannot be told apart is left ungated rather than judged against another.
-        if session.is_empty() {
-            return true;
-        }
+        // Naming no lifetime cannot vouch for itself past a lifetime that was
+        // recorded: only an unrecorded node leaves nothing for a cut to contradict.
         self.current
             .lock()
             .get(node)
@@ -47,8 +44,8 @@ impl AgentSessions {
         self.current.lock().remove(node);
     }
 
-    /// Forget every lifetime. Registrations in another term went to that term's
-    /// leader, so nothing recorded here can be vouched for once this one ends.
+    /// Forget every lifetime, none of which a new term can vouch for. Nodes do not
+    /// re-register on a leadership change, so cuts are ungated until they next do.
     pub(crate) fn clear(&self) {
         self.current.lock().clear();
     }
@@ -90,9 +87,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_that_names_no_lifetime_is_neither_recorded_nor_gated() {
-        // Gating a cut that names no lifetime against one it never claimed to be
-        // would discard that node's every cut, with no writer able to clear it.
+    fn an_agent_that_names_no_lifetime_is_not_recorded() {
         let sessions = AgentSessions::default();
         sessions.observe_registration("n1", "session-a");
         sessions.observe_registration("n1", "");
@@ -100,7 +95,19 @@ mod tests {
             sessions.vouches_for("n1", "session-a"),
             "an empty session must not overwrite a recorded lifetime"
         );
-        assert!(sessions.vouches_for("n1", ""));
+    }
+
+    #[test]
+    fn a_cut_naming_no_lifetime_cannot_vouch_past_a_recorded_one() {
+        // Real agents always name a lifetime, so an empty one on a node that has
+        // registered is a forgery skipping the check rather than an old agent.
+        let sessions = AgentSessions::default();
+        sessions.observe_registration("n1", "session-a");
+        assert!(!sessions.vouches_for("n1", ""));
+        assert!(
+            sessions.vouches_for("n2", ""),
+            "a node with no recorded lifetime has nothing to contradict"
+        );
     }
 
     #[test]

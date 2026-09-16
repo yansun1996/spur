@@ -2595,7 +2595,14 @@ pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason:
     match pulled {
         Ok(Ok(response)) => {
             if let Some(ledger) = response.into_inner().ledger {
-                crate::server::reconcile_node_ledger(cluster, node, ledger, &dispatched).await;
+                crate::server::reconcile_node_ledger(
+                    cluster,
+                    node,
+                    ledger,
+                    &dispatched,
+                    crate::server::CutProvenance::Pulled,
+                )
+                .await;
             }
         }
         // An agent that predates the pull keeps its pre-upgrade behaviour.

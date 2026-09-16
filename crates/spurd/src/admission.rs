@@ -915,6 +915,10 @@ impl AdmissionStore {
     /// or replayed fence can never un-cancel a run.
     pub fn fence_run(&self, run_key: RunKey, reject_before_unix_ms: u64) -> io::Result<u64> {
         let attempt = addressable_attempt(run_key)?;
+        // A cutoff further out than any launch it could cover never ages out, so
+        // controller clock skew would strand the record fencing the run forever.
+        let reject_before_unix_ms =
+            reject_before_unix_ms.min(now_unix_ms().saturating_add(LAUNCH_LIFETIME_MS));
         let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             // Fencing a run this node has no record of still has to hold: the
@@ -1873,6 +1877,31 @@ mod tests {
         // A reordered or replayed fence must not un-cancel a stopped run.
         assert_eq!(store.fence_run(key(7, 1), 1_000).unwrap(), 5_000);
         assert_eq!(store.reject_before(key(7, 1)), Some(5_000));
+    }
+
+    #[test]
+    fn a_fence_past_every_launch_it_could_cover_is_clamped() {
+        // A cutoff the clock never reaches fences the run for good, and the
+        // phantom record it creates has no other writer to lift it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let far_future = now_unix_ms().saturating_add(LAUNCH_LIFETIME_MS * 1000);
+
+        let applied = store.fence_run(key(7, 1), far_future).unwrap();
+        assert!(
+            applied < far_future,
+            "a skewed cutoff must not be taken verbatim"
+        );
+
+        let run = store.load_run(key(7, 1)).unwrap();
+        assert!(
+            run.fence_is_live(now_unix_ms()),
+            "the fence still holds now"
+        );
+        assert!(
+            !run.fence_is_live(applied.saturating_add(LAUNCH_LIFETIME_MS).saturating_add(1)),
+            "and it ages out once no launch it covers can still land"
+        );
     }
 
     #[test]

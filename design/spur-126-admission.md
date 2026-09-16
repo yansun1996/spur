@@ -274,6 +274,16 @@ The gate must clear under permissive, or a cluster with no authentication would
 deadlock every node at registration. Commit 7 adds no exposure of its own: it
 rides the existing completion-report path, whose trust properties are unchanged.
 
+**"Unproven" is a property of the cut, not of the cluster.** The two rows that
+withhold a destructive act apply to a cut arriving in a *registration*, where the
+hostname is whatever the caller asserted and open admission lets any host that can
+reach the port assert any of them. A cut the controller *pulled* names a peer it
+chose from its own node record, so it stays licensed under permissive and the
+hourly drift sweep keeps repairing. The residual is that open admission also lets
+a caller repoint that record's comm address, so the sweep is only as attested as
+the registration that last wrote the address — one more reason token admission is
+the supported posture for a cluster that is not on a trusted network.
+
 **The degradation is the point.** Permissive gets *visibility* — drift is detected,
 logged and metriced instead of silently accumulating. Token admission additionally
 gets *automatic repair*. Both are strictly better than today, where the drift is
@@ -884,7 +894,7 @@ heartbeat timeout**, never tested before and touched by commits 3, 5 and 7.
 
 | Surface | Status |
 | --- | --- |
-| `WalOperation` | **no new variant anywhere**; none renamed or removed. Commit 9 widens `JobDispatchBackoff`'s apply, a no-op on pre-upgrade entries |
+| `WalOperation` | **no new variant anywhere**; none renamed or removed. Commit 9 widens `JobDispatchBackoff`'s apply, a no-op on pre-upgrade entries. The reconcile gate widens `NodeUpdate` with an additive `Option<bool>` rather than adding a variant: absent means "leave the gate alone", so a plain re-registration cannot clear a gate it never set |
 | Persisted controller state | `Node.reconcile_pending` additive with `#[serde(default)]` |
 | Persisted agent state | new `admission/` records; `StepdDescriptor` gains `boot_id` additively with `#[serde(default)]`, behind a frozen-fixture guard written first |
 | Proto | append-only tags plus new RPCs (`FenceRun`, `RequestNodeLedger`); nothing renumbered. Commit 9 changes no proto |
@@ -930,7 +940,9 @@ correction it makes is real.
 workspace uses `serde(deny_unknown_fields)`, so an older controller reading a newer
 snapshot ignores `reconcile_pending` and an older agent reading a newer descriptor
 ignores `boot_id`. No new `WalOperation` variant means an older controller replays
-a newer log. The one asymmetry is commit 9's `JobDispatchBackoff` extension: a
+a newer log: the gate travels as a widened `NodeUpdate`, which such a controller
+applies as the no-op re-registration it echoes, simply never gating. The one
+asymmetry is commit 9's `JobDispatchBackoff` extension: a
 downgrade does not deallocate, leaking a charge that the reconcile passes catch.
 A fresh install discards that safety net for nothing — if the upgrade goes badly
 the wanted state is the old binary with the existing data, not an empty cluster.

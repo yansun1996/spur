@@ -872,6 +872,14 @@ pub(crate) struct ReconcileOutcome {
     pub settled: Vec<u32>,
 }
 
+/// How the controller came by a cut. A pull reaches an address the controller
+/// chose from its own record; a registration is whoever asserted the hostname.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CutProvenance {
+    Pulled,
+    Registered,
+}
+
 /// Diff an agent's asserted ledger against Raft and resolve the differences.
 /// `dispatched` must predate the cut: it names launches that could postdate it.
 pub(crate) async fn reconcile_node_ledger(
@@ -879,12 +887,14 @@ pub(crate) async fn reconcile_node_ledger(
     node: &str,
     ledger: spur_proto::proto::NodeLedger,
     dispatched: &crate::dispatch_tracker::DispatchWatch,
+    provenance: CutProvenance,
 ) -> ReconcileOutcome {
     reconcile_node_ledger_after(
         cluster,
         node,
         ledger,
         dispatched,
+        provenance,
         cluster.state_machine_ready(CONTROLLER_CATCH_UP_WAIT),
     )
     .await
@@ -899,14 +909,35 @@ struct ReconcileLicense<'a> {
     /// Whether something missing from `held` is evidence that the node let it
     /// go. A cut the agent could not complete says nothing about what is absent.
     absence_is_evidence: bool,
+    /// Whether the controller can attest whoever produced this cut. A caller it
+    /// cannot place may add what it missed, but never destroy what it holds.
+    teardown_is_licensed: bool,
+    /// The agent lifetime that took the cut, so a direction acting over several
+    /// awaits can tell whether it is still the one this node is running.
+    session: &'a str,
 }
 
-/// `None` when nothing may be acted on at all. Resolved before the record is
-/// sampled: an absence in a half-replayed log is not an absence.
+impl ReconcileLicense<'_> {
+    /// Why the licence no longer holds. Re-checked between acts, since a premise
+    /// that lapsed mid-pass cannot undo what has already been done under it.
+    fn lapsed(&self, cluster: &ClusterManager, node: &str) -> Option<&'static str> {
+        if !cluster.is_raft_leader() {
+            return Some("no longer the leader");
+        }
+        if !cluster.agent_sessions().vouches_for(node, self.session) {
+            return Some("a later registration replaced the lifetime that took this cut");
+        }
+        None
+    }
+}
+
+/// `None` when nothing may be acted on: a half-replayed log, or a cut whose
+/// lifetime a later registration replaced -- both settled before any sampling.
 async fn open_reconcile_license<'a>(
     cluster: &Arc<ClusterManager>,
     node: &str,
     ledger: &'a spur_proto::proto::NodeLedger,
+    provenance: CutProvenance,
     replayed: impl std::future::Future<Output = bool>,
 ) -> Option<ReconcileLicense<'a>> {
     if !replayed.await {
@@ -948,9 +979,20 @@ async fn open_reconcile_license<'a>(
             }
         }
     }
+    let teardown_is_licensed = match provenance {
+        CutProvenance::Pulled => true,
+        // Open admission lets any reachable host assert any hostname, so the cut
+        // names a node the controller has no way to place the caller at.
+        CutProvenance::Registered => matches!(
+            cluster.config().admission.mode,
+            spur_core::config::AdmissionMode::Token
+        ),
+    };
     Some(ReconcileLicense {
         held,
         absence_is_evidence: ledger.inventory_complete && every_entry_named_a_run,
+        teardown_is_licensed,
+        session: &ledger.agent_session_id,
     })
 }
 
@@ -968,10 +1010,10 @@ async fn cancel_unrecorded_claims(
         .iter()
         .filter(|(run, _)| !recorded.contains(run))
     {
-        // Cancelling bypasses Raft, so a controller that lost leadership since
-        // this pass opened must not still be killing work on its former nodes.
-        if !cluster.is_raft_leader() {
-            warn!(node = %node, "no longer the leader; leaving the rest of this node's claims alone");
+        // Cancelling bypasses Raft and cannot be taken back, so every premise the
+        // licence opened on has to still hold at the moment each kill goes out.
+        if let Some(reason) = license.lapsed(cluster, node) {
+            warn!(node = %node, reason, "leaving the rest of this node's claims alone");
             break;
         }
         // A run leaves the controller's record the moment its completion
@@ -985,6 +1027,17 @@ async fn cancel_unrecorded_claims(
                 run_attempt = entry.run_attempt,
                 disposition = %entry.disposition,
                 "agent has already accounted for this unrecorded claim; leaving it to settle"
+            );
+            continue;
+        }
+        // Reported either way: an operator sees the drift even where the caller
+        // proved too little for the controller to act on it.
+        if !license.teardown_is_licensed {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                "unattested registration cannot license cancelling a claim; leaving it alone"
             );
             continue;
         }
@@ -1014,9 +1067,11 @@ async fn reconcile_node_ledger_after(
     node: &str,
     ledger: spur_proto::proto::NodeLedger,
     dispatched: &crate::dispatch_tracker::DispatchWatch,
+    provenance: CutProvenance,
     replayed: impl std::future::Future<Output = bool>,
 ) -> ReconcileOutcome {
-    let Some(license) = open_reconcile_license(cluster, node, &ledger, replayed).await else {
+    let Some(license) = open_reconcile_license(cluster, node, &ledger, provenance, replayed).await
+    else {
         return ReconcileOutcome::default();
     };
     let mut outcome = ReconcileOutcome {
@@ -1052,6 +1107,16 @@ async fn reconcile_node_ledger_after(
             node = %node,
             job_id, run_attempt, "node no longer holds a job the controller placed on it"
         );
+        // Reported either way: an operator sees the drift even where the caller
+        // proved too little for the controller to act on it.
+        if !license.teardown_is_licensed {
+            warn!(
+                node = %node,
+                job_id,
+                "unattested registration cannot license settling a job; leaving its record alone"
+            );
+            continue;
+        }
         match cluster.node_complete(job_id, node, -1, 0, run_attempt) {
             Ok(
                 crate::cluster::NodeCompleteResult::AlreadyTerminal
@@ -2434,12 +2499,17 @@ impl SlurmController for ControllerService {
             self.cluster.set_reconcile_pending(&req.hostname, true);
         }
 
+        // Recorded only once the registration has been accepted, and before the
+        // reconcile below: a rejected one must disown no other lifetime.
+        self.cluster.agent_sessions().observe_registration(
+            &req.hostname,
+            ledger
+                .as_ref()
+                .map(|l| l.agent_session_id.as_str())
+                .unwrap_or_default(),
+        );
+
         if let Some(ledger) = ledger {
-            // Recorded only once the registration has been accepted, and before
-            // the reconcile below: a rejected one must disown no other lifetime.
-            self.cluster
-                .agent_sessions()
-                .observe_registration(&req.hostname, &ledger.agent_session_id);
             let node = req.hostname.clone();
             let cluster = self.cluster.clone();
             let cluster_for_reconcile = self.cluster.clone();
@@ -2449,7 +2519,13 @@ impl SlurmController for ControllerService {
                 let _gate = ReconcileGate::new(cluster, node.clone());
                 if tokio::time::timeout(
                     RECONCILE_BUDGET,
-                    reconcile_node_ledger(&cluster_for_reconcile, &node, ledger, &dispatched),
+                    reconcile_node_ledger(
+                        &cluster_for_reconcile,
+                        &node,
+                        ledger,
+                        &dispatched,
+                        CutProvenance::Registered,
+                    ),
                 )
                 .await
                 .is_err()
@@ -7136,6 +7212,7 @@ mod tests {
             "n1",
             ledger(false, Vec::new()),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7161,6 +7238,7 @@ mod tests {
             "n1",
             ledger(true, vec![(7, 1), (99, 1)]),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7169,6 +7247,81 @@ mod tests {
             vec![99],
             "job 7 is recorded here; job 99 is a claim Raft never placed"
         );
+    }
+
+    // Open admission lets any host that can reach the port assert any hostname,
+    // so a registration under it is not proof of what that node is holding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unattested_registration_cancels_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert_eq!(
+            svc.cluster.config().admission.mode,
+            spur_core::config::AdmissionMode::Open,
+            "fixture assumption: default admission mode is Open"
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            Vec::<u32>::new(),
+            "a caller the controller cannot place must not kill work"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unattested_registration_settles_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.settled,
+            Vec::<u32>::new(),
+            "an empty cut from an unplaceable caller is not proof the node let go"
+        );
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
+            "the job must still be recorded on the node"
+        );
+    }
+
+    // Degrade, do not deadlock: proving the join token restores the destructive
+    // half, so the gate costs an attested deployment nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_attested_registration_still_cancels_an_unrecorded_claim() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with_token_admission(&dir).await;
+        let cluster = svc.cluster.clone();
+        seed_a_job_on_a_node(&cluster);
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+
+        assert_eq!(outcome.cancelled, vec![99]);
     }
 
     // A leaked claim the node can name is capacity lost until someone looks. The
@@ -7226,6 +7379,7 @@ mod tests {
                 "n1",
                 ledger(true, vec![(7, 1), (8, 1)]),
                 &dispatched,
+                CutProvenance::Pulled,
                 readiness,
             ),
             replay,
@@ -7272,6 +7426,7 @@ mod tests {
             "n1",
             ledger(true, vec![(7, 1)]),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7291,6 +7446,7 @@ mod tests {
             "n1",
             ledger(true, Vec::new()),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7337,6 +7493,7 @@ mod tests {
             "n1",
             ledger_from("session-a", vec![(99, 1)]),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7364,6 +7521,7 @@ mod tests {
             "n1",
             ledger_from("session-b", vec![(99, 1)]),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7383,6 +7541,7 @@ mod tests {
             "n1",
             ledger_from("session-a", vec![(99, 1)]),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7391,7 +7550,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_registration_disowns_the_lifetime_it_replaces_before_reconciling() {
+    async fn a_re_registration_disowns_the_lifetime_it_replaces() {
         let dir = tempfile::TempDir::new().unwrap();
         let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
         register_lifetime(&svc, "session-a").await;
@@ -7423,6 +7582,7 @@ mod tests {
             "n1",
             ledger_from("session-b", vec![(99, 1)]),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7430,6 +7590,93 @@ mod tests {
             outcome.cancelled,
             vec![99],
             "a leaked claim must not be stranded by a lifetime no term can vouch for"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lifetime_replaced_mid_pass_stops_the_cancelling() {
+        // Direction A kills over many awaits, so the licence it opened under can
+        // go stale between one claim and the next.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        let cut = ledger_from("session-a", vec![(99, 1), (100, 1)]);
+        let license =
+            super::open_reconcile_license(&cluster, "n1", &cut, CutProvenance::Pulled, async {
+                true
+            })
+            .await
+            .expect("the only lifetime seen so far licenses its own cut");
+
+        register_lifetime(&svc, "session-b").await;
+
+        assert!(
+            super::cancel_unrecorded_claims(&cluster, "n1", &license)
+                .await
+                .is_empty(),
+            "a lifetime that has been replaced must not have the rest of its cut acted on"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconcile_reads_the_lifetime_its_replay_wait_produced() {
+        // Sampled before the wait, a registration landing while the pass is
+        // blocked cannot overtake the cut it replaces.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        let replaying = Arc::new(tokio::sync::Notify::new());
+        let replayed = Arc::new(tokio::sync::Notify::new());
+        let readiness = {
+            let (replaying, replayed) = (replaying.clone(), replayed.clone());
+            async move {
+                replaying.notify_one();
+                replayed.notified().await;
+                true
+            }
+        };
+        let register = async {
+            replaying.notified().await;
+            register_lifetime(&svc, "session-b").await;
+            replayed.notify_one();
+        };
+        let dispatched = no_launch_in_flight(&cluster, "n1");
+
+        let (outcome, ()) = tokio::join!(
+            super::reconcile_node_ledger_after(
+                &cluster,
+                "n1",
+                ledger_from("session-a", vec![(99, 1)]),
+                &dispatched,
+                CutProvenance::Pulled,
+                readiness,
+            ),
+            register,
+        );
+
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::default(),
+            "the registration that landed during the wait had already replaced this cut"
+        );
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_removed_from_the_cluster_takes_its_lifetime_with_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-a").await;
+        assert!(!cluster.agent_sessions().vouches_for("n1", "session-b"));
+
+        cluster.apply_operation(&spur_core::wal::WalOperation::NodeRemove {
+            name: "n1".into(),
+            reason: None,
+            at: None,
+        });
+
+        assert!(
+            cluster.agent_sessions().vouches_for("n1", "session-b"),
+            "a name that rejoins must not be judged against the cluster it left"
         );
     }
 
@@ -7478,6 +7725,7 @@ mod tests {
             "n1",
             ledger(true, vec![(7, 1)]),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7535,7 +7783,8 @@ mod tests {
         cut_taken.notify_one();
         launch.await.unwrap();
 
-        let outcome = reconcile_node_ledger(&cluster, "n1", cut, &dispatched).await;
+        let outcome =
+            reconcile_node_ledger(&cluster, "n1", cut, &dispatched, CutProvenance::Pulled).await;
 
         assert_eq!(
             outcome.settled,
@@ -7567,6 +7816,7 @@ mod tests {
             "n1",
             ledger(true, vec![(7, 1), (7, 2)]),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7598,6 +7848,7 @@ mod tests {
                 "n1",
                 ledger_disposed(true, vec![(7, 2, disposition)]),
                 &no_launch_in_flight(&cluster, "n1"),
+                CutProvenance::Pulled,
             )
             .await;
 
@@ -7623,6 +7874,7 @@ mod tests {
             "n1",
             ledger(true, vec![(7, 1), (7, 2)]),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
             async { true },
         )
         .await;
@@ -7679,6 +7931,7 @@ mod tests {
             "n1",
             ledger(true, vec![(7, 1), (99, 0)]),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7707,6 +7960,7 @@ mod tests {
             "n1",
             ledger(true, vec![(99, 1)]),
             &dispatched,
+            CutProvenance::Pulled,
             async { false },
         )
         .await;
@@ -7732,6 +7986,7 @@ mod tests {
             "n1",
             ledger(true, vec![(7, 1), (8, 1)]),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7752,6 +8007,7 @@ mod tests {
             "n1",
             ledger(true, vec![(7, 1)]),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
 
@@ -7770,6 +8026,7 @@ mod tests {
             "n1",
             ledger(true, Vec::new()),
             &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
         )
         .await;
         assert!(!holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
