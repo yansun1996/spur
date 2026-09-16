@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use spur_core::job::LAUNCH_LIFETIME_MS;
 use spur_core::step::StepId;
 
-use crate::stepd::{create_private_dir_all, publish_private};
+use crate::stepd::{create_private_dir_all, publish_private, verify_private_dir};
 
 /// Bumped only for a change old readers cannot absorb; additive fields default.
 pub const ADMISSION_SCHEMA_VERSION: u32 = 1;
@@ -682,8 +682,11 @@ impl AdmissionStore {
     }
 
     pub fn load_run(&self, job_id: u32, run_attempt: u32) -> io::Result<RunAdmission> {
-        let path = self.run_dir(job_id, run_attempt).join(RUN_FILE);
-        let run: RunAdmission = decode(&fs::read(&path)?)?;
+        let dir = self.run_dir(job_id, run_attempt);
+        // A record the agent could not have written is one it cannot trust, and
+        // the read side has to reach the same verdict the write side does.
+        verify_private_dir(&dir)?;
+        let run: RunAdmission = decode(&fs::read(dir.join(RUN_FILE))?)?;
         self.validate_run(&run, job_id, run_attempt)?;
         Ok(run)
     }
@@ -1333,6 +1336,31 @@ mod tests {
         );
         assert_eq!(loaded.rejected.len(), 1);
         assert!(loaded.rejected[0].reason.contains("somewhere-else"));
+    }
+
+    // A directory anyone could have written is not evidence the agent may act
+    // on: reading it as good let a permissions slip free a live run's slice.
+    #[test]
+    fn a_run_directory_that_is_not_private_is_rejected_rather_than_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        std::fs::set_permissions(store.run_dir(7, 1), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+
+        let loaded = store.load_all().unwrap();
+        assert!(
+            loaded.runs.is_empty(),
+            "a record the agent could not have written must not read as one it did"
+        );
+        assert_eq!(loaded.rejected.len(), 1);
+        assert!(loaded.rejected[0].reason.contains("is not private"));
+        assert!(
+            !store.ledger_cut("session").inventory_complete,
+            "a cut that cannot see this claim must not assert it is complete"
+        );
     }
 
     #[test]

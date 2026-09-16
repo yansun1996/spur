@@ -2657,7 +2657,7 @@ pub fn create_private_dir_all(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn verify_private_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn verify_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = fs::symlink_metadata(path)?;
