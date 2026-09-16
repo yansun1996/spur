@@ -1882,11 +1882,36 @@ fn an_exit_is_still_on_disk(
     })
 }
 
+/// Whether a run's processes may still be executing, read from its cgroup. A
+/// cgroup that cannot be read is not an empty one; only emptiness frees a slice.
+fn payload_may_still_be_running(job_id: u32, run_attempt: u32) -> bool {
+    let path = crate::executor::expected_cgroup_path(job_id, run_attempt);
+    crate::executor::cgroup_is_populated(&path).unwrap_or(true)
+}
+
+/// A run whose processes outlived their supervisor is not one nothing can speak
+/// for: reporting it over hands its cores to new work running beside the old.
+fn payload_outlived_its_supervisor(
+    admitted: &crate::admission::AdmittedRun,
+    payload_may_still_run: &dyn Fn(u32, u32) -> bool,
+) -> bool {
+    let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
+    if !payload_may_still_run(job_id, run_attempt) {
+        return false;
+    }
+    debug!(
+        job_id,
+        run_attempt, "a lost run's processes are still executing; holding its slice"
+    );
+    true
+}
+
 /// Runs no session is left to speak for. Without this the agent never asks, is
 /// never acknowledged, and the record charges the node's cores for good.
 fn runs_nothing_can_speak_for(
     store: &crate::stepd::StepdStore,
     admissions: &crate::admission::AdmissionStore,
+    payload_may_still_run: &dyn Fn(u32, u32) -> bool,
 ) -> Vec<crate::admission::AdmittedRun> {
     let Ok(loaded) = admissions.load_all() else {
         return Vec::new();
@@ -1899,6 +1924,7 @@ fn runs_nothing_can_speak_for(
                 && admitted.owes_a_report()
                 && supervisors_are_all_gone(admitted)
                 && !an_exit_is_still_on_disk(store, admitted)
+                && !payload_outlived_its_supervisor(admitted, payload_may_still_run)
         })
         .collect()
 }
@@ -1912,7 +1938,7 @@ async fn report_runs_nothing_can_speak_for(
     controller_addr: &str,
     reporting_node: &str,
 ) {
-    for admitted in runs_nothing_can_speak_for(store, admissions) {
+    for admitted in runs_nothing_can_speak_for(store, admissions, &payload_may_still_be_running) {
         let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
         let Some(step_id) = admitted.lifecycle_step() else {
             continue;
@@ -3266,36 +3292,47 @@ impl AgentService {
                 self.gather_run_evidence(admitted, descriptors, &store, boot_id.as_deref());
             let disposition = crate::admission::classify_run(&evidence);
 
-            // Every disposition holds. The recorded slice is exact, so this
-            // does not under-count the way a descriptor rebuild does.
-            match allocation.restore_for_job(
-                run.job_id,
-                run.run_attempt,
-                &run.allocation.cpu_ids,
-                run.allocation.memory_mb,
-                &run.allocation.gpu_devices,
-            ) {
-                Ok(_) => info!(
+            // Every disposition holds, but a slice already handed back does not:
+            // re-charging one takes a core from whatever the node gave it to.
+            if run.slice_released {
+                tracing::debug!(
                     job_id = run.job_id,
                     run_attempt = run.run_attempt,
-                    cpus = run.allocation.cpu_ids.len(),
-                    gpus = run.allocation.gpu_devices.len(),
                     ?disposition,
-                    "restored an admitted run's claim"
-                ),
-                // Superseded means a newer attempt already holds the slice,
-                // which is the expected outcome, not a loss.
-                Err(spur_sched::cons_tres::AllocError::Superseded) => tracing::debug!(
-                    job_id = run.job_id,
-                    run_attempt = run.run_attempt,
-                    "a newer attempt already holds this run's slice"
-                ),
-                Err(error) => error!(
-                    job_id = run.job_id,
-                    run_attempt = run.run_attempt,
-                    ?error,
-                    "could not restore an admitted run's claim; the slice is unprotected"
-                ),
+                    "an admitted run's slice was already released; not re-charging it"
+                );
+            } else {
+                // The recorded slice is exact, so this does not under-count the
+                // way a descriptor rebuild does.
+                match allocation.restore_for_job(
+                    run.job_id,
+                    run.run_attempt,
+                    &run.allocation.cpu_ids,
+                    run.allocation.memory_mb,
+                    &run.allocation.gpu_devices,
+                ) {
+                    Ok(_) => info!(
+                        job_id = run.job_id,
+                        run_attempt = run.run_attempt,
+                        cpus = run.allocation.cpu_ids.len(),
+                        gpus = run.allocation.gpu_devices.len(),
+                        ?disposition,
+                        "restored an admitted run's claim"
+                    ),
+                    // Superseded means a newer attempt already holds the slice,
+                    // which is the expected outcome, not a loss.
+                    Err(spur_sched::cons_tres::AllocError::Superseded) => tracing::debug!(
+                        job_id = run.job_id,
+                        run_attempt = run.run_attempt,
+                        "a newer attempt already holds this run's slice"
+                    ),
+                    Err(error) => error!(
+                        job_id = run.job_id,
+                        run_attempt = run.run_attempt,
+                        ?error,
+                        "could not restore an admitted run's claim; the slice is unprotected"
+                    ),
+                }
             }
             outcomes.push(AdoptedRunOutcome {
                 job_id: run.job_id,
@@ -10825,6 +10862,33 @@ mod tests {
         assert_eq!(allocation.lock().await.free_cpus(), 2);
     }
 
+    // A supervisor killed outright leaves its payload running. Reporting that
+    // run over frees cores the old work is still executing on.
+    #[tokio::test]
+    async fn a_run_whose_processes_outlived_its_supervisor_is_not_reported_lost() {
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        admit_a_supervised_run(
+            &admissions,
+            "test-node",
+            42,
+            vec![0, 1],
+            Some(a_gone_supervisor()),
+        );
+
+        assert!(
+            runs_nothing_can_speak_for(&store, &admissions, &|_, _| true).is_empty(),
+            "a run still executing is not one nothing can speak for"
+        );
+        assert_eq!(
+            runs_nothing_can_speak_for(&store, &admissions, &|_, _| false).len(),
+            1,
+            "the same run reports lost once its processes are gone"
+        );
+    }
+
     // The session carries the real exit status; a synthetic loss reported over
     // it would record the wrong outcome for the job.
     #[tokio::test]
@@ -16476,6 +16540,44 @@ mod tests {
             !alloc.allocated_cpus[0],
             "an unrecorded core must stay free"
         );
+    }
+
+    // A settled record that had already handed its slice back took the core
+    // again on every start, starving the runs that genuinely still held one.
+    #[tokio::test]
+    async fn a_released_slice_is_not_charged_again_at_startup() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let mut run = crate::admission::RunAdmission::new(
+            7,
+            1,
+            "n1",
+            crate::admission::AdmittedResources {
+                cpu_ids: vec![0],
+                memory_mb: 1024,
+                gpu_devices: Vec::new(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        run.state = crate::admission::RunState::Running;
+        svc.admissions().admit_run(&run).expect("admit");
+        svc.admissions()
+            .record_slice_released(7, 1)
+            .expect("record the release");
+
+        let outcomes = svc.replay_admitted_allocations(&[]).await;
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the record still has to be reported to the controller"
+        );
+
+        let alloc = svc.allocation.lock().await;
+        assert!(
+            alloc.charged_runs().is_empty(),
+            "a slice already given back must not be taken again"
+        );
+        assert!(!alloc.allocated_cpus[0], "the core must still read as free");
     }
 
     // A stale record winning the race left a running job's cores unprotected

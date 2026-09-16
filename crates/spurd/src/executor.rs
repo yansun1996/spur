@@ -1392,6 +1392,20 @@ pub fn cgroup_oom_killed(cgroup_path: &Path) -> bool {
     })
 }
 
+/// Whether the cgroup or any descendant still holds a live process. `None` where
+/// that cannot be read: an answer withheld is not an empty cgroup.
+pub fn cgroup_is_populated(cgroup_path: &Path) -> Option<bool> {
+    match std::fs::read_to_string(cgroup_path.join("cgroup.events")) {
+        Ok(events) => Some(events.lines().any(|line| {
+            let mut it = line.split_whitespace();
+            matches!((it.next(), it.next()), (Some("populated"), Some(n)) if n != "0")
+        })),
+        // No cgroup is the one absence that does prove there is nothing in it.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
+}
+
 /// Owns a job's cgroup until something else takes responsibility: a launch hands
 /// it to the caller, a teardown removes it. Error returns would strand it.
 #[must_use = "the cgroup is removed when this guard drops; bind it to choose when"]
@@ -3461,6 +3475,37 @@ mod tests {
         )
         .unwrap();
         assert!(cgroup_oom_killed(dir.path()));
+    }
+
+    #[test]
+    fn cgroup_is_populated_reads_cgroup_events() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            cgroup_is_populated(dir.path()),
+            Some(false),
+            "a cgroup that does not exist holds nothing"
+        );
+
+        std::fs::write(dir.path().join("cgroup.events"), "populated 0\nfrozen 0\n").unwrap();
+        assert_eq!(cgroup_is_populated(dir.path()), Some(false));
+
+        std::fs::write(dir.path().join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert_eq!(cgroup_is_populated(dir.path()), Some(true));
+    }
+
+    #[test]
+    fn a_cgroup_that_cannot_be_read_yields_no_answer() {
+        // A plain file where the cgroup should be: the read fails for a reason
+        // that is not "there is nothing here", which is the distinction tested.
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_cgroup = dir.path().join("occupied");
+        std::fs::write(&not_a_cgroup, b"").unwrap();
+
+        assert_eq!(
+            cgroup_is_populated(&not_a_cgroup),
+            None,
+            "an unreadable cgroup must not read as an empty one"
+        );
     }
 
     #[test]
