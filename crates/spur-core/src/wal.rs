@@ -468,7 +468,32 @@ impl WalOperation {
             Self::JobSuspend { at, .. }
             | Self::JobResume { at, .. }
             | Self::JobTimeLimitSignaled { at, .. } => Some(*at),
-            _ => None,
+            // Exhaustive on purpose: a new variant that dates something a user
+            // reads back must be a compile error here, not a silent `None`.
+            Self::JobStateChange { .. }
+            | Self::JobStepCreate { .. }
+            | Self::JobPriorityChange { .. }
+            | Self::JobDispatchBackoff { .. }
+            | Self::JobLaunchFailureDetail { .. }
+            | Self::NodeRegister { .. }
+            | Self::NodeUpdate { .. }
+            | Self::NodeReconcilePending { .. }
+            | Self::NodeLabelsUpdate { .. }
+            | Self::TokenCreate { .. }
+            | Self::TokenRevoke { .. }
+            | Self::PartitionCreate { .. }
+            | Self::PartitionUpdate { .. }
+            | Self::PartitionDelete { .. }
+            | Self::ReservationCreate { .. }
+            | Self::ReservationUpdate { .. }
+            | Self::ReservationDelete { .. }
+            | Self::NodeK0sAssign { .. }
+            | Self::K0sSetPhase { .. }
+            | Self::NodeK0sClear { .. }
+            | Self::NodeK0sSetError { .. }
+            | Self::K0sMemberNodesAdd { .. }
+            | Self::K0sMemberNodesRemove { .. }
+            | Self::EvictTerminalJobs { .. } => None,
         }
     }
 
@@ -487,7 +512,35 @@ impl WalOperation {
             | Self::JobEvict { at, .. }
             | Self::NodeStateChange { at, .. }
             | Self::NodeRemove { at, .. } => at,
-            _ => return,
+            // Exhaustive for the same reason as `occurred_at`: these carry no
+            // stamp, and a new one that does must not silently go unstamped.
+            Self::JobSuspend { .. }
+            | Self::JobResume { .. }
+            | Self::JobTimeLimitSignaled { .. }
+            | Self::JobStateChange { .. }
+            | Self::JobStepCreate { .. }
+            | Self::JobPriorityChange { .. }
+            | Self::JobDispatchBackoff { .. }
+            | Self::JobLaunchFailureDetail { .. }
+            | Self::NodeRegister { .. }
+            | Self::NodeUpdate { .. }
+            | Self::NodeReconcilePending { .. }
+            | Self::NodeLabelsUpdate { .. }
+            | Self::TokenCreate { .. }
+            | Self::TokenRevoke { .. }
+            | Self::PartitionCreate { .. }
+            | Self::PartitionUpdate { .. }
+            | Self::PartitionDelete { .. }
+            | Self::ReservationCreate { .. }
+            | Self::ReservationUpdate { .. }
+            | Self::ReservationDelete { .. }
+            | Self::NodeK0sAssign { .. }
+            | Self::K0sSetPhase { .. }
+            | Self::NodeK0sClear { .. }
+            | Self::NodeK0sSetError { .. }
+            | Self::K0sMemberNodesAdd { .. }
+            | Self::K0sMemberNodesRemove { .. }
+            | Self::EvictTerminalJobs { .. } => return,
         };
         slot.get_or_insert(now);
     }
