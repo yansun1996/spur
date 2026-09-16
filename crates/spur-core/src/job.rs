@@ -87,10 +87,44 @@ impl RunKey {
     pub fn names_attempt(self, attempt: u32) -> bool {
         self.run_attempt.is_none_or(|named| named == attempt)
     }
+}
 
-    /// The same job, every attempt of it.
-    pub fn any_attempt_of_same_job(self) -> Self {
-        Self::any_attempt(self.job_id)
+/// What a node's record says about a claim it still holds, as carried on the
+/// wire. Only what the record answers for: runtime evidence is a separate question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerDisposition {
+    /// A live claim with nothing decided about it yet.
+    Held,
+    /// The record says the run is over, but its slice has not gone back.
+    OverButCharged,
+    /// The agent is preserving evidence it cannot resolve on its own.
+    Unresolved,
+}
+
+impl LedgerDisposition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Held => "held",
+            Self::OverButCharged => "over_but_charged",
+            Self::Unresolved => "unresolved",
+        }
+    }
+
+    /// `None` for anything this controller cannot name, which it must then treat
+    /// as an ordinary claim rather than as licence to leave it alone.
+    pub fn from_wire(disposition: &str) -> Option<Self> {
+        match disposition {
+            "held" => Some(Self::Held),
+            "over_but_charged" => Some(Self::OverButCharged),
+            "unresolved" => Some(Self::Unresolved),
+            _ => None,
+        }
+    }
+
+    /// Whether the agent has already accounted for this run itself. Its slice is
+    /// owed back, not held by a payload a signal would reach.
+    pub fn already_accounted_for(self) -> bool {
+        matches!(self, Self::OverButCharged | Self::Unresolved)
     }
 }
 

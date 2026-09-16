@@ -286,8 +286,8 @@ pub(crate) fn resolve_startup_jwt_key(
 /// worse than one reconciled imperfectly: it is silently out of the cluster.
 const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long one node's asked-for pull holds off the next. Comfortably longer
-/// than a pull takes, so it is an in-flight guard as well as a rate limit.
+/// How long one node's asked-for pull holds off the next. A rate limit only:
+/// nothing here bounds a pull, so a slow one can still overlap its successor.
 const ASKED_LEDGER_PULL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a reconcile waits for this controller to replay its own log. Well under
@@ -960,6 +960,20 @@ async fn cancel_unrecorded_claims(
             warn!(node = %node, "no longer the leader; leaving the rest of this node's claims alone");
             break;
         }
+        // A run leaves the controller's record the moment its completion
+        // commits, yet stays in the cut until its slice actually goes back.
+        if spur_core::job::LedgerDisposition::from_wire(&entry.disposition)
+            .is_some_and(spur_core::job::LedgerDisposition::already_accounted_for)
+        {
+            info!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                disposition = %entry.disposition,
+                "agent has already accounted for this unrecorded claim; leaving it to settle"
+            );
+            continue;
+        }
         warn!(
             node = %node,
             job_id = entry.job_id,
@@ -1055,23 +1069,33 @@ async fn reconcile_node_ledger_after(
     outcome
 }
 
+/// Whether this node's ask starts a pull, stamping it when it does. Stamped on
+/// dispatch, never on completion: this paces asks, it does not track a pull.
+fn claim_ledger_pull_slot(
+    asked: &mut HashMap<String, std::time::Instant>,
+    node: &str,
+    now: std::time::Instant,
+) -> bool {
+    if let Some(started) = asked.get(node) {
+        if now.duration_since(*started) < ASKED_LEDGER_PULL_COOLDOWN {
+            return false;
+        }
+    }
+    // A node that stopped asking must not keep an entry once its cooldown has
+    // lapsed, or the map outlives the nodes it names.
+    asked.retain(|_, started| now.duration_since(*started) < ASKED_LEDGER_PULL_COOLDOWN);
+    asked.insert(node.to_string(), now);
+    true
+}
+
 impl ControllerService {
     /// On its own task: the heartbeat must not wait on an RPC back to the node,
     /// and the node's alternative is the routine sweep, an hour away.
     fn pull_ledger_for_asking_node(&self, node: String) {
         let mut asked = self.asked_ledger_pulls.lock();
-        let now = std::time::Instant::now();
-        // An entry is both the in-flight marker and the cooldown: it is planted
-        // before the task starts and cleared only once the pull has finished.
-        if let Some(started) = asked.get(&node) {
-            if now.duration_since(*started) < ASKED_LEDGER_PULL_COOLDOWN {
-                return;
-            }
+        if !claim_ledger_pull_slot(&mut asked, &node, std::time::Instant::now()) {
+            return;
         }
-        // A node that stopped asking must not keep an entry once its cooldown
-        // has lapsed, or the map outlives the nodes it names.
-        asked.retain(|_, started| now.duration_since(*started) < ASKED_LEDGER_PULL_COOLDOWN);
-        asked.insert(node.clone(), now);
         drop(asked);
         info!(node = %node, "node asked to be reconciled; pulling its ledger");
         let cluster = self.cluster.clone();
@@ -6939,6 +6963,19 @@ mod tests {
     ) -> (ControllerService, Arc<ClusterManager>) {
         let svc = test_service(dir).await;
         let cluster = svc.cluster.clone();
+        seed_a_job_on_a_node(&cluster);
+        (svc, cluster)
+    }
+
+    /// The same fixture with nothing behind it: no raft, so the controller reads
+    /// as a follower, which is what the leader-only paths have to answer for.
+    fn cluster_with_a_job_on_a_node_but_no_raft(dir: &tempfile::TempDir) -> Arc<ClusterManager> {
+        let cluster = Arc::new(ClusterManager::new(step_test_config(), dir.path()).unwrap());
+        seed_a_job_on_a_node(&cluster);
+        cluster
+    }
+
+    fn seed_a_job_on_a_node(cluster: &Arc<ClusterManager>) {
         cluster.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
             name: "n1".into(),
             hostname: "n1".into(),
@@ -6986,7 +7023,6 @@ mod tests {
             run_attempt: 1,
             at: Some(chrono::Utc::now()),
         });
-        (svc, cluster)
     }
 
     /// Charge a slice to "n1" for a job that is still Pending: the window
@@ -7039,6 +7075,25 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// The same cut, with each entry carrying the disposition the agent would
+    /// have stamped on it.
+    fn ledger_disposed(
+        complete: bool,
+        entries: Vec<(u32, u32, spur_core::job::LedgerDisposition)>,
+    ) -> spur_proto::proto::NodeLedger {
+        let mut cut = ledger(
+            complete,
+            entries
+                .iter()
+                .map(|(job_id, run_attempt, _)| (*job_id, *run_attempt))
+                .collect(),
+        );
+        for (proto, (_, _, disposition)) in cut.entries.iter_mut().zip(&entries) {
+            proto.disposition = disposition.as_str().to_string();
+        }
+        cut
     }
 
     /// A reconcile of a node this controller is not dispatching to.
@@ -7338,6 +7393,91 @@ mod tests {
             outcome.cancelled,
             vec![7],
             "attempt 2 of job 7 is a claim Raft never placed, whatever attempt 1 is"
+        );
+    }
+
+    // A run leaves the controller's record the moment its completion commits,
+    // yet stays in the cut until its slice goes back. That gap is not a leak.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_the_agent_has_already_accounted_for_is_not_killed() {
+        for disposition in [
+            spur_core::job::LedgerDisposition::OverButCharged,
+            spur_core::job::LedgerDisposition::Unresolved,
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+            assert!(
+                cluster
+                    .state_machine_ready(std::time::Duration::from_secs(5))
+                    .await
+            );
+
+            let outcome = reconcile_node_ledger(
+                &cluster,
+                "n1",
+                ledger_disposed(true, vec![(7, 2, disposition)]),
+                &no_launch_in_flight(&cluster, "n1"),
+            )
+            .await;
+
+            assert_eq!(
+                outcome.cancelled,
+                Vec::<u32>::new(),
+                "{} owes its slice back, not a signal to a payload that has ended",
+                disposition.as_str()
+            );
+        }
+    }
+
+    // Direction A cancels outside Raft, so this check is the only thing between
+    // a deposed leader and the work still running on its former nodes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_that_is_not_the_leader_cancels_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = cluster_with_a_job_on_a_node_but_no_raft(&dir);
+        assert!(!cluster.is_raft_leader(), "the fixture has no leadership");
+
+        let outcome = super::reconcile_node_ledger_after(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (7, 2)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            async { true },
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            Vec::<u32>::new(),
+            "attempt 2 is unrecorded here too, but this controller no longer speaks for the node"
+        );
+    }
+
+    #[test]
+    fn a_nodes_ask_is_paced_and_its_entry_does_not_outlive_the_cooldown() {
+        let mut asked = HashMap::new();
+        let t0 = std::time::Instant::now();
+
+        assert!(super::claim_ledger_pull_slot(&mut asked, "n1", t0));
+        assert!(
+            !super::claim_ledger_pull_slot(
+                &mut asked,
+                "n1",
+                t0 + ASKED_LEDGER_PULL_COOLDOWN - std::time::Duration::from_secs(1)
+            ),
+            "asking again inside the cooldown is the pull-per-heartbeat storm"
+        );
+        assert!(
+            super::claim_ledger_pull_slot(&mut asked, "n2", t0),
+            "one node's cooldown must not pace another's"
+        );
+
+        let lapsed = t0 + ASKED_LEDGER_PULL_COOLDOWN;
+        assert!(super::claim_ledger_pull_slot(&mut asked, "n1", lapsed));
+        assert_eq!(
+            asked.keys().collect::<Vec<_>>(),
+            vec!["n1"],
+            "n2 stopped asking, so its entry goes; otherwise the map grows without bound"
         );
     }
 

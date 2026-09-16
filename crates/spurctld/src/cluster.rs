@@ -9007,11 +9007,16 @@ mod tests {
         // A leader commits continuously, so an unlatched check would report the
         // controller untrustworthy again the moment it accepted new work.
         let dir = TempDir::new().unwrap();
+        let raft_dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         assert!(
             cm.state_machine_ready(std::time::Duration::from_secs(5))
                 .await
         );
+
+        // Substituted so the second call cannot pass on the first one's raft:
+        // this handle alone reads as not ready, as its own test asserts.
+        cm.set_raft(raft_that_cannot_apply(&raft_dir).await.raft);
 
         assert!(
             cm.state_machine_ready(std::time::Duration::ZERO).await,
