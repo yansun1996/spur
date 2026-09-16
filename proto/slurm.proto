@@ -988,7 +988,7 @@ message LaunchJobRequest {
   uint32 array_job_id = 7;
   uint32 array_task_id = 8;
   // Run epoch for this dispatch; agent echoes it in ReportJobStatusRequest so
-  // the controller can drop stale-run reports. 0 = unset (legacy), check off.
+  // the controller can drop stale-run reports. Attempts start at 1; 0 is refused.
   uint32 run_attempt = 9;
   PmixLaunchPlan pmix_plan = 10;
   // True when this dispatch is itself a per-task fan-out mechanism (a
@@ -1425,6 +1425,7 @@ message RegisterJobAllocationRequest {
   string mpi = 10;
   string work_dir = 11;
   string user = 12;  // Job owner; the agent gates exec/attach on it
+  // Which run this allocation belongs to. Attempts start at 1; 0 is refused.
   uint32 run_attempt = 13;
 }
 

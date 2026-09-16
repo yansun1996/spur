@@ -906,17 +906,22 @@ accept ``State=``, ``Reason=``, and ``Reconcile=``.
 
 ``Reconcile=yes`` asks the node for a fresh account of what it believes it is
 running and compares that against the controller's own record, resolving any
-difference. It changes nothing else about the node, so it is safe to run at any
-time. The controller already does this when a node registers, when a new
-controller takes over, and once an hour; this is the way to ask for it
-immediately — for instance after an incident, when you want to confirm a node
-is not still holding resources for a job that has finished.
+difference. This is not a read-only audit: work the node is holding that the
+controller has no record of is cancelled on that node with ``SIGKILL``. The
+controller already does this when a node registers, when a new controller takes
+over, and once an hour; this is the way to ask for it immediately — for
+instance after an incident, when you want to confirm a node is not still
+holding resources for a job that has finished.
 
-A node reports a reason of ``reconciling with the controller`` while that
-comparison is in progress. It accepts no new work until it completes. That is
-usually immediate; a controller that is still replaying its own log waits up to
-ten seconds for that before comparing anything, and the pass as a whole is
-capped at a minute.
+The reconcile a node runs as part of registering gates that node: it reports a
+reason of ``reconciling with the controller`` and accepts no new work until the
+comparison completes. A controller still replaying its own log waits up to ten
+seconds for that before comparing anything, and that pass as a whole is capped
+at a minute, after which the node is let back in regardless.
+
+``Reconcile=yes`` is not gated that way. The node stays schedulable throughout,
+and the command blocks until the comparison finishes rather than returning
+immediately.
 
 See Also
 --------
