@@ -84,6 +84,20 @@ fn entering_leadership(was_leader: &mut bool, is_leader: bool) -> bool {
     entering
 }
 
+/// Drop everything a former leader may no longer speak for. Kept whole so state
+/// that only one term can vouch for is not left behind in one place and not another.
+pub(crate) fn relinquish_leadership(
+    cluster: &Arc<ClusterManager>,
+    scheduler: &mut BackfillScheduler,
+) {
+    cluster.set_planned_reservations(HashMap::new());
+    cluster.set_planned_job_starts(HashMap::new());
+    // Registrations during another term went to that leader, so what is recorded
+    // here may already name a lifetime that has been replaced.
+    cluster.agent_sessions().clear();
+    scheduler.clear_outcomes();
+}
+
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
 pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let enforcer_cluster = cluster.clone();
@@ -171,11 +185,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         let entering_term = entering_leadership(&mut was_leader, is_leader);
 
         if !is_leader {
-            // A former leader must not keep serving planned-reservation info
-            // from before it lost leadership.
-            cluster.set_planned_reservations(HashMap::new());
-            cluster.set_planned_job_starts(HashMap::new());
-            scheduler.clear_outcomes();
+            relinquish_leadership(&cluster, &mut scheduler);
             continue;
         }
 
