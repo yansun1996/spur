@@ -2598,51 +2598,64 @@ impl StepdStore {
             .unwrap_or(false))
     }
 
-    /// The session a supervisor published for one step of one run, as it is on
-    /// disk. `NotFound` means no session was ever published for that step.
-    pub(crate) fn published_session(
+    /// Every session this store holds for one run, whatever step it belongs to:
+    /// a run's payload is whatever any of its participants is still running.
+    pub(crate) fn published_sessions_for_run(
         &self,
         job_id: u32,
         run_attempt: u32,
-        step_id: spur_core::step::StepId,
-    ) -> io::Result<StepdDescriptor> {
-        self.load_descriptor(&self.session_dir(job_id, run_attempt, step_id))
+    ) -> io::Result<Vec<io::Result<StepdDescriptor>>> {
+        let prefix = format!("{job_id}.{run_attempt}.");
+        Ok(self
+            .session_dirs()?
+            .into_iter()
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&prefix))
+            })
+            .map(|path| self.load_descriptor(&path))
+            .collect())
     }
 
     pub(crate) fn load_descriptor(&self, session_dir: &Path) -> io::Result<StepdDescriptor> {
-        let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
-        let contents = fs::read(&descriptor_path)?;
-        let descriptor: StepdDescriptor = serde_json::from_slice(&contents).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid {}: {e}", descriptor_path.display()),
-            )
-        })?;
-        // A range, not equality: a descriptor this build still understands must
-        // survive a version bump, because rejecting one reaps its job's cgroup.
-        if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&descriptor.format_version) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported runtime descriptor version {}",
-                    descriptor.format_version
-                ),
-            ));
-        }
-        if session_dir
-            != self.session_dir(
-                descriptor.job_id,
-                descriptor.run_attempt,
-                descriptor.step_id,
-            )
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "runtime descriptor identity does not match its directory",
-            ));
-        }
-        Ok(descriptor)
+        load_descriptor_at(session_dir)
     }
+}
+
+/// Read the descriptor a session directory holds. Free-standing because the
+/// freshest copy is found from a descriptor's own path, not from a store handle.
+pub(crate) fn load_descriptor_at(session_dir: &Path) -> io::Result<StepdDescriptor> {
+    let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
+    let contents = fs::read(&descriptor_path)?;
+    let descriptor: StepdDescriptor = serde_json::from_slice(&contents).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {}: {e}", descriptor_path.display()),
+        )
+    })?;
+    // A range, not equality: a descriptor this build still understands must
+    // survive a version bump, because rejecting one reaps its job's cgroup.
+    if !(MIN_SUPPORTED_FORMAT_VERSION..=FORMAT_VERSION).contains(&descriptor.format_version) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported runtime descriptor version {}",
+                descriptor.format_version
+            ),
+        ));
+    }
+    let named = format!(
+        "{}.{}.{}",
+        descriptor.job_id, descriptor.run_attempt, descriptor.step_id
+    );
+    if session_dir.file_name().and_then(|name| name.to_str()) != Some(named.as_str()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "runtime descriptor identity does not match its directory",
+        ));
+    }
+    Ok(descriptor)
 }
 
 #[cfg(unix)]
@@ -2742,6 +2755,41 @@ pub(crate) fn supervisor_liveness(
         Ok(_) => Ok(StepdLiveness::Stale),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StepdLiveness::Stale),
         Err(error) => Err(error),
+    }
+}
+
+/// What a published descriptor says about a session's workload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkloadLiveness {
+    Live,
+    Gone,
+    /// The descriptor could not be read, so nothing is proven either way. Never
+    /// read as gone: only positive proof may end a run.
+    Unknown,
+}
+
+/// The one verdict on whether a session's workload is still running: the
+/// completion gate and the teardown fence must not disagree about one process.
+pub(crate) fn workload_liveness(published: &io::Result<StepdDescriptor>) -> WorkloadLiveness {
+    match published {
+        Ok(descriptor) if workload_may_be_live(descriptor) => WorkloadLiveness::Live,
+        Ok(_) => WorkloadLiveness::Gone,
+        // No session on disk: nothing published a workload, so there is none.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => WorkloadLiveness::Gone,
+        Err(_) => WorkloadLiveness::Unknown,
+    }
+}
+
+/// The freshest copy of a session: what the supervisor last published, since the
+/// agent wrote its own before the launch returned and it names no workload.
+pub(crate) fn freshest_session(descriptor: &StepdDescriptor) -> io::Result<StepdDescriptor> {
+    let published = match descriptor.socket_path.parent() {
+        Some(session_dir) => load_descriptor_at(session_dir),
+        None => return Ok(descriptor.clone()),
+    };
+    match published {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(descriptor.clone()),
+        other => other,
     }
 }
 

@@ -134,6 +134,9 @@ pub struct ControllerService {
     /// compatibility fallback is public and cannot establish node identity.
     node_identity_key_configured: bool,
     incomplete_stepd_recoveries: Mutex<HashMap<(u32, u32), StepdRecoveryCohortState>>,
+    /// When each node's asked-for ledger pull last started. One node's standing
+    /// condition must not turn its heartbeat into a pull per heartbeat.
+    asked_ledger_pulls: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 enum StepdRecoveryCohortState {
@@ -282,6 +285,10 @@ pub(crate) fn resolve_startup_jwt_key(
 /// How long a node may stay gated for one reconcile. A node held past this is
 /// worse than one reconciled imperfectly: it is silently out of the cluster.
 const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long one node's asked-for pull holds off the next. Comfortably longer
+/// than a pull takes, so it is an in-flight guard as well as a rate limit.
+const ASKED_LEDGER_PULL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a reconcile waits for this controller to replay its own log. Well under
 /// `RECONCILE_BUDGET`, leaving time for the directions that do not depend on it.
@@ -883,28 +890,76 @@ pub(crate) async fn reconcile_node_ledger(
     .await
 }
 
-/// Direction A. The record is sampled inside, strictly after `replayed` settles:
-/// an absence in a half-replayed log is not an absence.
-async fn cancel_unrecorded_claims(
-    cluster: &Arc<ClusterManager>,
+/// What a cut licenses, established once for every direction. Built whole so a
+/// safety condition cannot be wired into one direction and forgotten in another.
+struct ReconcileLicense<'a> {
+    /// What the node asserts it is holding, keyed by the run, not the job: a
+    /// leaked attempt beside a recorded one is invisible to a job-keyed diff.
+    held: std::collections::HashMap<spur_core::job::RunKey, &'a spur_proto::proto::LedgerEntry>,
+    /// Whether something missing from `held` is evidence that the node let it
+    /// go. A cut the agent could not complete says nothing about what is absent.
+    absence_is_evidence: bool,
+}
+
+/// `None` when nothing may be acted on at all. Resolved before the record is
+/// sampled: an absence in a half-replayed log is not an absence.
+async fn open_reconcile_license<'a>(
     node: &str,
-    ledger: &spur_proto::proto::NodeLedger,
+    ledger: &'a spur_proto::proto::NodeLedger,
     replayed: impl std::future::Future<Output = bool>,
-) -> Vec<u32> {
+) -> Option<ReconcileLicense<'a>> {
     if !replayed.await {
         warn!(
             node = %node,
             "controller has not replayed its own log; leaving this node's claims alone"
         );
-        return Vec::new();
+        return None;
     }
+    let mut held = std::collections::HashMap::new();
+    let mut every_entry_named_a_run = true;
+    for entry in &ledger.entries {
+        match spur_core::job::RunKey::new(entry.job_id, entry.run_attempt) {
+            Some(run) => {
+                held.insert(run, entry);
+            }
+            // Nothing can be keyed on attempt 0, and a cut carrying one cannot
+            // be read as a complete account of what the node holds either.
+            None => {
+                warn!(
+                    node = %node,
+                    job_id = entry.job_id,
+                    "agent reported a claim under run attempt 0; it names no run to act on"
+                );
+                every_entry_named_a_run = false;
+            }
+        }
+    }
+    Some(ReconcileLicense {
+        held,
+        absence_is_evidence: ledger.inventory_complete && every_entry_named_a_run,
+    })
+}
+
+/// Direction A: the node asserts a claim Raft has no record of. Reasons from a
+/// presence, which an incomplete cut does not weaken.
+async fn cancel_unrecorded_claims(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    license: &ReconcileLicense<'_>,
+) -> Vec<u32> {
     let recorded = cluster.jobs_allocated_on_node(node);
     let mut cancelled = Vec::new();
-    for entry in ledger
-        .entries
+    for (run, entry) in license
+        .held
         .iter()
-        .filter(|e| !recorded.contains_key(&e.job_id))
+        .filter(|(run, _)| !recorded.contains(run))
     {
+        // Cancelling bypasses Raft, so a controller that lost leadership since
+        // this pass opened must not still be killing work on its former nodes.
+        if !cluster.is_raft_leader() {
+            warn!(node = %node, "no longer the leader; leaving the rest of this node's claims alone");
+            break;
+        }
         warn!(
             node = %node,
             job_id = entry.job_id,
@@ -913,20 +968,19 @@ async fn cancel_unrecorded_claims(
         );
         crate::scheduler_loop::cancel_job_on_nodes(
             cluster,
-            entry.job_id,
-            entry.run_attempt,
+            run.job_id(),
+            run.attempt().unwrap_or_default(),
             std::slice::from_ref(&node.to_string()),
             9,
         )
         .await;
-        cancelled.push(entry.job_id);
+        cancelled.push(run.job_id());
     }
     cancelled
 }
 
 /// As [`reconcile_node_ledger`], readiness taken unresolved so no part of the
-/// record can be read before it settles. Waiting after the read only makes it
-/// certain to be stale.
+/// record can be read before it settles.
 async fn reconcile_node_ledger_after(
     cluster: &Arc<ClusterManager>,
     node: &str,
@@ -934,19 +988,20 @@ async fn reconcile_node_ledger_after(
     dispatched: &crate::dispatch_tracker::DispatchWatch,
     replayed: impl std::future::Future<Output = bool>,
 ) -> ReconcileOutcome {
-    let held: std::collections::HashMap<u32, &spur_proto::proto::LedgerEntry> =
-        ledger.entries.iter().map(|e| (e.job_id, e)).collect();
+    let Some(license) = open_reconcile_license(node, &ledger, replayed).await else {
+        return ReconcileOutcome::default();
+    };
     let mut outcome = ReconcileOutcome {
-        cancelled: cancel_unrecorded_claims(cluster, node, &ledger, replayed).await,
+        cancelled: cancel_unrecorded_claims(cluster, node, &license).await,
         ..Default::default()
     };
 
-    // Direction B: Raft records a job here the agent did not report. Only an
-    // asserted-complete ledger licenses acting on an absence, and only for a run
-    // no launch of ours could have raced -- the cut may simply predate it.
+    // Direction B: Raft records a run the agent did not report. Reasons from an
+    // absence, so it needs a complete cut and a run no launch of ours raced.
     let raced_the_cut = dispatched.observed();
-    for (job_id, run_attempt) in cluster.jobs_confirmed_on_node(node) {
-        if held.contains_key(&job_id) {
+    for run in cluster.jobs_confirmed_on_node(node) {
+        let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
+        if license.held.contains_key(&run) {
             continue;
         }
         if raced_the_cut.contains(&job_id) {
@@ -957,7 +1012,7 @@ async fn reconcile_node_ledger_after(
             );
             continue;
         }
-        if !ledger.inventory_complete {
+        if !license.absence_is_evidence {
             warn!(
                 node = %node,
                 job_id,
@@ -984,7 +1039,7 @@ async fn reconcile_node_ledger_after(
         }
     }
 
-    // Direction C: both agree the job exists but the slices differ. Correcting
+    // Direction C: both agree the run exists but the slices differ. Correcting
     // means rewriting the record the controller derives its totals from.
     for entry in &ledger.entries {
         if entry.conflict_hold {
@@ -1004,6 +1059,20 @@ impl ControllerService {
     /// On its own task: the heartbeat must not wait on an RPC back to the node,
     /// and the node's alternative is the routine sweep, an hour away.
     fn pull_ledger_for_asking_node(&self, node: String) {
+        let mut asked = self.asked_ledger_pulls.lock();
+        let now = std::time::Instant::now();
+        // An entry is both the in-flight marker and the cooldown: it is planted
+        // before the task starts and cleared only once the pull has finished.
+        if let Some(started) = asked.get(&node) {
+            if now.duration_since(*started) < ASKED_LEDGER_PULL_COOLDOWN {
+                return;
+            }
+        }
+        // A node that stopped asking must not keep an entry once its cooldown
+        // has lapsed, or the map outlives the nodes it names.
+        asked.retain(|_, started| now.duration_since(*started) < ASKED_LEDGER_PULL_COOLDOWN);
+        asked.insert(node.clone(), now);
+        drop(asked);
         info!(node = %node, "node asked to be reconciled; pulling its ledger");
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
@@ -4485,6 +4554,7 @@ pub async fn serve(
         jwt_key,
         node_identity_key_configured,
         incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+        asked_ledger_pulls: parking_lot::Mutex::new(HashMap::new()),
     };
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
@@ -6215,6 +6285,7 @@ mod tests {
             jwt_key: String::new(),
             node_identity_key_configured: false,
             incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+            asked_ledger_pulls: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -6984,7 +7055,7 @@ mod tests {
         // agent cannot read its own spool.
         let dir = tempfile::TempDir::new().unwrap();
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
-        assert!(cluster.jobs_allocated_on_node("n1").contains_key(&7));
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
 
         reconcile_node_ledger(
             &cluster,
@@ -6995,7 +7066,7 @@ mod tests {
         .await;
 
         assert!(
-            cluster.jobs_allocated_on_node("n1").contains_key(&7),
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
             "an absence in a partial ledger proves nothing"
         );
     }
@@ -7056,7 +7127,7 @@ mod tests {
         // first, the wait makes the pre-replay reading certain instead of rare.
         let dir = tempfile::TempDir::new().unwrap();
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
-        assert!(!cluster.jobs_allocated_on_node("n1").contains_key(&8));
+        assert!(!holds_job(&cluster.jobs_allocated_on_node("n1"), 8));
 
         let replaying = Arc::new(tokio::sync::Notify::new());
         let replayed = Arc::new(tokio::sync::Notify::new());
@@ -7154,7 +7225,7 @@ mod tests {
             vec![7],
             "a complete ledger that omits a confirmed run is evidence the node let it go"
         );
-        assert!(!cluster.jobs_allocated_on_node("n1").contains_key(&7));
+        assert!(!holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7164,7 +7235,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
         reserve_pending_job_on_n1(&cluster, 8);
-        assert!(cluster.jobs_allocated_on_node("n1").contains_key(&8));
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 8));
 
         let outcome = reconcile_node_ledger(
             &cluster,
@@ -7180,7 +7251,7 @@ mod tests {
             "an unconfirmed launch is not something the cut can disown"
         );
         assert!(
-            cluster.jobs_allocated_on_node("n1").contains_key(&8),
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 8),
             "the reservation must stay charged to the node"
         );
         assert_eq!(
@@ -7240,7 +7311,91 @@ mod tests {
             Some(spur_core::job::JobState::Running),
             "the agent ran this job to completion; failing it loses the real exit code"
         );
-        assert!(cluster.jobs_allocated_on_node("n1").contains_key(&8));
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 8));
+    }
+
+    // The post-requeue shape: a redispatch reuses the job id, so the leaked
+    // claim and the recorded one differ only in the attempt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_leaked_attempt_beside_a_recorded_one_is_still_cancelled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (7, 2)]),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            vec![7],
+            "attempt 2 of job 7 is a claim Raft never placed, whatever attempt 1 is"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_claim_under_attempt_zero_is_reported_not_killed() {
+        // Attempt 0 names no run, so the cancel it would drive is an unfenced
+        // wildcard against whatever the node happens to be running.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 0)]),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            Vec::<u32>::new(),
+            "a claim that names no run must not drive a wildcard kill"
+        );
+        assert_eq!(
+            outcome.settled,
+            Vec::<u32>::new(),
+            "a cut carrying an unnameable claim is not a complete account either"
+        );
+    }
+
+    // Both directions read the same record, so the readiness wait has to hold
+    // both of them: settling on a half-replayed log finalizes live work.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_that_has_not_replayed_settles_nothing_either() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        let dispatched = no_launch_in_flight(&cluster, "n1");
+
+        let outcome = super::reconcile_node_ledger_after(
+            &cluster,
+            "n1",
+            ledger(true, vec![(99, 1)]),
+            &dispatched,
+            async { false },
+        )
+        .await;
+
+        assert_eq!(outcome, super::ReconcileOutcome::default());
+        assert_eq!(
+            cluster.get_job(7).map(|j| j.state),
+            Some(spur_core::job::JobState::Running),
+            "job 7 is absent from this cut, but nothing about this reconcile may act on that"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7279,7 +7434,7 @@ mod tests {
         )
         .await;
 
-        assert!(cluster.jobs_allocated_on_node("n1").contains_key(&7));
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7296,7 +7451,7 @@ mod tests {
             &no_launch_in_flight(&cluster, "n1"),
         )
         .await;
-        assert!(!cluster.jobs_allocated_on_node("n1").contains_key(&7));
+        assert!(!holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7308,7 +7463,7 @@ mod tests {
         crate::scheduler_loop::pull_node_ledger(&cluster, "n1", "test").await;
 
         assert!(
-            cluster.jobs_allocated_on_node("n1").contains_key(&7),
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
             "a failed pull must not be read as an empty ledger"
         );
     }
@@ -7318,7 +7473,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
         crate::scheduler_loop::pull_node_ledger(&cluster, "nowhere", "test").await;
-        assert!(cluster.jobs_allocated_on_node("n1").contains_key(&7));
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7338,6 +7493,12 @@ mod tests {
             !info.state_reason.is_empty(),
             "an idle node that silently refuses work is the outcome this rules out"
         );
+    }
+
+    /// Whether any run of `job_id` is placed here. The reconciler compares on
+    /// the pair; these cases only care that the job is accounted for at all.
+    fn holds_job(placed: &std::collections::HashSet<spur_core::job::RunKey>, job_id: u32) -> bool {
+        placed.iter().any(|run| run.job_id() == job_id)
     }
 
     async fn await_reconcile_gate(svc: &ControllerService, name: &str, expected: bool) {
@@ -7534,6 +7695,7 @@ mod tests {
             jwt_key,
             node_identity_key_configured,
             incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
+            asked_ledger_pulls: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 

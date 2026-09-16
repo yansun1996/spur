@@ -871,8 +871,8 @@ message RegisterAgentRequest {
 // What an agent believes it is entitled to. Absence and emptiness differ: only
 // a complete ledger licenses acting on what is missing from it.
 message NodeLedger {
-  // Identifies the agent process. A cut from a session that ended before the
-  // controller read it is discarded rather than applied as current.
+  // Identifies the agent process this cut was taken in, so two agent lifetimes
+  // can be told apart. Not a staleness gate: a cut answers the call that made it.
   string agent_session_id = 1;
   // False when the agent could not enumerate its own state. The controller may
   // then add claims it did not know about, but must never remove any.
@@ -886,8 +886,8 @@ message LedgerEntry {
   repeated uint32 cpu_ids = 3;
   uint64 memory_mb = 4;
   repeated uint32 gpu_devices = 5;
-  // What the agent's local evidence says about this run, so the controller can
-  // tell "still running" from "finished, unreported" from "cannot tell".
+  // What this node's record says about the run. One of "held" (a live claim),
+  // "over_but_charged" (finished, slice not back), "unresolved" (held evidence).
   string disposition = 6;
   // The agent is preserving this run's evidence and cannot resolve it alone.
   bool conflict_hold = 7;
@@ -1012,8 +1012,6 @@ message LaunchJobRequest {
   string command_digest = 15;
 }
 
-// Refuse every launch for this run attempt issued at or before the cutoff, so
-// one already in flight cannot land after the decision that cancelled it.
 // Ask an agent for a fresh cut of its ledger. The heartbeat carries no
 // inventory, so the controller pulls when it has reason to.
 message RequestNodeLedgerRequest {
@@ -1024,6 +1022,8 @@ message RequestNodeLedgerResponse {
   NodeLedger ledger = 1;
 }
 
+// Refuse every launch for this run attempt issued at or before the cutoff, so
+// one already in flight cannot land after the decision that cancelled it.
 message FenceRunRequest {
   uint32 job_id = 1;
   uint32 run_attempt = 2;

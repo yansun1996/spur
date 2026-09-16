@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
@@ -22,7 +22,7 @@ use spur_core::burst_buffer::BbStageState;
 use spur_core::config::{EnforcePartLimits, HealthCheck, SlurmConfig};
 use spur_core::job::{
     effective_gpus, effective_memory_mb, Job, JobId, JobSpec, JobState, NodeCompleteError,
-    PendingReason, TransitionOutcome, DEFAULT_PRIORITY,
+    PendingReason, RunKey, TransitionOutcome, DEFAULT_PRIORITY,
 };
 use spur_core::node::{Node, NodeEvent, NodeSource, NodeState};
 use spur_core::partition::{requested_partition_names, Partition, PreemptMode};
@@ -426,9 +426,9 @@ pub struct ClusterManager {
     /// while a same-name racer can't act on a stale label diff (see `register_node`).
     node_registration_locks: parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<()>>>>,
     raft: RwLock<Option<SpurRaft>>,
-    /// Latch for `state_machine_ready`: a leader commits continuously, so an
-    /// instantaneous check would flap back off once replay had finished.
-    state_machine_ready: AtomicBool,
+    /// Latch for `state_machine_ready`, keyed to the term it was taken in: a
+    /// leader commits continuously, and a regained one replayed nothing.
+    state_machine_ready_term: AtomicU64,
     accounting: RwLock<Option<AccountingNotifier>>,
     fairshare_cache: Arc<FairshareCache>,
     qos_cache: Arc<QosCache>,
@@ -542,6 +542,12 @@ pub struct RequeueOutcome {
     pub skipped: Vec<String>,
 }
 
+/// A latch is only good for the term it was taken in: a controller that lost
+/// and regained leadership replayed nothing in between. Term 0 means never.
+fn readiness_latch_holds(latched_term: u64, current_term: u64) -> bool {
+    latched_term != 0 && latched_term == current_term
+}
+
 impl ClusterManager {
     #[cfg(test)]
     pub fn new(config: SlurmConfig, state_dir: &Path) -> anyhow::Result<Self> {
@@ -586,7 +592,7 @@ impl ClusterManager {
             k0s_phase_accounting: parking_lot::Mutex::new(()),
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
             raft: RwLock::new(None),
-            state_machine_ready: AtomicBool::new(false),
+            state_machine_ready_term: AtomicU64::new(0),
             accounting: RwLock::new(None),
             fairshare_cache,
             qos_cache,
@@ -5168,12 +5174,13 @@ impl ClusterManager {
     /// Whether this controller has applied its whole log, waiting up to `wait_for`.
     /// Until then an absence in cluster state is no evidence; unknown reads false.
     pub async fn state_machine_ready(&self, wait_for: std::time::Duration) -> bool {
-        if self.state_machine_ready.load(Ordering::Relaxed) {
-            return true;
-        }
         let Some(raft) = self.raft.read().clone() else {
             return false;
         };
+        let term = raft.metrics().borrow().current_term;
+        if readiness_latch_holds(self.state_machine_ready_term.load(Ordering::Relaxed), term) {
+            return true;
+        }
         let caught_up = raft
             .wait(Some(wait_for))
             .metrics(
@@ -5183,9 +5190,21 @@ impl ClusterManager {
             .await
             .is_ok();
         if caught_up {
-            self.state_machine_ready.store(true, Ordering::Relaxed);
+            let settled = raft.metrics().borrow().current_term;
+            self.state_machine_ready_term
+                .store(settled, Ordering::Relaxed);
         }
         caught_up
+    }
+
+    /// Cheap, locally-cached leadership check, for paths that act on agents
+    /// outside Raft and so cannot fail closed by a rejected proposal.
+    pub fn is_raft_leader(&self) -> bool {
+        let Some(raft) = self.raft.read().clone() else {
+            return false;
+        };
+        let metrics = raft.metrics().borrow().clone();
+        metrics.current_leader == Some(metrics.id)
     }
 
     pub fn set_accounting(&self, notifier: AccountingNotifier) {
@@ -5771,24 +5790,22 @@ impl ClusterManager {
         &self.dispatch_tracker
     }
 
-    /// Every non-finalized job Raft places on this node, with its attempt.
-    pub fn jobs_allocated_on_node(&self, node: &str) -> HashMap<JobId, u32> {
-        self.jobs
-            .read()
-            .values()
-            .filter(|job| job.is_held_on(node))
-            .map(|job| (job.job_id, job.run_attempt))
-            .collect()
+    /// Every non-finalized run Raft places on this node. Keyed by the run, not
+    /// the job: a leaked attempt beside a recorded one must not read as recorded.
+    pub fn jobs_allocated_on_node(&self, node: &str) -> HashSet<RunKey> {
+        Self::runs_on_node(&self.jobs.read(), |job| job.is_held_on(node))
     }
 
-    /// Every job on this node whose launch an agent confirmed, with its attempt.
+    /// Every run on this node whose launch an agent confirmed.
     /// Narrower than [`Self::jobs_allocated_on_node`]: no in-flight dispatches.
-    pub fn jobs_confirmed_on_node(&self, node: &str) -> HashMap<JobId, u32> {
-        self.jobs
-            .read()
-            .values()
-            .filter(|job| job.is_confirmed_on(node))
-            .map(|job| (job.job_id, job.run_attempt))
+    pub fn jobs_confirmed_on_node(&self, node: &str) -> HashSet<RunKey> {
+        Self::runs_on_node(&self.jobs.read(), |job| job.is_confirmed_on(node))
+    }
+
+    fn runs_on_node(jobs: &HashMap<JobId, Job>, placed: impl Fn(&Job) -> bool) -> HashSet<RunKey> {
+        jobs.values()
+            .filter(|job| placed(job))
+            .filter_map(|job| RunKey::new(job.job_id, job.run_attempt))
             .collect()
     }
 
@@ -8975,23 +8992,30 @@ mod tests {
         assert!(!cm.state_machine_ready(std::time::Duration::ZERO).await);
     }
 
+    // A controller that lost and regained leadership replayed nothing in the
+    // interval, so the latch it took in the old term says nothing about the new.
+    #[test]
+    fn a_readiness_latch_does_not_carry_across_a_term() {
+        assert!(!readiness_latch_holds(0, 0), "never latched is never ready");
+        assert!(!readiness_latch_holds(0, 4));
+        assert!(readiness_latch_holds(4, 4));
+        assert!(!readiness_latch_holds(4, 5));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn readiness_latches_once_the_controller_has_caught_up() {
         // A leader commits continuously, so an unlatched check would report the
         // controller untrustworthy again the moment it accepted new work.
         let dir = TempDir::new().unwrap();
-        let raft_dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         assert!(
             cm.state_machine_ready(std::time::Duration::from_secs(5))
                 .await
         );
 
-        cm.set_raft(raft_that_cannot_apply(&raft_dir).await.raft);
-
         assert!(
             cm.state_machine_ready(std::time::Duration::ZERO).await,
-            "the same raft reads as not ready when it is the first one seen"
+            "a controller that has caught up in this term must not have to wait again"
         );
     }
 
@@ -22298,9 +22322,12 @@ mod tests {
         }
 
         let placed = cm.jobs_allocated_on_node("n1");
-        assert_eq!(placed.get(&1), Some(&3), "a live job must be accounted for");
         assert!(
-            !placed.contains_key(&2),
+            placed.contains(&RunKey::new(1, 3).expect("attempt 3")),
+            "a live run must be accounted for, under the attempt that owns it"
+        );
+        assert!(
+            !placed.iter().any(|run| run.job_id() == 2),
             "a finished job is not something the agent still owes"
         );
         assert!(cm.jobs_allocated_on_node("other").is_empty());
