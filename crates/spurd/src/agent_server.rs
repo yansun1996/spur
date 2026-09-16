@@ -3978,7 +3978,7 @@ async fn settle_cancelled_runs(
         let Some(run_key) = run.key() else { continue };
         let store = admissions.clone();
         let settled =
-            tokio::task::spawn_blocking(move || store.settle_cancelled_run(run_key)).await;
+            tokio::task::spawn_blocking(move || store.settle_acknowledged_run(run_key)).await;
         match settled {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
@@ -5053,6 +5053,59 @@ impl SlurmAgent for AgentService {
             }
             Err(error) => Err(Status::unavailable(format!(
                 "could not persist the fence for job {job_id}: {error}"
+            ))),
+        }
+    }
+
+    async fn settle_run(
+        &self,
+        request: Request<SettleRunRequest>,
+    ) -> Result<Response<SettleRunResponse>, Status> {
+        Self::require_controller(&request)?;
+        let req = request.into_inner();
+        let (job_id, run_attempt) = (req.job_id, req.run_attempt);
+        let run = named_run(job_id, run_attempt)
+            .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to settle"))?;
+        // Declining costs a slice until the next reconcile; releasing one a
+        // payload is still on hands its cores to a second job.
+        if self
+            .running
+            .lock()
+            .await
+            .get(&job_id)
+            .is_some_and(|tracked| tracked.run_attempt == run_attempt)
+        {
+            warn!(
+                job_id,
+                run_attempt, "declining to settle a run this agent is still running"
+            );
+            return Ok(Response::new(SettleRunResponse {
+                released: false,
+                error: "this agent is still running the run".into(),
+            }));
+        }
+        self.allocation
+            .lock()
+            .await
+            .release_job(ReleaseWarrant::acknowledged(run, 1));
+        let admissions = self.admissions();
+        let settled = tokio::task::spawn_blocking(move || admissions.settle_acknowledged_run(run))
+            .await
+            .map_err(|error| Status::internal(format!("settle task failed: {error}")))?;
+        match settled {
+            Ok(_) => {
+                info!(
+                    job_id,
+                    run_attempt,
+                    "controller answered a claim it has no record of; released the slice"
+                );
+                Ok(Response::new(SettleRunResponse {
+                    released: true,
+                    error: String::new(),
+                }))
+            }
+            Err(error) => Err(Status::unavailable(format!(
+                "could not settle run {job_id}.{run_attempt}: {error}"
             ))),
         }
     }
@@ -8146,7 +8199,7 @@ impl AgentService {
         let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
         let admissions = self.admissions();
         let settled =
-            tokio::task::spawn_blocking(move || admissions.settle_cancelled_run(run)).await;
+            tokio::task::spawn_blocking(move || admissions.settle_acknowledged_run(run)).await;
         match settled {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
@@ -17409,6 +17462,99 @@ mod tests {
                 .expect("sweep"),
             1,
             "and nothing of it may be left to re-advertise as a claim"
+        );
+    }
+
+    // The one answer that unsticks a run whose completion never landed: the
+    // controller's word that it is not accounting for it.
+    #[tokio::test]
+    async fn a_settle_from_the_controller_releases_a_run_nothing_else_can_free() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(7, 1, 2, 1000, &[])
+                .expect("allocate");
+            alloc.commit_job(7, 1);
+        }
+        // The stranded shape: teardown done, no acknowledgement, slice charged.
+        admissions.mark_run_cleaned(key(7, 1)).expect("cleaned");
+        admissions
+            .take_conflict_hold(key(7, 1), "held with no tracked job on this agent")
+            .expect("hold");
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+
+        assert!(response.released);
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "the cores the run was holding must go back to the node"
+        );
+        let run = admissions.load_run(key(7, 1)).expect("record");
+        assert!(run.slice_released);
+        assert!(
+            run.conflict_hold.is_none(),
+            "the hold is what kept asking for a reconcile that never resolved"
+        );
+    }
+
+    // No acknowledgement may free a slice out from under a live payload; the
+    // agent declining costs one reconcile, obeying costs a double-allocated core.
+    #[tokio::test]
+    async fn a_settle_for_a_run_this_agent_is_still_running_is_declined() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        svc.insert_test_job(
+            7,
+            TrackedJob {
+                run_attempt: 1,
+                ..TrackedJob::dummy(0)
+            },
+        )
+        .await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(7, 1, 2, 1000, &[])
+                .expect("allocate");
+            alloc.commit_job(7, 1);
+        }
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+
+        assert!(!response.released);
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "a payload is still on these cores"
+        );
+        assert!(
+            !admissions
+                .load_run(key(7, 1))
+                .expect("record")
+                .slice_released
         );
     }
 

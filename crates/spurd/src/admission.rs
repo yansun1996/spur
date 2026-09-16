@@ -520,11 +520,13 @@ pub struct LedgerCutEntry {
 }
 
 fn disposition_of(admitted: &AdmittedRun) -> LedgerDisposition {
-    if admitted.run.conflict_hold.is_some() {
-        return LedgerDisposition::Unresolved;
-    }
-    if admitted.run.is_over() {
+    // A finished teardown outranks a hold: it is positive proof the payload is
+    // gone, where a hold only says the agent could not account for the claim.
+    if admitted.run.state == RunState::Cleaned {
         return LedgerDisposition::OverButCharged;
+    }
+    if admitted.run.conflict_hold.is_some() || admitted.run.is_over() {
+        return LedgerDisposition::Unresolved;
     }
     LedgerDisposition::Held
 }
@@ -1060,9 +1062,9 @@ impl AdmissionStore {
         Ok(())
     }
 
-    /// Settle a cancelled run: the cancel is the controller's own acknowledgement.
-    /// Owed reports go with it -- one owed forever is what makes a record immortal.
-    pub fn settle_cancelled_run(&self, run_key: RunKey) -> io::Result<bool> {
+    /// Settle a run the controller has spoken for, whether by cancelling it or by
+    /// answering the claim. Owed reports go with it, or the record is immortal.
+    pub fn settle_acknowledged_run(&self, run_key: RunKey) -> io::Result<bool> {
         if !self.record_controller_ack(run_key, 1)? {
             return Ok(false);
         }
@@ -1584,7 +1586,7 @@ mod tests {
         owed.final_report.required = true;
         store.admit_participant(&owed).unwrap();
 
-        assert!(store.settle_cancelled_run(key(7, 1)).unwrap());
+        assert!(store.settle_acknowledged_run(key(7, 1)).unwrap());
         assert_eq!(
             store.sweep(u64::MAX, 1, &HashSet::new()).unwrap(),
             1,
@@ -1974,6 +1976,81 @@ mod tests {
         );
     }
 
+    // The strand this fixes: teardown finished, the report never landed, and a
+    // hold that reported "cannot tell" left the controller nothing to answer.
+    #[test]
+    fn a_finished_run_still_holding_its_slice_reports_that_it_is_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1)).unwrap();
+        store
+            .take_conflict_hold(key(7, 1), "held with no tracked job")
+            .unwrap();
+
+        let entry = store
+            .ledger_cut("session-a")
+            .entries
+            .into_iter()
+            .find(|entry| entry.job_id == 7)
+            .expect("a run holding a slice stays in the cut");
+        assert_eq!(
+            entry.disposition,
+            LedgerDisposition::OverButCharged,
+            "a finished teardown is what licenses the controller to answer the claim"
+        );
+        assert!(
+            entry.conflict_hold,
+            "the hold still travels; it just no longer hides the teardown"
+        );
+    }
+
+    #[test]
+    fn a_run_the_agent_cannot_account_for_still_reports_unresolved() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store
+            .take_conflict_hold(key(7, 1), "held with no tracked job")
+            .unwrap();
+
+        let entry = store
+            .ledger_cut("session-a")
+            .entries
+            .into_iter()
+            .find(|entry| entry.job_id == 7)
+            .expect("a run holding a slice stays in the cut");
+        assert_eq!(
+            entry.disposition,
+            LedgerDisposition::Unresolved,
+            "nothing proves this run is over, so nothing may settle it"
+        );
+        assert!(!entry.disposition.may_be_settled());
+    }
+
+    #[test]
+    fn a_cancel_whose_teardown_is_still_running_may_not_be_settled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_controller_cancelled(key(7, 1)).unwrap();
+
+        let entry = store
+            .ledger_cut("session-a")
+            .entries
+            .into_iter()
+            .find(|entry| entry.job_id == 7)
+            .expect("a run holding a slice stays in the cut");
+        assert!(
+            !entry.disposition.may_be_settled(),
+            "the payload may still be exiting; releasing its cores hands them to a second job"
+        );
+        assert!(
+            entry.disposition.already_accounted_for(),
+            "it is still not something to kill"
+        );
+    }
+
     #[test]
     fn a_relaunch_of_the_same_attempt_cannot_reset_the_cutoff() {
         // Otherwise the fence evaporates on any same-attempt redispatch and the
@@ -2071,7 +2148,7 @@ mod tests {
                 if entry.job_id == 7 && pass == 0 {
                     store.mark_controller_cancelled(entry_key).unwrap();
                 } else {
-                    store.settle_cancelled_run(entry_key).unwrap();
+                    store.settle_acknowledged_run(entry_key).unwrap();
                 }
             }
         }

@@ -476,6 +476,9 @@ service SlurmAgent {
   rpc LaunchJob(LaunchJobRequest) returns (LaunchJobResponse);
   rpc FenceRun(FenceRunRequest) returns (FenceRunResponse);
   rpc RequestNodeLedger(RequestNodeLedgerRequest) returns (RequestNodeLedgerResponse);
+  // The controller's own word that it is not accounting for this run on this
+  // node. That is the acknowledgement a held slice is waiting for.
+  rpc SettleRun(SettleRunRequest) returns (SettleRunResponse);
   // Start PMIx server and verify multi-node peers before rank exec (multi-node pmix only).
   rpc PreparePmix(PreparePmixRequest) returns (PreparePmixResponse);
   // Tear down a prepared-but-not-launched PMIx server (prepare rollback).
@@ -1035,6 +1038,18 @@ message FenceRunResponse {
   string error = 2;
   // What the agent now enforces, which never moves backwards.
   uint64 reject_before_unix_ms = 3;
+}
+
+message SettleRunRequest {
+  uint32 job_id = 1;
+  uint32 run_attempt = 2;
+}
+
+message SettleRunResponse {
+  // False when the agent still has a live payload for the run, which no
+  // acknowledgement may release out from under.
+  bool released = 1;
+  string error = 2;
 }
 
 // Why a launch was rejected, when the controller's response depends on it.

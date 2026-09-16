@@ -518,7 +518,9 @@ request as submitted, which distinguishes the two:
      - While pending, the slot the scheduler is holding: when it projects the
        job will start, and on which nodes. With no slot reserved, ``StartTime``
        reads ``N/A`` and ``SchedNodeList`` is omitted. ``StartTime`` becomes the
-       real start once the job runs.
+       real start once the job runs. A slot the scheduler held only because its
+       search ran past a year out also reads ``N/A``: the slot is still
+       reserved, but that date is where the search stopped, not a projection.
    * - ``EndTime``
      - The recorded end once the job finishes, otherwise its start plus its
        time limit. ``N/A`` for an unlimited job, or a pending one with no
@@ -931,10 +933,28 @@ accept ``State=``, ``Reason=``, and ``Reconcile=``.
    scontrol update NodeName=node01 State=drain Reason="maintenance"
    scontrol update NodeName=node01 Reconcile=yes
 
+``--controller`` and the other global flags are parsed as flags wherever they
+appear, including after the ``key=value`` pairs. A token among those pairs that
+is not a ``key=value`` pair is an error naming the token, rather than being
+silently dropped.
+
 ``Reconcile=yes`` asks the node for a fresh account of what it believes it is
 running and compares that against the controller's own record, resolving any
-difference. This is not a read-only audit: work the node is holding that the
-controller has no record of is cancelled on that node with ``SIGKILL``.
+difference. This is not a read-only audit. What happens to work the node is
+holding that the controller has no record of depends on what the node says
+about it:
+
+- still running — cancelled on that node with ``SIGKILL``;
+- finished, with its resources not yet handed back — the controller answers
+  that it is not accounting for the run, which releases those resources. This
+  is the acknowledgement such a run is waiting for, and without it the node
+  holds those CPUs, GPUs and memory indefinitely, including across a restart;
+- neither — the node cannot account for the claim and the controller has no
+  record of it, so nothing may end it and nothing proves it is over. It is left
+  alone and named in the node's reason as ``holding claims the controller has
+  no record of``, followed by the job ids. The reason clears itself once the
+  claims resolve, and never overwrites a reason an operator set. Only an
+  operator can clear the underlying condition.
 
 The controller already reconciles a node on its own:
 

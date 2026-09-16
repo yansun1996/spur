@@ -95,7 +95,8 @@ impl RunKey {
 pub enum LedgerDisposition {
     /// A live claim with nothing decided about it yet.
     Held,
-    /// The record says the run is over, but its slice has not gone back.
+    /// Teardown has finished and the slice has not gone back. Nothing is left
+    /// running under it, so the claim is waiting on an answer, not on a payload.
     OverButCharged,
     /// The agent is preserving evidence it cannot resolve on its own.
     Unresolved,
@@ -125,6 +126,12 @@ impl LedgerDisposition {
     /// owed back, not held by a payload a signal would reach.
     pub fn already_accounted_for(self) -> bool {
         matches!(self, Self::OverButCharged | Self::Unresolved)
+    }
+
+    /// Whether a claim the controller has no record of may be answered by
+    /// settling it. Only a finished teardown proves there is nothing to end first.
+    pub fn may_be_settled(self) -> bool {
+        matches!(self, Self::OverButCharged)
     }
 }
 

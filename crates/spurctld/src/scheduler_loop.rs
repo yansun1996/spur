@@ -15,7 +15,8 @@ use spur_core::task_launch::batch_dispatched_multi_node_pmix;
 use spur_proto::proto::slurm_controller_client::SlurmControllerClient;
 use spur_proto::proto::{
     AgentCancelJobRequest, AgentSuspendJobRequest, FenceRunRequest, JobSpec as ProtoJobSpec,
-    LaunchJobRequest, RegisterJobAllocationRequest, RequestNodeLedgerRequest, SubmitJobRequest,
+    LaunchJobRequest, RegisterJobAllocationRequest, RequestNodeLedgerRequest, SettleRunRequest,
+    SubmitJobRequest,
 };
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
@@ -2682,6 +2683,51 @@ async fn fence_one_agent(
     }
 }
 
+/// Tell a node the controller is not accounting for a run it still holds, which
+/// is the acknowledgement that run's slice is waiting on. Whether it went back.
+pub async fn settle_run_on_node(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    run: spur_core::job::RunKey,
+) -> bool {
+    let job_id = run.job_id();
+    // A settle names one run's slice; the wildcard key names no slice to free.
+    let Some(run_attempt) = run.attempt() else {
+        return false;
+    };
+    let Some(addr) = cluster.get_node(node).and_then(|n| node_comm_http_url(&n)) else {
+        return false;
+    };
+    let Ok(mut client) = crate::agent_client::connect(addr).await else {
+        debug!(job_id, node = %node, "could not reach an agent to settle a run");
+        return false;
+    };
+    let settled = tokio::time::timeout(
+        CANCEL_RPC_TIMEOUT,
+        client.settle_run(SettleRunRequest {
+            job_id,
+            run_attempt,
+        }),
+    )
+    .await;
+    match settled {
+        Ok(Ok(response)) => response.into_inner().released,
+        // An agent that predates the settle keeps holding; the next pass retries.
+        Ok(Err(status)) if status.code() == tonic::Code::Unimplemented => {
+            debug!(job_id, node = %node, "agent predates run settlement");
+            false
+        }
+        Ok(Err(status)) => {
+            warn!(job_id, node = %node, %status, "agent refused a run settlement");
+            false
+        }
+        Err(_) => {
+            warn!(job_id, node = %node, "timed out settling a run");
+            false
+        }
+    }
+}
+
 /// Like `send_cancel_to_nodes`, but awaits delivery of every cancel before
 /// returning so the caller can establish a happens-before ordering against
 /// later actions. Each RPC is bounded by `CANCEL_RPC_TIMEOUT` so an
@@ -3556,6 +3602,17 @@ mod tests {
                     success: true,
                     error: String::new(),
                     reject_before_unix_ms: 0,
+                }))
+            }
+
+            async fn settle_run(
+                &self,
+                _request: tonic::Request<spur_proto::proto::SettleRunRequest>,
+            ) -> Result<tonic::Response<spur_proto::proto::SettleRunResponse>, tonic::Status>
+            {
+                Ok(tonic::Response::new(spur_proto::proto::SettleRunResponse {
+                    released: true,
+                    error: String::new(),
                 }))
             }
 
