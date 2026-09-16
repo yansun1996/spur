@@ -1504,7 +1504,6 @@ pub(crate) async fn resolve_node_names(
     spur_core::hostlist::expand(pattern).context("invalid node name pattern")
 }
 
-/// Parse a Slurm node state name into its proto representation.
 /// Slurm accepts several spellings for a boolean `Key=Value`; anything else
 /// reads as "no" so a typo cannot silently trigger an action.
 fn parse_yes_no(value: &str) -> bool {
@@ -1514,6 +1513,7 @@ fn parse_yes_no(value: &str) -> bool {
     )
 }
 
+/// Parse a Slurm node state name into its proto representation.
 fn parse_node_state(state: &str) -> Result<i32> {
     match state.to_lowercase().as_str() {
         "idle" | "resume" => Ok(spur_proto::proto::NodeState::NodeIdle as i32),

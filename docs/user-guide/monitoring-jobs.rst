@@ -299,7 +299,8 @@ may nonetheless be skipped by the scheduler, and says so in the same field
    * - ``reconciling with the controller``
      - The agent has just registered and declared what it holds; the node takes
        no new work until the controller has compared that against its own
-       records. Normally lasts milliseconds.
+       records. Usually immediate, but a controller still replaying its own log
+       waits for that first, and the whole pass is capped at a minute.
    * - ``dispatch cooldown after a failed launch (<n>s remaining)``
      - A launch failed on this node, so the scheduler skips it for
        ``controller.dispatch_reject_cooldown_secs`` instead of re-picking it
@@ -911,9 +912,11 @@ controller takes over, and once an hour; this is the way to ask for it
 immediately — for instance after an incident, when you want to confirm a node
 is not still holding resources for a job that has finished.
 
-A node briefly reports a reason of ``reconciling with the controller`` while
-that comparison is in progress. It accepts no new work until it completes,
-which normally takes under a second.
+A node reports a reason of ``reconciling with the controller`` while that
+comparison is in progress. It accepts no new work until it completes. That is
+usually immediate; a controller that is still replaying its own log waits up to
+ten seconds for that before comparing anything, and the pass as a whole is
+capped at a minute.
 
 See Also
 --------
