@@ -5783,19 +5783,17 @@ impl ClusterManager {
     /// Proposed rather than set locally so a follower promoted mid-reconcile does
     /// not schedule onto it, and on `NodeUpdate` so an older controller can read it.
     pub fn set_reconcile_pending(&self, name: &str, pending: bool) {
-        let Some(node) = self.get_node(name) else {
-            warn!(node = %name, "no record to carry the reconcile gate");
-            return;
-        };
+        // Carries the gate and nothing else: echoing back a read of the record
+        // would revert a registration that commits before this entry applies.
         if let Err(error) = self.propose(WalOperation::NodeUpdate {
             name: name.to_string(),
-            hostname: node.hostname.clone(),
-            resources: node.total_resources.clone(),
-            address: node.address.clone().unwrap_or_default(),
-            port: node.port,
-            wg_pubkey: node.wg_pubkey.clone().unwrap_or_default(),
-            version: node.version.clone().unwrap_or_default(),
-            source: node.source.clone(),
+            hostname: String::new(),
+            resources: ResourceSet::default(),
+            address: String::new(),
+            port: 0,
+            wg_pubkey: String::new(),
+            version: String::new(),
+            source: NodeSource::default(),
             reconcile_pending: Some(pending),
         }) {
             warn!(node = %name, %error, "could not record the reconcile gate");
@@ -6768,23 +6766,34 @@ impl ClusterManager {
                 reconcile_pending,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
-                    node.total_resources = resources.clone();
-                    if !hostname.is_empty() {
-                        node.hostname = hostname.clone();
+                    // An entry carrying nothing the node asserted is not the node
+                    // speaking: it moves the gate alone, overwriting nothing else.
+                    let asserted = !hostname.is_empty()
+                        || !address.is_empty()
+                        || !wg_pubkey.is_empty()
+                        || !version.is_empty()
+                        || *port != 0;
+                    if asserted {
+                        node.total_resources = resources.clone();
+                        if !hostname.is_empty() {
+                            node.hostname = hostname.clone();
+                        }
+                        if !address.is_empty() {
+                            node.address = Some(address.clone());
+                        }
+                        if *port != 0 {
+                            node.port = *port;
+                        }
+                        if !wg_pubkey.is_empty() {
+                            node.wg_pubkey = Some(wg_pubkey.clone());
+                        }
+                        if !version.is_empty() {
+                            node.version = Some(version.clone());
+                        }
+                        node.source =
+                            spur_core::node::resolve_wal_node_source(source, version, &node.labels);
+                        node.last_heartbeat = Some(Utc::now());
                     }
-                    if !address.is_empty() {
-                        node.address = Some(address.clone());
-                    }
-                    node.port = *port;
-                    if !wg_pubkey.is_empty() {
-                        node.wg_pubkey = Some(wg_pubkey.clone());
-                    }
-                    if !version.is_empty() {
-                        node.version = Some(version.clone());
-                    }
-                    node.source =
-                        spur_core::node::resolve_wal_node_source(source, version, &node.labels);
-                    node.last_heartbeat = Some(Utc::now());
                     // Only an entry that speaks to the gate moves it: a plain
                     // re-registration must not release a reconcile it never saw.
                     if let Some(pending) = reconcile_pending {
@@ -22294,6 +22303,42 @@ mod tests {
         cm.set_reconcile_pending("n1", false);
         wait_for("released", || !cm.get_node("n1").unwrap().reconcile_pending);
         assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reconcile_gate_carries_nothing_but_the_gate() {
+        // Anything else it carried would come from a read a registration
+        // committing before the entry applies has already made stale.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let before = cm.get_node("n1").unwrap();
+
+        cm.set_reconcile_pending("n1", true);
+        wait_for("gated", || cm.get_node("n1").unwrap().reconcile_pending);
+
+        let after = cm.get_node("n1").unwrap();
+        assert_eq!(
+            after.total_resources, before.total_resources,
+            "the gate must not restate resources it could only have read stale"
+        );
+        assert_eq!((after.port, after.address), (before.port, before.address));
+        assert_eq!(
+            after.last_heartbeat, before.last_heartbeat,
+            "the gate is not the node speaking, so it must not stand in for a heartbeat"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gating_a_node_that_has_left_the_cluster_creates_nothing() {
+        // The gate is released from a `Drop` that can outlive the node, and a
+        // record conjured there would be one nothing ever registered.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.set_reconcile_pending("ghost", true);
+        cm.set_reconcile_pending("ghost", false);
+        assert!(cm.get_node("ghost").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

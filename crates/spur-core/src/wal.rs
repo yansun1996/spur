@@ -1200,10 +1200,28 @@ mod deregistration_wal_tests {
         }
     }
 
+    // The other half of the upgrade: a controller predating the gate has to read
+    // an entry carrying it, which holds only while unknown fields stay ignored.
     #[test]
-    fn a_node_update_round_trips_the_reconcile_gate() {
+    fn a_pre_upgrade_controller_still_reads_an_entry_carrying_the_gate() {
+        #[derive(Deserialize)]
+        enum PreGateWalOperation {
+            NodeUpdate {
+                name: String,
+                #[serde(default)]
+                hostname: String,
+                resources: ResourceSet,
+                address: String,
+                port: u16,
+                wg_pubkey: String,
+                version: String,
+                #[serde(default)]
+                source: NodeSource,
+            },
+        }
+
         for gate in [None, Some(true), Some(false)] {
-            let op = WalOperation::NodeUpdate {
+            let encoded = serde_json::to_string(&WalOperation::NodeUpdate {
                 name: "n1".into(),
                 hostname: "n1".into(),
                 resources: ResourceSet::default(),
@@ -1213,15 +1231,26 @@ mod deregistration_wal_tests {
                 version: "0.8.0".into(),
                 source: NodeSource::default(),
                 reconcile_pending: gate,
-            };
-            let encoded = serde_json::to_string(&op).expect("serialize");
-            let back: WalOperation = serde_json::from_str(&encoded).expect("deserialize");
-            match back {
-                WalOperation::NodeUpdate {
-                    reconcile_pending, ..
-                } => assert_eq!(reconcile_pending, gate),
-                _ => panic!("wrong variant"),
-            }
+            })
+            .expect("serialize");
+
+            let PreGateWalOperation::NodeUpdate {
+                name,
+                hostname,
+                resources,
+                address,
+                port,
+                wg_pubkey,
+                version,
+                source,
+            } = serde_json::from_str(&encoded).unwrap_or_else(|e| {
+                panic!("a controller without the gate field must still parse {encoded}: {e}")
+            });
+            assert_eq!((name.as_str(), hostname.as_str()), ("n1", "n1"));
+            assert_eq!(resources, ResourceSet::default());
+            assert_eq!(address, "10.0.0.1:6818");
+            assert_eq!((port, wg_pubkey.as_str()), (6818, ""));
+            assert_eq!((version.as_str(), source), ("0.8.0", NodeSource::default()));
         }
     }
 
