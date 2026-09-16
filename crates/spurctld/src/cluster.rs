@@ -2671,6 +2671,7 @@ impl ClusterManager {
                             wg_pubkey,
                             version,
                             source: source.clone(),
+                            reconcile_pending: None,
                         })
                         .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                         info!(node = %name, "node comm address or metadata updated");
@@ -2692,6 +2693,7 @@ impl ClusterManager {
                     wg_pubkey,
                     version,
                     source: source.clone(),
+                    reconcile_pending: None,
                 })
                 .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 self.sync_node_labels(&name, labels, caller_privileged)?;
@@ -5778,12 +5780,23 @@ impl ClusterManager {
         }
     }
 
-    /// Hold a node out of scheduling, or release it. Proposed rather than set
-    /// locally so a follower promoted mid-reconcile does not schedule onto it.
+    /// Proposed rather than set locally so a follower promoted mid-reconcile does
+    /// not schedule onto it, and on `NodeUpdate` so an older controller can read it.
     pub fn set_reconcile_pending(&self, name: &str, pending: bool) {
-        if let Err(error) = self.propose(WalOperation::NodeReconcilePending {
+        let Some(node) = self.get_node(name) else {
+            warn!(node = %name, "no record to carry the reconcile gate");
+            return;
+        };
+        if let Err(error) = self.propose(WalOperation::NodeUpdate {
             name: name.to_string(),
-            pending,
+            hostname: node.hostname.clone(),
+            resources: node.total_resources.clone(),
+            address: node.address.clone().unwrap_or_default(),
+            port: node.port,
+            wg_pubkey: node.wg_pubkey.clone().unwrap_or_default(),
+            version: node.version.clone().unwrap_or_default(),
+            source: node.source.clone(),
+            reconcile_pending: Some(pending),
         }) {
             warn!(node = %name, %error, "could not record the reconcile gate");
         }
@@ -6682,11 +6695,6 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::NodeReconcilePending { name, pending } => {
-                if let Some(node) = nodes.get_mut(name) {
-                    node.reconcile_pending = *pending;
-                }
-            }
             WalOperation::NodeRegister {
                 name,
                 hostname,
@@ -6757,6 +6765,7 @@ impl ClusterManager {
                 wg_pubkey,
                 version,
                 source,
+                reconcile_pending,
             } => {
                 if let Some(node) = nodes.get_mut(name) {
                     node.total_resources = resources.clone();
@@ -6776,6 +6785,11 @@ impl ClusterManager {
                     node.source =
                         spur_core::node::resolve_wal_node_source(source, version, &node.labels);
                     node.last_heartbeat = Some(Utc::now());
+                    // Only an entry that speaks to the gate moves it: a plain
+                    // re-registration must not release a reconcile it never saw.
+                    if let Some(pending) = reconcile_pending {
+                        node.reconcile_pending = *pending;
+                    }
                 }
             }
             WalOperation::NodeStateChange {
@@ -22280,6 +22294,26 @@ mod tests {
         cm.set_reconcile_pending("n1", false);
         wait_for("released", || !cm.get_node("n1").unwrap().reconcile_pending);
         assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_does_not_release_a_reconcile_it_never_saw() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+
+        cm.set_reconcile_pending("n1", true);
+        wait_for("gated", || cm.get_node("n1").unwrap().reconcile_pending);
+
+        // Takes the Update path, so it proposes a NodeUpdate of its own.
+        register_node(&cm, "n1", 16, 32000);
+        wait_for("resources updated", || {
+            cm.get_node("n1").unwrap().total_resources.cpus == 16
+        });
+        assert!(
+            cm.get_node("n1").unwrap().reconcile_pending,
+            "an unrelated update must leave the gate where it found it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
