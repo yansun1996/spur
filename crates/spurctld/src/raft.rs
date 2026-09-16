@@ -755,7 +755,10 @@ impl openraft::RaftNetwork<SpurTypeConfig> for SpurNetworkConnection {
 /// Whether the state machine has applied every entry this node's log holds. False
 /// after a restart until RaftCore replays the entries logged past the snapshot.
 pub fn state_machine_caught_up(metrics: &openraft::RaftMetrics<NodeId, BasicNode>) -> bool {
-    metrics.last_applied.map(|id| id.index) >= metrics.last_log_index
+    // The placeholder metrics installed before RaftCore's first report describe an
+    // empty log fully applied. A node naming no leader has reported nothing yet.
+    metrics.current_leader.is_some()
+        && metrics.last_applied.map(|id| id.index) >= metrics.last_log_index
 }
 
 /// Handle to the running Raft node — exposes leadership queries.
@@ -1070,6 +1073,7 @@ mod tests {
         last_applied: Option<u64>,
     ) -> openraft::RaftMetrics<NodeId, BasicNode> {
         let mut m = openraft::RaftMetrics::new_initial(1);
+        m.current_leader = Some(1);
         m.last_log_index = last_log_index;
         m.last_applied =
             last_applied.map(|index| LogId::new(openraft::CommittedLeaderId::new(1, 1), index));
@@ -1088,6 +1092,26 @@ mod tests {
     fn a_state_machine_level_with_its_log_is_caught_up() {
         assert!(state_machine_caught_up(&metrics_at(Some(9), Some(9))));
         assert!(state_machine_caught_up(&metrics_at(None, None)));
+    }
+
+    #[test]
+    fn metrics_no_one_has_reported_yet_are_not_caught_up() {
+        // What Raft::new installs before RaftCore reports: an empty log and
+        // nothing applied, which must not read as a replayed state machine.
+        assert!(!state_machine_caught_up(&openraft::RaftMetrics::<
+            NodeId,
+            BasicNode,
+        >::new_initial(1)));
+    }
+
+    #[test]
+    fn a_node_that_names_no_leader_is_not_caught_up() {
+        let mut m = metrics_at(Some(9), Some(9));
+        m.current_leader = None;
+        assert!(
+            !state_machine_caught_up(&m),
+            "a level log is no answer from a node that has reported no leader"
+        );
     }
 
     #[test]
