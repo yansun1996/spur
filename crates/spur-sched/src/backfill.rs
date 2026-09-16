@@ -167,10 +167,17 @@ impl BackfillScheduler {
     /// `planned_starts`, busy nodes are included.
     pub fn planned_job_starts(&self) -> PlannedJobStarts {
         let now = Utc::now();
+        // The slot is still reserved, but a start out at the search horizon is
+        // where the search gave up. Reporting it would be inventing a date.
+        let horizon = now + crate::timeline::PROJECTION_HORIZON;
         let mut by_job: PlannedJobStarts = HashMap::new();
         for tl in &self.timelines {
             let mut earliest_per_job: HashMap<JobId, chrono::DateTime<Utc>> = HashMap::new();
-            for iv in tl.intervals.iter().filter(|iv| iv.start > now) {
+            for iv in tl
+                .intervals
+                .iter()
+                .filter(|iv| iv.start > now && iv.start < horizon)
+            {
                 if let Some(job_id) = iv.job_id {
                     earliest_per_job
                         .entry(job_id)
@@ -229,7 +236,7 @@ impl BackfillScheduler {
         duration: chrono::Duration,
         floor: chrono::DateTime<Utc>,
     ) -> chrono::DateTime<Utc> {
-        let max_check = floor + chrono::Duration::days(365);
+        let max_check = floor + crate::timeline::PROJECTION_HORIZON;
         let mut candidate = floor;
         loop {
             if candidate > max_check {
@@ -611,7 +618,7 @@ impl Scheduler for BackfillScheduler {
             // at — an independently-computed per-node start can be stale
             // once shifted forward to match the slowest node in the set.
             let mut earliest = assigned_nodes.iter().map(|(_, t)| *t).max().unwrap_or(now);
-            let common_horizon = now + chrono::Duration::days(365);
+            let common_horizon = now + crate::timeline::PROJECTION_HORIZON;
             loop {
                 let next = assigned_nodes
                     .iter()
@@ -1991,6 +1998,27 @@ mod tests {
             .expect("job-keyed view must report the held slot");
         assert_eq!(nodes_held, vec!["node001"]);
         assert!(start > Utc::now());
+    }
+
+    // A search that runs out of horizon returns its own bound. Reporting that as
+    // a start puts a date a year out on a job nobody has projected anything for.
+    #[test]
+    fn a_slot_held_out_at_the_search_horizon_is_not_reported_as_a_start() {
+        let mut sched = BackfillScheduler::new(100);
+        let nodes = make_nodes(1);
+        sched.init_timelines(&nodes);
+        let slot = Utc::now() + crate::timeline::PROJECTION_HORIZON + Duration::hours(1);
+        sched.timelines[0].reserve_for_job(
+            slot,
+            slot + Duration::hours(1),
+            ResourceAllocations::with_scalar(64, 256_000),
+            Some(1),
+        );
+
+        assert!(
+            !sched.planned_job_starts().contains_key(&1),
+            "the slot is still reserved; it is the fabricated date that must not be published"
+        );
     }
 
     #[test]
