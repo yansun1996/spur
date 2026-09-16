@@ -2598,6 +2598,17 @@ impl StepdStore {
             .unwrap_or(false))
     }
 
+    /// The session a supervisor published for one step of one run, as it is on
+    /// disk. `NotFound` means no session was ever published for that step.
+    pub(crate) fn published_session(
+        &self,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> io::Result<StepdDescriptor> {
+        self.load_descriptor(&self.session_dir(job_id, run_attempt, step_id))
+    }
+
     pub(crate) fn load_descriptor(&self, session_dir: &Path) -> io::Result<StepdDescriptor> {
         let descriptor_path = session_dir.join(DESCRIPTOR_FILE);
         let contents = fs::read(&descriptor_path)?;
@@ -2694,33 +2705,40 @@ pub(crate) fn process_start_ticks(pid: u32) -> io::Result<u64> {
 /// as gone, and so does a zombie: it has already released everything and only
 /// waits to be reaped.
 pub(crate) fn process_is_live(pid: u32, start_ticks: u64) -> bool {
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return false;
-    };
+    matches!(process_liveness(pid, start_ticks), Ok(StepdLiveness::Live))
+}
+
+/// The same reading, keeping "could not tell" apart from "gone" for callers
+/// that may not treat an unreadable `/proc` as a death.
+pub(crate) fn process_liveness(pid: u32, start_ticks: u64) -> io::Result<StepdLiveness> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let Some((_, fields)) = stat.rsplit_once(") ") else {
-        return false;
+        return Ok(StepdLiveness::Stale);
     };
     let mut fields = fields.split_ascii_whitespace();
     if fields.next() == Some("Z") {
-        return false;
+        return Ok(StepdLiveness::Stale);
     }
-    matches!(fields.nth(18).and_then(|t| t.parse::<u64>().ok()), Some(ticks) if ticks == start_ticks)
+    match fields.nth(18).and_then(|t| t.parse::<u64>().ok()) {
+        Some(ticks) if ticks == start_ticks => Ok(StepdLiveness::Live),
+        _ => Ok(StepdLiveness::Stale),
+    }
 }
 
-/// Whether a recorded supervisor identity still names a running process. `Err`
-/// is undetermined, which no caller may read as a death.
+/// Whether a recorded `(pid, start_ticks, boot_id)` still names the process it
+/// was recorded for. `Err` is undetermined, which no caller may read as a death.
 pub(crate) fn supervisor_liveness(
-    supervisor: &crate::admission::SupervisorRef,
+    recorded: &crate::admission::SupervisorRef,
 ) -> io::Result<StepdLiveness> {
     // `process_start_ticks` counts from boot and the spool survives one, so a
-    // pid and tick match across boots is a collision, not the same supervisor.
-    if supervisor.boot_scope(crate::admission::current_boot_id().as_deref())
+    // pid and tick match across boots is a collision, not the same process.
+    if recorded.boot_scope(crate::admission::current_boot_id().as_deref())
         == crate::admission::BootScope::Different
     {
         return Ok(StepdLiveness::Stale);
     }
-    match process_start_ticks(supervisor.pid) {
-        Ok(start_ticks) if start_ticks == supervisor.start_ticks => Ok(StepdLiveness::Live),
+    match process_start_ticks(recorded.pid) {
+        Ok(start_ticks) if start_ticks == recorded.start_ticks => Ok(StepdLiveness::Live),
         Ok(_) => Ok(StepdLiveness::Stale),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(StepdLiveness::Stale),
         Err(error) => Err(error),
@@ -2733,6 +2751,28 @@ pub(crate) fn stepd_liveness(descriptor: &StepdDescriptor) -> io::Result<StepdLi
         start_ticks: descriptor.process_start_ticks,
         boot_id: descriptor.boot_id.clone(),
     })
+}
+
+/// Undetermined counts as executing; an unrecorded workload (`0`) holds nothing
+/// up. Unlike a supervisor, a zombie counts as gone -- it holds none of the slice.
+pub(crate) fn workload_may_be_live(descriptor: &StepdDescriptor) -> bool {
+    if descriptor.workload_pid == 0 {
+        return false;
+    }
+    let recorded = crate::admission::SupervisorRef {
+        pid: descriptor.workload_pid,
+        start_ticks: descriptor.workload_start_ticks,
+        boot_id: descriptor.boot_id.clone(),
+    };
+    if recorded.boot_scope(crate::admission::current_boot_id().as_deref())
+        == crate::admission::BootScope::Different
+    {
+        return false;
+    }
+    match process_liveness(descriptor.workload_pid, descriptor.workload_start_ticks) {
+        Ok(liveness) => liveness == StepdLiveness::Live,
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 #[cfg(test)]

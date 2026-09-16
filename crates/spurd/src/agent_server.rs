@@ -1339,6 +1339,7 @@ pub(crate) fn monitor_recovered_stepds(
                             reason: "epilog script failed".into(),
                         }),
                         step_id: Some(completion.step_id),
+                        payload: PayloadEvidence::Supervised(&store),
                     },
                 )
                 .await
@@ -1508,14 +1509,13 @@ async fn fence_dead_stepd(
                 "failed to record synthetic exit for a dead stepd");
         }
     }
-    // The crashed supervisor was the cgroup's only owner, so its job process
-    // can outlive it as an orphan — reap it before releasing this node's ledger.
-    // No unit is left to retry stopping, so an unconfirmed cgroup still proceeds.
-    if !runtime_cgroup_reaped(&effective_cgroup_path(&descriptor)) {
+    // A crashed supervisor's job can outlive it. Teardown's confirmation falls
+    // back to the recorded workload; a cgroup-only reap would do nothing here.
+    if !runtime_teardown_confirmed(&descriptor, &Ok(())).await {
         warn!(
             job_id = descriptor.job_id,
             run_attempt = descriptor.run_attempt,
-            "could not confirm the crashed stepd's cgroup is empty; releasing tracking anyway"
+            "could not confirm a crashed stepd's workload is gone; its slice stays held"
         );
     }
     // The supervisor cannot be recovered, but its death still has to reach the
@@ -1530,6 +1530,7 @@ async fn fence_dead_stepd(
             reporting_node: hostname,
             drain: None,
             step_id: Some(descriptor.step_id),
+            payload: PayloadEvidence::Supervised(store),
         },
     )
     .await
@@ -1701,6 +1702,7 @@ async fn handle_completion_notification(
                         reason: "epilog script failed".into(),
                     }),
                     step_id: Some(step_id),
+                    payload: PayloadEvidence::Supervised(&context.stepds_store),
                 },
             )
             .await
@@ -1795,6 +1797,7 @@ pub async fn replay_unacknowledged_stepd_completions(
                     reason: "epilog script failed".into(),
                 }),
                 step_id: Some(completion.step_id),
+                payload: PayloadEvidence::Supervised(store),
             },
         )
         .await
@@ -1882,36 +1885,13 @@ fn an_exit_is_still_on_disk(
     })
 }
 
-/// Whether a run's processes may still be executing, read from its cgroup. A
-/// cgroup that cannot be read is not an empty one; only emptiness frees a slice.
-fn payload_may_still_be_running(job_id: u32, run_attempt: u32) -> bool {
-    let path = crate::executor::expected_cgroup_path(job_id, run_attempt);
-    crate::executor::cgroup_is_populated(&path).unwrap_or(true)
-}
-
-/// A run whose processes outlived their supervisor is not one nothing can speak
-/// for: reporting it over hands its cores to new work running beside the old.
-fn payload_outlived_its_supervisor(
-    admitted: &crate::admission::AdmittedRun,
-    payload_may_still_run: &dyn Fn(u32, u32) -> bool,
-) -> bool {
-    let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
-    if !payload_may_still_run(job_id, run_attempt) {
-        return false;
-    }
-    debug!(
-        job_id,
-        run_attempt, "a lost run's processes are still executing; holding its slice"
-    );
-    true
-}
-
 /// Runs no session is left to speak for. Without this the agent never asks, is
 /// never acknowledged, and the record charges the node's cores for good.
+/// Whether the payload really stopped is answered for every report alike, on
+/// the way out; it is not this filter's to decide for one path only.
 fn runs_nothing_can_speak_for(
     store: &crate::stepd::StepdStore,
     admissions: &crate::admission::AdmissionStore,
-    payload_may_still_run: &dyn Fn(u32, u32) -> bool,
 ) -> Vec<crate::admission::AdmittedRun> {
     let Ok(loaded) = admissions.load_all() else {
         return Vec::new();
@@ -1924,7 +1904,6 @@ fn runs_nothing_can_speak_for(
                 && admitted.owes_a_report()
                 && supervisors_are_all_gone(admitted)
                 && !an_exit_is_still_on_disk(store, admitted)
-                && !payload_outlived_its_supervisor(admitted, payload_may_still_run)
         })
         .collect()
 }
@@ -1938,7 +1917,7 @@ async fn report_runs_nothing_can_speak_for(
     controller_addr: &str,
     reporting_node: &str,
 ) {
-    for admitted in runs_nothing_can_speak_for(store, admissions, &payload_may_still_be_running) {
+    for admitted in runs_nothing_can_speak_for(store, admissions) {
         let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
         let Some(step_id) = admitted.lifecycle_step() else {
             continue;
@@ -1953,6 +1932,7 @@ async fn report_runs_nothing_can_speak_for(
                 reporting_node,
                 drain: None,
                 step_id: Some(step_id),
+                payload: PayloadEvidence::Supervised(store),
             },
         )
         .await
@@ -3890,6 +3870,7 @@ impl AgentService {
                             drain: drain.as_ref(),
                             // Unsupervised path: the report speaks for the job.
                             step_id: None,
+                            payload: PayloadEvidence::Reaped,
                         },
                     )
                     .await
@@ -4778,6 +4759,52 @@ pub(crate) struct CompletionReport<'a> {
     pub reporting_node: &'a str,
     pub drain: Option<&'a DrainRequest>,
     pub step_id: Option<spur_core::step::StepId>,
+    pub payload: PayloadEvidence<'a>,
+}
+
+/// Carried on every report, so a path reporting a run over cannot be written
+/// without answering for the processes it says have stopped.
+pub(crate) enum PayloadEvidence<'a> {
+    /// The agent spawned and reaped the payload itself, so none of it is left.
+    Reaped,
+    /// A `spurstepd` session owns the payload; its published identity decides.
+    Supervised(&'a crate::stepd::StepdStore),
+}
+
+/// Read from the recorded `(pid, start_ticks)` identity, not cgroup population:
+/// available where cgroups are not, and names only the process the report ends.
+fn payload_still_executing(report: &CompletionReport<'_>) -> bool {
+    let PayloadEvidence::Supervised(store) = report.payload else {
+        return false;
+    };
+    let Some(step_id) = report.step_id else {
+        return false;
+    };
+    let descriptor = match store.published_session(report.job_id, report.run_attempt, step_id) {
+        Ok(descriptor) => descriptor,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(error) => {
+            warn!(
+                job_id = report.job_id,
+                run_attempt = report.run_attempt,
+                step_id,
+                %error,
+                "could not read a run's session; withholding its completion report"
+            );
+            return true;
+        }
+    };
+    if !crate::stepd::workload_may_be_live(&descriptor) {
+        return false;
+    }
+    warn!(
+        job_id = report.job_id,
+        run_attempt = report.run_attempt,
+        step_id,
+        pid = descriptor.workload_pid,
+        "this run's payload is still executing; withholding its completion report"
+    );
+    true
 }
 
 /// What the controller said when handed one node's account of a finished run.
@@ -4814,6 +4841,11 @@ pub(crate) async fn report_completion(
     controller_addr: &str,
     report: CompletionReport<'_>,
 ) -> CompletionOutcome {
+    // Before the RPC, not after: an acknowledgement frees the slice, and a
+    // payload still on the cores makes this report a lie the controller acts on.
+    if payload_still_executing(&report) {
+        return CompletionOutcome::Undelivered;
+    }
     let CompletionReport {
         job_id,
         exit_code,
@@ -4822,6 +4854,7 @@ pub(crate) async fn report_completion(
         reporting_node,
         drain,
         step_id,
+        payload: _,
     } = report;
     // Wire `state` is derived from `exit_code` alone (advisory): a signaled job
     // reports Completed/0 because the controller's validator requires
@@ -10496,6 +10529,68 @@ mod tests {
         descriptor
     }
 
+    /// The same session, naming a real running process as its workload.
+    fn fenced_session_holding(
+        store: &crate::stepd::StepdStore,
+        workload_pid: u32,
+    ) -> crate::stepd::StepdDescriptor {
+        let mut descriptor = fenced_session(store);
+        descriptor.workload_pid = workload_pid;
+        descriptor.workload_start_ticks =
+            crate::stepd::process_start_ticks(workload_pid).expect("workload start ticks");
+        store.publish(&descriptor).expect("publish descriptor");
+        descriptor
+    }
+
+    // Reaping only the cgroup leaves the workload running wherever cgroups are
+    // unavailable, which is every job on a node that cannot use them.
+    #[tokio::test]
+    async fn fencing_a_dead_stepd_reaps_the_workload_it_left_behind() {
+        let (controller_addr, reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in workload");
+        let descriptor = fenced_session_holding(&store, child.id());
+
+        let running = new_running_jobs();
+        let allocation = Arc::new(Mutex::new(NodeAllocation::new(
+            "test-node".into(),
+            &ResourceSet::default(),
+        )));
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        sessions
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let mut context = fence_context(
+            &running,
+            &allocation,
+            &sessions,
+            &crate::step_completion::StepCompletions::new(),
+            &store,
+        );
+        context.controller_addr = controller_addr;
+
+        fence_dead_stepd(&context, descriptor.clone()).await;
+
+        assert!(
+            !crate::stepd::process_is_live(
+                descriptor.workload_pid,
+                descriptor.workload_start_ticks
+            ),
+            "the fenced workload must actually be dead, not merely reported so"
+        );
+        assert_eq!(
+            reports.lock().expect("completion reports").len(),
+            1,
+            "with the workload gone the run's completion must reach the controller"
+        );
+        let _ = child.wait();
+    }
+
     async fn fence_against_controller(controller_addr: String, store: &crate::stepd::StepdStore) {
         let descriptor = fenced_session(store);
         let running = new_running_jobs();
@@ -10862,14 +10957,41 @@ mod tests {
         assert_eq!(allocation.lock().await.free_cpus(), 2);
     }
 
+    /// The session a supervisor leaves behind, naming `workload` as the process
+    /// it launched. The supervisor itself is recorded as one already gone.
+    fn publish_session_for_workload(
+        store: &crate::stepd::StepdStore,
+        job_id: u32,
+        workload: &crate::admission::SupervisorRef,
+    ) {
+        let gone = a_gone_supervisor();
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            gone.pid,
+            gone.start_ticks,
+            store
+                .session_dir(job_id, 1, spur_core::step::STEP_BATCH)
+                .join("stepd.sock"),
+            std::path::PathBuf::new(),
+        );
+        descriptor.workload_pid = workload.pid;
+        descriptor.workload_start_ticks = workload.start_ticks;
+        descriptor.boot_id = workload.boot_id.clone();
+        store.publish(&descriptor).expect("publish the session");
+    }
+
     // A supervisor killed outright leaves its payload running. Reporting that
     // run over frees cores the old work is still executing on.
     #[tokio::test]
     async fn a_run_whose_processes_outlived_its_supervisor_is_not_reported_lost() {
+        let (controller_addr, reports) = spawn_mock_controller();
         let state = tempfile::tempdir().expect("runtime state directory");
         let spool = tempfile::tempdir().expect("admission state directory");
         let store = crate::stepd::StepdStore::new(state.path());
         let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
         admit_a_supervised_run(
             &admissions,
             "test-node",
@@ -10877,16 +10999,69 @@ mod tests {
             vec![0, 1],
             Some(a_gone_supervisor()),
         );
+        allocation
+            .lock()
+            .await
+            .restore_for_job(42, 1, &[0, 1], 1_000, &[])
+            .expect("charge the recorded slice");
+        publish_session_for_workload(&store, 42, &a_live_supervisor());
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
 
         assert!(
-            runs_nothing_can_speak_for(&store, &admissions, &|_, _| true).is_empty(),
-            "a run still executing is not one nothing can speak for"
+            reports.lock().expect("completion reports").is_empty(),
+            "the payload is still on these cores, so nothing may report the run over"
         );
+        assert_eq!(allocation.lock().await.free_cpus(), 2);
+    }
+
+    // The same run once its payload is gone: the report it owes must still go.
+    #[tokio::test]
+    async fn a_lost_run_is_reported_once_its_payload_is_gone() {
+        let (controller_addr, reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let allocation = four_core_node();
+        admit_a_supervised_run(
+            &admissions,
+            "test-node",
+            42,
+            vec![0, 1],
+            Some(a_gone_supervisor()),
+        );
+        allocation
+            .lock()
+            .await
+            .restore_for_job(42, 1, &[0, 1], 1_000, &[])
+            .expect("charge the recorded slice");
+        publish_session_for_workload(&store, 42, &a_gone_supervisor());
+
+        replay_unacknowledged_stepd_completions(
+            &store,
+            &admissions,
+            &allocation,
+            &controller_addr,
+            "test-node",
+        )
+        .await
+        .expect("replay");
+
         assert_eq!(
-            runs_nothing_can_speak_for(&store, &admissions, &|_, _| false).len(),
+            reports.lock().expect("completion reports").len(),
             1,
-            "the same run reports lost once its processes are gone"
+            "a run nothing is left to speak for still owes the controller a report"
         );
+        assert_eq!(allocation.lock().await.free_cpus(), 4);
     }
 
     // The session carries the real exit status; a synthetic loss reported over
@@ -17032,6 +17207,57 @@ mod tests {
         drop(running);
 
         assert!(admissions.load_run(14, 1).is_ok());
+    }
+
+    fn a_test_reporter() -> Arc<NodeReporter> {
+        Arc::new(NodeReporter::new(
+            "test-node".into(),
+            "http://localhost:6817".into(),
+            ResourceSet {
+                cpus: 4,
+                memory_mb: 8192,
+                ..Default::default()
+            },
+            spur_net::NodeAddress {
+                ip: "127.0.0.1".into(),
+                hostname: "test-node".into(),
+                port: 6818,
+                source: spur_net::AddressSource::Static,
+            },
+            std::collections::HashMap::new(),
+            String::new(),
+            String::new(),
+            new_running_jobs(),
+        ))
+    }
+
+    // The agent can name this the moment it sees it. Left for the routine sweep,
+    // the cores it holds stay out of the cluster for up to an hour.
+    #[tokio::test]
+    async fn a_claim_with_no_job_behind_it_asks_the_controller_to_reconcile() {
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        let reporter = a_test_reporter();
+        reporter.set_admissions(admissions.clone());
+        admit_a_supervised_run(
+            &admissions,
+            "test-node",
+            42,
+            vec![0, 1],
+            Some(a_live_supervisor()),
+        );
+
+        assert!(
+            !reporter.needs_reconcile(),
+            "a run with a live supervisor behind it explains itself"
+        );
+
+        flag_unbacked_allocations(&[(42, 1)], &admissions).await;
+
+        assert!(
+            reporter.needs_reconcile(),
+            "a claim the agent cannot account for must reach the controller now, not in an hour"
+        );
     }
 
     #[tokio::test]
