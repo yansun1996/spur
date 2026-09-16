@@ -460,6 +460,9 @@ pub struct ClusterManager {
     /// Launches this controller has on the wire, so a ledger cut taken while one
     /// was in flight is not read as the node having let that job go.
     dispatch_tracker: Arc<crate::dispatch_tracker::DispatchTracker>,
+    /// The agent lifetime each node last registered under, so a cut from a
+    /// lifetime that has since been replaced is not read as current.
+    agent_sessions: Arc<crate::agent_sessions::AgentSessions>,
 }
 
 /// Reserved job-name prefix marking a controller-submitted health-check job, so
@@ -606,6 +609,7 @@ impl ClusterManager {
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
             dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
+            agent_sessions: Arc::new(crate::agent_sessions::AgentSessions::default()),
         };
 
         info!("cluster manager initialized (state will be recovered via Raft)");
@@ -5790,6 +5794,11 @@ impl ClusterManager {
         &self.dispatch_tracker
     }
 
+    /// The agent lifetime each node last registered under.
+    pub(crate) fn agent_sessions(&self) -> &Arc<crate::agent_sessions::AgentSessions> {
+        &self.agent_sessions
+    }
+
     /// Every non-finalized run Raft places on this node. Keyed by the run, not
     /// the job: a leaked attempt beside a recorded one must not read as recorded.
     pub fn jobs_allocated_on_node(&self, node: &str) -> HashSet<RunKey> {
@@ -6833,6 +6842,7 @@ impl ClusterManager {
                     }
                 }
                 nodes.remove(name);
+                self.agent_sessions.forget(name);
                 info!(
                     node = %name,
                     reason = reason.as_deref().unwrap_or(""),

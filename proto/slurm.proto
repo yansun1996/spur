@@ -871,8 +871,8 @@ message RegisterAgentRequest {
 // What an agent believes it is entitled to. Absence and emptiness differ: only
 // a complete ledger licenses acting on what is missing from it.
 message NodeLedger {
-  // Identifies the agent process this cut was taken in, so two agent lifetimes
-  // can be told apart. Not a staleness gate: a cut answers the call that made it.
+  // Identifies the agent process that took this cut. One whose session a later
+  // registration has replaced is discarded rather than applied as current.
   string agent_session_id = 1;
   // False when the agent could not enumerate its own state. The controller may
   // then add claims it did not know about, but must never remove any.

@@ -904,6 +904,7 @@ struct ReconcileLicense<'a> {
 /// `None` when nothing may be acted on at all. Resolved before the record is
 /// sampled: an absence in a half-replayed log is not an absence.
 async fn open_reconcile_license<'a>(
+    cluster: &Arc<ClusterManager>,
     node: &str,
     ledger: &'a spur_proto::proto::NodeLedger,
     replayed: impl std::future::Future<Output = bool>,
@@ -912,6 +913,19 @@ async fn open_reconcile_license<'a>(
         warn!(
             node = %node,
             "controller has not replayed its own log; leaving this node's claims alone"
+        );
+        return None;
+    }
+    // Read after the wait, so a re-registration that landed while this pass was
+    // blocked is still seen to overtake the cut.
+    if !cluster
+        .agent_sessions()
+        .vouches_for(node, &ledger.agent_session_id)
+    {
+        warn!(
+            node = %node,
+            agent_session_id = %ledger.agent_session_id,
+            "a later registration replaced the agent lifetime that took this cut; discarding it"
         );
         return None;
     }
@@ -1002,7 +1016,7 @@ async fn reconcile_node_ledger_after(
     dispatched: &crate::dispatch_tracker::DispatchWatch,
     replayed: impl std::future::Future<Output = bool>,
 ) -> ReconcileOutcome {
-    let Some(license) = open_reconcile_license(node, &ledger, replayed).await else {
+    let Some(license) = open_reconcile_license(cluster, node, &ledger, replayed).await else {
         return ReconcileOutcome::default();
     };
     let mut outcome = ReconcileOutcome {
@@ -2421,6 +2435,11 @@ impl SlurmController for ControllerService {
         }
 
         if let Some(ledger) = ledger {
+            // Recorded only once the registration has been accepted, and before
+            // the reconcile below: a rejected one must disown no other lifetime.
+            self.cluster
+                .agent_sessions()
+                .observe_registration(&req.hostname, &ledger.agent_session_id);
             let node = req.hostname.clone();
             let cluster = self.cluster.clone();
             let cluster_for_reconcile = self.cluster.clone();
@@ -7281,6 +7300,168 @@ mod tests {
             "a complete ledger that omits a confirmed run is evidence the node let it go"
         );
         assert!(!holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+    }
+
+    /// Register `n1` as a fresh agent lifetime, the way a restarted agent does.
+    /// The cut asserts nothing, so the reconcile it spawns cannot race the caller.
+    async fn register_lifetime(svc: &ControllerService, session: &str) {
+        let mut cut = ledger(false, Vec::new());
+        cut.agent_session_id = session.into();
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            port: 6818,
+            ledger: Some(cut),
+            ..Default::default()
+        }))
+        .await
+        .expect("an agent must be able to register");
+    }
+
+    fn ledger_from(session: &str, entries: Vec<(u32, u32)>) -> spur_proto::proto::NodeLedger {
+        let mut cut = ledger(true, entries);
+        cut.agent_session_id = session.into();
+        cut
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_from_a_lifetime_that_has_re_registered_is_discarded() {
+        // A rolling upgrade restarts an agent under every outstanding pull. The
+        // reply names a node that no longer exists, in both directions at once.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-b").await;
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_from("session-a", vec![(99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::default(),
+            "a cut the agent's current lifetime did not take proves nothing either way"
+        );
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
+            "an absence in a superseded cut must not settle a live run"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_from_the_lifetime_that_registered_is_acted_on() {
+        // The same cut the previous test discards, differing only in the lifetime
+        // it names: the gate must turn on staleness and nothing else.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-b").await;
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_from("session-b", vec![(99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
+
+        assert_eq!(outcome.cancelled, vec![99]);
+        assert_eq!(outcome.settled, vec![7]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_controller_that_has_seen_no_registration_still_reconciles() {
+        // A restarted controller keeps its nodes from the snapshot, so they never
+        // re-register. Treating that silence as doubt would strand every leak.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_from("session-a", vec![(99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
+
+        assert_eq!(outcome.cancelled, vec![99]);
+        assert_eq!(outcome.settled, vec![7]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_disowns_the_lifetime_it_replaces_before_reconciling() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-a").await;
+        register_lifetime(&svc, "session-b").await;
+
+        assert!(
+            !cluster.agent_sessions().vouches_for("n1", "session-a"),
+            "a re-registration must disown the lifetime it replaces"
+        );
+        assert!(
+            cluster.agent_sessions().vouches_for("n1", "session-b"),
+            "the cut that establishes a lifetime cannot be stale against it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lifetime_recorded_in_a_term_that_ended_no_longer_gates_a_cut() {
+        // Registrations during another term went to that leader. Keeping this
+        // term's record would discard every later cut, with nothing to clear it.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-a").await;
+
+        let mut scheduler = spur_sched::backfill::BackfillScheduler::new(100);
+        crate::scheduler_loop::relinquish_leadership(&cluster, &mut scheduler);
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_from("session-b", vec![(99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            vec![99],
+            "a leaked claim must not be stranded by a lifetime no term can vouch for"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_registration_disowns_no_lifetime() {
+        // A registration that never took effect runs no reconcile of its own, so
+        // letting it supersede the live lifetime would discard cuts and replace none.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-a").await;
+
+        let mut cut = ledger(false, Vec::new());
+        cut.agent_session_id = "session-b".into();
+        let mut rejected = Request::new(RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            port: 6818,
+            labels: [("pool".to_string(), "stolen".to_string())].into(),
+            ledger: Some(cut),
+            ..Default::default()
+        });
+        rejected.extensions_mut().insert(viewer("mallory", false));
+        let err = svc
+            .register_agent(rejected)
+            .await
+            .expect_err("a non-admin caller must not be able to relabel an existing node");
+        assert_eq!(err.code(), Code::PermissionDenied);
+
+        assert!(
+            cluster.agent_sessions().vouches_for("n1", "session-a"),
+            "the lifetime still running must keep speaking for this node"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -56,8 +56,8 @@ pub struct NodeReporter {
     /// The entitlement ledger, wired once the state root is known. Without one
     /// the agent registers with no ledger, which asserts nothing.
     admissions: std::sync::OnceLock<crate::admission::AdmissionStore>,
-    /// Identifies this agent process, so two agent lifetimes can be told apart.
-    /// Not a staleness gate: a cut answers the call that made it.
+    /// Identifies this agent process. A cut whose session a later registration
+    /// has replaced is discarded rather than applied as current.
     agent_session_id: String,
     /// Whether the last cut could see everything. Only the transition is worth
     /// saying: the condition needs an operator, and it does not clear itself.
@@ -157,8 +157,8 @@ impl NodeReporter {
         cut.wants_reconcile()
     }
 
-    /// Identifies this agent process, so two agent lifetimes can be told apart.
-    /// Not a staleness gate: a cut answers the call that made it.
+    /// Identifies this agent process. A cut whose session a later registration
+    /// has replaced is discarded rather than applied as current.
     pub fn agent_session_id(&self) -> &str {
         &self.agent_session_id
     }
