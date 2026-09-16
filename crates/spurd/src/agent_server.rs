@@ -3976,26 +3976,18 @@ async fn settle_cancelled_runs(
         }
         let (job_id, run_attempt) = (run.job_id, run.run_attempt);
         let Some(run_key) = run.key() else { continue };
-        let store = admissions.clone();
-        let settled =
-            tokio::task::spawn_blocking(move || store.settle_acknowledged_run(run_key)).await;
-        match settled {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                warn!(job_id, run_attempt, %error, "failed to settle a cancelled run");
-                continue;
+        // Settled and freed together, not on the next tick: settling makes the
+        // record collectable and the sweep may take it before another pass reads it.
+        match settle_and_release_run(allocation, admissions, run_key).await {
+            Ok(SettleRunOutcome::NotQuiescent) => {
+                debug!(
+                    job_id,
+                    run_attempt, "a hook is still running under a cancelled run"
+                )
             }
-            Err(error) => {
-                warn!(job_id, run_attempt, %error, "settle task failed");
-                continue;
-            }
+            Ok(_) => {}
+            Err(error) => warn!(job_id, run_attempt, %error, "failed to settle a cancelled run"),
         }
-        // Freed here, not on the next tick: settling makes the record collectable
-        // and the sweep may take it before another pass reads it.
-        let step_id = admitted
-            .lifecycle_step()
-            .unwrap_or(spur_core::step::STEP_BATCH);
-        release_acknowledged_allocation(allocation, admissions, run_key, step_id).await;
     }
 }
 
@@ -4084,6 +4076,44 @@ async fn release_acknowledged_allocation(
         debug!(%run, %ground, "a run's slice was already free at its acknowledgement");
     }
     released
+}
+
+/// What came of taking the controller's word that it is not accounting for a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettleRunOutcome {
+    Released,
+    AlreadyFree,
+    NoRecord,
+    NotQuiescent,
+}
+
+/// Settle a run the controller has no record of and hand its slice back, in that
+/// order: cores freed ahead of the record are cores a restart cannot re-charge.
+async fn settle_and_release_run(
+    allocation: &Arc<Mutex<NodeAllocation>>,
+    admissions: &crate::admission::AdmissionStore,
+    run: RunKey,
+) -> std::io::Result<SettleRunOutcome> {
+    let store = admissions.clone();
+    let permit = tokio::task::spawn_blocking(move || store.settle_permit(run))
+        .await
+        .map_err(|error| std::io::Error::other(format!("settle permit task failed: {error}")))??;
+    let step_id = match permit {
+        crate::admission::SettlePermit::Due(step_id) => step_id,
+        crate::admission::SettlePermit::NoRecord => return Ok(SettleRunOutcome::NoRecord),
+        crate::admission::SettlePermit::NotQuiescent => return Ok(SettleRunOutcome::NotQuiescent),
+    };
+    let store = admissions.clone();
+    let settled = tokio::task::spawn_blocking(move || store.settle_acknowledged_run(run))
+        .await
+        .map_err(|error| std::io::Error::other(format!("settle task failed: {error}")))??;
+    if !settled {
+        return Ok(SettleRunOutcome::NoRecord);
+    }
+    if release_acknowledged_allocation(allocation, admissions, run, step_id).await {
+        return Ok(SettleRunOutcome::Released);
+    }
+    Ok(SettleRunOutcome::AlreadyFree)
 }
 
 /// Settle a run the controller has taken the completion of, and free its slice.
@@ -5066,6 +5096,9 @@ impl SlurmAgent for AgentService {
         let (job_id, run_attempt) = (req.job_id, req.run_attempt);
         let run = named_run(job_id, run_attempt)
             .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to settle"))?;
+        // Held across the running check and the release under it, as teardown does,
+        // so a re-dispatch either lands before this or finds nothing taken from it.
+        let _lifecycle = self.lifecycle.acquire(job_id).await;
         // Declining costs a slice until the next reconcile; releasing one a
         // payload is still on hands its cores to a second job.
         if self
@@ -5084,30 +5117,37 @@ impl SlurmAgent for AgentService {
                 error: "this agent is still running the run".into(),
             }));
         }
-        self.allocation
-            .lock()
+        let outcome = settle_and_release_run(&self.allocation, &self.admissions(), run)
             .await
-            .release_job(ReleaseWarrant::acknowledged(run, 1));
-        let admissions = self.admissions();
-        let settled = tokio::task::spawn_blocking(move || admissions.settle_acknowledged_run(run))
-            .await
-            .map_err(|error| Status::internal(format!("settle task failed: {error}")))?;
-        match settled {
-            Ok(_) => {
+            .map_err(|error| {
+                Status::unavailable(format!(
+                    "could not settle run {job_id}.{run_attempt}: {error}"
+                ))
+            })?;
+        let declined = match outcome {
+            SettleRunOutcome::Released => {
                 info!(
                     job_id,
                     run_attempt,
                     "controller answered a claim it has no record of; released the slice"
                 );
-                Ok(Response::new(SettleRunResponse {
+                return Ok(Response::new(SettleRunResponse {
                     released: true,
                     error: String::new(),
-                }))
+                }));
             }
-            Err(error) => Err(Status::unavailable(format!(
-                "could not settle run {job_id}.{run_attempt}: {error}"
-            ))),
-        }
+            SettleRunOutcome::AlreadyFree => "the slice was already free",
+            SettleRunOutcome::NoRecord => "this agent has no record of the run",
+            SettleRunOutcome::NotQuiescent => "the run is still being torn down",
+        };
+        warn!(
+            job_id,
+            run_attempt, declined, "declining to report a slice as released"
+        );
+        Ok(Response::new(SettleRunResponse {
+            released: false,
+            error: declined.into(),
+        }))
     }
 
     async fn launch_job(
@@ -17556,6 +17596,87 @@ mod tests {
                 .expect("record")
                 .slice_released
         );
+    }
+
+    // Teardown drops the job from `running` and marks the record cleaned before
+    // the epilog runs, so both of the settle's own guards pass while a hook is live.
+    #[tokio::test]
+    async fn a_settle_while_an_epilog_is_still_running_is_declined() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(7, 1, 2, 1000, &[])
+                .expect("allocate");
+            alloc.commit_job(7, 1);
+        }
+        admissions.mark_run_cleaned(key(7, 1)).expect("cleaned");
+        admissions
+            .record_epilog(key(7, 1), crate::admission::HookState::Running)
+            .expect("epilog running");
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+
+        assert!(
+            !response.released,
+            "the controller cannot see the hook; only this side can veto on it"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "an epilog is still on these cores"
+        );
+        let run = admissions.load_run(key(7, 1)).expect("record");
+        assert!(
+            !run.slice_released,
+            "a cut that drops this entry stops advertising a claim the node still holds"
+        );
+
+        // The veto lifts with the hook, and nothing else is needed to unstick it.
+        admissions
+            .record_epilog(key(7, 1), crate::admission::HookState::Succeeded)
+            .expect("epilog done");
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+        assert!(response.released);
+        assert_eq!(svc.allocation.lock().await.free_cpus(), while_held + 2);
+    }
+
+    // The controller counts what comes back as a release it caused, so a settle
+    // that found nothing to settle must not be counted as one.
+    #[tokio::test]
+    async fn a_settle_for_a_run_this_agent_has_no_record_of_reports_no_release() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+
+        let response = svc
+            .settle_run(Request::new(SettleRunRequest {
+                job_id: 7,
+                run_attempt: 1,
+            }))
+            .await
+            .expect("settle")
+            .into_inner();
+
+        assert!(!response.released);
+        assert!(!response.error.is_empty(), "the caller is told why");
     }
 
     // Reconciling cancels a leaked attempt beside a live one, and PMIx

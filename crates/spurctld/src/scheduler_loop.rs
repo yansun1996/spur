@@ -2683,23 +2683,38 @@ async fn fence_one_agent(
     }
 }
 
+/// One node's agent connection, opened on first use and reused for the rest of
+/// that node's pass: a handshake and a minted credential per claim is a tax.
+pub type AgentLink = Option<
+    spur_proto::proto::slurm_agent_client::SlurmAgentClient<crate::agent_client::AgentChannel>,
+>;
+
 /// Tell a node the controller is not accounting for a run it still holds, which
 /// is the acknowledgement that run's slice is waiting on. Whether it went back.
 pub async fn settle_run_on_node(
     cluster: &Arc<ClusterManager>,
     node: &str,
     run: spur_core::job::RunKey,
+    link: &mut AgentLink,
 ) -> bool {
     let job_id = run.job_id();
     // A settle names one run's slice; the wildcard key names no slice to free.
     let Some(run_attempt) = run.attempt() else {
         return false;
     };
-    let Some(addr) = cluster.get_node(node).and_then(|n| node_comm_http_url(&n)) else {
-        return false;
-    };
-    let Ok(mut client) = crate::agent_client::connect(addr).await else {
-        debug!(job_id, node = %node, "could not reach an agent to settle a run");
+    if link.is_none() {
+        let Some(addr) = cluster.get_node(node).and_then(|n| node_comm_http_url(&n)) else {
+            return false;
+        };
+        match crate::agent_client::connect(addr).await {
+            Ok(client) => *link = Some(client),
+            Err(_) => {
+                debug!(job_id, node = %node, "could not reach an agent to settle a run");
+                return false;
+            }
+        }
+    }
+    let Some(client) = link.as_mut() else {
         return false;
     };
     let settled = tokio::time::timeout(

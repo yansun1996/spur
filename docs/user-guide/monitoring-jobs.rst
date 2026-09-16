@@ -933,10 +933,9 @@ accept ``State=``, ``Reason=``, and ``Reconcile=``.
    scontrol update NodeName=node01 State=drain Reason="maintenance"
    scontrol update NodeName=node01 Reconcile=yes
 
-``--controller`` and the other global flags are parsed as flags wherever they
-appear, including after the ``key=value`` pairs. A token among those pairs that
-is not a ``key=value`` pair is an error naming the token, rather than being
-silently dropped.
+``--controller`` is parsed as a flag wherever it appears, including after the
+``key=value`` pairs. A token among those pairs that is not a ``key=value`` pair
+is an error naming the token, rather than being silently dropped.
 
 ``Reconcile=yes`` asks the node for a fresh account of what it believes it is
 running and compares that against the controller's own record, resolving any
@@ -948,13 +947,24 @@ about it:
 - finished, with its resources not yet handed back — the controller answers
   that it is not accounting for the run, which releases those resources. This
   is the acknowledgement such a run is waiting for, and without it the node
-  holds those CPUs, GPUs and memory indefinitely, including across a restart;
+  holds those CPUs, GPUs and memory indefinitely, including across a restart.
+  The node keeps a veto it alone can exercise: while a cleanup hook is still
+  running under the job, it declines and the next reconcile asks again;
 - neither — the node cannot account for the claim and the controller has no
   record of it, so nothing may end it and nothing proves it is over. It is left
   alone and named in the node's reason as ``holding claims the controller has
-  no record of``, followed by the job ids. The reason clears itself once the
-  claims resolve, and never overwrites a reason an operator set. Only an
-  operator can clear the underlying condition.
+  no record of``, followed by the job ids. Only an operator can clear the
+  underlying condition.
+
+The reason is written only where the controller has no other reason to
+overwrite, and is cleared only once a reconcile that could see every claim finds
+none left. A node carrying any other reason — an operator's, or one the
+controller set for something else such as a missed heartbeat — keeps it, and the
+drift is reported in the controller log instead. Naming needs an
+attested reconcile: under the default ``open`` node admission a ledger that
+arrives with a registration cannot license it, so on those clusters the reason
+is written by a reconcile the controller initiated. See
+:doc:`/admin-guide/configuration` for how ``admission.mode`` decides that.
 
 The controller already reconciles a node on its own:
 

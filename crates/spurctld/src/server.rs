@@ -1010,13 +1010,17 @@ async fn open_reconcile_license<'a>(
 /// Direction A: the node asserts a claim Raft has no record of. Reasons from a
 /// presence, which an incomplete cut does not weaken. Every such claim gets an
 /// answer -- ended, released, or named as one only an operator can clear.
+/// False when a claim went unanswered, leaving `outcome.unresolved` a part of
+/// this node's account rather than the whole of it.
 async fn answer_unrecorded_claims(
     cluster: &Arc<ClusterManager>,
     node: &str,
     license: &ReconcileLicense<'_>,
     outcome: &mut ReconcileOutcome,
-) {
+) -> bool {
     let recorded = cluster.jobs_allocated_on_node(node);
+    let mut answered_every_claim = true;
+    let mut link: crate::scheduler_loop::AgentLink = None;
     for (run, entry) in license
         .held
         .iter()
@@ -1026,6 +1030,7 @@ async fn answer_unrecorded_claims(
         // release hands cores away -- so the premises are retaken before each.
         if let Some(reason) = license.lapsed(cluster, node) {
             warn!(node = %node, reason, "leaving the rest of this node's claims alone");
+            answered_every_claim = false;
             break;
         }
         // Reported either way: an operator sees the drift even where the caller
@@ -1037,21 +1042,32 @@ async fn answer_unrecorded_claims(
                 run_attempt = entry.run_attempt,
                 "unattested registration cannot license answering a claim; leaving it alone"
             );
+            answered_every_claim = false;
             continue;
         }
         let disposition = spur_core::job::LedgerDisposition::from_wire(&entry.disposition);
         // Teardown is done and Raft has no record of the run, so the completion
         // this claim is waiting on is one only this side can still give it.
         if disposition.is_some_and(spur_core::job::LedgerDisposition::may_be_settled) {
-            info!(
+            // Said of the answer, never of the intent: an agent that declines --
+            // because a hook is still on the cores -- leaves the claim standing.
+            if crate::scheduler_loop::settle_run_on_node(cluster, node, *run, &mut link).await {
+                info!(
+                    node = %node,
+                    job_id = entry.job_id,
+                    run_attempt = entry.run_attempt,
+                    "agent held a finished run the controller has no record of; released it"
+                );
+                outcome.released.push(entry.job_id);
+                continue;
+            }
+            warn!(
                 node = %node,
                 job_id = entry.job_id,
                 run_attempt = entry.run_attempt,
-                "agent holds a finished run the controller has no record of; releasing it"
+                "agent would not release a finished run the controller has no record of"
             );
-            if crate::scheduler_loop::settle_run_on_node(cluster, node, *run).await {
-                outcome.released.push(entry.job_id);
-            }
+            outcome.unresolved.push(entry.job_id);
             continue;
         }
         // "Cannot tell" is never "dead". Nothing here licenses ending the claim
@@ -1083,6 +1099,7 @@ async fn answer_unrecorded_claims(
         .await;
         outcome.cancelled.push(run.job_id());
     }
+    answered_every_claim
 }
 
 /// As [`reconcile_node_ledger`], readiness taken unresolved so no part of the
@@ -1100,7 +1117,8 @@ async fn reconcile_node_ledger_after(
         return ReconcileOutcome::default();
     };
     let mut outcome = ReconcileOutcome::default();
-    answer_unrecorded_claims(cluster, node, &license, &mut outcome).await;
+    let answered_every_claim =
+        answer_unrecorded_claims(cluster, node, &license, &mut outcome).await;
 
     // Direction B: Raft records a run the agent did not report. Reasons from an
     // absence, so it needs a complete cut and a run no launch of ours raced.
@@ -1174,7 +1192,11 @@ async fn reconcile_node_ledger_after(
         }
     }
 
-    name_unresolved_claims_on_node(cluster, node, &outcome);
+    // A pass that answered only some of this node's claims knows a subset, and a
+    // subset may neither clear the reason nor rewrite it to a shorter list.
+    if answered_every_claim {
+        name_unresolved_claims_on_node(cluster, node, &outcome);
+    }
     outcome
 }
 
@@ -1192,13 +1214,18 @@ fn name_unresolved_claims_on_node(
     let Some(current) = cluster.get_node(node) else {
         return;
     };
-    // An operator-held node carries a reason of their own, and theirs outranks
-    // this one in both directions -- it is neither overwritten nor cleared.
-    if current.state.is_admin_hold() {
+    // Authorship, not state: a heartbeat timeout puts a node in an admin-hold
+    // state without an operator behind it, and that is the likeliest to strand.
+    if current.admin_locked {
         return;
     }
     let existing = current.state_reason.as_deref().unwrap_or_default();
-    let wanted = match outcome.unresolved.as_slice() {
+    // The ids come out of a map, so an unsorted list rewrites the same fact in a
+    // different order every pass and proposes a state change through Raft for it.
+    let mut claims = outcome.unresolved.clone();
+    claims.sort_unstable();
+    claims.dedup();
+    let wanted = match claims.as_slice() {
         [] => String::new(),
         claims => format!(
             "{UNRESOLVED_CLAIM_REASON}: {}",
@@ -1212,8 +1239,9 @@ fn name_unresolved_claims_on_node(
     if existing == wanted {
         return;
     }
-    // Only this pass's own text is cleared; an unrelated reason is left standing.
-    if wanted.is_empty() && !existing.starts_with(UNRESOLVED_CLAIM_REASON) {
+    // Only this pass's own text is touched, in either direction: a reason set
+    // anywhere else is somebody's, and its attribution goes with it.
+    if !existing.is_empty() && !existing.starts_with(UNRESOLVED_CLAIM_REASON) {
         return;
     }
     let reason = (!wanted.is_empty()).then_some(wanted);
@@ -7154,6 +7182,15 @@ mod tests {
         cluster
     }
 
+    /// A port this process bound and let go. The agent port would make a test
+    /// that turns on nothing answering depend on what else the machine runs.
+    fn a_port_nothing_listens_on() -> u16 {
+        let bound = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = bound.local_addr().expect("ephemeral address").port();
+        drop(bound);
+        port
+    }
+
     fn seed_a_job_on_a_node(cluster: &Arc<ClusterManager>) {
         cluster.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
             name: "n1".into(),
@@ -7164,7 +7201,7 @@ mod tests {
                 ..Default::default()
             },
             address: "127.0.0.1".into(),
-            port: 6818,
+            port: a_port_nothing_listens_on(),
             wg_pubkey: String::new(),
             version: String::new(),
             labels: std::collections::HashMap::new(),
@@ -7661,7 +7698,7 @@ mod tests {
                 ..Default::default()
             },
             address: "127.0.0.1".into(),
-            port: 6818,
+            port: a_port_nothing_listens_on(),
             wg_pubkey: String::new(),
             version: String::new(),
             labels: std::collections::HashMap::new(),
@@ -7714,7 +7751,7 @@ mod tests {
         svc.register_agent(Request::new(RegisterAgentRequest {
             hostname: "n1".into(),
             address: "127.0.0.1".into(),
-            port: 6818,
+            port: a_port_nothing_listens_on().into(),
             ledger: Some(cut),
             ..Default::default()
         }))
@@ -7941,7 +7978,7 @@ mod tests {
         let mut rejected = Request::new(RegisterAgentRequest {
             hostname: "n1".into(),
             address: "127.0.0.1".into(),
-            port: 6818,
+            port: a_port_nothing_listens_on().into(),
             labels: [("pool".to_string(), "stolen".to_string())].into(),
             ledger: Some(cut),
             ..Default::default()
@@ -8631,6 +8668,162 @@ mod tests {
             .state_reason
     }
 
+    async fn await_node_reason(svc: &ControllerService, name: &str, expected: &str) {
+        for _ in 0..600 {
+            if node_reason(svc, name).await == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!(
+            "node {name} reason never became {expected:?}; it is {:?}",
+            node_reason(svc, name).await
+        );
+    }
+
+    fn set_node_reason(cluster: &Arc<ClusterManager>, node: &str, reason: &str) {
+        let state = cluster.get_node(node).expect("node").state;
+        cluster
+            .update_node_state(node, state, Some(reason.to_string()), None)
+            .expect("set a reason on the node");
+    }
+
+    fn unresolved_reason(claims: &str) -> String {
+        format!("{}: {claims}", super::UNRESOLVED_CLAIM_REASON)
+    }
+
+    // An unlicensed pass answers no claim, so its empty account of the node is
+    // not evidence that the claims went away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unlicensed_pass_leaves_an_already_named_claim_named() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        set_node_reason(&cluster, "n1", &unresolved_reason("9"));
+        await_node_reason(&svc, "n1", &unresolved_reason("9")).await;
+
+        // Open admission cannot place the caller at the node a registration names,
+        // so nothing in this cut licenses acting on -- or clearing -- anything.
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![(9, 1, spur_core::job::LedgerDisposition::Unresolved)],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+
+        assert_eq!(
+            node_reason(&svc, "n1").await,
+            unresolved_reason("9"),
+            "the claim is still held; only a pass that could see it may clear it"
+        );
+    }
+
+    // The ids come out of a map. An unsorted list rewrites the same fact in a
+    // different order each pass, proposing a state change through Raft every time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_same_unresolved_claims_are_named_the_same_way_every_pass() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        for _ in 0..8 {
+            reconcile_node_ledger(
+                &cluster,
+                "n1",
+                ledger_disposed(
+                    true,
+                    vec![
+                        (9, 1, spur_core::job::LedgerDisposition::Unresolved),
+                        (8, 1, spur_core::job::LedgerDisposition::Unresolved),
+                    ],
+                ),
+                &no_launch_in_flight(&cluster, "n1"),
+                CutProvenance::Pulled,
+            )
+            .await;
+            await_node_reason(&svc, "n1", &unresolved_reason("8,9")).await;
+        }
+    }
+
+    // Only this pass's own text is its to move. A reason set anywhere else carries
+    // somebody's attribution, and rewriting it destroys that with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reason_this_pass_did_not_write_is_left_standing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        set_node_reason(&cluster, "n1", "cable replacement");
+        await_node_reason(&svc, "n1", "cable replacement").await;
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![(9, 1, spur_core::job::LedgerDisposition::Unresolved)],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            node_reason(&svc, "n1").await,
+            "cable replacement",
+            "the drift belongs in the log, not over the top of somebody else's reason"
+        );
+    }
+
+    // A settle the agent does not answer -- unreachable, or too old to know the
+    // call -- releases nothing, so the claim is still there to be accounted for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settle_that_released_nothing_leaves_the_claim_named() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![(9, 1, spur_core::job::LedgerDisposition::OverButCharged)],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.released,
+            Vec::<u32>::new(),
+            "nothing came back, so nothing may be counted as released"
+        );
+        assert_eq!(outcome.unresolved, vec![9]);
+        await_node_reason(&svc, "n1", &unresolved_reason("9")).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_node_on_dispatch_cooldown_says_why_it_is_being_skipped() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -9223,7 +9416,7 @@ mod tests {
     async fn a_keyed_token_cluster_rejects_an_untokened_or_forged_heartbeat() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service_with_token_admission(&dir).await;
-        point_node_at_probe_agent(&svc, "n1", 6818).await;
+        point_node_at_probe_agent(&svc, "n1", a_port_nothing_listens_on()).await;
 
         let error = svc
             .heartbeat(Request::new(HeartbeatRequest {
@@ -9299,7 +9492,7 @@ mod tests {
     async fn a_keyed_token_cluster_rejects_an_untokened_deregistration() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let svc = test_service_with_token_admission(&dir).await;
-        point_node_at_probe_agent(&svc, "n1", 6818).await;
+        point_node_at_probe_agent(&svc, "n1", a_port_nothing_listens_on()).await;
 
         let error = svc
             .deregister_agent(Request::new(spur_proto::proto::DeregisterAgentRequest {
@@ -9326,7 +9519,7 @@ mod tests {
             svc.node_identity_key_configured,
             "fixture assumption: a key is configured but admission stays open"
         );
-        point_node_at_probe_agent(&svc, "n1", 6818).await;
+        point_node_at_probe_agent(&svc, "n1", a_port_nothing_listens_on()).await;
 
         svc.heartbeat(Request::new(HeartbeatRequest {
             hostname: "n1".into(),

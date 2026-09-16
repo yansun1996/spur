@@ -47,6 +47,17 @@ pub enum RunState {
     Cleaned,
 }
 
+/// Whether a run's slice may be handed back on the controller's word alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettlePermit {
+    /// Teardown is finished and no hook is under it; the release keys to this step.
+    Due(StepId),
+    /// Nothing here to settle, so nothing to report back as released.
+    NoRecord,
+    /// A payload or a hook is still on the cores. The controller cannot see this.
+    NotQuiescent,
+}
+
 /// A hook whose owner died mid-run loads as `Unknown` and is never re-run: the
 /// agent cannot tell whether its side effects landed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -982,6 +993,31 @@ impl AdmissionStore {
             .controller_ack
             .release_raft_index
             .map(|index| ReleaseWarrant::acknowledged(run_key, index)))
+    }
+
+    /// Whether the controller's word that it is not accounting for this run may be
+    /// acted on yet. The agent keeps the veto: only it can see the hooks.
+    pub fn settle_permit(&self, run_key: RunKey) -> io::Result<SettlePermit> {
+        let run = match self.load_run(run_key) {
+            Ok(run) => run,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(SettlePermit::NoRecord)
+            }
+            Err(error) => return Err(error),
+        };
+        if run.state != RunState::Cleaned || run.cleanup.epilog.is_in_flight() {
+            return Ok(SettlePermit::NotQuiescent);
+        }
+        let step_id = match run.lifecycle_owner_step {
+            Some(step_id) => step_id,
+            None => self
+                .participants(run_key)?
+                .0
+                .first()
+                .map(|participant| participant.step_id)
+                .unwrap_or(spur_core::step::STEP_BATCH),
+        };
+        Ok(SettlePermit::Due(step_id))
     }
 
     /// Record how this run's epilog is going. The gate reads this, so a hook
@@ -2048,6 +2084,51 @@ mod tests {
         assert!(
             entry.disposition.already_accounted_for(),
             "it is still not something to kill"
+        );
+    }
+
+    // What every completion looks like on a cluster with an epilog hook: teardown
+    // has marked the record cleaned and the hook is still on the cores.
+    #[test]
+    fn a_finished_teardown_with_a_live_epilog_asks_to_be_settled_but_refuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1)).unwrap();
+        store.record_epilog(key(7, 1), HookState::Running).unwrap();
+
+        let entry = store
+            .ledger_cut("session-a")
+            .entries
+            .into_iter()
+            .find(|entry| entry.job_id == 7)
+            .expect("a run holding a slice stays in the cut");
+        assert!(
+            entry.disposition.may_be_settled(),
+            "the cut cannot see the hook, so the controller will ask"
+        );
+        assert_eq!(
+            store.settle_permit(key(7, 1)).unwrap(),
+            SettlePermit::NotQuiescent,
+            "and the agent, which can see it, is what refuses"
+        );
+
+        store
+            .record_epilog(key(7, 1), HookState::Succeeded)
+            .unwrap();
+        assert!(matches!(
+            store.settle_permit(key(7, 1)).unwrap(),
+            SettlePermit::Due(_)
+        ));
+    }
+
+    #[test]
+    fn a_settle_permit_for_a_run_with_no_record_names_no_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        assert_eq!(
+            store.settle_permit(key(7, 1)).unwrap(),
+            SettlePermit::NoRecord
         );
     }
 
