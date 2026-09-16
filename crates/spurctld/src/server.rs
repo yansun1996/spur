@@ -873,29 +873,38 @@ pub(crate) async fn reconcile_node_ledger(
     ledger: spur_proto::proto::NodeLedger,
     dispatched: &crate::dispatch_tracker::DispatchWatch,
 ) -> ReconcileOutcome {
-    let held: std::collections::HashMap<u32, &spur_proto::proto::LedgerEntry> =
-        ledger.entries.iter().map(|e| (e.job_id, e)).collect();
-    let recorded = cluster.jobs_allocated_on_node(node);
+    reconcile_node_ledger_after(
+        cluster,
+        node,
+        ledger,
+        dispatched,
+        cluster.state_machine_ready(CONTROLLER_CATCH_UP_WAIT),
+    )
+    .await
+}
 
-    // Direction A: the agent holds a slice Raft does not record. That absence is
-    // only evidence once this controller has applied its own log.
-    let unrecorded: Vec<&spur_proto::proto::LedgerEntry> = ledger
+/// Direction A. The record is sampled inside, strictly after `replayed` settles:
+/// an absence in a half-replayed log is not an absence.
+async fn cancel_unrecorded_claims(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    ledger: &spur_proto::proto::NodeLedger,
+    replayed: impl std::future::Future<Output = bool>,
+) -> Vec<u32> {
+    if !replayed.await {
+        warn!(
+            node = %node,
+            "controller has not replayed its own log; leaving this node's claims alone"
+        );
+        return Vec::new();
+    }
+    let recorded = cluster.jobs_allocated_on_node(node);
+    let mut cancelled = Vec::new();
+    for entry in ledger
         .entries
         .iter()
         .filter(|e| !recorded.contains_key(&e.job_id))
-        .collect();
-    let controller_ready =
-        unrecorded.is_empty() || cluster.state_machine_ready(CONTROLLER_CATCH_UP_WAIT).await;
-    let mut outcome = ReconcileOutcome::default();
-    for entry in unrecorded {
-        if !controller_ready {
-            warn!(
-                node = %node,
-                job_id = entry.job_id,
-                "controller has not replayed its own log; leaving this claim alone"
-            );
-            continue;
-        }
+    {
         warn!(
             node = %node,
             job_id = entry.job_id,
@@ -910,8 +919,27 @@ pub(crate) async fn reconcile_node_ledger(
             9,
         )
         .await;
-        outcome.cancelled.push(entry.job_id);
+        cancelled.push(entry.job_id);
     }
+    cancelled
+}
+
+/// As [`reconcile_node_ledger`], readiness taken unresolved so no part of the
+/// record can be read before it settles. Waiting after the read only makes it
+/// certain to be stale.
+async fn reconcile_node_ledger_after(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    ledger: spur_proto::proto::NodeLedger,
+    dispatched: &crate::dispatch_tracker::DispatchWatch,
+    replayed: impl std::future::Future<Output = bool>,
+) -> ReconcileOutcome {
+    let held: std::collections::HashMap<u32, &spur_proto::proto::LedgerEntry> =
+        ledger.entries.iter().map(|e| (e.job_id, e)).collect();
+    let mut outcome = ReconcileOutcome {
+        cancelled: cancel_unrecorded_claims(cluster, node, &ledger, replayed).await,
+        ..Default::default()
+    };
 
     // Direction B: Raft records a job here the agent did not report. Only an
     // asserted-complete ledger licenses acting on an absence, and only for a run
@@ -973,6 +1001,16 @@ pub(crate) async fn reconcile_node_ledger(
 }
 
 impl ControllerService {
+    /// On its own task: the heartbeat must not wait on an RPC back to the node,
+    /// and the node's alternative is the routine sweep, an hour away.
+    fn pull_ledger_for_asking_node(&self, node: String) {
+        info!(node = %node, "node asked to be reconciled; pulling its ledger");
+        let cluster = self.cluster.clone();
+        tokio::spawn(async move {
+            crate::scheduler_loop::pull_node_ledger(&cluster, &node, "node asked").await;
+        });
+    }
+
     /// Stricter form of [`Self::require_admin`] for reservations: the admin bar, or the
     /// root-or-`sudo`/`wheel` rule the CLI states, resolved from the caller's name on this host.
     /// `require_admin` alone would be inert under the default `permissive` mode, since it waves an
@@ -2492,6 +2530,9 @@ impl SlurmController for ControllerService {
             self.reclaim_stale_agent_jobs(&req.hostname, &req.running_jobs);
             if let Some(k0s) = &req.k0s_status {
                 self.record_k0s_node_status(&req.hostname, k0s);
+            }
+            if req.needs_reconcile {
+                self.pull_ledger_for_asking_node(req.hostname.clone());
             }
             Ok(Response::new(HeartbeatResponse {}))
         } else {
@@ -6985,6 +7026,78 @@ mod tests {
         );
     }
 
+    // A leaked claim the node can name is capacity lost until someone looks. The
+    // routine sweep is an hour away, so the heartbeat has to be what brings it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_asking_to_be_reconciled_is_pulled_on_its_heartbeat() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let (agent, mut pulls) = spawn_probe_agent_watching_pulls().await;
+        point_node_at_probe_agent(&svc, "n1", agent.port()).await;
+
+        svc.heartbeat(Request::new(HeartbeatRequest {
+            hostname: "n1".into(),
+            needs_reconcile: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("heartbeat");
+
+        assert_eq!(
+            pulls.recv().await.as_deref(),
+            Some("node asked"),
+            "a node that says it is holding something unexplained must be looked at"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconcile_reads_the_record_its_replay_wait_produced() {
+        // The wait is only protective if the record is read after it. Sampled
+        // first, the wait makes the pre-replay reading certain instead of rare.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(!cluster.jobs_allocated_on_node("n1").contains_key(&8));
+
+        let replaying = Arc::new(tokio::sync::Notify::new());
+        let replayed = Arc::new(tokio::sync::Notify::new());
+        let readiness = {
+            let (replaying, replayed) = (replaying.clone(), replayed.clone());
+            async move {
+                replaying.notify_one();
+                replayed.notified().await;
+                true
+            }
+        };
+        let replay = async {
+            replaying.notified().await;
+            reserve_pending_job_on_n1(&cluster, 8);
+            replayed.notify_one();
+        };
+        let dispatched = no_launch_in_flight(&cluster, "n1");
+
+        let (outcome, ()) = tokio::join!(
+            super::reconcile_node_ledger_after(
+                &cluster,
+                "n1",
+                ledger(true, vec![(7, 1), (8, 1)]),
+                &dispatched,
+                readiness,
+            ),
+            replay,
+        );
+
+        assert_eq!(
+            outcome.cancelled,
+            Vec::<u32>::new(),
+            "both claims are in the log this reconcile waited for"
+        );
+        assert_eq!(
+            cluster.get_job(8).map(|j| j.state),
+            Some(spur_core::job::JobState::Pending),
+            "cancelling would kill a job the replay had already placed"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_controller_that_cannot_vouch_for_its_own_record_cancels_nothing() {
         // A restart replays its log behind the gRPC server coming up, so a claim
@@ -7493,15 +7606,21 @@ mod tests {
         /// Holds `fence_run` until the test releases it, so a test can keep a
         /// reconcile open rather than race the window in which it runs.
         fence_gate: Option<Arc<tokio::sync::Notify>>,
+        /// Reports each ledger pull's reason, so a test can await the pull it
+        /// expects instead of guessing how long the controller takes to make it.
+        ledger_pulls: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     }
 
     #[tonic::async_trait]
     impl spur_proto::proto::slurm_agent_server::SlurmAgent for ProbeAgent {
         async fn request_node_ledger(
             &self,
-            _request: tonic::Request<spur_proto::proto::RequestNodeLedgerRequest>,
+            request: tonic::Request<spur_proto::proto::RequestNodeLedgerRequest>,
         ) -> Result<tonic::Response<spur_proto::proto::RequestNodeLedgerResponse>, tonic::Status>
         {
+            if let Some(pulls) = &self.ledger_pulls {
+                let _ = pulls.send(request.into_inner().reason);
+            }
             Ok(tonic::Response::new(
                 spur_proto::proto::RequestNodeLedgerResponse { ledger: None },
             ))
@@ -7683,14 +7802,35 @@ mod tests {
         (addr, gate)
     }
 
+    /// A probe agent that reports every ledger pull the controller makes to it.
+    async fn spawn_probe_agent_watching_pulls() -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (spawn_probe_agent_full(false, None, Some(tx)).await, rx)
+    }
+
     async fn spawn_probe_agent_with(
         active: bool,
         fence_gate: Option<Arc<tokio::sync::Notify>>,
     ) -> std::net::SocketAddr {
+        spawn_probe_agent_full(active, fence_gate, None).await
+    }
+
+    async fn spawn_probe_agent_full(
+        active: bool,
+        fence_gate: Option<Arc<tokio::sync::Notify>>,
+        ledger_pulls: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> std::net::SocketAddr {
         let incoming =
             tonic::transport::server::TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let addr = incoming.local_addr().unwrap();
-        let agent = ProbeAgent { active, fence_gate };
+        let agent = ProbeAgent {
+            active,
+            fence_gate,
+            ledger_pulls,
+        };
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent))
