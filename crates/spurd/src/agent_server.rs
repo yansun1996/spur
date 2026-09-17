@@ -1551,6 +1551,21 @@ async fn fence_dead_stepd(
         .flatten();
     let (exit_code, signal) =
         recorded_exit.unwrap_or((0, nix::sys::signal::Signal::SIGKILL as i32));
+    // Strictly above both the synthetic exit below, which would read as a hook
+    // not reached, and the teardown that retires the ledger holding this answer.
+    let recorded_epilog = match store.epilog_result(
+        descriptor.job_id,
+        descriptor.run_attempt,
+        descriptor.step_id,
+    ) {
+        Ok(Some(failed)) => epilog_outcome(failed),
+        Ok(None) => crate::admission::HookState::Unknown,
+        Err(error) => {
+            warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
+                "could not read how a dead stepd's epilog ended");
+            crate::admission::HookState::Unknown
+        }
+    };
     if recorded_exit.is_none() {
         if let Some(reason) = store.recorded_failure(
             descriptor.job_id,
@@ -1610,15 +1625,8 @@ async fn fence_dead_stepd(
 
     release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
     if reported {
-        // The supervisor died, so whether its epilog ran is unknowable. Recorded
-        // as such rather than left reading as one that never started.
         if let Some(run) = named_run(descriptor.job_id, descriptor.run_attempt) {
-            record_run_epilog(
-                admissions,
-                run,
-                descriptor.step_id,
-                crate::admission::HookState::Unknown,
-            );
+            record_run_epilog(admissions, run, descriptor.step_id, recorded_epilog);
             settle_acknowledged_completion(allocation, admissions, run, descriptor.step_id).await;
         }
     }
@@ -4349,9 +4357,9 @@ pub(crate) async fn settle_acknowledged_completion(
 ) -> bool {
     let _ = admissions.record_controller_ack(run, 1);
     let _ = admissions.record_report_acknowledged(run, step_id);
-    // No epilog is owed here: every caller has already recorded how this run's
-    // hook ended, and a mark left in flight belongs to an owner that is gone.
-    let _ = admissions.mark_run_cleaned(run, crate::admission::EpilogOwed::No);
+    // Settling a hook still in flight is the teardown's to do, never an
+    // acknowledgement's: the controller cannot see whose hook is still running.
+    let _ = admissions.mark_acknowledged_run_cleaned(run);
     release_acknowledged_allocation(allocation, admissions, run, step_id).await
         == ReleaseOutcome::Freed
 }
@@ -4405,6 +4413,46 @@ fn supervised_epilog_owed(
         Liveness::Gone => crate::admission::EpilogOwed::No,
         Liveness::Live | Liveness::CannotTell => crate::admission::EpilogOwed::Yes,
     }
+}
+
+/// What a cancelled run's teardown still owes. A record that cannot be read in
+/// full never says no hook is owed; the owner-loss sweep ends that hold instead.
+fn cancelled_epilog_owed(
+    admissions: &crate::admission::AdmissionStore,
+    hooks: &HooksConfig,
+    run: RunKey,
+) -> crate::admission::EpilogOwed {
+    // Nothing can owe a hook this node does not run.
+    if hooks.epilog.is_none() {
+        return crate::admission::EpilogOwed::No;
+    }
+    let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
+    match admissions.load_admitted(run) {
+        Ok((admitted, rejected)) if rejected.is_empty() => supervised_epilog_owed(&admitted, hooks),
+        Ok(_) => crate::admission::EpilogOwed::Yes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::admission::EpilogOwed::No
+        }
+        Err(error) => {
+            warn!(job_id, run_attempt, %error,
+                "could not read a cancelled run's participants; holding its slice");
+            crate::admission::EpilogOwed::Yes
+        }
+    }
+}
+
+/// Carry the hook a cancelled run's teardown still owes into the record the gate
+/// reads. A run whose hook has already spoken keeps its answer.
+fn hold_cancelled_run_for_epilog(
+    admissions: &crate::admission::AdmissionStore,
+    hooks: &HooksConfig,
+    run: RunKey,
+) -> std::io::Result<()> {
+    if cancelled_epilog_owed(admissions, hooks, run) == crate::admission::EpilogOwed::No {
+        return Ok(());
+    }
+    admissions.record_epilog_if_unstarted(run, crate::admission::HookState::Pending)?;
+    Ok(())
 }
 
 /// Record how a run's epilog ended, from the step that owns the hook. A numbered
@@ -8676,24 +8724,7 @@ impl AgentService {
         let admissions = self.admissions();
         let hooks = self.hooks.clone();
         let recorded = tokio::task::spawn_blocking(move || {
-            let epilog = match admissions.load_admitted(run) {
-                // Nothing can owe a hook this node does not run.
-                _ if hooks.epilog.is_none() => crate::admission::EpilogOwed::No,
-                Ok((admitted, rejected)) if rejected.is_empty() => {
-                    supervised_epilog_owed(&admitted, &hooks)
-                }
-                // A record the node cannot read in full is never its word that
-                // no hook is owed; the owner-loss sweep resolves the hold instead.
-                Ok(_) => crate::admission::EpilogOwed::Yes,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    crate::admission::EpilogOwed::No
-                }
-                Err(error) => {
-                    warn!(job_id, run_attempt, %error,
-                        "could not read a cancelled run's participants; holding its slice");
-                    crate::admission::EpilogOwed::Yes
-                }
-            };
+            let epilog = cancelled_epilog_owed(&admissions, &hooks, run);
             admissions.mark_controller_cancelled(run)?;
             admissions.mark_run_cleaned(run, epilog)
         })
@@ -8738,13 +8769,20 @@ impl AgentService {
         self.allocation.lock().await.charged_attempt(job_id)
     }
 
-    /// Note the controller's cancel on a run still being torn down. Settling it
-    /// here would free the slice out from under processes that are still exiting.
+    /// Note the controller's cancel on a run still being torn down, and the hook
+    /// its teardown owes: settling here frees the slice under processes still exiting.
     async fn mark_controller_cancelled(&self, run: RunKey) {
         let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
         let admissions = self.admissions();
-        let marked =
-            tokio::task::spawn_blocking(move || admissions.mark_controller_cancelled(run)).await;
+        let hooks = self.hooks.clone();
+        let marked = tokio::task::spawn_blocking(move || -> std::io::Result<bool> {
+            if !admissions.mark_controller_cancelled(run)? {
+                return Ok(false);
+            }
+            hold_cancelled_run_for_epilog(&admissions, &hooks, run)?;
+            Ok(true)
+        })
+        .await;
         match marked {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
@@ -11908,6 +11946,47 @@ mod tests {
             pending_replays(&store),
             0,
             "replaying a report to a controller that has no record of it is futile"
+        );
+    }
+
+    // A supervisor that ran its hook before dying still said how it ended. Taken
+    // as unknowable, that answer never reaches the record the gate reads.
+    #[tokio::test]
+    async fn fencing_keeps_the_epilog_outcome_the_dead_supervisor_recorded() {
+        let (controller_addr, _reports) = spawn_mock_controller();
+        let state = tempfile::tempdir().expect("runtime state directory");
+        let spool = tempfile::tempdir().expect("admission state directory");
+        let store = crate::stepd::StepdStore::new(state.path());
+        let admissions = crate::admission::AdmissionStore::new(spool.path(), "test-node");
+        store
+            .prepare_session_dir(42, 7, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        let obligations = store.obligations(42, 7, spur_core::step::STEP_BATCH);
+        obligations
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 9,
+            })
+            .expect("record the observed exit");
+        obligations
+            .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: true })
+            .expect("record the failed epilog");
+
+        let allocation = fence_a_slice_holding_run(controller_addr, &store, &admissions).await;
+
+        assert_eq!(
+            admissions
+                .load_run(key(42, 7))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Failed,
+            "the ledger's own word on the hook must survive the fence"
+        );
+        assert_eq!(
+            allocation.lock().await.free_cpus(),
+            4,
+            "a hook that has answered holds nothing, so the cores still go back"
         );
     }
 
@@ -17876,6 +17955,29 @@ mod tests {
         )
     }
 
+    /// The session that makes a cancel leave `job_id` tracked, naming the same
+    /// process the run's participant records as its supervisor.
+    async fn register_a_supervisor_session(
+        svc: &AgentService,
+        job_id: u32,
+        state: &std::path::Path,
+    ) {
+        let live = a_live_supervisor();
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            1,
+            spur_core::step::STEP_BATCH,
+            live.pid,
+            live.start_ticks,
+            state.join(format!("unreachable-{job_id}.sock")),
+            std::path::PathBuf::new(),
+        );
+        svc.stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor);
+    }
+
     /// A supervised run of `job_id` holding two cores, tracked and charged, as a
     /// cancel finds it: the shape every test below cancels out from under.
     async fn a_cancellable_supervised_run(
@@ -20014,6 +20116,164 @@ mod tests {
                 .cleanup
                 .epilog,
             crate::admission::HookState::Pending
+        );
+    }
+
+    // A cancel of a job still being torn down leaves the record for the supervisor
+    // to finish, and the hook it owes has to be written down there and then.
+    #[tokio::test]
+    async fn a_cancel_of_a_tracked_run_records_the_epilog_its_supervisor_owes() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_supervised_run(&svc, 71, a_live_supervisor()).await;
+        // A registered supervisor is what leaves the job tracked through the
+        // signal, which is the branch this covers.
+        register_a_supervisor_session(&svc, 71, state.path()).await;
+
+        let mut req = Request::new(AgentCancelJobRequest {
+            job_id: 71,
+            signal: 9,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        svc.cancel_job(req).await.expect("cancel");
+
+        assert!(
+            svc.running.lock().await.contains_key(&71),
+            "a supervised job stays tracked through its cancel"
+        );
+        let run = admissions.load_run(key(71, 1)).expect("record");
+        assert_eq!(
+            run.cleanup.epilog,
+            crate::admission::HookState::Pending,
+            "a tracked cancel that records no hook is a gate nothing can close"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "and the cancel itself must not hand the cores back"
+        );
+    }
+
+    // The acknowledgement is the controller's word about its own accounting, not
+    // the hook's about the cores. Taken for both, it freed under a running epilog.
+    #[tokio::test]
+    async fn an_acknowledged_completion_does_not_settle_an_epilog_still_in_flight() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_supervised_run(&svc, 72, a_live_supervisor()).await;
+        // Cancelled and still admitted, which is where a tracked cancel leaves it.
+        admissions
+            .mark_controller_cancelled(key(72, 1))
+            .expect("mark cancelled");
+        admissions
+            .record_epilog(key(72, 1), crate::admission::HookState::Pending)
+            .expect("record the owed hook");
+
+        let freed = settle_acknowledged_completion(
+            &svc.allocation,
+            &admissions,
+            key(72, 1),
+            spur_core::step::STEP_BATCH,
+        )
+        .await;
+
+        assert!(
+            !freed,
+            "the hook, not the acknowledgement, frees these cores"
+        );
+        assert_eq!(svc.allocation.lock().await.free_cpus(), while_held);
+        assert!(admissions
+            .load_run(key(72, 1))
+            .expect("record")
+            .cleanup
+            .epilog
+            .is_in_flight());
+    }
+
+    // A gate that never opens is worse than one that opens early. The hold an
+    // acknowledgement declines has to end when the supervisor's ledger answers.
+    #[tokio::test]
+    async fn the_hold_an_acknowledgement_declined_ends_when_the_epilog_answers() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let store = crate::stepd::StepdStore::new(state.path());
+        let while_held = a_cancellable_supervised_run(&svc, 73, a_live_supervisor()).await;
+        register_a_supervisor_session(&svc, 73, state.path()).await;
+        let mut req = Request::new(AgentCancelJobRequest {
+            job_id: 73,
+            signal: 9,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        svc.cancel_job(req).await.expect("cancel");
+        settle_acknowledged_completion(
+            &svc.allocation,
+            &admissions,
+            key(73, 1),
+            spur_core::step::STEP_BATCH,
+        )
+        .await;
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "the acknowledgement must find the hook still holding"
+        );
+
+        store
+            .prepare_session_dir(73, 1, spur_core::step::STEP_BATCH)
+            .expect("session dir");
+        let obligations = store.obligations(73, 1, spur_core::step::STEP_BATCH);
+        obligations
+            .append(&crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 9,
+            })
+            .expect("record the observed exit");
+        obligations
+            .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
+            .expect("record the finished epilog");
+        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
+        release_due_allocations(&svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "once the hook has answered nothing may keep the cores"
+        );
+    }
+
+    // A second cancel must not put a hook that has already answered back in
+    // flight: nothing re-runs one, so that hold would have no way out.
+    #[tokio::test]
+    async fn a_cancel_does_not_re_hold_a_run_whose_epilog_already_answered() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        a_cancellable_supervised_run(&svc, 74, a_live_supervisor()).await;
+        register_a_supervisor_session(&svc, 74, state.path()).await;
+        admissions
+            .record_epilog(key(74, 1), crate::admission::HookState::Succeeded)
+            .expect("record the finished hook");
+
+        let mut req = Request::new(AgentCancelJobRequest {
+            job_id: 74,
+            signal: 9,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        svc.cancel_job(req).await.expect("cancel");
+
+        assert_eq!(
+            admissions
+                .load_run(key(74, 1))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Succeeded
         );
     }
 
