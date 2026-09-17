@@ -1918,16 +1918,37 @@ pub async fn replay_unacknowledged_stepd_completions(
     Ok(reconciled)
 }
 
-/// Whether every read proves its supervisor gone. No reads at all proves
-/// nothing, and neither does one that could not be completed.
-fn all_supervisors_read_as_gone(reads: &[std::io::Result<crate::stepd::StepdLiveness>]) -> bool {
-    !reads.is_empty()
+/// What a run's recorded supervisors can be *proven* to be. "No evidence" is its
+/// own answer, so silence can never be spent as proof of death.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liveness {
+    /// Every recorded supervisor read as stale, and there was one to read.
+    Gone,
+    Live,
+    /// Nothing was recorded, or a read could not be completed.
+    CannotTell,
+}
+
+/// Whether the reads prove anything. No reads at all proves nothing, and neither
+/// does one that could not be completed.
+fn liveness_of(reads: &[std::io::Result<crate::stepd::StepdLiveness>]) -> Liveness {
+    if reads
+        .iter()
+        .any(|read| matches!(read, Ok(crate::stepd::StepdLiveness::Live)))
+    {
+        return Liveness::Live;
+    }
+    if !reads.is_empty()
         && reads
             .iter()
             .all(|read| matches!(read, Ok(crate::stepd::StepdLiveness::Stale)))
+    {
+        return Liveness::Gone;
+    }
+    Liveness::CannotTell
 }
 
-fn supervisors_are_all_gone(admitted: &crate::admission::AdmittedRun) -> bool {
+fn recorded_supervisor_liveness(admitted: &crate::admission::AdmittedRun) -> Liveness {
     let reads: Vec<std::io::Result<crate::stepd::StepdLiveness>> = admitted
         .recorded_supervisors()
         .map(crate::stepd::supervisor_liveness)
@@ -1943,7 +1964,7 @@ fn supervisors_are_all_gone(admitted: &crate::admission::AdmittedRun) -> bool {
             );
         }
     }
-    all_supervisors_read_as_gone(&reads)
+    liveness_of(&reads)
 }
 
 /// Whether some participant left an exit behind. One exists only on disk, so a
@@ -1979,7 +2000,7 @@ fn runs_nothing_can_speak_for(
         .filter(|admitted| {
             !admitted.run.controller_ack.is_given()
                 && admitted.owes_a_report()
-                && supervisors_are_all_gone(admitted)
+                && recorded_supervisor_liveness(admitted) == Liveness::Gone
                 && !an_exit_is_still_on_disk(store, admitted)
         })
         .collect()
@@ -3320,7 +3341,7 @@ impl AgentService {
         let boot_id = crate::admission::current_boot_id();
         // Before the read below, so the rebuilt ledger sees the settled values.
         // Gated on the owner: an adopted supervisor outlives this restart.
-        match admissions.settle_hooks_whose_owner_is_gone(hook_owner_is_gone) {
+        match admissions.settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart) {
             Ok(settled) if settled > 0 => {
                 warn!(
                     runs = settled,
@@ -3364,7 +3385,7 @@ impl AgentService {
         // A record whose supervisor is proven gone must not take a contested core
         // from one still running: the loser of that race goes unprotected.
         let mut ordered: Vec<&crate::admission::AdmittedRun> = loaded.runs.iter().collect();
-        ordered.sort_by_key(|admitted| supervisors_are_all_gone(admitted));
+        ordered.sort_by_key(|admitted| recorded_supervisor_liveness(admitted) == Liveness::Gone);
 
         let mut allocation = self.allocation.lock().await;
         for admitted in ordered {
@@ -4116,7 +4137,18 @@ async fn collect_settled_admissions(
     allocation: &Arc<Mutex<NodeAllocation>>,
     admissions: &crate::admission::AdmissionStore,
 ) {
-    let charged = allocation.lock().await.charged_runs();
+    // Sweeping against a set that cannot name every charge would collect the
+    // record that is the only thing left able to order that release.
+    let charged = match allocation.lock().await.charged_runs() {
+        Ok(charged) => charged,
+        Err(job_id) => {
+            warn!(
+                job_id,
+                "this node charges a reservation that names no run; not collecting any record"
+            );
+            return;
+        }
+    };
     let store = admissions.clone();
     let swept = tokio::task::spawn_blocking(move || {
         store.sweep(
@@ -4354,25 +4386,28 @@ fn hook_owner_step(admitted: &crate::admission::AdmittedRun) -> Option<spur_core
         .map(|participant| participant.step_id)
 }
 
-/// Whether nothing is left that could still be running this run's epilog. A run
-/// that recorded no supervisor had the agent's own hook, and that agent is gone.
-fn hook_owner_is_gone(admitted: &crate::admission::AdmittedRun) -> bool {
-    admitted.recorded_supervisors().next().is_none() || supervisors_are_all_gone(admitted)
+/// Whether nothing that could still run this run's epilog survived the restart.
+/// A run that named no supervisor had the previous agent's own hook.
+fn hook_owner_did_not_survive_restart(admitted: &crate::admission::AdmittedRun) -> bool {
+    if admitted.recorded_supervisors().next().is_none() {
+        return true;
+    }
+    matches!(recorded_supervisor_liveness(admitted), Liveness::Gone)
 }
 
-/// What a run still owes once the agent stops tracking it. Past that point only a
-/// supervisor runs a hook, so a debt without one would never have a payer.
+/// What a run still owes once the agent stops tracking it. Only proof that
+/// nothing can run the hook cancels the debt; anything less holds the slice.
 fn supervised_epilog_owed(
     admitted: &crate::admission::AdmittedRun,
     hooks: &HooksConfig,
 ) -> crate::admission::EpilogOwed {
-    if hooks.epilog.is_none()
-        || hook_owner_step(admitted).is_none()
-        || supervisors_are_all_gone(admitted)
-    {
+    if hooks.epilog.is_none() {
         return crate::admission::EpilogOwed::No;
     }
-    crate::admission::EpilogOwed::Yes
+    match recorded_supervisor_liveness(admitted) {
+        Liveness::Gone => crate::admission::EpilogOwed::No,
+        Liveness::Live | Liveness::CannotTell => crate::admission::EpilogOwed::Yes,
+    }
 }
 
 /// Record how a run's epilog ended, from the step that owns the hook. A numbered
@@ -4424,15 +4459,27 @@ async fn resolve_supervised_epilogs(
         if !admitted.run.cleanup.epilog.is_in_flight() {
             continue;
         }
-        let (Some(run), Some(step_id)) = (admitted.run.key(), hook_owner_step(&admitted)) else {
+        let Some(run) = admitted.run.key() else {
             continue;
         };
         let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
+        // No owner was ever named, so no ledger can answer for the hook. The
+        // hold ends at the restart that proves the owner did not survive.
+        let Some(step_id) = hook_owner_step(&admitted) else {
+            still_held.insert(run);
+            if epilog_hold_is_worth_saying(held_since, run) {
+                warn!(
+                    job_id,
+                    run_attempt, "an epilog with no recorded owner is holding this run's slice"
+                );
+            }
+            continue;
+        };
         let state = match store.epilog_result(job_id, run_attempt, step_id) {
             Ok(Some(failed)) => epilog_outcome(failed),
             // Nothing the ledger can be read as; only proof the owner is gone
             // may settle it, never the wait itself.
-            Ok(None) if hook_owner_is_gone(&admitted) => {
+            Ok(None) if recorded_supervisor_liveness(&admitted) == Liveness::Gone => {
                 warn!(
                     job_id,
                     run_attempt, "settling an epilog whose supervisor is gone"
@@ -4451,7 +4498,7 @@ async fn resolve_supervised_epilogs(
             }
             // A ledger that cannot be read is never proof the hook ended, but a
             // hold it takes must still end when nothing is left to end it.
-            Err(error) if hook_owner_is_gone(&admitted) => {
+            Err(error) if recorded_supervisor_liveness(&admitted) == Liveness::Gone => {
                 warn!(job_id, run_attempt, %error,
                     "settling an unreadable epilog whose supervisor is gone");
                 crate::admission::HookState::Unknown
@@ -6151,7 +6198,9 @@ impl SlurmAgent for AgentService {
                             boot_id: descriptor.boot_id.clone(),
                         },
                     ) {
-                        warn!(job_id, run_attempt, %error, "failed to record the supervisor identity");
+                        error!(job_id, run_attempt, %error,
+                            "failed to record the supervisor identity; this run's slice is \
+                             held until the agent restarts");
                     }
                 }
 
@@ -6925,8 +6974,8 @@ impl SlurmAgent for AgentService {
             // launch must leave the slice held rather than hand it back.
             reservation_guard.mark_spawned();
 
-            // Names who answers for this run's hooks. Unrecorded, the teardown
-            // gate finds no owner and hands the slice back under a live epilog.
+            // Names who answers for this run's hooks. Unrecorded, no ledger can
+            // answer for them, so the gate holds until a restart settles it.
             if let Err(error) = admissions.record_supervisor(
                 alloc_run,
                 spur_core::step::STEP_EXTERN,
@@ -6936,7 +6985,9 @@ impl SlurmAgent for AgentService {
                     boot_id: descriptor.boot_id.clone(),
                 },
             ) {
-                warn!(job_id = req.job_id, %error, "failed to record the supervisor identity");
+                error!(job_id = req.job_id, %error,
+                    "failed to record the supervisor identity; this allocation's slice is \
+                     held until the agent restarts");
             }
 
             // The allocation's cgroup is created here, not by the supervisor, so
@@ -8690,6 +8741,7 @@ impl AgentService {
             .lock()
             .await
             .charged_runs()
+            .ok()?
             .iter()
             .find(|run| run.job_id() == job_id)
             .and_then(|run| run.attempt())
@@ -11818,20 +11870,22 @@ mod tests {
     #[test]
     fn a_liveness_read_that_could_not_complete_never_proves_a_supervisor_gone() {
         use crate::stepd::StepdLiveness;
-        assert!(all_supervisors_read_as_gone(&[Ok(StepdLiveness::Stale)]));
-        assert!(
-            !all_supervisors_read_as_gone(&[]),
+        assert_eq!(liveness_of(&[Ok(StepdLiveness::Stale)]), Liveness::Gone);
+        assert_eq!(
+            liveness_of(&[]),
+            Liveness::CannotTell,
             "nothing read proves nothing"
         );
-        assert!(!all_supervisors_read_as_gone(&[
-            Ok(StepdLiveness::Stale),
-            Ok(StepdLiveness::Live),
-        ]));
-        assert!(
-            !all_supervisors_read_as_gone(&[
+        assert_eq!(
+            liveness_of(&[Ok(StepdLiveness::Stale), Ok(StepdLiveness::Live)]),
+            Liveness::Live
+        );
+        assert_eq!(
+            liveness_of(&[
                 Ok(StepdLiveness::Stale),
                 Err(std::io::Error::other("proc unreadable")),
             ]),
+            Liveness::CannotTell,
             "an unreadable process is not a gone one"
         );
     }
@@ -17876,7 +17930,7 @@ mod tests {
 
         let alloc = svc.allocation.lock().await;
         assert!(
-            alloc.charged_runs().is_empty(),
+            alloc.charged_runs().expect("named runs").is_empty(),
             "a slice already given back must not be taken again"
         );
         assert!(!alloc.allocated_cpus[0], "the core must still read as free");
@@ -17897,7 +17951,7 @@ mod tests {
 
         assert_eq!(
             svc.allocation.lock().await.charged_runs(),
-            HashSet::from([key(2, 1)]),
+            Ok(HashSet::from([key(2, 1)])),
             "the run still on those cores must be the one holding them"
         );
     }
@@ -19776,7 +19830,7 @@ mod tests {
 
         // What replay_admitted_allocations does before it rebuilds the index.
         admissions
-            .settle_hooks_whose_owner_is_gone(hook_owner_is_gone)
+            .settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart)
             .expect("settle the hooks of a previous agent");
         settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
 
@@ -19798,7 +19852,7 @@ mod tests {
         svc.drop_tracked_job(57, 1).await;
 
         admissions
-            .settle_hooks_whose_owner_is_gone(hook_owner_is_gone)
+            .settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart)
             .expect("sweep the hooks of a previous agent");
         settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
 
@@ -19815,6 +19869,76 @@ mod tests {
             svc.allocation.lock().await.free_cpus(),
             while_held,
             "and the cores stay under the hook that is still running"
+        );
+    }
+
+    /// A run whose supervisor could not be recorded at launch. The supervisor is
+    /// live and will run the epilog; only the name of it is missing.
+    async fn a_cancellable_run_that_named_no_supervisor(svc: &AgentService, job_id: u32) -> u32 {
+        admit_a_supervised_run(
+            &svc.admissions(),
+            &svc.reporter.hostname,
+            job_id,
+            vec![0, 1],
+            None,
+        );
+        let while_held = {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(job_id, 1, 2, 1_000, &[])
+                .expect("allocate");
+            alloc.commit_job(job_id, 1);
+            alloc.free_cpus()
+        };
+        svc.insert_test_job(job_id, an_allocation_only_job(1)).await;
+        while_held
+    }
+
+    // One failed write at launch leaves a live supervisor unnamed. Reading that
+    // silence as "no hook is owed" hands the slice back under a live epilog.
+    #[tokio::test]
+    async fn a_cancelled_run_whose_supervisor_was_never_recorded_holds_its_slice() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let while_held = a_cancellable_run_that_named_no_supervisor(&svc, 63).await;
+
+        svc.drop_tracked_job(63, 1).await;
+
+        assert_eq!(
+            svc.admissions()
+                .load_run(key(63, 1))
+                .expect("record")
+                .cleanup
+                .epilog,
+            crate::admission::HookState::Pending,
+            "an unnamed owner is no evidence that no hook is owed"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "so the cores stay under the epilog that may still be running"
+        );
+    }
+
+    // The way out of the hold above, without which it would never end: a run
+    // that named nobody had the previous agent's hook, and it did not survive.
+    #[tokio::test]
+    async fn a_restart_settles_a_hook_whose_run_named_no_supervisor() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_run_that_named_no_supervisor(&svc, 64).await;
+        svc.drop_tracked_job(64, 1).await;
+
+        admissions
+            .settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart)
+            .expect("sweep the hooks of a previous agent");
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "a hook nothing is left to run must not strand the cores"
         );
     }
 

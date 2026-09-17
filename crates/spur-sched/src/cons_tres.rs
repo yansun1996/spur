@@ -27,6 +27,9 @@ pub enum ReleaseGround {
     /// The controller answered a claim Raft never had. Its answer is the whole
     /// of the acknowledgement, so there is no committed index to name.
     SettledUnrecordedClaim,
+    /// The controller dispatched a newer attempt onto this job id, and that
+    /// dispatch is the decision which ends the attempt being displaced.
+    SupersededByNewerAttempt,
 }
 
 /// Licence to hand a run's slice back. Deliberately not `Clone` and built only
@@ -71,6 +74,15 @@ impl ReleaseWarrant {
         }
     }
 
+    /// A newer attempt is taking over this job id's reservation. Mint this only
+    /// where that attempt has already been judged feasible.
+    pub fn superseded_by_newer_attempt(run: RunKey) -> Self {
+        Self {
+            run,
+            ground: ReleaseGround::SupersededByNewerAttempt,
+        }
+    }
+
     pub fn run(&self) -> RunKey {
         self.run
     }
@@ -87,6 +99,7 @@ impl std::fmt::Display for ReleaseGround {
             Self::ControllerCancelled => f.write_str("controller cancelled"),
             Self::NeverSpawned => f.write_str("never spawned"),
             Self::SettledUnrecordedClaim => f.write_str("settled an unrecorded claim"),
+            Self::SupersededByNewerAttempt => f.write_str("superseded by a newer attempt"),
         }
     }
 }
@@ -295,6 +308,8 @@ impl NodeAllocation {
         if free_cpus < cpus as usize {
             return Err(AllocError::CpusUnavailable);
         }
+        // A node that could not read its own memory reports 0. Unknown is not
+        // zero: enforcing a ceiling there refuses every job on the node.
         if self.total_memory_mb > 0
             && self
                 .allocated_memory_mb
@@ -304,8 +319,6 @@ impl NodeAllocation {
         {
             return Err(AllocError::MemoryUnavailable);
         }
-        self.drop_owner(job_id);
-
         let mut gpu_indices = Vec::with_capacity(gpu_device_ids.len());
         for &id in gpu_device_ids {
             let idx = self
@@ -313,7 +326,11 @@ impl NodeAllocation {
                 .iter()
                 .position(|g| g.device_id == id)
                 .ok_or(AllocError::GpusUnavailable)?;
-            if self.gpu_allocated[idx] || gpu_indices.contains(&idx) {
+            // A device the outgoing owner holds is free to this job: it is what
+            // the reclaim above already counted as available.
+            if (self.gpu_allocated[idx] && !reclaimable.gpu_ids.contains(&id))
+                || gpu_indices.contains(&idx)
+            {
                 return Err(AllocError::GpusUnavailable);
             }
             gpu_indices.push(idx);
@@ -321,24 +338,19 @@ impl NodeAllocation {
 
         // Chosen before anything is marked, so a shortfall refuses instead of
         // serving a short list the caller reads as a full allocation.
-        let cpu_ids: Vec<u32> = self
-            .allocated_cpus
-            .iter()
-            .enumerate()
-            .filter(|(_, allocated)| !**allocated)
-            .map(|(i, _)| i as u32)
+        let cpu_ids: Vec<u32> = (0..self.allocated_cpus.len() as u32)
+            .filter(|id| !self.allocated_cpus[*id as usize] || reclaimable.cpu_ids.contains(id))
             .take(cpus as usize)
             .collect();
         if cpu_ids.len() < cpus as usize {
             return Err(AllocError::CpusUnavailable);
         }
-        // A node that could not read its own memory reports 0. Unknown is not
-        // zero: enforcing a ceiling there refuses every job on the node.
-        if self.total_memory_mb > 0
-            && self.allocated_memory_mb.saturating_add(memory_mb) > self.total_memory_mb
-        {
-            return Err(AllocError::MemoryUnavailable);
-        }
+
+        // Nothing below can refuse, so a launch that is turned away never drops
+        // the reservation it was about to supersede.
+        self.drop_owner(ReleaseWarrant::superseded_by_newer_attempt(
+            RunKey::any_attempt(job_id),
+        ));
 
         for &id in &cpu_ids {
             self.allocated_cpus[id as usize] = true;
@@ -425,7 +437,9 @@ impl NodeAllocation {
             }
             gpu_indices.push(idx);
         }
-        self.drop_owner(job_id);
+        self.drop_owner(ReleaseWarrant::superseded_by_newer_attempt(
+            RunKey::any_attempt(job_id),
+        ));
 
         for &cpu in cpu_ids {
             self.allocated_cpus[cpu as usize] = true;
@@ -471,9 +485,10 @@ impl NodeAllocation {
         owned
     }
 
-    /// Drop a job's ownership entry and free what it held. Private: every way
-    /// out of the allocator goes through `release_job`, which demands a warrant.
-    fn drop_owner(&mut self, job_id: u32) -> bool {
+    /// Drop a job's ownership entry and free what it held. Takes the warrant so
+    /// no path out of the allocator can be written without naming its ground.
+    fn drop_owner(&mut self, warrant: ReleaseWarrant) -> bool {
+        let job_id = warrant.run().job_id();
         self.launching.remove(&job_id);
         let Some(owned) = self.owners.remove(&job_id) else {
             return false;
@@ -496,7 +511,7 @@ impl NodeAllocation {
         if !owned_by_this_run && run.attempt().is_some() {
             return false;
         }
-        self.drop_owner(job_id)
+        self.drop_owner(warrant)
     }
 
     /// Release owned allocations whose job is neither live nor launching within
@@ -530,13 +545,17 @@ impl NodeAllocation {
         unbacked
     }
 
-    /// Every run this node still charges resources to, including launches in
-    /// flight: anything the ledger must keep a record for until it is released.
-    pub fn charged_runs(&self) -> HashSet<RunKey> {
-        self.owners
-            .iter()
-            .filter_map(|(job_id, owned)| RunKey::new(*job_id, owned.run_attempt))
-            .collect()
+    /// Every run this node still charges resources to, launches in flight
+    /// included: `Err` names a charge no `RunKey` can represent, never drops it.
+    pub fn charged_runs(&self) -> Result<HashSet<RunKey>, u32> {
+        let mut charged = HashSet::with_capacity(self.owners.len());
+        for (job_id, owned) in &self.owners {
+            let Some(run) = RunKey::new(*job_id, owned.run_attempt) else {
+                return Err(*job_id);
+            };
+            charged.insert(run);
+        }
+        Ok(charged)
     }
 }
 
@@ -1240,5 +1259,69 @@ mod tests {
         };
         assert_eq!(alloc.cpu_list(), "0,1,2,3");
         assert_eq!(alloc.gpu_list(), "0,1");
+    }
+
+    // The superseded owner may still be running. A refusal that has already
+    // freed it hands its cores and GPUs to the next job to ask.
+    #[test]
+    fn a_refused_relaunch_leaves_the_attempt_it_would_have_superseded_holding() {
+        let mut node = make_node(16, 64_000, 4, "mi300x");
+        node.allocate_for_job(7, 1, 8, 32_000, &[0, 1])
+            .expect("the first attempt reserves");
+        node.commit_job(7, 1);
+        // Held by another job, so the relaunch below cannot have it.
+        node.allocate_for_job(9, 1, 4, 8_000, &[2])
+            .expect("a neighbour takes a device");
+        node.commit_job(9, 1);
+
+        assert_eq!(
+            node.allocate_for_job(7, 2, 8, 32_000, &[0, 2]),
+            Err(AllocError::GpusUnavailable)
+        );
+
+        assert_eq!(
+            node.charged_runs(),
+            Ok(HashSet::from([key(7, 1), key(9, 1)])),
+            "a refused attempt must not evict the one it was superseding"
+        );
+        assert_eq!(node.free_cpus(), 4);
+        assert_eq!(node.free_memory_mb(), 24_000);
+        let mut still_allocated = node.allocated_gpu_ids();
+        still_allocated.sort_unstable();
+        assert_eq!(still_allocated, vec![0, 1, 2]);
+    }
+
+    // The set gates whether a record may be deleted, so an owner it cannot
+    // represent must stop the sweep rather than read as nothing being charged.
+    #[test]
+    fn an_owner_that_cannot_be_named_as_a_run_is_reported_not_dropped() {
+        let mut node = make_node(8, 16_000, 0, "mi300x");
+        node.restore_for_job(7, 0, &[0, 1], 1_000, &[])
+            .expect("a descriptor naming no attempt still charges the node");
+
+        assert_eq!(
+            node.charged_runs(),
+            Err(7),
+            "a charge the set cannot name must not read as uncharged"
+        );
+    }
+
+    // The superseding attempt still has to be able to take over what the
+    // outgoing one held, or every relaunch refuses itself.
+    #[test]
+    fn a_newer_attempt_reclaims_the_slice_of_the_one_it_supersedes() {
+        let mut node = make_node(16, 64_000, 4, "mi300x");
+        node.allocate_for_job(7, 1, 16, 64_000, &[0, 1, 2, 3])
+            .expect("the first attempt takes the whole node");
+        node.commit_job(7, 1);
+
+        let second = node
+            .allocate_for_job(7, 2, 16, 64_000, &[0, 1, 2, 3])
+            .expect("the newer attempt reclaims what the older one held");
+
+        assert_eq!(second.gpu_ids, vec![0, 1, 2, 3]);
+        assert_eq!(node.charged_runs(), Ok(HashSet::from([key(7, 2)])));
+        assert_eq!(node.free_cpus(), 0);
+        assert_eq!(node.free_memory_mb(), 0);
     }
 }
