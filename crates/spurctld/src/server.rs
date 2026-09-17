@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 use spur_core::job::NodeCompleteError;
 use spur_core::mpi::MPI_PMIX;
+use spur_core::node::{Node, NodeState};
 use spur_core::reservation::Reservation;
 use spur_core::task_launch::{
     batch_script_uses_step_launch, build_step_task_plan, step_needs_pmix_prepare,
@@ -1192,7 +1193,7 @@ async fn reconcile_node_ledger_after(
     // A pass that answered only some of this node's claims knows a subset, and a
     // subset may neither clear the reason nor rewrite it to a shorter list.
     if answered_every_claim {
-        name_unresolved_claims_on_node(cluster, node, &outcome);
+        name_unresolved_claims_on_node(cluster, node, &license, &outcome);
     }
     outcome
 }
@@ -1284,22 +1285,36 @@ fn release_the_owed_epilog(
 /// from an operator's and clear only the former.
 const UNRESOLVED_CLAIM_REASON: &str = "holding claims the controller has no record of";
 
-/// Put an unresolvable claim where an operator looks: the node is holding cores
-/// the controller counts as free, and only a person can reconcile that.
+/// Hold a node whose claims nobody can account for out of service: left
+/// schedulable it is picked every cycle and refuses every launch, indefinitely.
 fn name_unresolved_claims_on_node(
     cluster: &Arc<ClusterManager>,
     node: &str,
+    license: &ReconcileLicense<'_>,
     outcome: &ReconcileOutcome,
 ) {
+    // Both directions took awaits, so the premises this pass opened on are at
+    // least that stale, and putting a node in or out of service is an act.
+    if let Some(reason) = license.lapsed(cluster, node) {
+        warn!(node = %node, reason, "leaving this node's reason alone");
+        return;
+    }
     let Some(current) = cluster.get_node(node) else {
         return;
     };
-    // Authorship, not state: a heartbeat timeout puts a node in an admin-hold
-    // state without an operator behind it, and that is the likeliest to strand.
-    if current.admin_locked {
+    // Power management owns this node's state and is not a fault to report over.
+    if current.state == NodeState::Suspended {
         return;
     }
     let existing = current.state_reason.as_deref().unwrap_or_default();
+    // Authorship, not state: the hold below is itself an admin hold, so without
+    // this the pass would be locked out of lifting the one it placed.
+    let mine = existing.starts_with(UNRESOLVED_CLAIM_REASON);
+    // A reason set anywhere else is somebody's, and its attribution goes with
+    // it; an admin hold with no text at all is theirs on the same grounds.
+    if !mine && (current.admin_locked || !existing.is_empty()) {
+        return;
+    }
     // The ids come out of a map, so an unsorted list rewrites the same fact in a
     // different order every pass and proposes a state change through Raft for it.
     let mut claims = outcome.unresolved.clone();
@@ -1316,17 +1331,45 @@ fn name_unresolved_claims_on_node(
                 .join(",")
         ),
     };
-    if existing == wanted {
+    if wanted.is_empty() {
+        release_unresolved_claim_hold(cluster, &current, mine, license);
         return;
     }
-    // Only this pass's own text is touched, in either direction: a reason set
-    // anywhere else is somebody's, and its attribution goes with it.
-    if !existing.is_empty() && !existing.starts_with(UNRESOLVED_CLAIM_REASON) {
+    let target = claim_hold_state(&current);
+    if current.state == target && existing == wanted {
         return;
     }
-    let reason = (!wanted.is_empty()).then_some(wanted);
-    if let Err(error) = cluster.update_node_state(node, current.state, reason, None) {
-        warn!(node = %node, ?error, "could not record an unresolved claim on the node");
+    // uid 0 so `sinfo -R` names the controller rather than an unknown user.
+    if let Err(error) = cluster.update_node_state(node, target, Some(wanted), Some(0)) {
+        warn!(node = %node, ?error, "could not hold the node for an unresolved claim");
+    }
+}
+
+/// Where a held node's state goes. A node another subsystem already took out of
+/// service keeps that state, so only the reason and the hold move.
+fn claim_hold_state(node: &Node) -> NodeState {
+    match node.state {
+        NodeState::Down | NodeState::Error => node.state,
+        _ if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() => {
+            NodeState::Draining
+        }
+        _ => NodeState::Drain,
+    }
+}
+
+/// Put a node back in service once its claims are answered. Lifting a hold is an
+/// inference from absence, so it needs the premises a settle needs, and the tag.
+fn release_unresolved_claim_hold(
+    cluster: &Arc<ClusterManager>,
+    current: &Node,
+    mine: bool,
+    license: &ReconcileLicense<'_>,
+) {
+    if !mine || !license.absence_is_evidence || !license.teardown_is_licensed(cluster) {
+        return;
+    }
+    if let Err(error) = cluster.release_controller_hold(&current.name) {
+        warn!(node = %current.name, ?error, "could not return the node to service");
     }
 }
 
@@ -9216,6 +9259,332 @@ mod tests {
         );
         assert_eq!(outcome.unresolved, vec![9]);
         await_node_reason(&svc, "n1", &unresolved_reason("9")).await;
+    }
+
+    /// A pass that finds job 9 held on `node` with nothing able to account for it,
+    /// beside the runs in `holding` that both sides agree on.
+    async fn reconcile_an_unresolvable_claim(
+        cluster: &Arc<ClusterManager>,
+        node: &str,
+        holding: Vec<(u32, u32)>,
+    ) {
+        let mut entries: Vec<_> = holding
+            .into_iter()
+            .map(|(job_id, run)| (job_id, run, spur_core::job::LedgerDisposition::Held))
+            .collect();
+        entries.push((9, 1, spur_core::job::LedgerDisposition::Unresolved));
+        let outcome = reconcile_node_ledger(
+            cluster,
+            node,
+            ledger_disposed(true, entries),
+            &no_launch_in_flight(cluster, node),
+            CutProvenance::Pulled,
+        )
+        .await;
+        assert_eq!(outcome.unresolved, vec![9], "the claim must go unanswered");
+    }
+
+    /// A pass that finds the node holding nothing the controller cannot place.
+    /// `holding` names the runs both sides agree on, which such a pass leaves be.
+    async fn reconcile_a_clean_ledger(
+        cluster: &Arc<ClusterManager>,
+        node: &str,
+        holding: Vec<(u32, u32)>,
+    ) {
+        let outcome = reconcile_node_ledger(
+            cluster,
+            node,
+            ledger(true, holding),
+            &no_launch_in_flight(cluster, node),
+            CutProvenance::Pulled,
+        )
+        .await;
+        assert_eq!(outcome.unresolved, Vec::<u32>::new());
+    }
+
+    // Left schedulable, a node holding cores the record counts as free is picked
+    // every cycle and every launch onto them is refused, for as long as it holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unresolvable_claim_takes_the_node_out_of_the_scheduler() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert!(cluster.get_node("n1").expect("node").is_schedulable());
+
+        reconcile_an_unresolvable_claim(&cluster, "n1", Vec::new()).await;
+
+        let held = cluster.get_node("n1").expect("node");
+        assert_eq!(
+            held.state_reason.as_deref(),
+            Some(unresolved_reason("9").as_str())
+        );
+        assert_eq!(held.state, NodeState::Drain);
+        assert_eq!(held.reason_uid, Some(0), "`sinfo -R` must name the setter");
+        assert!(
+            !held.is_schedulable(),
+            "the scheduler must stop picking a node whose cores are spoken for"
+        );
+
+        // The hold is an admin hold, so only a pass that knows it wrote this one
+        // can take it off again.
+        reconcile_a_clean_ledger(&cluster, "n1", Vec::new()).await;
+
+        let back = cluster.get_node("n1").expect("node");
+        assert_eq!(back.state, NodeState::Idle);
+        assert!(back.is_schedulable());
+        assert!(!back.admin_locked, "the node must not stay locked out");
+        assert_eq!(back.state_reason, None);
+    }
+
+    /// The fields a release would move, so a test can say "nothing moved".
+    fn node_hold(cluster: &Arc<ClusterManager>, name: &str) -> (NodeState, Option<String>, bool) {
+        let node = cluster.get_node(name).expect("node");
+        (node.state, node.state_reason, node.admin_locked)
+    }
+
+    // The release derives its target from allocation alone, so on a node out of
+    // service for something it did not write it would silently declare it fit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_that_finds_nothing_releases_no_node_it_never_held() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        cluster.apply_operation(&spur_core::wal::WalOperation::NodeStateChange {
+            at: None,
+            name: "n1".into(),
+            old_state: NodeState::Idle,
+            new_state: NodeState::Unknown,
+            reason: None,
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+        });
+        let before = node_hold(&cluster, "n1");
+
+        reconcile_a_clean_ledger(&cluster, "n1", Vec::new()).await;
+
+        assert_eq!(
+            node_hold(&cluster, "n1"),
+            before,
+            "a node nobody held has nothing to release"
+        );
+    }
+
+    // Lifting the hold is an inference from absence, so a cut the agent could not
+    // finish is no more evidence for it than it is for settling a vanished run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incomplete_cut_cannot_lift_the_hold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        reconcile_an_unresolvable_claim(&cluster, "n1", Vec::new()).await;
+        let held = node_hold(&cluster, "n1");
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(false, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            node_hold(&cluster, "n1"),
+            held,
+            "an agent that cannot read its own spool has not shown the claim gone"
+        );
+    }
+
+    // Under open admission any reachable host can assert any hostname, so a cut
+    // arriving with a registration cannot license putting a node back in service.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unattested_cut_cannot_lift_the_hold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        assert_eq!(
+            cluster.config().admission.mode,
+            spur_core::config::AdmissionMode::Open
+        );
+        reconcile_an_unresolvable_claim(&cluster, "n1", Vec::new()).await;
+        let held = node_hold(&cluster, "n1");
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+
+        assert_eq!(
+            node_hold(&cluster, "n1"),
+            held,
+            "the controller cannot place the caller at the node this cut names"
+        );
+    }
+
+    // A node released while it is still running work is not idle, and reporting
+    // it so would let the scheduler count cores another job already has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_released_while_it_still_holds_work_comes_back_as_mixed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        reconcile_an_unresolvable_claim(&cluster, "n1", vec![(7, 1)]).await;
+        assert_eq!(
+            cluster.get_node("n1").expect("node").state,
+            NodeState::Draining
+        );
+
+        reconcile_a_clean_ledger(&cluster, "n1", vec![(7, 1)]).await;
+
+        let back = cluster.get_node("n1").expect("node");
+        assert_eq!(back.state, NodeState::Mixed);
+        assert!(back.is_schedulable());
+        assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+    }
+
+    // A reason on a node nobody drained is still somebody's: the pass has to read
+    // the text, not the hold, to tell that it is not looking at its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reason_on_an_unheld_node_is_not_this_pass_to_clear() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        set_node_reason(&cluster, "n1", "awaiting a firmware flash");
+        assert!(!cluster.get_node("n1").expect("node").admin_locked);
+
+        reconcile_a_clean_ledger(&cluster, "n1", Vec::new()).await;
+
+        let node = cluster.get_node("n1").expect("node");
+        assert_eq!(
+            node.state_reason.as_deref(),
+            Some("awaiting a firmware flash")
+        );
+    }
+
+    // Re-proposing an unchanged fact restamps its set-time, so the hold would
+    // read as brand new every pass and `sinfo -R` would never age it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn holding_the_same_claim_again_does_not_restamp_the_hold() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        reconcile_an_unresolvable_claim(&cluster, "n1", vec![(7, 1)]).await;
+        let first = cluster.get_node("n1").expect("node");
+        reconcile_an_unresolvable_claim(&cluster, "n1", vec![(7, 1)]).await;
+        let second = cluster.get_node("n1").expect("node");
+
+        assert_eq!(first.state, NodeState::Draining);
+        assert_eq!(second.state, first.state);
+        assert_eq!(second.reason_time, first.reason_time, "nothing changed");
+    }
+
+    // An operator's drain carries their attribution; a reconcile that rewrote or
+    // cleared it would destroy that along with the reason to keep the node out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operator_drain_outlives_a_pass_that_finds_an_unresolvable_claim() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        cluster
+            .drain_node("n1", Some("cable replacement".into()), Some(1234))
+            .expect("operator drain");
+
+        reconcile_an_unresolvable_claim(&cluster, "n1", vec![(7, 1)]).await;
+        reconcile_a_clean_ledger(&cluster, "n1", vec![(7, 1)]).await;
+
+        let node = cluster.get_node("n1").expect("node");
+        assert_eq!(node.state_reason.as_deref(), Some("cable replacement"));
+        assert_eq!(node.state, NodeState::Draining);
+        assert!(node.admin_locked);
+        assert_eq!(node.reason_uid, Some(1234), "the attribution stands too");
+    }
+
+    // Draining is not exempt from the heartbeat timeout, so a held node that goes
+    // quiet lands in Down still locked, where nothing in the health path recovers it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_node_that_stopped_heartbeating_still_comes_back() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        reconcile_an_unresolvable_claim(&cluster, "n1", vec![(7, 1)]).await;
+        assert_eq!(
+            cluster.get_node("n1").expect("node").state,
+            NodeState::Draining
+        );
+
+        cluster.check_node_health(0, crate::cluster::MarkDownPolicy::Allowed);
+        let down = cluster.get_node("n1").expect("node");
+        assert_eq!(down.state, NodeState::Down, "the hazard this test pins");
+        assert!(down.admin_locked);
+
+        reconcile_a_clean_ledger(&cluster, "n1", Vec::new()).await;
+
+        let unlocked = cluster.get_node("n1").expect("node");
+        assert!(!unlocked.admin_locked, "a locked Down node never recovers");
+        assert_eq!(unlocked.state_reason, None);
+        assert_eq!(
+            unlocked.state,
+            NodeState::Down,
+            "liveness is the health pass's call, not this one's"
+        );
+
+        cluster.update_heartbeat("n1", 0, 0);
+        cluster.check_node_health(90, crate::cluster::MarkDownPolicy::Allowed);
+        assert!(cluster.get_node("n1").expect("node").is_schedulable());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

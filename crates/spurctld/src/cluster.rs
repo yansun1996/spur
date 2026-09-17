@@ -3328,6 +3328,37 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Lift a hold the controller placed on itself, unlike `update_node_state`
+    /// which derives the lock from the target and so cannot unlock in place.
+    pub fn release_controller_hold(&self, name: &str) -> anyhow::Result<()> {
+        let (old_state, new_state) = {
+            let nodes = self.nodes.read();
+            let node = nodes
+                .get(name)
+                .ok_or_else(|| anyhow::anyhow!("node {} not found", name))?;
+            // A node another subsystem put down keeps that state, unlocked, so its
+            // own recovery decides when it is fit again rather than this release.
+            let mut released = node.clone();
+            if !matches!(released.state, NodeState::Down | NodeState::Error) {
+                released.state = NodeState::Idle;
+                released.update_state_from_alloc();
+            }
+            (node.state, released.state)
+        };
+        self.propose(WalOperation::NodeStateChange {
+            at: None,
+            name: name.to_string(),
+            old_state,
+            new_state,
+            reason: None,
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+        })?;
+        info!(node = %name, state = %new_state, "controller hold released");
+        Ok(())
+    }
+
     pub fn update_node_labels(
         &self,
         name: &str,
