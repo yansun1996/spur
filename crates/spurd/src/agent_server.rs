@@ -45,6 +45,27 @@ fn maybe_deny_gpu_env(env: &mut HashMap<String, String>, allocated_device_ids: &
     }
 }
 
+type TerminalExit = std::pin::Pin<Box<dyn std::future::Future<Output = i32> + Send>>;
+
+/// A shell running under its own supervisor, from the agent's side: the master
+/// it bridges, the pid its signals target, and where its exit status arrives.
+struct SupervisedTerminal {
+    master: std::os::fd::OwnedFd,
+    pid: i32,
+    exit: TerminalExit,
+}
+
+/// What a terminal inherits from the job it opens into. Copied out under one
+/// lock so the launch below never holds the running-job table.
+struct TerminalJobFacts {
+    run_attempt: u32,
+    cpus: u32,
+    memory_mb: u64,
+    gpu_devices: Vec<u32>,
+    partition: String,
+    nodelist: String,
+}
+
 struct StepdLaunchOptions {
     step_id: spur_core::step::StepId,
     allocation_only: bool,
@@ -185,8 +206,7 @@ async fn launch_stepd(
     launch_spec.controller_addr = controller_addr.into();
     launch_spec.reporting_node = reporting_node.into();
     launch_spec.run_attempt = run_attempt;
-    launch_spec.allocation_only =
-        options.allocation_only || config.io_mode == executor::LaunchIo::Pty;
+    launch_spec.allocation_only = options.allocation_only;
     launch_spec.step_id = options.step_id;
     launch_spec.container_rootfs_mode = options.container_rootfs_mode;
     launch_spec.hooks = options.hooks;
@@ -2617,6 +2637,112 @@ fn step_scratch_names(node_id: u32, step_id: u32) -> (String, String) {
     )
 }
 
+/// The environment an interactive shell starts from: the job's own, never
+/// spurd's, plus the identity a login shell expects to find.
+fn terminal_environment(
+    entry: &crate::job_entry::JobEntry,
+    job_id: u32,
+) -> HashMap<String, String> {
+    let mut environment = HashMap::from([("TERM".to_string(), "xterm-256color".to_string())]);
+    environment.extend(AgentService::session_environ(entry));
+    environment.extend(entry.env_vars(job_id));
+    if entry.uid > 0 {
+        if let Some(user) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(entry.uid))
+            .ok()
+            .flatten()
+        {
+            environment.insert("HOME".into(), user.dir.to_string_lossy().into_owned());
+            environment.insert("USER".into(), user.name.clone());
+            environment.insert("LOGNAME".into(), user.name);
+            environment.insert("SHELL".into(), user.shell.to_string_lossy().into_owned());
+        }
+    }
+    environment
+}
+
+/// Who the terminal belongs to and where it runs.
+struct TerminalIdentity {
+    job_id: u32,
+    step_id: u32,
+    node: String,
+}
+
+/// The launch a terminal's supervisor is handed. The step id stays the client's
+/// user step, which is what puts the shell in a cgroup leaf under the job
+/// rather than on the job node itself.
+fn terminal_launch_config(
+    entry: &crate::job_entry::JobEntry,
+    identity: TerminalIdentity,
+    argv: &[String],
+    winsize: Option<crate::pty::WindowSize>,
+    job: TerminalJobFacts,
+    memlock: spur_core::config::MemlockLimit,
+    cgroup: CgroupConfig,
+) -> Result<executor::JobLaunchConfig, Status> {
+    let TerminalIdentity {
+        job_id,
+        step_id,
+        node,
+    } = identity;
+    let environment = terminal_environment(entry, job_id);
+    let script = supervised_step_script(entry, entry.uid, entry.gid, &session_shell(entry, argv))?;
+    Ok(executor::JobLaunchConfig {
+        job_id,
+        step_id,
+        run_attempt: job.run_attempt,
+        script,
+        work_dir: match entry.work_dir.is_empty() {
+            true => "/tmp".to_string(),
+            false => entry.work_dir.clone(),
+        },
+        name: format!("{job_id}.{step_id}"),
+        user: environment.get("USER").cloned().unwrap_or_default(),
+        node,
+        array_job_id: None,
+        array_task_id: None,
+        environment,
+        // The terminal is the session's only output; nothing is spooled.
+        stdout_path: String::new(),
+        stderr_path: String::new(),
+        stdin_path: String::new(),
+        open_mode: None,
+        cpus: job.cpus,
+        memory_mb: job.memory_mb,
+        gpu_devices: job.gpu_devices,
+        cpu_ids: Vec::new(),
+        uid: entry.uid,
+        gid: entry.gid,
+        container: None,
+        prolog_script: None,
+        partition: job.partition,
+        nodelist: job.nodelist,
+        mpi: String::new(),
+        host_device_plan: None,
+        memlock,
+        cgroup,
+        io_mode: executor::LaunchIo::Pty(winsize),
+        pmix_multi_task: false,
+        joins_parent_namespaces: entry.has_namespaces() && entry.pid > 0,
+        allocation_holder: false,
+    })
+}
+
+/// What an interactive session runs when the client named nothing. A job in its
+/// own mount namespace is probed through /proc, not on the host filesystem.
+fn session_shell(entry: &crate::job_entry::JobEntry, argv: &[String]) -> Vec<String> {
+    if !argv.is_empty() {
+        return argv.to_vec();
+    }
+    let bash = match entry.pid > 0 && entry.has_mount_namespace {
+        true => format!("/proc/{}/root/bin/bash", entry.pid),
+        false => "/bin/bash".to_string(),
+    };
+    match std::path::Path::new(&bash).exists() {
+        true => vec!["/bin/bash".to_string()],
+        false => vec!["/bin/sh".to_string()],
+    }
+}
+
 /// The script a supervised step runs. A step joining a running job enters its
 /// namespaces from inside the script, so the supervisor itself stays outside
 /// them and survives independently of the job it is running work for.
@@ -3795,6 +3921,236 @@ impl AgentService {
         }
     }
 
+    /// Take up this step's terminal, opening one only if the step has none.
+    /// Reattaching after a client left — or after this agent restarted — must
+    /// find the shell already running rather than start a second one.
+    async fn attach_terminal(
+        &self,
+        entry: &crate::job_entry::JobEntry,
+        init: &InitSession,
+        argv: &[String],
+        winsize: Option<crate::pty::WindowSize>,
+    ) -> Result<SupervisedTerminal, Status> {
+        let held = stepds_for_job(&*self.stepds.lock().await, init.job_id)
+            .into_iter()
+            .find(|descriptor| descriptor.step_id == init.step_id);
+        if let Some(descriptor) = held {
+            let waiter = self
+                .step_completions
+                .register(init.job_id, descriptor.run_attempt, descriptor.step_id)
+                .await;
+            match self.claim_terminal(&descriptor, waiter).await {
+                Some(terminal) => {
+                    info!(
+                        job_id = init.job_id,
+                        step_id = init.step_id,
+                        child_pid = terminal.pid,
+                        "resumed a supervised terminal"
+                    );
+                    return Ok(terminal);
+                }
+                // Its supervisor is gone or never opened a terminal; the launch
+                // below fences whatever is left of it.
+                None => {
+                    self.step_completions
+                        .deregister(init.job_id, descriptor.run_attempt, descriptor.step_id)
+                        .await
+                }
+            }
+        }
+        self.launch_supervised_terminal(entry, init.job_id, init.step_id, argv, winsize)
+            .await
+    }
+
+    /// Open this step's terminal under its own supervisor. The shell is then a
+    /// child of a process that outlives the agent, and `scancel` reaches it
+    /// through the stepd map like every other step.
+    async fn launch_supervised_terminal(
+        &self,
+        entry: &crate::job_entry::JobEntry,
+        job_id: u32,
+        step_id: u32,
+        argv: &[String],
+        winsize: Option<crate::pty::WindowSize>,
+    ) -> Result<SupervisedTerminal, Status> {
+        let tracked = {
+            let jobs = self.running.lock().await;
+            let tracked = jobs.get(&job_id).ok_or_else(|| {
+                Status::failed_precondition(format!("job {job_id} is not running on this node"))
+            })?;
+            TerminalJobFacts {
+                run_attempt: tracked.run_attempt,
+                cpus: tracked.cpus,
+                memory_mb: tracked.memory_mb,
+                gpu_devices: tracked.gpu_devices.clone(),
+                partition: tracked.partition.clone(),
+                nodelist: tracked.nodelist.clone(),
+            }
+        };
+        let run_attempt = tracked.run_attempt;
+
+        let config = terminal_launch_config(
+            entry,
+            TerminalIdentity {
+                job_id,
+                step_id,
+                node: self.reporter.hostname.clone(),
+            },
+            argv,
+            winsize,
+            tracked,
+            self.limits.memlock,
+            self.cgroup.clone(),
+        )?;
+
+        fence_displaced_stepd(&self.stepds, job_id, step_id, run_attempt)
+            .await
+            .map_err(|error| {
+                Status::internal(format!(
+                    "could not fence a displaced terminal supervisor: {error}"
+                ))
+            })?;
+
+        // Registered before the spawn: a shell that exits immediately would
+        // otherwise deliver its status to nobody.
+        let waiter = self
+            .step_completions
+            .register(job_id, run_attempt, step_id)
+            .await;
+
+        let descriptor = match launch_stepd(
+            &config,
+            run_attempt,
+            &self.reporter.controller_addr,
+            &self.reporter.hostname,
+            &self.stepd_state_dir,
+            StepdLaunchOptions {
+                step_id,
+                allocation_only: false,
+                container_rootfs_mode: None,
+                hooks: (*self.hooks).clone(),
+                plugstack_path: self.plugstack_path.clone(),
+                pmix: None,
+            },
+        )
+        .await
+        {
+            Ok((_, descriptor)) => descriptor,
+            Err(error) => {
+                self.step_completions
+                    .deregister(job_id, run_attempt, step_id)
+                    .await;
+                return Err(Status::internal(format!(
+                    "terminal supervisor failed to start: {error}"
+                )));
+            }
+        };
+
+        if let Err(descriptor) = claim_stepd_slot(&self.stepds, descriptor.clone()).await {
+            self.step_completions
+                .deregister(job_id, run_attempt, step_id)
+                .await;
+            discard_stepd_session(&descriptor).await;
+            return Err(Status::aborted(
+                "terminal supervisor superseded before it could be tracked",
+            ));
+        }
+
+        if let Err(error) =
+            crate::stepd::start_job(&descriptor, uuid::Uuid::new_v4().to_string()).await
+        {
+            self.step_completions
+                .deregister(job_id, run_attempt, step_id)
+                .await;
+            self.abandon_terminal_supervisor(&descriptor, "terminal could not be released")
+                .await;
+            return Err(Status::internal(format!(
+                "failed to release the terminal: {error}"
+            )));
+        }
+
+        match self.claim_terminal(&descriptor, waiter).await {
+            Some(terminal) => Ok(terminal),
+            None => {
+                self.step_completions
+                    .deregister(job_id, run_attempt, step_id)
+                    .await;
+                self.abandon_terminal_supervisor(&descriptor, "terminal never became reachable")
+                    .await;
+                Err(Status::internal(
+                    "the terminal supervisor never handed back a terminal",
+                ))
+            }
+        }
+    }
+
+    /// Stop and untrack a supervisor whose terminal this agent could not take
+    /// up, so it does not sit holding the step's slice with nobody attached.
+    async fn abandon_terminal_supervisor(
+        &self,
+        descriptor: &crate::stepd::StepdDescriptor,
+        reason: &'static str,
+    ) {
+        if let Err(error) = stop_stepd_process(descriptor).await {
+            warn!(
+                job_id = descriptor.job_id,
+                step_id = descriptor.step_id,
+                %error,
+                "failed to stop an unattached terminal supervisor"
+            );
+        }
+        release_stepd_tracking(
+            &self.running,
+            &self.allocation,
+            &self.stepds,
+            descriptor,
+            reason,
+        )
+        .await;
+    }
+
+    /// Take up a terminal a supervisor is holding: its shell's pid names the
+    /// master in custody, and its exit arrives on the step-completion channel.
+    async fn claim_terminal(
+        &self,
+        descriptor: &crate::stepd::StepdDescriptor,
+        waiter: tokio::sync::oneshot::Receiver<crate::step_completion::StepOutcome>,
+    ) -> Option<SupervisedTerminal> {
+        let pid = supervised_step_workload_pid(descriptor).await?;
+        let session_dir = descriptor.socket_path.parent()?;
+        let master = match crate::stepd::reclaim_pty_master(session_dir, pid).await {
+            Ok(master) => master?,
+            Err(error) => {
+                warn!(
+                    job_id = descriptor.job_id,
+                    step_id = descriptor.step_id,
+                    %error,
+                    "could not take up the supervised terminal"
+                );
+                return None;
+            }
+        };
+        // AsyncFd in the bridge polls this fd; a blocking master would stall the
+        // whole reactor on the first read that has nothing behind it.
+        if let Err(error) = nix::fcntl::fcntl(
+            &master,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        ) {
+            warn!(job_id = descriptor.job_id, %error, "could not set the terminal non-blocking");
+            return None;
+        }
+        Some(SupervisedTerminal {
+            master,
+            pid: pid as i32,
+            exit: Box::pin(async move {
+                match waiter.await {
+                    Ok(outcome) => spur_core::process::shell_exit_code(&step_exit_status(outcome)),
+                    Err(_) => 128,
+                }
+            }),
+        })
+    }
+
     pub fn stepd_recovery_cleanup(&self) -> StepdRecoveryCleanup {
         StepdRecoveryCleanup {
             running: self.running.clone(),
@@ -4926,7 +5282,7 @@ struct LaunchPlan {
 }
 
 /// Decide how to enter a job and run `command`, shared by `exec_in_job` and
-/// `spawn_pty_in_job`.
+/// the script a supervised step runs.
 ///
 /// When the job has live namespaces, enter them with `nsenter` and drop
 /// privilege inside via `setpriv` (see [`build_nsenter_argv`]); the child hook
@@ -6190,7 +6546,7 @@ impl SlurmAgent for AgentService {
             memlock: self.limits.memlock,
             cgroup: self.cgroup.clone(),
             io_mode: if spec.pty {
-                executor::LaunchIo::Pty
+                executor::LaunchIo::Pty(None)
             } else {
                 executor::LaunchIo::File
             },
@@ -8248,8 +8604,8 @@ impl SlurmAgent for AgentService {
         let interactive = !init.non_interactive;
 
         // Same defense-in-depth gate as exec_in_job: the uid comes from the tracked job, but an
-        // interactive PTY into a root job must obey allow_root_jobs too. Checked here rather than
-        // inside spawn_pty_in_job, which is a static helper with no access to the agent config.
+        // interactive PTY into a root job must obey allow_root_jobs too. Checked here because
+        // nothing further down the supervised launch can read the agent's config.
         if let Err(msg) = crate::privdrop::check_root_execution_allowed(
             entry.uid,
             self.allow_root_jobs,
@@ -8332,18 +8688,14 @@ impl SlurmAgent for AgentService {
             );
         }
 
-        // The supervisor that outlives this agent, so a terminal it is holding
-        // can be found again after a restart.
-        let custody_dir = stepds_for_job(&*self.stepds.lock().await, init.job_id)
+        // Left by an agent that predates supervised terminals: its shell has no
+        // supervisor of its own, so the job's holds the master on its behalf.
+        let legacy_custody_dir = stepds_for_job(&*self.stepds.lock().await, init.job_id)
             .into_iter()
             .find(|descriptor| !spur_core::step::is_user_step(descriptor.step_id))
             .and_then(|descriptor| descriptor.socket_path.parent().map(|dir| dir.to_path_buf()));
-
-        // Resume rather than open a new one: a terminal held for a job this
-        // agent is not already bridging was orphaned when its agent went away,
-        // and its user wants it back.
         let already_bridging = self.live_ptys.lock().await.contains(&init.job_id);
-        let reclaimed = match custody_dir.as_deref() {
+        let legacy = match legacy_custody_dir.as_deref() {
             Some(dir) if !already_bridging => match crate::stepd::reclaim_orphaned_pty(dir).await {
                 Ok(found) => found,
                 Err(error) => {
@@ -8351,76 +8703,51 @@ impl SlurmAgent for AgentService {
                     None
                 }
             },
-            _ => {
-                if custody_dir.is_none() {
-                    warn!(
-                        job_id = init.job_id,
-                        "no supervisor to hold this terminal; it will not survive a restart"
-                    );
-                }
-                None
-            }
+            _ => None,
         };
 
-        type ExitFuture = std::pin::Pin<Box<dyn std::future::Future<Output = i32> + Send>>;
-        let (master_fd, wait_exit, child_pid): (std::os::fd::OwnedFd, ExitFuture, i32) =
-            match reclaimed {
-                Some((session_id, master)) => {
-                    let pid = session_id as i32;
-                    info!(job_id = init.job_id, pid, "resumed an orphaned terminal");
-                    (master, Box::pin(wait_for_reparented_exit(pid)), pid)
+        let terminal = match legacy {
+            Some((session_id, master)) => {
+                let pid = session_id as i32;
+                info!(job_id = init.job_id, pid, "resumed an orphaned terminal");
+                SupervisedTerminal {
+                    master,
+                    pid,
+                    exit: Box::pin(wait_for_reparented_exit(pid)),
                 }
-                None => {
-                    let (master, mut child, pid) = Self::spawn_pty_in_job(
-                        &entry,
-                        &argv,
-                        init.job_id,
-                        winsize.as_ref(),
-                        self.cgroup.required,
-                    )?;
-                    // Deposited with the supervisor, which outlives this agent:
-                    // without a second holder the master closes when the agent
-                    // does and the terminal hangs up under the user.
-                    if let Some(dir) = custody_dir.as_deref() {
-                        if let Err(error) = crate::stepd::deposit_pty_master(
-                            dir,
-                            pid as u32,
-                            std::os::fd::AsFd::as_fd(&master),
-                        )
-                        .await
-                        {
-                            warn!(job_id = init.job_id, pid, %error, "pty master custody failed");
-                        }
-                    }
+            }
+            None => self
+                .attach_terminal(&entry, &init, &argv, winsize)
+                .await
+                .inspect(|terminal| {
                     info!(
                         job_id = init.job_id,
-                        child_pid = pid,
+                        step_id = init.step_id,
+                        child_pid = terminal.pid,
                         overlap = init.overlap,
                         "interactive session started"
-                    );
-                    let exit = async move {
-                        child
-                            .wait()
-                            .await
-                            .ok()
-                            .and_then(|s| s.code())
-                            .unwrap_or(128)
-                    };
-                    (master, Box::pin(exit), pid)
-                }
-            };
+                    )
+                })?,
+        };
 
         self.live_ptys.lock().await.insert(init.job_id);
         let live_ptys = self.live_ptys.clone();
         let job_id = init.job_id;
-        let bridge =
-            Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx);
+        let child_pid = terminal.pid;
+        let bridge = Self::run_pty_bridge(
+            terminal.master,
+            terminal.exit,
+            child_pid,
+            interactive,
+            inbound,
+            tx,
+        );
         tokio::spawn(async move {
             bridge.await;
             live_ptys.lock().await.remove(&job_id);
-            // The terminal is gone; stop holding its descriptor or it leaks for
-            // as long as the job runs.
-            if let Some(dir) = custody_dir.as_deref() {
+            // Only the legacy shape needs this: a terminal's own supervisor exits
+            // with the shell, and until then a reattach still has to find it.
+            if let Some(dir) = legacy_custody_dir.as_deref() {
                 if let Err(error) = crate::stepd::release_pty_master(dir, child_pid as u32).await {
                     warn!(job_id, child_pid, %error, "failed to release a closed terminal");
                 }
@@ -9761,107 +10088,6 @@ impl AgentService {
         }
     }
 
-    fn spawn_pty_in_job(
-        entry: &crate::job_entry::JobEntry,
-        argv: &[String],
-        job_id: u32,
-        winsize: Option<&crate::pty::WindowSize>,
-        cgroup_required: bool,
-    ) -> Result<(std::os::fd::OwnedFd, tokio::process::Child, i32), Status> {
-        use std::os::fd::AsRawFd;
-        use std::process::Stdio;
-
-        let (master, slave) = crate::pty::openpty_with_winsize(winsize)
-            .map_err(|e| Status::internal(format!("openpty: {e}")))?;
-
-        let shell = if argv.is_empty() {
-            let bash_exists = if entry.pid > 0 && entry.has_mount_namespace {
-                std::path::Path::new(&format!("/proc/{}/root/bin/bash", entry.pid)).exists()
-            } else {
-                std::path::Path::new("/bin/bash").exists()
-            };
-            if bash_exists {
-                vec!["/bin/bash".to_string()]
-            } else {
-                vec!["/bin/sh".to_string()]
-            }
-        } else {
-            argv.to_vec()
-        };
-
-        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
-
-        let plan = build_launch_plan(entry, priv_drop.as_ref(), &shell);
-        let containment = ChildContainment::for_plan(&plan, entry, priv_drop, cgroup_required);
-        let launch_cmd = plan.program;
-        let launch_args = plan.args;
-
-        let mut cmd = tokio::process::Command::new(&launch_cmd);
-        let work_dir = if entry.work_dir.is_empty() {
-            "/tmp"
-        } else {
-            &entry.work_dir
-        };
-        cmd.args(&launch_args)
-            .current_dir(work_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        // Start from an empty environment so spurd's own environment (which may
-        // hold daemon secrets) never leaks into the session; then apply the job's
-        // own environment.
-        cmd.env_clear();
-        cmd.env("TERM", "xterm-256color");
-        for (k, v) in Self::session_environ(entry) {
-            cmd.env(k, v);
-        }
-        for (k, v) in entry.env_vars(job_id) {
-            cmd.env(k, v);
-        }
-        if entry.uid > 0 {
-            if let Some(user) = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(entry.uid))
-                .ok()
-                .flatten()
-            {
-                cmd.env("HOME", user.dir.to_string_lossy().as_ref());
-                cmd.env("USER", &user.name);
-                cmd.env("LOGNAME", &user.name);
-                cmd.env("SHELL", user.shell.to_string_lossy().as_ref());
-            }
-        }
-
-        let raw = crate::executor::JobIoRaw::Pty {
-            master: master.as_raw_fd(),
-            slave: slave.as_raw_fd(),
-        };
-        // Hooks run in registration order, so the child wires its PTY, then
-        // joins the job's cgroup, then drops privilege.
-        unsafe {
-            cmd.pre_exec(move || raw.wire());
-        }
-        containment.register(&mut cmd);
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| Status::internal(format!("spawn PTY shell: {e}")))?;
-        let child_pid = child
-            .id()
-            .ok_or_else(|| Status::internal("spawned PTY child exited before pid could be read"))?
-            as i32;
-
-        drop(slave);
-
-        // Set non-blocking so AsyncFd reads/writes are correct.
-        nix::fcntl::fcntl(
-            &master,
-            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-        )
-        .map_err(|e| Status::internal(format!("fcntl O_NONBLOCK: {e}")))?;
-
-        Ok((master, child, child_pid))
-    }
-
     /// Read environment variables from a running process via /proc.
     fn read_proc_environ(pid: u32) -> Vec<(String, String)> {
         const MAX_ENVIRON: usize = 1 << 20; // 1 MiB
@@ -10175,6 +10401,40 @@ mod tests {
 
         assert!(!failed.exists());
         assert!(retained.exists());
+    }
+
+    // Nothing else reaches an interactive shell: it has no `active_steps` entry,
+    // and `cancel_active_steps_for_job` skips supervised steps by design.
+    #[test]
+    fn a_cancel_reaches_a_terminal_running_under_its_own_supervisor() {
+        let terminal_step = 7;
+        let sessions: StepdMap = [spur_core::step::STEP_BATCH, terminal_step]
+            .into_iter()
+            .map(|step_id| {
+                (
+                    (42, step_id),
+                    crate::stepd::StepdDescriptor::new(
+                        42,
+                        3,
+                        step_id,
+                        0,
+                        0,
+                        std::path::PathBuf::from("/tmp/runtime.sock"),
+                        std::path::PathBuf::new(),
+                    ),
+                )
+            })
+            .collect();
+
+        let reached: Vec<u32> = stepds_for_attempt(&sessions, 42, 3)
+            .into_iter()
+            .map(|descriptor| descriptor.step_id)
+            .collect();
+        assert!(
+            reached.contains(&terminal_step),
+            "a cancel must reach the terminal: {reached:?}"
+        );
+        assert!(stepds_for_attempt(&sessions, 42, 4).is_empty());
     }
 
     #[test]
@@ -13141,6 +13401,130 @@ mod tests {
         }
     }
 
+    fn terminal_job_facts() -> TerminalJobFacts {
+        TerminalJobFacts {
+            run_attempt: 3,
+            cpus: 4,
+            memory_mb: 2048,
+            gpu_devices: vec![1],
+            partition: "batch".into(),
+            nodelist: "node-a".into(),
+        }
+    }
+
+    fn terminal_config(
+        entry: &crate::job_entry::JobEntry,
+        step_id: u32,
+        winsize: Option<crate::pty::WindowSize>,
+    ) -> executor::JobLaunchConfig {
+        terminal_launch_config(
+            entry,
+            TerminalIdentity {
+                job_id: 42,
+                step_id,
+                node: "node-a".into(),
+            },
+            &["/bin/bash".to_string()],
+            winsize,
+            terminal_job_facts(),
+            spur_core::config::MemlockLimit::Unlimited,
+            CgroupConfig::default(),
+        )
+        .expect("a terminal launch config")
+    }
+
+    // The whole point of the change: an interactive shell is a supervised
+    // launch on a terminal, not an unsupervised child of the agent.
+    #[test]
+    fn a_terminal_launches_on_a_pty_sized_the_way_the_client_asked() {
+        let winsize = crate::pty::WindowSize {
+            rows: 50,
+            cols: 200,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        let config = terminal_config(&nsenter_job_entry(1000, 1000), 7, Some(winsize));
+
+        assert_eq!(config.io_mode, executor::LaunchIo::Pty(Some(winsize)));
+    }
+
+    // A reserved step id would send setup_cgroup down the job-creation branch
+    // and have it claim the job node the allocation already owns.
+    #[test]
+    fn a_terminal_keeps_the_user_step_that_puts_it_in_a_cgroup_leaf() {
+        let config = terminal_config(&nsenter_job_entry(1000, 1000), 7, None);
+
+        assert_eq!(config.step_id, 7);
+        assert!(spur_core::step::is_user_step(config.step_id));
+        assert_eq!(config.run_attempt, terminal_job_facts().run_attempt);
+    }
+
+    #[test]
+    fn a_terminal_into_a_namespaced_job_enters_it_rather_than_unsharing_again() {
+        let config = terminal_config(&nsenter_job_entry(1000, 1000), 7, None);
+
+        assert!(config.joins_parent_namespaces);
+        assert!(
+            config.script.contains("nsenter"),
+            "the terminal must enter the job: {}",
+            config.script
+        );
+    }
+
+    #[test]
+    fn a_terminal_on_a_plain_job_runs_the_shell_without_nsenter() {
+        let entry = crate::job_entry::JobEntry {
+            pid: 0,
+            has_pid_namespace: false,
+            has_user_namespace: false,
+            has_mount_namespace: false,
+            uid: 1000,
+            gid: 1000,
+            work_dir: "/home/user".into(),
+            cgroup_path: None,
+        };
+        let config = terminal_config(&entry, 7, None);
+
+        assert!(!config.joins_parent_namespaces);
+        assert!(!config.script.contains("nsenter"), "{}", config.script);
+        assert!(config.script.contains("/bin/bash"), "{}", config.script);
+    }
+
+    // spurd's own environment may hold daemon secrets, so a session starts from
+    // the job's and nothing else.
+    #[test]
+    fn a_terminal_carries_the_jobs_environment_and_a_term() {
+        std::env::set_var("SPUR_TERMINAL_LEAK_CANARY", "leaked");
+        let config = terminal_config(&nsenter_job_entry(1000, 1000), 7, None);
+
+        assert_eq!(
+            config.environment.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        assert_eq!(
+            config.environment.get("SPUR_JOB_ID").map(String::as_str),
+            Some("42")
+        );
+        assert!(!config.environment.contains_key("SPUR_TERMINAL_LEAK_CANARY"));
+        std::env::remove_var("SPUR_TERMINAL_LEAK_CANARY");
+    }
+
+    // An empty argv is the bare `srun --pty`; the shell is resolved inside the
+    // job's mount namespace, not against the host's filesystem.
+    #[test]
+    fn a_session_with_no_command_resolves_a_shell() {
+        let entry = nsenter_job_entry(1000, 1000);
+        assert_eq!(
+            session_shell(&entry, &[]),
+            vec!["/bin/sh".to_string()],
+            "a job whose namespace has no bash falls back to sh"
+        );
+        assert_eq!(
+            session_shell(&entry, &["id".to_string()]),
+            vec!["id".to_string()]
+        );
+    }
+
     #[test]
     fn build_nsenter_argv_non_root_wraps_with_setpriv_init_groups() {
         let entry = nsenter_job_entry(1000, 1000);
@@ -13175,7 +13559,7 @@ mod tests {
 
     #[test]
     fn build_nsenter_argv_pty_shell_wraps_with_setpriv_init_groups() {
-        // spawn_pty_in_job passes the resolved shell as the command.
+        // An interactive session passes the resolved shell as the command.
         let entry = nsenter_job_entry(1000, 1000);
         let pd = crate::privdrop::PrivDrop::for_test(1000, 1000);
         let argv = build_nsenter_argv(&entry, Some(&pd), &["/bin/bash".to_string()]);
@@ -13283,111 +13667,6 @@ mod tests {
         assert_eq!(plan.program, "echo");
         assert_eq!(plan.args, vec!["hi".to_string()]);
         assert!(plan.apply_priv_in_child);
-    }
-
-    #[tokio::test]
-    async fn spawn_pty_in_job_direct_spawn_runs_command() {
-        // Drives the real spawn_pty_in_job handler (not just the pure planner)
-        // on the direct-spawn path: no namespaces, uid 0 so no privilege drop.
-        // This exercises the build_launch_plan call site inside the handler.
-        let entry = crate::job_entry::JobEntry {
-            pid: 0,
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
-            uid: 0,
-            gid: 0,
-            work_dir: "/tmp".into(),
-            cgroup_path: None,
-        };
-        let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None, false)
-                .expect("spawn_pty_in_job should succeed for a direct /usr/bin/true");
-        assert!(pid > 0);
-        let status = child.wait().await.expect("child should be reapable");
-        assert!(status.success(), "`true` should exit 0");
-        drop(master);
-    }
-
-    // The device filter lives on the job cgroup, so a child that fails to join it runs
-    // unfiltered. Under `required` that must abort before exec, not exec and warn.
-    #[tokio::test]
-    async fn a_required_join_that_cannot_land_aborts_the_attach() {
-        let entry = crate::job_entry::JobEntry {
-            pid: 0,
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
-            uid: 0,
-            gid: 0,
-            work_dir: "/tmp".into(),
-            // A path with no cgroup.procs: the pre-exec open fails, so the join cannot land.
-            cgroup_path: Some("/nonexistent/spur-required/job_1".into()),
-        };
-
-        let err = AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 1, None, true)
-            .expect_err("a required join that cannot land must fail the spawn");
-        assert_eq!(err.code(), tonic::Code::Internal);
-    }
-
-    // The same unjoinable cgroup without `required` is the degraded non-root-agent path:
-    // it must still run rather than refuse the user their shell.
-    #[tokio::test]
-    async fn a_best_effort_join_failure_still_runs_the_command() {
-        let entry = crate::job_entry::JobEntry {
-            pid: 0,
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
-            uid: 0,
-            gid: 0,
-            work_dir: "/tmp".into(),
-            cgroup_path: Some("/nonexistent/spur-besteffort/job_1".into()),
-        };
-
-        let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 1, None, false)
-                .expect("a best-effort join failure must still spawn the command");
-        assert!(pid > 0);
-        let status = child.wait().await.expect("child should be reapable");
-        assert!(status.success(), "`true` should exit 0");
-        drop(master);
-    }
-
-    // An attach that keeps spurd's cgroup reaches every device on the node,
-    // including ones the job was never allocated.
-    #[tokio::test]
-    async fn a_pty_attach_joins_the_job_cgroup() {
-        // A plain file stands in for `cgroup.procs`: the child opens and writes
-        // it exactly as it would the kernel's, so no root and no cgroupfs.
-        let cgroup = tempfile::tempdir().expect("tempdir");
-        std::fs::write(cgroup.path().join("cgroup.procs"), "").expect("cgroup.procs");
-
-        let entry = crate::job_entry::JobEntry {
-            pid: 0,
-            has_pid_namespace: false,
-            has_user_namespace: false,
-            has_mount_namespace: false,
-            uid: 0,
-            gid: 0,
-            work_dir: "/tmp".into(),
-            cgroup_path: Some(cgroup.path().to_path_buf()),
-        };
-
-        let (master, mut child, pid) =
-            AgentService::spawn_pty_in_job(&entry, &["true".to_string()], 7, None, false)
-                .expect("spawn_pty_in_job should succeed for a direct /usr/bin/true");
-        let status = child.wait().await.expect("child should be reapable");
-        assert!(status.success(), "`true` should exit 0");
-        drop(master);
-
-        let joined =
-            std::fs::read_to_string(cgroup.path().join("cgroup.procs")).expect("read cgroup.procs");
-        assert_eq!(
-            joined.trim(),
-            pid.to_string(),
-            "the attached PTY child must join the job's cgroup"
-        );
     }
 
     #[test]
