@@ -476,6 +476,9 @@ pub struct ClusterManager {
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
+    /// Victim taken for a pending job, keyed by that beneficiary. Leader-local:
+    /// a failover costs one extra victim per starved beneficiary, not one total.
+    preempt_debt: RwLock<HashMap<JobId, JobId>>,
     /// The live pacing window per node for ledger pulls, covering every trigger
     /// the node's own behaviour drives. Leader-local, never persisted.
     ledger_pull_starts: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
@@ -636,6 +639,7 @@ impl ClusterManager {
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
+            preempt_debt: RwLock::new(HashMap::<JobId, JobId>::new()),
             ledger_pull_starts: parking_lot::Mutex::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
             dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
@@ -695,6 +699,47 @@ impl ClusterManager {
             .get(name)
             .filter(|&&until| until > now)
             .map(|&until| until - now)
+    }
+
+    /// Record that a victim is already giving up its slice for this pending job,
+    /// so the next pass waits for it instead of killing a second job.
+    pub(crate) fn record_preempt_debt(&self, beneficiary: JobId, victim: JobId) {
+        self.preempt_debt.write().insert(beneficiary, victim);
+    }
+
+    /// Whether a victim taken for this pending job is still giving up its slice.
+    pub(crate) fn owed_a_preempted_slice(&self, beneficiary: JobId) -> bool {
+        self.preempt_debt.read().contains_key(&beneficiary)
+    }
+
+    /// Drop every debt whose victim has handed its slice back. Charged, not
+    /// Preempted: a cancel-mode victim holds its slice through its epilog too.
+    pub(crate) fn discharge_preempt_debt(&self) {
+        let taken: Vec<(JobId, JobId)> = self
+            .preempt_debt
+            .read()
+            .iter()
+            .map(|(&beneficiary, &victim)| (beneficiary, victim))
+            .collect();
+        if taken.is_empty() {
+            return;
+        }
+        let discharged: Vec<JobId> = {
+            let jobs = self.jobs.read();
+            taken
+                .into_iter()
+                .filter(|(_, victim)| {
+                    !jobs
+                        .get(victim)
+                        .is_some_and(|j| j.allocated_nodes.iter().any(|name| j.is_held_on(name)))
+                })
+                .map(|(beneficiary, _)| beneficiary)
+                .collect()
+        };
+        let mut debt = self.preempt_debt.write();
+        for beneficiary in discharged {
+            debt.remove(&beneficiary);
+        }
     }
 
     /// Names still within their dispatch cooldown, pruning any that have expired.
