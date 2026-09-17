@@ -63,8 +63,11 @@ pub enum SettlePermit {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookState {
+    /// No hook is configured for this point. Distinct from `Pending`, which is
+    /// what makes a finished teardown with a hook still owed say so.
     #[default]
     NotStarted,
+    Pending,
     Running,
     Succeeded,
     Failed,
@@ -72,10 +75,11 @@ pub enum HookState {
 }
 
 impl HookState {
-    /// What a persisted `Running` means once its owner is gone.
+    /// What a hook recorded as still owed or still running means once the
+    /// process that owed it is gone.
     pub fn settled_after_owner_loss(self) -> Self {
         match self {
-            Self::Running => Self::Unknown,
+            Self::Pending | Self::Running => Self::Unknown,
             other => other,
         }
     }
@@ -83,8 +87,16 @@ impl HookState {
     /// Whether the hook may still be touching the run's resources. Holding for a
     /// failed or unknowable one strands the slice: nothing ever re-runs a hook.
     pub fn is_in_flight(self) -> bool {
-        self == Self::Running
+        matches!(self, Self::Pending | Self::Running)
     }
+}
+
+/// Whether an epilog is still owed when a run's teardown finishes. The hook runs
+/// after the record is marked cleaned, so the debt is written with the mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpilogOwed {
+    Yes,
+    No,
 }
 
 /// Kept as its own node so a record written before the phase field was dropped
@@ -119,6 +131,18 @@ pub enum HoldOutcome {
 pub struct ControllerAck {
     #[serde(default)]
     pub release_raft_index: Option<u64>,
+    /// The controller answered a claim it had no record of. That answer is an
+    /// acknowledgement in its own right, and no committed index lies behind it.
+    #[serde(default)]
+    pub settled_unrecorded_claim: bool,
+}
+
+impl ControllerAck {
+    /// Whether the controller has spoken for this run's completion, by either
+    /// route. Only one of the two has an index to name.
+    pub fn is_given(&self) -> bool {
+        self.release_raft_index.is_some() || self.settled_unrecorded_claim
+    }
 }
 
 /// `admission/<job>.<attempt>/run.json`
@@ -198,7 +222,7 @@ impl RunAdmission {
     pub fn is_over(&self) -> bool {
         self.state == RunState::Cleaned
             || self.cancelled_by_controller
-            || self.controller_ack.release_raft_index.is_some()
+            || self.controller_ack.is_given()
     }
 
     /// When this run stops being interesting if nothing else ever happens to it.
@@ -679,7 +703,7 @@ impl AdmissionStore {
                     .max_launch_expiry_unix_ms
                     .max(existing.max_launch_expiry_unix_ms);
                 // Carried forward only while this write is not itself clearing it.
-                if run.conflict_hold.is_none() && run.controller_ack.release_raft_index.is_none() {
+                if run.conflict_hold.is_none() && !run.controller_ack.is_given() {
                     run.conflict_hold = existing.conflict_hold;
                 }
             }
@@ -861,9 +885,9 @@ impl AdmissionStore {
         Ok(loaded)
     }
 
-    /// Read-modify-write so cleanup cannot silently discard a conflict hold or
-    /// the creation time the age rule depends on.
-    pub fn mark_run_cleaned(&self, run_key: RunKey) -> io::Result<bool> {
+    /// Read-modify-write so cleanup cannot discard a hold or the creation time,
+    /// and the caller must say whether an epilog is owed: teardown precedes it.
+    pub fn mark_run_cleaned(&self, run_key: RunKey, epilog: EpilogOwed) -> io::Result<bool> {
         let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -873,9 +897,41 @@ impl AdmissionStore {
             return Ok(true);
         }
         run.state = RunState::Cleaned;
-        run.cleanup.epilog = run.cleanup.epilog.settled_after_owner_loss();
+        run.cleanup.epilog = match (epilog, run.cleanup.epilog) {
+            (EpilogOwed::Yes, HookState::NotStarted) => HookState::Pending,
+            (_, recorded) => recorded.settled_after_owner_loss(),
+        };
         self.admit_run(&run)?;
         Ok(true)
+    }
+
+    /// Settle every hook left in flight by a process that is gone. Sound only at
+    /// startup: nothing this process started can already be recorded as running.
+    pub fn settle_hooks_whose_owner_is_gone(&self) -> io::Result<usize> {
+        let loaded = self.load_all()?;
+        let mut settled = 0;
+        let mut failure = None;
+        for admitted in loaded.runs {
+            if !admitted.run.cleanup.epilog.is_in_flight() {
+                continue;
+            }
+            let Some(run_key) = admitted.run.key() else {
+                continue;
+            };
+            // One unwritable record must not leave every other run's hook in
+            // flight: nothing runs this again, so the rest would strand.
+            match self.record_epilog(
+                run_key,
+                admitted.run.cleanup.epilog.settled_after_owner_loss(),
+            ) {
+                Ok(_) => settled += 1,
+                Err(error) => failure = failure.or(Some(error)),
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(settled),
+        }
     }
 
     /// Record the supervisor that now speaks for a participant. Read-modify-write
@@ -910,7 +966,7 @@ impl AdmissionStore {
         };
         // A release landing after the caller read its snapshot would otherwise
         // leave a record claiming to hold a core it has already given back.
-        if run.controller_ack.release_raft_index.is_some() {
+        if run.controller_ack.is_given() {
             return Ok(HoldOutcome::AlreadyReleased);
         }
         if run.conflict_hold.is_some() {
@@ -989,6 +1045,9 @@ impl AdmissionStore {
         if run.cleanup.epilog.is_in_flight() {
             return Ok(None);
         }
+        if run.controller_ack.settled_unrecorded_claim {
+            return Ok(Some(ReleaseWarrant::settled_unrecorded_claim(run_key)));
+        }
         Ok(run
             .controller_ack
             .release_raft_index
@@ -1043,12 +1102,28 @@ impl AdmissionStore {
         run_key: RunKey,
         release_raft_index: u64,
     ) -> io::Result<bool> {
+        self.take_controller_ack(run_key, |ack| {
+            ack.release_raft_index = Some(release_raft_index)
+        })
+    }
+
+    /// Record the controller's answer to a claim it has no record of. An answer
+    /// and not a commit, so the release names it as such rather than an index.
+    pub fn record_settled_claim(&self, run_key: RunKey) -> io::Result<bool> {
+        self.take_controller_ack(run_key, |ack| ack.settled_unrecorded_claim = true)
+    }
+
+    fn take_controller_ack(
+        &self,
+        run_key: RunKey,
+        record: impl FnOnce(&mut ControllerAck),
+    ) -> io::Result<bool> {
         let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
-        run.controller_ack.release_raft_index = Some(release_raft_index);
+        record(&mut run.controller_ack);
         // An acknowledged completion resolves exactly what a hold taken for an
         // untracked claim was preserving, and nothing else would ever clear it.
         run.conflict_hold = None;
@@ -1098,15 +1173,14 @@ impl AdmissionStore {
         Ok(())
     }
 
-    /// Settle a run the controller has spoken for, whether by cancelling it or by
-    /// answering the claim. Owed reports go with it, or the record is immortal.
+    /// Settle a run the controller has answered. Owed reports go with it, or the
+    /// record is immortal; the slice flag is the release's to write, not this.
     pub fn settle_acknowledged_run(&self, run_key: RunKey) -> io::Result<bool> {
-        if !self.record_controller_ack(run_key, 1)? {
+        if !self.record_settled_claim(run_key)? {
             return Ok(false);
         }
         self.discharge_owed_reports(run_key)?;
-        self.record_slice_released(run_key)?;
-        self.mark_run_cleaned(run_key)
+        self.mark_run_cleaned(run_key, EpilogOwed::No)
     }
 
     /// Mark a participant's completion as acknowledged, so the durable retry
@@ -1778,7 +1852,7 @@ mod tests {
         });
         store.admit_run(&run).unwrap();
 
-        assert!(store.mark_run_cleaned(key(7, 1)).unwrap());
+        assert!(store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap());
         let after = store.load_run(key(7, 1)).unwrap();
         assert_eq!(after.state, RunState::Cleaned);
         assert_eq!(after.created_at_unix_ms, 1_234, "the age must survive");
@@ -1789,7 +1863,9 @@ mod tests {
     #[test]
     fn marking_a_run_that_was_never_admitted_is_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!store(&dir).mark_run_cleaned(key(9, 9)).unwrap());
+        assert!(!store(&dir)
+            .mark_run_cleaned(key(9, 9), EpilogOwed::No)
+            .unwrap());
     }
 
     #[test]
@@ -2019,7 +2095,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
-        store.mark_run_cleaned(key(7, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
         store
             .take_conflict_hold(key(7, 1), "held with no tracked job")
             .unwrap();
@@ -2094,7 +2170,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
-        store.mark_run_cleaned(key(7, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
         store.record_epilog(key(7, 1), HookState::Running).unwrap();
 
         let entry = store
@@ -2129,6 +2205,131 @@ mod tests {
         assert_eq!(
             store.settle_permit(key(7, 1)).unwrap(),
             SettlePermit::NoRecord
+        );
+    }
+
+    // The window the record could not describe: a hook owed but not yet started,
+    // which `not_started` cannot tell apart from a node with no hook at all.
+    #[test]
+    fn a_teardown_that_still_owes_a_hook_cannot_record_itself_as_quiescent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::Yes).unwrap();
+
+        let run = store.load_run(key(7, 1)).unwrap();
+        assert_eq!(run.state, RunState::Cleaned);
+        assert_eq!(run.cleanup.epilog, HookState::Pending);
+        assert_eq!(
+            store.settle_permit(key(7, 1)).unwrap(),
+            SettlePermit::NotQuiescent,
+            "the hook has not run yet, so these cores are not the node's"
+        );
+        assert!(store
+            .release_is_due(key(7, 1), spur_core::step::STEP_BATCH)
+            .unwrap()
+            .is_none());
+
+        store.record_epilog(key(7, 1), HookState::Running).unwrap();
+        assert_eq!(
+            store.settle_permit(key(7, 1)).unwrap(),
+            SettlePermit::NotQuiescent
+        );
+        store
+            .record_epilog(key(7, 1), HookState::Succeeded)
+            .unwrap();
+        assert!(matches!(
+            store.settle_permit(key(7, 1)).unwrap(),
+            SettlePermit::Due(_)
+        ));
+    }
+
+    // A node with no epilog configured must not be held by the debt a node with
+    // one records, or every completion waits for a hook that never comes.
+    #[test]
+    fn a_teardown_that_owes_no_hook_is_quiescent_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap().cleanup.epilog,
+            HookState::NotStarted
+        );
+        assert!(matches!(
+            store.settle_permit(key(7, 1)).unwrap(),
+            SettlePermit::Due(_)
+        ));
+    }
+
+    // Nothing re-runs a hook, and the mark is only ever written by the agent's
+    // own monitor, so a hook still in flight at startup is one nobody owns.
+    #[test]
+    fn a_hook_left_in_flight_by_a_dead_agent_is_settled_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::Yes).unwrap();
+        store.admit_run(&run_with(8, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(8, 1), EpilogOwed::Yes).unwrap();
+        store.record_epilog(key(8, 1), HookState::Running).unwrap();
+        store.admit_run(&run_with(9, 1, 1)).unwrap();
+        store.record_epilog(key(9, 1), HookState::Failed).unwrap();
+
+        assert_eq!(store.settle_hooks_whose_owner_is_gone().unwrap(), 2);
+
+        for job_id in [7, 8] {
+            assert_eq!(
+                store.load_run(key(job_id, 1)).unwrap().cleanup.epilog,
+                HookState::Unknown,
+                "an owed hook nobody will run must not hold the slice forever"
+            );
+        }
+        assert_eq!(
+            store.load_run(key(9, 1)).unwrap().cleanup.epilog,
+            HookState::Failed,
+            "an outcome already recorded is evidence, not something to overwrite"
+        );
+    }
+
+    // Settling licenses the release; it is not the release. A cut that drops the
+    // entry here stops advertising a claim the node is still physically holding.
+    #[test]
+    fn settling_a_claim_does_not_take_it_out_of_the_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+
+        assert!(store.settle_acknowledged_run(key(7, 1)).unwrap());
+        assert!(
+            !store.load_run(key(7, 1)).unwrap().slice_released,
+            "only the release itself may say the cores went back"
+        );
+        assert_eq!(store.ledger_cut("session-a").entries.len(), 1);
+
+        store.record_slice_released(key(7, 1)).unwrap();
+        assert!(store.ledger_cut("session-a").entries.is_empty());
+    }
+
+    // The settle is the acknowledgement, so it must free the slice -- but the
+    // audit has to be able to tell it from a completion Raft actually committed.
+    #[test]
+    fn a_settled_claim_releases_on_its_own_ground_not_a_borrowed_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+        store.settle_acknowledged_run(key(7, 1)).unwrap();
+
+        let warrant = store
+            .release_is_due(key(7, 1), spur_core::step::STEP_BATCH)
+            .unwrap()
+            .expect("an answered claim is a release the record licenses");
+        assert_eq!(
+            warrant.ground(),
+            spur_sched::cons_tres::ReleaseGround::SettledUnrecordedClaim
         );
     }
 
@@ -2228,9 +2429,12 @@ mod tests {
                 // can only be noted; the rest give the slice back outright.
                 if entry.job_id == 7 && pass == 0 {
                     store.mark_controller_cancelled(entry_key).unwrap();
-                } else {
-                    store.settle_acknowledged_run(entry_key).unwrap();
+                    continue;
                 }
+                store.settle_acknowledged_run(entry_key).unwrap();
+                // The pair the agent performs: settling licenses the release,
+                // and only the release itself says the slice went back.
+                store.record_slice_released(entry_key).unwrap();
             }
         }
 
@@ -2255,7 +2459,7 @@ mod tests {
         for job_id in [7, 8, 9] {
             store.admit_run(&run_with(job_id, 1, 1)).unwrap();
         }
-        store.mark_run_cleaned(key(7, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
         store.mark_controller_cancelled(key(8, 1)).unwrap();
         store.record_controller_ack(key(9, 1), 42).unwrap();
 
@@ -2448,7 +2652,7 @@ mod tests {
         store.admit_run(&run_with(7, 1, 1)).unwrap();
 
         store.record_epilog(key(7, 1), HookState::Failed).unwrap();
-        store.mark_run_cleaned(key(7, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
 
         assert_eq!(
             store.load_run(key(7, 1)).unwrap().cleanup.epilog,
@@ -2600,16 +2804,18 @@ mod tests {
 
     #[test]
     fn a_hook_running_when_its_owner_died_settles_as_unknown() {
-        assert_eq!(
-            HookState::Running.settled_after_owner_loss(),
-            HookState::Unknown
-        );
+        for in_flight in [HookState::Pending, HookState::Running] {
+            assert_eq!(in_flight.settled_after_owner_loss(), HookState::Unknown);
+            assert!(in_flight.is_in_flight());
+        }
         for settled in [
             HookState::NotStarted,
             HookState::Succeeded,
             HookState::Failed,
+            HookState::Unknown,
         ] {
             assert_eq!(settled.settled_after_owner_loss(), settled);
+            assert!(!settled.is_in_flight());
         }
     }
 

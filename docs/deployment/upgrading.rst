@@ -233,7 +233,8 @@ Follow this order for any cluster upgrade:
 1. **Rebuild all binaries together** from the same source tree — they share a Raft
    WAL schema and must stay version-matched.
 2. **Upgrade controllers before agents.** Both playbooks do this automatically, one
-   controller at a time to preserve quorum.
+   controller at a time to preserve quorum. One release reverses this step; see
+   :ref:`node-reconciliation-upgrade`.
 3. **Drain agents before swapping binaries.** The rolling playbook drains automatically; a
    running job blocks the swap unless you force it.
 4. **Never wipe state during an upgrade.** Keep the default ``spur_wipe_state=false``.
@@ -404,6 +405,8 @@ An agent without them logs ``device filter not installed`` and runs the job with
 device isolation, so an unprivileged ``spurd`` behaves as before — unless ``required = true``, which
 turns that degradation into a refused launch.
 
+.. _node-reconciliation-upgrade:
+
 Node reconciliation and resource release
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -413,16 +416,30 @@ what it is holding against its own record and resolves the difference, and a
 job's resources are freed on the controller's acknowledgement rather than when
 the job's processes exit. See :doc:`/user-guide/monitoring-jobs` for both.
 
-No new ordering rule applies. :ref:`Safe Upgrade Order <safe-upgrade-order>`
-already requires controllers before agents and forward-only rolls, which is
-exactly what this change needs.
+**This change inverts step 2 of** :ref:`Safe Upgrade Order <safe-upgrade-order>`
+**— upgrade agents before controllers.** Every other step of that order still
+applies: rebuild all binaries together, roll forward only.
+
+The reason is where the refusal lives. When the controller tells a node it is not
+accounting for a run the node still holds, only the node can see whether an
+epilog is still running on those cores, so only the node can refuse. An agent
+that predates that refusal answers every such request by releasing, whatever is
+still running under the run — so a controller that asks paired with an agent that
+cannot say no is what hands a job's cores to a second job while the operator's
+epilog is still on them. Upgrading agents first never creates that pairing; its
+cost is the capacity stall described below, which loses no work.
 
 **Reconciliation stays inert until the agents are upgraded.** A pre-upgrade agent
 sends no ledger with its registration, so the controller builds no comparison and
 gates nothing; a controller that pulls one from such an agent gets "not
-implemented" back and leaves the node alone. Upgrading controllers first
-therefore changes no node behaviour on its own — reconciliation starts working
-node by node, as each agent is replaced.
+implemented" back and leaves the node alone. Reconciliation therefore starts
+working node by node as each agent is replaced, in either order.
+
+**A pre-upgrade controller can clear a node's unresolved-claim reason while the
+claim is still held.** It counts only the claims an agent released, so an agent's
+refusal leaves it nothing to name and it rewrites ``Reason=`` to empty. No
+resources move and no claim is dropped, but the operator signal pointing at that
+claim disappears until an upgraded controller reconciles the node again.
 
 **An upgraded agent under a pre-upgrade controller stalls rather than losing
 work.** Registration still succeeds: the old controller ignores the ledger and
@@ -430,8 +447,15 @@ cancels nothing. But the new agent no longer frees a claim it has merely lost
 track of — forgetting a job is not evidence the job finished — and an old
 controller never reconciles it. Those claims stay booked, so the node's usable
 capacity shrinks until an upgraded controller is in place. Nothing is killed and
-no job record is lost; following the controllers-first order avoids the window
-entirely.
+no job record is lost, and the stall ends as each controller is upgraded.
+
+**Downgrading an agent strands whatever it was mid-teardown on.** An agent that
+owes a job's epilog records that debt on disk, and a pre-upgrade agent cannot
+read the record back. It keeps the record rather than guessing, but it does not
+restore that run's slice and reports its own inventory as incomplete, so those
+cores stay out of the pool until the record ages out. This is the general
+roll-forward rule in :ref:`Safe Upgrade Order <safe-upgrade-order>` applied to
+the node's own ledger; drain a node before rolling its agent back.
 
 **A new node reason appears.** While the controller is comparing a freshly
 registered node's ledger, that node reports ``reconciling with the controller``

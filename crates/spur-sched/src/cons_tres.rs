@@ -24,6 +24,9 @@ pub enum ReleaseGround {
     /// The reservation never had anything spawned against it, so there is no
     /// payload to answer for and nothing for the controller to acknowledge.
     NeverSpawned,
+    /// The controller answered a claim Raft never had. Its answer is the whole
+    /// of the acknowledgement, so there is no committed index to name.
+    SettledUnrecordedClaim,
 }
 
 /// Licence to hand a run's slice back. Deliberately not `Clone` and built only
@@ -59,6 +62,15 @@ impl ReleaseWarrant {
         }
     }
 
+    /// The controller has answered a claim it holds no record of. Mint this only
+    /// from that answer, so the audit never reads it as a committed completion.
+    pub fn settled_unrecorded_claim(run: RunKey) -> Self {
+        Self {
+            run,
+            ground: ReleaseGround::SettledUnrecordedClaim,
+        }
+    }
+
     pub fn run(&self) -> RunKey {
         self.run
     }
@@ -74,6 +86,7 @@ impl std::fmt::Display for ReleaseGround {
             Self::Acknowledged(index) => write!(f, "acknowledged at raft index {index}"),
             Self::ControllerCancelled => f.write_str("controller cancelled"),
             Self::NeverSpawned => f.write_str("never spawned"),
+            Self::SettledUnrecordedClaim => f.write_str("settled an unrecorded claim"),
         }
     }
 }
