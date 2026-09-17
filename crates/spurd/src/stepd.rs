@@ -1447,9 +1447,8 @@ async fn try_notify_agent(
     serde_json::from_str(&line).map_err(io::Error::other)
 }
 
-/// Every open terminal this session holds, keyed by the shell's pid: a job can
-/// have several at once, and a hand-back retains custody so the terminal still
-/// outlives however many agents come and go.
+/// Every open terminal this session holds, keyed by the shell's pid. A hand-back
+/// retains custody, so the terminal outlives however many agents come and go.
 pub type PtyCustody = Arc<Mutex<HashMap<u32, std::os::fd::OwnedFd>>>;
 
 /// Take custody of a terminal this supervisor opened for its own launch, so the

@@ -2660,16 +2660,24 @@ fn terminal_environment(
     environment
 }
 
-/// Who the terminal belongs to and where it runs.
+/// Only a supervisor confirmed dead may be launched over. An unreadable one
+/// counts as alive: fencing it would SIGTERM a shell that is still serving.
+fn confirmed_gone(liveness: std::io::Result<crate::stepd::StepdLiveness>) -> bool {
+    matches!(liveness, Ok(crate::stepd::StepdLiveness::Stale))
+}
+
+fn terminal_supervisor_is_gone(descriptor: &crate::stepd::StepdDescriptor) -> bool {
+    confirmed_gone(crate::stepd::stepd_liveness(descriptor))
+}
+
 struct TerminalIdentity {
     job_id: u32,
     step_id: u32,
     node: String,
 }
 
-/// The launch a terminal's supervisor is handed. The step id stays the client's
-/// user step, which is what puts the shell in a cgroup leaf under the job
-/// rather than on the job node itself.
+/// The step id stays the client's user step, which is what puts the shell in a
+/// cgroup leaf under the job rather than on the job node itself.
 fn terminal_launch_config(
     entry: &crate::job_entry::JobEntry,
     identity: TerminalIdentity,
@@ -3922,8 +3930,7 @@ impl AgentService {
     }
 
     /// Take up this step's terminal, opening one only if the step has none.
-    /// Reattaching after a client left — or after this agent restarted — must
-    /// find the shell already running rather than start a second one.
+    /// A reattach must find the shell already running, not start a second one.
     async fn attach_terminal(
         &self,
         entry: &crate::job_entry::JobEntry,
@@ -3934,37 +3941,57 @@ impl AgentService {
         let held = stepds_for_job(&*self.stepds.lock().await, init.job_id)
             .into_iter()
             .find(|descriptor| descriptor.step_id == init.step_id);
-        if let Some(descriptor) = held {
-            let waiter = self
-                .step_completions
-                .register(init.job_id, descriptor.run_attempt, descriptor.step_id)
-                .await;
-            match self.claim_terminal(&descriptor, waiter).await {
-                Some(terminal) => {
-                    info!(
-                        job_id = init.job_id,
-                        step_id = init.step_id,
-                        child_pid = terminal.pid,
-                        "resumed a supervised terminal"
-                    );
-                    return Ok(terminal);
-                }
-                // Its supervisor is gone or never opened a terminal; the launch
-                // below fences whatever is left of it.
-                None => {
-                    self.step_completions
-                        .deregister(init.job_id, descriptor.run_attempt, descriptor.step_id)
-                        .await
-                }
-            }
+        // Only a supervisor that is confirmed gone may be launched over: fencing
+        // a live one would SIGTERM the shell whose terminal was asked for.
+        if let Some(descriptor) = held.filter(|descriptor| !terminal_supervisor_is_gone(descriptor))
+        {
+            return self.resume_terminal(&descriptor).await;
         }
         self.launch_supervised_terminal(entry, init.job_id, init.step_id, argv, winsize)
             .await
     }
 
-    /// Open this step's terminal under its own supervisor. The shell is then a
-    /// child of a process that outlives the agent, and `scancel` reaches it
-    /// through the stepd map like every other step.
+    /// Take over a terminal whose supervisor is still running. Refused rather
+    /// than shared: two bridges on one master interleave the user's keystrokes.
+    async fn resume_terminal(
+        &self,
+        descriptor: &crate::stepd::StepdDescriptor,
+    ) -> Result<SupervisedTerminal, Status> {
+        let (job_id, step_id) = (descriptor.job_id, descriptor.step_id);
+        let waiter = self
+            .step_completions
+            .reregister(job_id, descriptor.run_attempt, step_id)
+            .await
+            .ok_or_else(|| {
+                Status::already_exists(format!(
+                    "job {job_id} step {step_id} already has a client attached"
+                ))
+            })?;
+        match self.claim_terminal(descriptor, waiter).await {
+            Some(terminal) => {
+                info!(
+                    job_id,
+                    step_id,
+                    child_pid = terminal.pid,
+                    "resumed a supervised terminal"
+                );
+                Ok(terminal)
+            }
+            None => {
+                // Ours to clear: reregister refused to hand one out while another
+                // client's was parked, so this waiter can only be the one above.
+                self.step_completions
+                    .deregister(job_id, descriptor.run_attempt, step_id)
+                    .await;
+                Err(Status::unavailable(format!(
+                    "job {job_id} step {step_id} is running but its terminal could not be read"
+                )))
+            }
+        }
+    }
+
+    /// The shell becomes a child of a process that outlives the agent, and
+    /// `scancel` reaches it through the stepd map like every other step.
     async fn launch_supervised_terminal(
         &self,
         entry: &crate::job_entry::JobEntry,
@@ -4084,21 +4111,15 @@ impl AgentService {
         }
     }
 
-    /// Stop and untrack a supervisor whose terminal this agent could not take
-    /// up, so it does not sit holding the step's slice with nobody attached.
+    /// Discard a supervisor whose terminal this agent could not take up. The
+    /// shell may already be running, and stopping the supervisor alone would
+    /// leave it on init still holding the step's cgroup.
     async fn abandon_terminal_supervisor(
         &self,
         descriptor: &crate::stepd::StepdDescriptor,
         reason: &'static str,
     ) {
-        if let Err(error) = stop_stepd_process(descriptor).await {
-            warn!(
-                job_id = descriptor.job_id,
-                step_id = descriptor.step_id,
-                %error,
-                "failed to stop an unattached terminal supervisor"
-            );
-        }
+        discard_stepd_session(descriptor).await;
         release_stepd_tracking(
             &self.running,
             &self.allocation,
@@ -8586,6 +8607,15 @@ impl SlurmAgent for AgentService {
             }
         };
 
+        // A reserved id names the job's own supervisor, which this would then
+        // fence and replace with a shell.
+        if !spur_core::step::is_user_step(init.step_id) {
+            return Err(Status::invalid_argument(format!(
+                "step {} is reserved and cannot host a session",
+                init.step_id
+            )));
+        }
+
         self.check_job_access(init.job_id, identity.as_ref(), &init.user, "attach to")
             .await?;
 
@@ -8706,9 +8736,13 @@ impl SlurmAgent for AgentService {
             _ => None,
         };
 
+        // Only a terminal actually taken from the job's custody is released back
+        // to it; a supervised one is its own supervisor's to hold.
+        let mut release_to_legacy_custody = false;
         let terminal = match legacy {
             Some((session_id, master)) => {
                 let pid = session_id as i32;
+                release_to_legacy_custody = true;
                 info!(job_id = init.job_id, pid, "resumed an orphaned terminal");
                 SupervisedTerminal {
                     master,
@@ -8745,9 +8779,10 @@ impl SlurmAgent for AgentService {
         tokio::spawn(async move {
             bridge.await;
             live_ptys.lock().await.remove(&job_id);
-            // Only the legacy shape needs this: a terminal's own supervisor exits
-            // with the shell, and until then a reattach still has to find it.
-            if let Some(dir) = legacy_custody_dir.as_deref() {
+            if let Some(dir) = legacy_custody_dir
+                .as_deref()
+                .filter(|_| release_to_legacy_custody)
+            {
                 if let Err(error) = crate::stepd::release_pty_master(dir, child_pid as u32).await {
                     warn!(job_id, child_pid, %error, "failed to release a closed terminal");
                 }
@@ -10405,28 +10440,28 @@ mod tests {
 
     // Nothing else reaches an interactive shell: it has no `active_steps` entry,
     // and `cancel_active_steps_for_job` skips supervised steps by design.
-    #[test]
-    fn a_cancel_reaches_a_terminal_running_under_its_own_supervisor() {
+    #[tokio::test]
+    async fn a_cancel_reaches_a_terminal_tracked_the_way_its_launch_tracks_it() {
         let terminal_step = 7;
-        let sessions: StepdMap = [spur_core::step::STEP_BATCH, terminal_step]
-            .into_iter()
-            .map(|step_id| {
-                (
-                    (42, step_id),
-                    crate::stepd::StepdDescriptor::new(
-                        42,
-                        3,
-                        step_id,
-                        0,
-                        0,
-                        std::path::PathBuf::from("/tmp/runtime.sock"),
-                        std::path::PathBuf::new(),
-                    ),
-                )
-            })
-            .collect();
+        let sessions: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
+        for step_id in [spur_core::step::STEP_BATCH, terminal_step] {
+            claim_stepd_slot(
+                &sessions,
+                crate::stepd::StepdDescriptor::new(
+                    42,
+                    3,
+                    step_id,
+                    0,
+                    0,
+                    std::path::PathBuf::from("/tmp/runtime.sock"),
+                    std::path::PathBuf::new(),
+                ),
+            )
+            .await
+            .expect("a terminal must claim its slot");
+        }
 
-        let reached: Vec<u32> = stepds_for_attempt(&sessions, 42, 3)
+        let reached: Vec<u32> = stepds_for_attempt(&*sessions.lock().await, 42, 3)
             .into_iter()
             .map(|descriptor| descriptor.step_id)
             .collect();
@@ -10434,7 +10469,52 @@ mod tests {
             reached.contains(&terminal_step),
             "a cancel must reach the terminal: {reached:?}"
         );
-        assert!(stepds_for_attempt(&sessions, 42, 4).is_empty());
+        assert!(stepds_for_attempt(&*sessions.lock().await, 42, 4).is_empty());
+    }
+
+    // A second client must be refused rather than handed the same master: two
+    // bridges on one terminal interleave the user's keystrokes.
+    #[tokio::test]
+    async fn a_second_client_cannot_take_over_a_terminal_that_still_has_one() {
+        let completions = crate::step_completion::StepCompletions::new();
+        let first = completions
+            .reregister(42, 3, 7)
+            .await
+            .expect("the first client takes the terminal");
+
+        assert!(
+            completions.reregister(42, 3, 7).await.is_none(),
+            "a second client must not displace the first"
+        );
+
+        drop(first);
+        assert!(
+            completions.reregister(42, 3, 7).await.is_some(),
+            "the terminal is free again once its client is gone"
+        );
+    }
+
+    // An unreadable supervisor is not a dead one. Treating it as dead makes the
+    // fresh launch fence it, killing the shell the client asked to resume.
+    #[test]
+    fn only_a_supervisor_confirmed_dead_is_launched_over() {
+        assert!(confirmed_gone(Ok(crate::stepd::StepdLiveness::Stale)));
+        assert!(!confirmed_gone(Ok(crate::stepd::StepdLiveness::Live)));
+        assert!(!confirmed_gone(Err(std::io::Error::other("unreadable"))));
+    }
+
+    #[test]
+    fn a_live_supervisor_reads_as_live_through_the_descriptor() {
+        let live = crate::stepd::StepdDescriptor::new(
+            42,
+            3,
+            7,
+            std::process::id(),
+            crate::stepd::process_start_ticks(std::process::id()).unwrap_or(0),
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+        assert!(!terminal_supervisor_is_gone(&live));
     }
 
     #[test]
@@ -13388,6 +13468,15 @@ mod tests {
         assert!(!running.lock().await.contains_key(&42));
     }
 
+    /// A namespaced job whose pid cannot exist, so `/proc/<pid>/...` probes and
+    /// `/proc/<pid>/environ` reads resolve the same way on every host.
+    fn dead_pid_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {
+        crate::job_entry::JobEntry {
+            pid: i32::MAX,
+            ..nsenter_job_entry(uid, gid)
+        }
+    }
+
     fn nsenter_job_entry(uid: u32, gid: u32) -> crate::job_entry::JobEntry {
         crate::job_entry::JobEntry {
             pid: 1234,
@@ -13433,8 +13522,8 @@ mod tests {
         .expect("a terminal launch config")
     }
 
-    // The whole point of the change: an interactive shell is a supervised
-    // launch on a terminal, not an unsupervised child of the agent.
+    // An interactive shell is a supervised launch on a terminal, so the size
+    // the client asked for has to survive into the launch config.
     #[test]
     fn a_terminal_launches_on_a_pty_sized_the_way_the_client_asked() {
         let winsize = crate::pty::WindowSize {
@@ -13448,14 +13537,25 @@ mod tests {
         assert_eq!(config.io_mode, executor::LaunchIo::Pty(Some(winsize)));
     }
 
-    // A reserved step id would send setup_cgroup down the job-creation branch
-    // and have it claim the job node the allocation already owns.
+    // A reserved step id sends setup_cgroup down the job-creation branch, where
+    // it would claim the job node the allocation already owns.
     #[test]
-    fn a_terminal_keeps_the_user_step_that_puts_it_in_a_cgroup_leaf() {
+    fn a_terminal_lands_in_a_cgroup_leaf_below_the_job() {
         let config = terminal_config(&nsenter_job_entry(1000, 1000), 7, None);
+        let job = executor::reapable_cgroup_path(
+            config.job_id,
+            config.run_attempt,
+            spur_core::step::STEP_BATCH,
+        );
+        let leaf =
+            executor::reapable_cgroup_path(config.job_id, config.run_attempt, config.step_id);
 
-        assert_eq!(config.step_id, 7);
-        assert!(spur_core::step::is_user_step(config.step_id));
+        assert_ne!(leaf, job, "a terminal must not claim the job's own node");
+        assert_eq!(
+            leaf.parent(),
+            Some(job.as_path()),
+            "a terminal's cgroup must sit under the job's"
+        );
         assert_eq!(config.run_attempt, terminal_job_facts().run_attempt);
     }
 
@@ -13494,8 +13594,7 @@ mod tests {
     // the job's and nothing else.
     #[test]
     fn a_terminal_carries_the_jobs_environment_and_a_term() {
-        std::env::set_var("SPUR_TERMINAL_LEAK_CANARY", "leaked");
-        let config = terminal_config(&nsenter_job_entry(1000, 1000), 7, None);
+        let config = terminal_config(&dead_pid_job_entry(1000, 1000), 7, None);
 
         assert_eq!(
             config.environment.get("TERM").map(String::as_str),
@@ -13505,19 +13604,21 @@ mod tests {
             config.environment.get("SPUR_JOB_ID").map(String::as_str),
             Some("42")
         );
-        assert!(!config.environment.contains_key("SPUR_TERMINAL_LEAK_CANARY"));
-        std::env::remove_var("SPUR_TERMINAL_LEAK_CANARY");
+        assert_eq!(
+            config.environment.get("SLURM_JOB_ID").map(String::as_str),
+            Some("42")
+        );
     }
 
     // An empty argv is the bare `srun --pty`; the shell is resolved inside the
     // job's mount namespace, not against the host's filesystem.
     #[test]
     fn a_session_with_no_command_resolves_a_shell() {
-        let entry = nsenter_job_entry(1000, 1000);
+        let entry = dead_pid_job_entry(1000, 1000);
         assert_eq!(
             session_shell(&entry, &[]),
             vec!["/bin/sh".to_string()],
-            "a job whose namespace has no bash falls back to sh"
+            "a namespace whose /proc root cannot be read falls back to sh"
         );
         assert_eq!(
             session_shell(&entry, &["id".to_string()]),
@@ -15330,7 +15431,6 @@ mod tests {
         );
     }
 
-    // The exec counterpart of the PTY required-join test: `spur exec` must refuse to
     // run outside the job's device filter when `[cgroup] required` and the join fails.
     #[tokio::test]
     async fn a_required_join_that_cannot_land_aborts_the_exec() {
