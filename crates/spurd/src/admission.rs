@@ -1255,7 +1255,7 @@ impl AdmissionStore {
             // The record is the only instruction to release a slice, so taking
             // one still charged strands it with nothing left to say so.
             let Some(run_key) = run.key() else { continue };
-            if charged.contains(&run_key) {
+            if charge_covers(charged, run.job_id, run.run_attempt) {
                 continue;
             }
             if admitted.is_settled() || admitted.aged_out(now_unix_ms, retention_ms) {
@@ -1285,8 +1285,7 @@ impl AdmissionStore {
             }
             // Unreadable is not evidence the slice it names came back.
             if parse_run_dir_name(&entry.path)
-                .and_then(|(job_id, attempt)| RunKey::new(job_id, attempt))
-                .is_some_and(|run| charged.contains(&run))
+                .is_some_and(|(job_id, attempt)| charge_covers(charged, job_id, attempt))
             {
                 continue;
             }
@@ -1305,6 +1304,13 @@ impl AdmissionStore {
         }
         Ok(removed)
     }
+}
+
+/// Whether anything charged names this run: its own key, or the widened key of a
+/// charge no attempt could be put to. Exact containment would collect that one.
+fn charge_covers(charged: &HashSet<RunKey>, job_id: u32, run_attempt: u32) -> bool {
+    RunKey::new(job_id, run_attempt).is_some_and(|run| charged.contains(&run))
+        || charged.contains(&RunKey::any_attempt(job_id))
 }
 
 /// Removes a run directory or a stray file left in the ledger root; a record
@@ -1682,6 +1688,39 @@ mod tests {
         let charged = HashSet::from([key(1, 1)]);
         assert_eq!(store.sweep(u64::MAX, 1, &charged).unwrap(), 0);
         assert_eq!(store.sweep(u64::MAX, 1, &HashSet::new()).unwrap(), 1);
+    }
+
+    // A charge no attempt names has to spare its own job and no one else's;
+    // halting the sweep node-wide instead grows the ledger without bound.
+    #[test]
+    fn a_widened_charge_spares_its_own_job_and_sweeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+
+        let mut held = run_with(1, 2, 1);
+        held.state = RunState::Cleaned;
+        store.admit_run(&held).unwrap();
+        let unreadable = store.prepare_run_dir(key(1, 3)).unwrap();
+        publish_private(&unreadable, RUN_FILE, b"{ not json").unwrap();
+
+        let mut collectable = run_with(2, 1, 1);
+        collectable.state = RunState::Cleaned;
+        store.admit_run(&collectable).unwrap();
+
+        let charged = HashSet::from([RunKey::any_attempt(1)]);
+        assert_eq!(store.sweep(u64::MAX, 1, &charged).unwrap(), 1);
+        assert!(
+            store.load_run(key(1, 2)).is_ok(),
+            "an unnameable charge still owes its job's records a release"
+        );
+        assert!(
+            store.root().join("1.3").exists(),
+            "unreadable is not evidence the widened charge came back"
+        );
+        assert!(
+            store.load_run(key(2, 1)).is_err(),
+            "another job's settled record must still be collected"
+        );
     }
 
     #[test]

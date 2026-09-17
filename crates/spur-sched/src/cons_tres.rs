@@ -545,17 +545,31 @@ impl NodeAllocation {
         unbacked
     }
 
-    /// Every run this node still charges resources to, launches in flight
-    /// included: `Err` names a charge no `RunKey` can represent, never drops it.
-    pub fn charged_runs(&self) -> Result<HashSet<RunKey>, u32> {
+    /// Every run this node charges, and the job ids no exact `RunKey` names.
+    /// Those widen into the set to cover their whole job, never dropped or fatal.
+    pub fn charged_runs(&self) -> (HashSet<RunKey>, Vec<u32>) {
         let mut charged = HashSet::with_capacity(self.owners.len());
+        let mut unnameable = Vec::new();
         for (job_id, owned) in &self.owners {
-            let Some(run) = RunKey::new(*job_id, owned.run_attempt) else {
-                return Err(*job_id);
-            };
-            charged.insert(run);
+            match RunKey::new(*job_id, owned.run_attempt) {
+                Some(run) => {
+                    charged.insert(run);
+                }
+                None => {
+                    unnameable.push(*job_id);
+                    charged.insert(RunKey::any_attempt(*job_id));
+                }
+            }
         }
-        Ok(charged)
+        unnameable.sort_unstable();
+        (charged, unnameable)
+    }
+
+    /// The attempt this node charges for one job, `None` if it charges nothing or
+    /// names no attempt. Reads this job's owner alone, so no other answers for it.
+    pub fn charged_attempt(&self, job_id: u32) -> Option<u32> {
+        let owned = self.owners.get(&job_id)?;
+        RunKey::new(job_id, owned.run_attempt)?.attempt()
     }
 }
 
@@ -1281,7 +1295,7 @@ mod tests {
 
         assert_eq!(
             node.charged_runs(),
-            Ok(HashSet::from([key(7, 1), key(9, 1)])),
+            (HashSet::from([key(7, 1), key(9, 1)]), vec![]),
             "a refused attempt must not evict the one it was superseding"
         );
         assert_eq!(node.free_cpus(), 4);
@@ -1292,18 +1306,36 @@ mod tests {
     }
 
     // The set gates whether a record may be deleted, so an owner it cannot
-    // represent must stop the sweep rather than read as nothing being charged.
+    // represent must widen to its whole job rather than read as uncharged.
     #[test]
-    fn an_owner_that_cannot_be_named_as_a_run_is_reported_not_dropped() {
+    fn an_owner_that_cannot_be_named_as_a_run_is_widened_not_dropped() {
         let mut node = make_node(8, 16_000, 0, "mi300x");
         node.restore_for_job(7, 0, &[0, 1], 1_000, &[])
             .expect("a descriptor naming no attempt still charges the node");
 
         assert_eq!(
             node.charged_runs(),
-            Err(7),
-            "a charge the set cannot name must not read as uncharged"
+            (HashSet::from([RunKey::any_attempt(7)]), vec![7]),
+            "a charge the set cannot name must cover every attempt of its job"
         );
+    }
+
+    // One unnameable owner used to answer for the whole node, so a healthy
+    // neighbour's charge has to survive it being there.
+    #[test]
+    fn an_unnameable_owner_does_not_answer_for_another_job() {
+        let mut node = make_node(8, 16_000, 0, "mi300x");
+        node.restore_for_job(7, 0, &[0, 1], 1_000, &[])
+            .expect("a descriptor naming no attempt still charges the node");
+        node.allocate_for_job(9, 3, 2, 1_000, &[])
+            .expect("a neighbour reserves alongside it");
+
+        assert_eq!(node.charged_attempt(9), Some(3));
+        assert_eq!(node.charged_attempt(7), None);
+        assert_eq!(node.charged_attempt(11), None);
+        let (charged, unnameable) = node.charged_runs();
+        assert!(charged.contains(&key(9, 3)));
+        assert_eq!(unnameable, vec![7]);
     }
 
     // The superseding attempt still has to be able to take over what the
@@ -1320,7 +1352,7 @@ mod tests {
             .expect("the newer attempt reclaims what the older one held");
 
         assert_eq!(second.gpu_ids, vec![0, 1, 2, 3]);
-        assert_eq!(node.charged_runs(), Ok(HashSet::from([key(7, 2)])));
+        assert_eq!(node.charged_runs(), (HashSet::from([key(7, 2)]), vec![]));
         assert_eq!(node.free_cpus(), 0);
         assert_eq!(node.free_memory_mb(), 0);
     }

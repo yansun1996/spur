@@ -4137,18 +4137,15 @@ async fn collect_settled_admissions(
     allocation: &Arc<Mutex<NodeAllocation>>,
     admissions: &crate::admission::AdmissionStore,
 ) {
-    // Sweeping against a set that cannot name every charge would collect the
-    // record that is the only thing left able to order that release.
-    let charged = match allocation.lock().await.charged_runs() {
-        Ok(charged) => charged,
-        Err(job_id) => {
-            warn!(
-                job_id,
-                "this node charges a reservation that names no run; not collecting any record"
-            );
-            return;
-        }
-    };
+    // A charge no attempt names still spares its own job's records — widened into
+    // the set — rather than stopping the sweep for every other job on the node.
+    let (charged, unnameable) = allocation.lock().await.charged_runs();
+    for job_id in unnameable {
+        warn!(
+            job_id,
+            "this node charges a reservation that names no run; keeping its records"
+        );
+    }
     let store = admissions.clone();
     let swept = tokio::task::spawn_blocking(move || {
         store.sweep(
@@ -8737,14 +8734,7 @@ impl AgentService {
     /// The attempt this node's claim index still charges for `job_id`. The only
     /// name a reservation whose launch never reached the tracking map still has.
     async fn charged_attempt(&self, job_id: u32) -> Option<u32> {
-        self.allocation
-            .lock()
-            .await
-            .charged_runs()
-            .ok()?
-            .iter()
-            .find(|run| run.job_id() == job_id)
-            .and_then(|run| run.attempt())
+        self.allocation.lock().await.charged_attempt(job_id)
     }
 
     /// Note the controller's cancel on a run still being torn down. Settling it
@@ -16897,6 +16887,52 @@ mod tests {
         assert_eq!(svc.allocation.lock().await.free_cpus(), 8);
     }
 
+    // One owner nobody can name used to stop collection for the whole node, so
+    // the spool grew for as long as that single job lasted.
+    #[tokio::test]
+    async fn an_unnameable_charge_does_not_stop_the_node_from_collecting() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .restore_for_job(88, 0, &[0, 1], 1000, &[])
+                .expect("a charge that names no attempt");
+        }
+
+        let mut settled = crate::admission::RunAdmission::new(
+            77,
+            1,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        settled.state = crate::admission::RunState::Cleaned;
+        admissions.admit_run(&settled).expect("admit");
+
+        let mut held = crate::admission::RunAdmission::new(
+            88,
+            4,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        held.state = crate::admission::RunState::Cleaned;
+        admissions.admit_run(&held).expect("admit");
+
+        collect_settled_admissions(&svc.allocation, &admissions).await;
+
+        assert!(
+            admissions.load_run(key(77, 1)).is_err(),
+            "an unrelated job's settled record must still be collected"
+        );
+        assert!(
+            admissions.load_run(key(88, 4)).is_ok(),
+            "the unnameable charge keeps its own records, its release unproven"
+        );
+    }
+
     // A completion the controller acknowledges late settles the record away from
     // the release. The sweep must not collect the slice's only instruction.
     #[tokio::test]
@@ -17930,7 +17966,7 @@ mod tests {
 
         let alloc = svc.allocation.lock().await;
         assert!(
-            alloc.charged_runs().expect("named runs").is_empty(),
+            alloc.charged_runs().0.is_empty(),
             "a slice already given back must not be taken again"
         );
         assert!(!alloc.allocated_cpus[0], "the core must still read as free");
@@ -17951,7 +17987,7 @@ mod tests {
 
         assert_eq!(
             svc.allocation.lock().await.charged_runs(),
-            Ok(HashSet::from([key(2, 1)])),
+            (HashSet::from([key(2, 1)]), vec![]),
             "the run still on those cores must be the one holding them"
         );
     }
@@ -20331,6 +20367,59 @@ mod tests {
             svc.allocation.lock().await.free_cpus(),
             while_held + 2,
             "and released once the hook's owner says it ended"
+        );
+    }
+
+    // Nothing was ever named to answer for this hook, so no ledger can say it
+    // ended. Waiting is not proof, and the slice stays put until a restart is.
+    #[tokio::test]
+    async fn an_epilog_whose_owner_was_never_recorded_holds_its_slice() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let store = crate::stepd::StepdStore::new(state.path());
+
+        admit_a_supervised_run(&admissions, &svc.reporter.hostname, 74, vec![0, 1], None);
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(74, 1, 2, 1_000, &[])
+                .expect("allocate");
+            alloc.commit_job(74, 1);
+        }
+        svc.insert_test_job(74, an_allocation_only_job(1)).await;
+        let while_held = svc.allocation.lock().await.free_cpus();
+
+        svc.drop_tracked_job(74, 1).await;
+        let admitted = admissions
+            .load_all()
+            .expect("the ledger")
+            .runs
+            .into_iter()
+            .find(|admitted| admitted.run.job_id == 74)
+            .expect("the record");
+        assert!(
+            hook_owner_step(&admitted).is_none(),
+            "no participant carries a supervisor, so no step owns the hook"
+        );
+        assert!(admitted.run.cleanup.epilog.is_in_flight());
+
+        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "an epilog no one can answer for must not hand its cores on"
+        );
+        assert!(
+            admissions
+                .load_run(key(74, 1))
+                .expect("the record")
+                .cleanup
+                .epilog
+                .is_in_flight(),
+            "and the hook must still read as unfinished"
         );
     }
 
