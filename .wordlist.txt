@@ -343,3 +343,5 @@ tmp
 adminlevel
 extern
 stepd
+misconfiguration
+unrepaired
