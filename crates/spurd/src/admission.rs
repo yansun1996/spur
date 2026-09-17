@@ -885,24 +885,37 @@ impl AdmissionStore {
         Ok(loaded)
     }
 
-    /// Read-modify-write so cleanup cannot discard a hold or the creation time,
-    /// and the caller must say whether an epilog is owed: teardown precedes it.
+    /// Read-modify-write so cleanup cannot discard a hold or the creation time.
+    /// The epilog debt only ever widens here: clearing one is the hook's to do.
     pub fn mark_run_cleaned(&self, run_key: RunKey, epilog: EpilogOwed) -> io::Result<bool> {
         let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
-        if run.state == RunState::Cleaned {
+        let already_cleaned = run.state == RunState::Cleaned;
+        let epilog = match (epilog, run.cleanup.epilog) {
+            (EpilogOwed::Yes, HookState::NotStarted) => HookState::Pending,
+            // A re-mark may add a debt but never settle one: only the first
+            // stands for the teardown that could have lost the hook's owner.
+            (_, recorded) if already_cleaned => recorded,
+            (_, recorded) => recorded.settled_after_owner_loss(),
+        };
+        if already_cleaned && run.cleanup.epilog == epilog {
             return Ok(true);
         }
         run.state = RunState::Cleaned;
-        run.cleanup.epilog = match (epilog, run.cleanup.epilog) {
-            (EpilogOwed::Yes, HookState::NotStarted) => HookState::Pending,
-            (_, recorded) => recorded.settled_after_owner_loss(),
-        };
+        run.cleanup.epilog = epilog;
         self.admit_run(&run)?;
         Ok(true)
+    }
+
+    /// One run and everything admitted under it, for a caller that has to reason
+    /// about its supervisors rather than only its own fields.
+    pub fn load_admitted(&self, run_key: RunKey) -> io::Result<AdmittedRun> {
+        let run = self.load_run(run_key)?;
+        let (participants, _) = self.participants(run_key)?;
+        Ok(AdmittedRun { run, participants })
     }
 
     /// Settle every hook left in flight by a process that is gone. Sound only at
@@ -2260,6 +2273,54 @@ mod tests {
         assert!(matches!(
             store.settle_permit(key(7, 1)).unwrap(),
             SettlePermit::Due(_)
+        ));
+    }
+
+    // Teardown can be marked by one caller and the hook owed by a later one, so a
+    // mark that stops at the first would drop the debt the gate is built on.
+    #[test]
+    fn a_later_mark_can_still_add_the_hook_a_cleaned_run_owes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::Yes).unwrap();
+
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap().cleanup.epilog,
+            HookState::Pending,
+            "a run already marked cleaned must still be able to take on a hook"
+        );
+        assert!(
+            store
+                .release_is_due(key(7, 1), spur_core::step::STEP_BATCH)
+                .unwrap()
+                .is_none(),
+            "and that debt must hold the release"
+        );
+    }
+
+    // Three of the mark's callers hardcode "nothing owed". None of them has seen
+    // the hook, so none may be the one that declares it over.
+    #[test]
+    fn a_later_mark_never_settles_a_hook_still_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::Yes).unwrap();
+        store.record_epilog(key(7, 1), HookState::Running).unwrap();
+
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap().cleanup.epilog,
+            HookState::Running,
+            "a caller that never saw the hook must not settle it"
+        );
+        assert!(matches!(
+            store.settle_permit(key(7, 1)).unwrap(),
+            SettlePermit::NotQuiescent
         ));
     }
 
