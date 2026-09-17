@@ -6622,7 +6622,7 @@ impl SlurmAgent for AgentService {
 
         // An srun allocation holds a slice with no launch of its own, so it
         // needs the same record: the claim outlives whatever steps join it.
-        let run_record = crate::admission::RunAdmission::new(
+        let mut run_record = crate::admission::RunAdmission::new(
             req.job_id,
             req.run_attempt,
             &self.reporter.hostname,
@@ -6633,8 +6633,26 @@ impl SlurmAgent for AgentService {
             },
             crate::admission::now_unix_ms(),
         );
+        run_record.lifecycle_owner_step = Some(spur_core::step::STEP_EXTERN);
         if let Err(error) = admissions.admit_run_async(run_record.clone()).await {
             error!(job_id = req.job_id, %error, "failed to persist the run admission record");
+            return Err(Status::unavailable(format!(
+                "could not record the admission for job {}: {error}",
+                req.job_id
+            )));
+        }
+        // The allocation's own participant. Without it the run has no step that
+        // can own a hook, and its teardown reads as owing nothing.
+        let mut participant_record = crate::admission::ParticipantAdmission::new(
+            req.job_id,
+            req.run_attempt,
+            spur_core::step::STEP_EXTERN,
+            &self.reporter.hostname,
+            run_record.allocation.clone(),
+        );
+        participant_record.final_report.required = true;
+        if let Err(error) = admissions.admit_participant_async(participant_record).await {
+            error!(job_id = req.job_id, %error, "failed to persist the participant admission record");
             return Err(Status::unavailable(format!(
                 "could not record the admission for job {}: {error}",
                 req.job_id
@@ -6751,6 +6769,24 @@ impl SlurmAgent for AgentService {
             .map_err(|error| {
                 Status::unavailable(format!("failed to start allocation stepd: {error}"))
             })?;
+
+            // A supervisor is live against this reservation now, so an abandoned
+            // launch must leave the slice held rather than hand it back.
+            reservation_guard.mark_spawned();
+
+            // Names who answers for this run's hooks. Unrecorded, the teardown
+            // gate finds no owner and hands the slice back under a live epilog.
+            if let Err(error) = admissions.record_supervisor(
+                alloc_run,
+                spur_core::step::STEP_EXTERN,
+                crate::admission::SupervisorRef {
+                    pid: descriptor.pid,
+                    start_ticks: descriptor.process_start_ticks,
+                    boot_id: descriptor.boot_id.clone(),
+                },
+            ) {
+                warn!(job_id = req.job_id, %error, "failed to record the supervisor identity");
+            }
 
             // The allocation's cgroup is created here, not by the supervisor, so
             // record it or a stale session leaves its steps unreaped.
@@ -19611,6 +19647,109 @@ mod tests {
             svc.allocation.lock().await.free_cpus(),
             while_held + 2,
             "a ledger nobody is left to write must not hold the cores for good"
+        );
+    }
+
+    /// An `srun --pty` allocation as the RPC leaves it, plus the supervisor
+    /// identity a unit test cannot spawn a real `spurstepd` to write.
+    async fn a_registered_allocation(svc: &AgentService, job_id: u32) -> u32 {
+        svc.register_job_allocation(Request::new(RegisterJobAllocationRequest {
+            job_id,
+            cpus: 2,
+            run_attempt: 1,
+            allocated: Some(ResourceAllocations {
+                cpus: 2,
+                memory_mb: 512,
+                devices: std::collections::HashMap::new(),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .expect("register the allocation");
+        svc.admissions()
+            .record_supervisor(
+                key(job_id, 1),
+                spur_core::step::STEP_EXTERN,
+                a_live_supervisor(),
+            )
+            .expect("record the allocation supervisor");
+        svc.allocation.lock().await.free_cpus()
+    }
+
+    // The allocation path launches nothing the controller told it to, so its
+    // record was the one nobody wrote — and a cancel read that as owing no hook.
+    #[tokio::test]
+    async fn a_registered_allocation_names_the_step_that_owns_its_lifetime() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        a_registered_allocation(&svc, 70).await;
+
+        let admissions = svc.admissions();
+        assert_eq!(
+            admissions
+                .load_run(key(70, 1))
+                .expect("record")
+                .lifecycle_owner_step,
+            Some(spur_core::step::STEP_EXTERN),
+            "an allocation's own step has to be the one a release is keyed on"
+        );
+        let (admitted, rejected) = admissions.load_admitted(key(70, 1)).expect("participants");
+        assert!(rejected.is_empty());
+        assert_eq!(
+            hook_owner_step(&admitted),
+            Some(spur_core::step::STEP_EXTERN),
+            "without a participant the run has no step that could answer for a hook"
+        );
+    }
+
+    // Measured live: a cancelled pty job handed its cores to the next job 321ms
+    // in, while its own epilog still had ~29s left to run on them.
+    #[tokio::test]
+    async fn a_cancelled_allocation_holds_its_cores_until_its_epilog_ends() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let store = crate::stepd::StepdStore::new(state.path());
+        let while_held = a_registered_allocation(&svc, 71).await;
+
+        svc.drop_tracked_job(71, 1).await;
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "cores an epilog is still running on are not free"
+        );
+
+        store
+            .prepare_session_dir(71, 1, spur_core::step::STEP_EXTERN)
+            .expect("session dir");
+        store
+            .obligations(71, 1, spur_core::step::STEP_EXTERN)
+            .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
+            .expect("record the epilog's outcome");
+        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
+        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "and released once the hook's owner says it ended"
+        );
+    }
+
+    // The control for the hold above: a gate that refuses everything reads the
+    // same as one that refuses only what a hook is standing on.
+    #[tokio::test]
+    async fn a_cancelled_allocation_with_no_epilog_releases_at_once() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let while_held = a_registered_allocation(&svc, 72).await;
+
+        svc.drop_tracked_job(72, 1).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "a node that runs no epilog has nothing to wait for"
         );
     }
 
