@@ -17760,6 +17760,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
             running.clone(),
             false,
         ));
@@ -18186,6 +18187,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
             running.clone(),
             false,
         ));
@@ -18253,6 +18255,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
             running.clone(),
             false,
         ));
@@ -18900,6 +18903,7 @@ mod tests {
             std::collections::HashMap::new(),
             String::new(),
             String::new(),
+            std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
             false,
         ))
