@@ -134,9 +134,6 @@ pub struct ControllerService {
     /// compatibility fallback is public and cannot establish node identity.
     node_identity_key_configured: bool,
     incomplete_stepd_recoveries: Mutex<HashMap<(u32, u32), StepdRecoveryCohortState>>,
-    /// When each node's asked-for ledger pull last started. One node's standing
-    /// condition must not turn its heartbeat into a pull per heartbeat.
-    asked_ledger_pulls: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 enum StepdRecoveryCohortState {
@@ -285,10 +282,6 @@ pub(crate) fn resolve_startup_jwt_key(
 /// How long a node may stay gated for one reconcile. A node held past this is
 /// worse than one reconciled imperfectly: it is silently out of the cluster.
 const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// How long one node's asked-for pull holds off the next. A rate limit only:
-/// nothing here bounds a pull, so a slow one can still overlap its successor.
-const ASKED_LEDGER_PULL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a reconcile waits for this controller to replay its own log. Well under
 /// `RECONCILE_BUDGET`, leaving time for the directions that do not depend on it.
@@ -1250,34 +1243,13 @@ fn name_unresolved_claims_on_node(
     }
 }
 
-/// Whether this node's ask starts a pull, stamping it when it does. Stamped on
-/// dispatch, never on completion: this paces asks, it does not track a pull.
-fn claim_ledger_pull_slot(
-    asked: &mut HashMap<String, std::time::Instant>,
-    node: &str,
-    now: std::time::Instant,
-) -> bool {
-    if let Some(started) = asked.get(node) {
-        if now.duration_since(*started) < ASKED_LEDGER_PULL_COOLDOWN {
-            return false;
-        }
-    }
-    // A node that stopped asking must not keep an entry once its cooldown has
-    // lapsed, or the map outlives the nodes it names.
-    asked.retain(|_, started| now.duration_since(*started) < ASKED_LEDGER_PULL_COOLDOWN);
-    asked.insert(node.to_string(), now);
-    true
-}
-
 impl ControllerService {
     /// On its own task: the heartbeat must not wait on an RPC back to the node,
     /// and the node's alternative is the routine sweep, an hour away.
     fn pull_ledger_for_asking_node(&self, node: String) {
-        let mut asked = self.asked_ledger_pulls.lock();
-        if !claim_ledger_pull_slot(&mut asked, &node, std::time::Instant::now()) {
+        if !self.cluster.claim_ledger_pull_slot(&node) {
             return;
         }
-        drop(asked);
         info!(node = %node, "node asked to be reconciled; pulling its ledger");
         let cluster = self.cluster.clone();
         tokio::spawn(async move {
@@ -4794,7 +4766,6 @@ pub async fn serve(
         jwt_key,
         node_identity_key_configured,
         incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
-        asked_ledger_pulls: parking_lot::Mutex::new(HashMap::new()),
     };
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
@@ -6525,7 +6496,6 @@ mod tests {
             jwt_key: String::new(),
             node_identity_key_configured: false,
             incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
-            asked_ledger_pulls: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -8420,34 +8390,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_nodes_ask_is_paced_and_its_entry_does_not_outlive_the_cooldown() {
-        let mut asked = HashMap::new();
-        let t0 = std::time::Instant::now();
-
-        assert!(super::claim_ledger_pull_slot(&mut asked, "n1", t0));
-        assert!(
-            !super::claim_ledger_pull_slot(
-                &mut asked,
-                "n1",
-                t0 + ASKED_LEDGER_PULL_COOLDOWN - std::time::Duration::from_secs(1)
-            ),
-            "asking again inside the cooldown is the pull-per-heartbeat storm"
-        );
-        assert!(
-            super::claim_ledger_pull_slot(&mut asked, "n2", t0),
-            "one node's cooldown must not pace another's"
-        );
-
-        let lapsed = t0 + ASKED_LEDGER_PULL_COOLDOWN;
-        assert!(super::claim_ledger_pull_slot(&mut asked, "n1", lapsed));
-        assert_eq!(
-            asked.keys().collect::<Vec<_>>(),
-            vec!["n1"],
-            "n2 stopped asking, so its entry goes; otherwise the map grows without bound"
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_claim_under_attempt_zero_is_reported_not_killed() {
         // Attempt 0 names no run, so the cancel it would drive is an unfenced
@@ -8976,7 +8918,6 @@ mod tests {
             jwt_key,
             node_identity_key_configured,
             incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
-            asked_ledger_pulls: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 

@@ -1082,8 +1082,8 @@ enum LaunchFailureKind {
   LAUNCH_FAILURE_TARGET_MISMATCH = 7;
 }
 
-// What the node was already holding when it refused, so the controller can act
-// in the same round trip instead of guessing.
+// What the node named as already held when it refused. Diagnostic: the
+// controller re-derives the claim from the node's ledger before acting on it.
 message LaunchConflict {
   uint32 job_id = 1;
   uint32 run_attempt = 2;

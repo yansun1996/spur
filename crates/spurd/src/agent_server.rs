@@ -4134,14 +4134,91 @@ async fn collect_settled_admissions(
     }
 }
 
-/// A refusal the controller can resolve: it names the job already holding the
-/// resources, so it can decide which of the two is stale.
-fn overlap_status(holder: Option<u32>) -> Status {
-    match holder {
-        Some(job_id) => Status::resource_exhausted(format!(
-            "allocated resources are held on this node by job {job_id}"
-        )),
-        None => Status::resource_exhausted("allocated resources unavailable on this node"),
+/// A refusal the controller can resolve by looking at this node. Carried in a
+/// response, not a transport error, which has nowhere to say any of this.
+#[derive(Debug)]
+pub(crate) struct HeldRefusal {
+    message: String,
+    conflict: Option<LaunchConflict>,
+}
+
+impl HeldRefusal {
+    /// The node can say which job holds the resources, so the controller can
+    /// look that job up and decide which of the two is stale.
+    fn named(job_id: u32, run_attempt: u32, held: &AllocationResult) -> Self {
+        Self {
+            message: format!("allocated resources are held on this node by job {job_id}"),
+            conflict: Some(LaunchConflict {
+                job_id,
+                run_attempt,
+                cpu_ids: held.cpu_ids.clone(),
+                gpu_devices: held.gpu_ids.clone(),
+            }),
+        }
+    }
+
+    /// The node is holding something it cannot attribute to a job: only a full
+    /// ledger pull can tell the controller what.
+    fn unattributed(detail: &str) -> Self {
+        Self {
+            message: detail.to_string(),
+            conflict: None,
+        }
+    }
+
+    /// Derived from the conflict rather than stored beside it: an overlap the
+    /// controller is told to look up must always carry the job to look up.
+    pub(crate) fn kind(&self) -> LaunchFailureKind {
+        match self.conflict {
+            Some(_) => LaunchFailureKind::LaunchFailureLocalOverlap,
+            None => LaunchFailureKind::LaunchFailureResidualState,
+        }
+    }
+
+    pub(crate) fn into_response(self) -> LaunchJobResponse {
+        let failure_kind = self.kind() as i32;
+        LaunchJobResponse {
+            success: false,
+            error: self.message,
+            stdout_path: String::new(),
+            stderr_path: String::new(),
+            failure_kind,
+            conflict: self.conflict,
+        }
+    }
+}
+
+/// Describe what the node holds, or say it cannot. Both are answers the
+/// controller can act on; only the first names a job for it to adjudicate.
+fn held_refusal(alloc: &NodeAllocation, holder: Option<u32>, detail: &str) -> HeldRefusal {
+    match holder.and_then(|job_id| alloc.claim_of(job_id).map(|claim| (job_id, claim))) {
+        Some((job_id, (run_attempt, held))) => HeldRefusal::named(job_id, run_attempt, &held),
+        None => HeldRefusal::unattributed(detail),
+    }
+}
+
+/// A committed owner the node is not tracking as live that holds cores: the
+/// claim behind a shortfall. One holding none of them explains nothing.
+fn unexplained_cpu_holder(alloc: &NodeAllocation, live: &HashSet<u32>) -> Option<u32> {
+    alloc.committed_owners().into_iter().find(|owner| {
+        !live.contains(owner)
+            && alloc
+                .claim_of(*owner)
+                .is_some_and(|(_, held)| !held.cpu_ids.is_empty())
+    })
+}
+
+/// Why a launch could not reserve its slice: something this node is holding,
+/// which the controller resolves by looking, or an error only it can act on.
+#[derive(Debug)]
+pub(crate) enum LaunchRejection {
+    Held(HeldRefusal),
+    Failed(Status),
+}
+
+impl From<Status> for LaunchRejection {
+    fn from(status: Status) -> Self {
+        Self::Failed(status)
     }
 }
 
@@ -5425,10 +5502,17 @@ impl SlurmAgent for AgentService {
         // A launch names the node the controller scheduled it onto. If it does not name this host it
         // was aimed at the wrong agent — refuse rather than run another node's allocation here.
         if !req.target_node.is_empty() && !self.agent_owns_node(&req.target_node) {
-            return Err(Status::failed_precondition(format!(
-                "launch targeted node '{}' but this agent serves '{}'",
-                req.target_node, self.reporter.hostname
-            )));
+            return Ok(Response::new(LaunchJobResponse {
+                success: false,
+                error: format!(
+                    "launch targeted node '{}' but this agent serves '{}'",
+                    req.target_node, self.reporter.hostname
+                ),
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+                failure_kind: LaunchFailureKind::LaunchFailureTargetMismatch as i32,
+                conflict: None,
+            }));
         }
         // Before anything is reserved or spawned. These refuse a stale command
         // from the controller; they authenticate nobody.
@@ -5825,7 +5909,7 @@ impl SlurmAgent for AgentService {
         let (cpus, memory_mb) =
             resolve_cgroup_budget(req.allocated.as_ref(), &spec, tasks_per_node);
 
-        let (alloc_result, allocated_device_ids) = self
+        let reserved = self
             .allocate_local_resources(
                 job_id,
                 run_attempt,
@@ -5834,7 +5918,16 @@ impl SlurmAgent for AgentService {
                 cpus,
                 memory_mb,
             )
-            .await?;
+            .await;
+        let (alloc_result, allocated_device_ids) = match reserved {
+            Ok(reserved) => reserved,
+            // A transport error has nowhere to carry the holder, so the
+            // controller's reconcile never fires on one.
+            Err(LaunchRejection::Held(refusal)) => {
+                return Ok(Response::new(refusal.into_response()))
+            }
+            Err(LaunchRejection::Failed(status)) => return Err(status),
+        };
 
         // Release the reservation on any exit before commit, including a
         // cancelled launch future; disarmed once committed to `running`.
@@ -8628,14 +8721,15 @@ impl AgentService {
         allocated: Option<&ResourceAllocations>,
         cpus: u32,
         memory_mb: u64,
-    ) -> Result<(AllocationResult, Vec<u32>), Status> {
+    ) -> Result<(AllocationResult, Vec<u32>), LaunchRejection> {
         // A zero request reserves an empty cpuset on a node with nothing free,
         // which confirms as an allocation mismatch instead of refusing here.
         if cpus == 0 {
             warn!(job_id, "rejecting launch: it would reserve no cpu at all");
             return Err(Status::resource_exhausted(
                 "a launch must reserve at least one cpu on this node",
-            ));
+            )
+            .into());
         }
 
         let controller_gpu_ids: Vec<u32> = allocated
@@ -8650,7 +8744,8 @@ impl AgentService {
                 "job requests {} GPUs (type: {}) but controller sent no device IDs",
                 gres_gpu_count,
                 gres_gpu_type.as_deref().unwrap_or("any"),
-            )));
+            ))
+            .into());
         }
 
         // Hold running across the reclaim (running-then-allocation, as in commit)
@@ -8667,9 +8762,10 @@ impl AgentService {
                 Err(AllocError::GpusUnavailable) => {
                     // An owner absent from the live set is unaccounted for, not
                     // finished. Displacing it puts two jobs on one GPU.
-                    let unaccounted: Vec<u32> = alloc
-                        .conflicting_owners(&controller_gpu_ids)
-                        .into_iter()
+                    let conflicting = alloc.conflicting_owners(&controller_gpu_ids);
+                    let unaccounted: Vec<u32> = conflicting
+                        .iter()
+                        .copied()
                         .filter(|owner| !live.contains(owner))
                         .collect();
                     warn!(
@@ -8679,14 +8775,14 @@ impl AgentService {
                         already_allocated = ?alloc.allocated_gpu_ids(),
                         "refusing dispatch: the allocated GPUs are held on this node"
                     );
-                    // Named so the controller can look the holder up rather than
-                    // guess which of the two is stale.
-                    return Err(overlap_status(
-                        alloc
-                            .conflicting_owners(&controller_gpu_ids)
-                            .first()
-                            .copied(),
-                    ));
+                    // The unaccounted owner first: a live one holding the same
+                    // device is the controller's own doing, not the drift.
+                    let holder = unaccounted.first().or(conflicting.first()).copied();
+                    return Err(LaunchRejection::Held(held_refusal(
+                        &alloc,
+                        holder,
+                        "allocated resources unavailable on this node",
+                    )));
                 }
                 Err(AllocError::DuplicateJob) => {
                     // A launch is already in flight for this job id (reserved, not
@@ -8698,7 +8794,8 @@ impl AgentService {
                     );
                     return Err(Status::already_exists(format!(
                         "job {job_id} already has a launch in flight on this node"
-                    )));
+                    ))
+                    .into());
                 }
                 Err(AllocError::Superseded) => {
                     // A newer attempt already reserved/committed this job id; this
@@ -8710,21 +8807,27 @@ impl AgentService {
                 );
                     return Err(Status::failed_precondition(format!(
                         "job {job_id} was superseded by a newer attempt on this node"
-                    )));
+                    ))
+                    .into());
                 }
                 // Reachable on dispatch now that a shortfall refuses rather than
                 // serving a short list the caller reads as a full allocation.
                 Err(AllocError::CpusUnavailable) => {
                     warn!(job_id, "rejecting launch: allocated cores unavailable");
-                    return Err(Status::resource_exhausted(
+                    let holder = unexplained_cpu_holder(&alloc, &live);
+                    return Err(LaunchRejection::Held(held_refusal(
+                        &alloc,
+                        holder,
                         "allocated cores unavailable on this node",
-                    ));
+                    )));
                 }
+                // Unattributed whatever the node holds: a conflict carries cores
+                // and devices, and neither can say whose memory is in the way.
                 Err(AllocError::MemoryUnavailable) => {
                     warn!(job_id, "rejecting launch: no room for the requested memory");
-                    return Err(Status::resource_exhausted(
+                    return Err(LaunchRejection::Held(HeldRefusal::unattributed(
                         "allocated memory unavailable on this node",
-                    ));
+                    )));
                 }
             };
 
@@ -8740,7 +8843,7 @@ impl AgentService {
         job_id: u32,
         spec: &JobSpec,
         allocated: Option<&ResourceAllocations>,
-    ) -> Result<(AllocationResult, Vec<u32>), Status> {
+    ) -> Result<(AllocationResult, Vec<u32>), LaunchRejection> {
         let (cpus, memory_mb) = resolve_cgroup_budget(allocated, spec, 1);
         self.allocate_local_resources(job_id, 1, spec, allocated, cpus, memory_mb)
             .await
@@ -15206,6 +15309,144 @@ mod tests {
         );
     }
 
+    /// Driven through the real RPC: a refusal over resources this node already holds has to reach
+    /// the controller as an answer it can classify, since a transport error carries no kind at all.
+    #[tokio::test]
+    async fn a_launch_refused_over_a_held_slice_answers_with_the_holder() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // Job 99 holds the whole node and is not tracked as live: exactly the
+        // claim the controller's own view has lost.
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(99, 3, 4, 0, &[])
+                .expect("fill the 4-cpu test node");
+            alloc.commit_job(99, 3);
+        }
+
+        let refused = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
+                job_id: 7,
+                spec: Some(JobSpec {
+                    uid: 1000,
+                    name: "j".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 2,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("the refusal is an answer, not a transport failure")
+            .into_inner();
+
+        assert!(!refused.success);
+        assert_eq!(
+            refused.failure_kind,
+            LaunchFailureKind::LaunchFailureLocalOverlap as i32,
+            "a transport error reaches the controller with no kind, so no reconcile fires"
+        );
+        let conflict = refused
+            .conflict
+            .expect("the node knows which job holds the slice");
+        assert_eq!((conflict.job_id, conflict.run_attempt), (99, 3));
+        assert_eq!(conflict.cpu_ids, vec![0, 1, 2, 3]);
+    }
+
+    /// An unaccounted claim is only worth naming if it explains the shortfall. One holding no core
+    /// does not explain a core shortfall, and naming it would send the controller after the wrong job.
+    #[tokio::test]
+    async fn a_core_shortfall_names_only_a_holder_that_holds_cores() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        svc.insert_test_job(99, TrackedJob::dummy(0)).await;
+        {
+            let mut alloc = svc.allocation.lock().await;
+            // Unaccounted, but holds memory only: the lowest id, so the naive
+            // scan would reach it first.
+            alloc.allocate_for_job(50, 1, 0, 1_000, &[]).expect("held");
+            alloc.commit_job(50, 1);
+            // The cores are all held by a job the node is tracking as live.
+            alloc.allocate_for_job(99, 1, 4, 0, &[]).expect("held");
+            alloc.commit_job(99, 1);
+        }
+
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        let refusal = held(
+            svc.allocate_local_for_test(7, &spec, None)
+                .await
+                .expect_err("every core is held"),
+        );
+
+        assert_eq!(
+            refusal.kind(),
+            LaunchFailureKind::LaunchFailureResidualState,
+            "job 50 holds no core, so it cannot be the claim behind a core shortfall"
+        );
+        assert!(refusal.conflict.is_none());
+    }
+
+    /// A conflict carries cores and devices, so it can never say whose memory is in the way. The
+    /// node says that plainly rather than naming a job whose claim does not explain the shortfall.
+    #[tokio::test]
+    async fn a_memory_shortfall_refuses_without_naming_a_holder() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        // An unaccounted owner is present and still must not be named: it holds
+        // one core, which says nothing about the memory that fell short.
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc
+                .allocate_for_job(99, 1, 1, 8_000, &[])
+                .expect("the 8192MB test node has room for this");
+            alloc.commit_job(99, 1);
+        }
+
+        let spec = JobSpec {
+            cpus_per_task: 1,
+            ..Default::default()
+        };
+        let allocated = ResourceAllocations {
+            cpus: 1,
+            memory_mb: 4096,
+            ..Default::default()
+        };
+        let refusal = held(
+            svc.allocate_local_for_test(7, &spec, Some(&allocated))
+                .await
+                .expect_err("the node has no room for another 4096MB"),
+        );
+
+        assert_eq!(
+            refusal.kind(),
+            LaunchFailureKind::LaunchFailureResidualState
+        );
+        assert!(refusal.conflict.is_none());
+    }
+
     /// A launch aimed at another node's name must be refused: the agent only runs allocations
     /// scheduled onto its own host.
     #[tokio::test]
@@ -15217,7 +15458,7 @@ mod tests {
             spur_core::config::MemlockLimit::Unlimited,
         );
 
-        let err = svc
+        let refused = svc
             .launch_job(Request::new(LaunchJobRequest {
                 run_attempt: 1,
                 job_id: 7,
@@ -15235,8 +15476,17 @@ mod tests {
                 ..Default::default()
             }))
             .await
-            .expect_err("a launch targeting another node must be refused");
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+            .expect("the refusal is an answer, not a transport failure")
+            .into_inner();
+        assert!(!refused.success);
+        assert_eq!(
+            refused.failure_kind,
+            LaunchFailureKind::LaunchFailureTargetMismatch as i32
+        );
+        assert!(
+            refused.conflict.is_none(),
+            "a misaddressed launch says nothing about what this node holds"
+        );
     }
 
     #[tokio::test]
@@ -16039,7 +16289,12 @@ mod tests {
             .await
             .expect_err("a launch reserving nothing must be refused");
 
-        assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+        // A bad ask, not a claim this node is holding: nothing for the
+        // controller to reconcile, so it stays a transport error.
+        let LaunchRejection::Failed(status) = refused else {
+            panic!("a zero-cpu ask is a bad launch, not an overlap: {refused:?}");
+        };
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
         let reserved_anything = svc
             .allocation
             .lock()
@@ -16486,18 +16741,33 @@ mod tests {
         );
     }
 
-    // The monitor loop must flag a claim with no tracked job and not free it.
-    // Exercises the real wiring without driving the timed loop.
+    // The kind is derived from the conflict, so an overlap the controller is
+    // told to look up can never arrive without the job to look up.
     #[test]
-    fn an_overlap_refusal_names_the_job_holding_the_resources() {
-        // Without the id the controller cannot tell which of the two is stale,
-        // and its only option is to guess or give up.
-        let named = overlap_status(Some(42));
-        assert!(named.message().contains("42"), "got: {}", named.message());
-        assert_eq!(named.code(), tonic::Code::ResourceExhausted);
+    fn a_refusal_that_names_nothing_never_claims_a_holder_to_look_up() {
+        let held = AllocationResult {
+            cpu_ids: vec![2, 3],
+            gpu_ids: vec![1],
+            memory_mb: 512,
+        };
+        let named = HeldRefusal::named(42, 7, &held).into_response();
+        assert!(!named.success);
+        assert_eq!(
+            named.failure_kind,
+            LaunchFailureKind::LaunchFailureLocalOverlap as i32
+        );
+        let conflict = named.conflict.expect("a named overlap must carry the job");
+        assert_eq!((conflict.job_id, conflict.run_attempt), (42, 7));
+        assert_eq!(conflict.cpu_ids, vec![2, 3]);
+        assert_eq!(conflict.gpu_devices, vec![1]);
 
-        let anonymous = overlap_status(None);
-        assert_eq!(anonymous.code(), tonic::Code::ResourceExhausted);
+        let anonymous = HeldRefusal::unattributed("nothing to attribute").into_response();
+        assert!(!anonymous.success);
+        assert_eq!(
+            anonymous.failure_kind,
+            LaunchFailureKind::LaunchFailureResidualState as i32
+        );
+        assert!(anonymous.conflict.is_none());
     }
 
     #[test]
@@ -17100,8 +17370,11 @@ mod tests {
         let res = svc
             .allocate_local_for_test(100, &spec, Some(&allocated))
             .await;
-        let err = res.expect_err("must reject: the conflicting GPU owner is still running");
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        let refusal =
+            held(res.expect_err("must reject: the conflicting GPU owner is still running"));
+        let conflict = refusal.conflict.expect("the holder is nameable");
+        assert_eq!((conflict.job_id, conflict.run_attempt), (99, 1));
+        assert_eq!(conflict.gpu_devices, vec![0]);
     }
 
     // A still-launching conflicting owner is a real duplicate: the reclaim must
@@ -17145,8 +17418,14 @@ mod tests {
         let res = svc
             .allocate_local_for_test(100, &spec, Some(&allocated))
             .await;
-        let err = res.expect_err("must reject: the conflicting GPU owner is still launching");
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        let refusal =
+            held(res.expect_err("must reject: the conflicting GPU owner is still launching"));
+        // A launch in flight is a live duplicate, not a claim to adjudicate, so
+        // the node names nobody and the controller looks at the whole ledger.
+        assert_eq!(
+            refusal.kind(),
+            LaunchFailureKind::LaunchFailureResidualState
+        );
 
         // The launching owner must NOT have been reclaimed.
         assert_eq!(
@@ -17154,6 +17433,15 @@ mod tests {
             0,
             "launching owner must be spared"
         );
+    }
+
+    fn held(rejection: LaunchRejection) -> HeldRefusal {
+        match rejection {
+            LaunchRejection::Held(refusal) => refusal,
+            LaunchRejection::Failed(status) => {
+                panic!("expected a refusal naming what the node holds, got {status:?}")
+            }
+        }
     }
 
     fn gpu_alloc_request(device_ids: &[u32]) -> ResourceAllocations {
@@ -17233,8 +17521,12 @@ mod tests {
         let res = svc
             .allocate_local_for_test(100, &spec, Some(&gpu_alloc_request(&[0, 1])))
             .await;
-        let err = res.expect_err("must reject: GPU 1's owner is still running");
-        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        let refusal = held(res.expect_err("must reject: GPU 1's owner is still running"));
+        let conflict = refusal.conflict.expect("the stale holder is nameable");
+        assert_eq!(
+            conflict.job_id, 98,
+            "the unaccounted holder is the drift; the running one is the controller's own doing"
+        );
     }
 
     // A registered srun allocation must be committed AND tracked in `running`

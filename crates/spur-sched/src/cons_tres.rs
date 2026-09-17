@@ -175,15 +175,41 @@ impl NodeAllocation {
             .collect()
     }
 
-    /// Job ids owning any of `device_ids`, excluding mid-launch owners (a launch
-    /// in flight is a real duplicate, not a reclaimable stale owner).
+    /// Job ids owning any of `device_ids`, in job-id order, excluding mid-launch
+    /// owners (a launch in flight is a real duplicate, not a stale owner).
     pub fn conflicting_owners(&self, device_ids: &[u32]) -> Vec<u32> {
-        self.owners
+        let mut owners: Vec<u32> = self
+            .owners
             .iter()
             .filter(|(id, _)| !self.launching.contains_key(id))
             .filter(|(_, owned)| owned.result.gpu_ids.iter().any(|g| device_ids.contains(g)))
             .map(|(id, _)| *id)
-            .collect()
+            .collect();
+        // Ordered so a refusal names the same holder each time rather than
+        // whichever one the map happened to yield first.
+        owners.sort_unstable();
+        owners
+    }
+
+    /// Committed owners in job-id order. A launch still in flight is a live
+    /// duplicate rather than a claim the node cannot explain, so it is left out.
+    pub fn committed_owners(&self) -> Vec<u32> {
+        let mut owners: Vec<u32> = self
+            .owners
+            .keys()
+            .copied()
+            .filter(|id| !self.launching.contains_key(id))
+            .collect();
+        owners.sort_unstable();
+        owners
+    }
+
+    /// The attempt and slice recorded for a job here, a launch still in flight
+    /// included, so a refusal can describe the claim and not only name it.
+    pub fn claim_of(&self, job_id: u32) -> Option<(u32, AllocationResult)> {
+        self.owners
+            .get(&job_id)
+            .map(|owned| (owned.run_attempt, owned.result.clone()))
     }
 
     /// Available GPU count (optionally filtered by type).

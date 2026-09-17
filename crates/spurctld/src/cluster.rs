@@ -369,6 +369,29 @@ impl K0sRoleCounts {
     }
 }
 
+/// How long one node's ledger pull holds off the next. A rate limit only:
+/// nothing here bounds a pull, so a slow one can still overlap its successor.
+pub(crate) const LEDGER_PULL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether this node's pull may start, stamping it when it may. Stamped when a
+/// pull starts, never when it ends: this paces triggers, it does not track one.
+pub(crate) fn claim_ledger_pull_slot(
+    started_at: &mut HashMap<String, std::time::Instant>,
+    node: &str,
+    now: std::time::Instant,
+) -> bool {
+    if let Some(started) = started_at.get(node) {
+        if now.duration_since(*started) < LEDGER_PULL_COOLDOWN {
+            return false;
+        }
+    }
+    // A node that stopped triggering must not keep an entry once its cooldown
+    // has lapsed, or the map outlives the nodes it names.
+    started_at.retain(|_, started| now.duration_since(*started) < LEDGER_PULL_COOLDOWN);
+    started_at.insert(node.to_string(), now);
+    true
+}
+
 /// Central cluster state manager.
 ///
 /// Thread-safe via RwLock. The scheduler and gRPC server both access this.
@@ -453,6 +476,9 @@ pub struct ClusterManager {
     /// Nodes skipped for new dispatch until the given instant after a
     /// resources-unavailable reject. Leader-local and transient, never persisted.
     node_dispatch_cooldowns: RwLock<HashMap<String, std::time::Instant>>,
+    /// The live pacing window per node for ledger pulls, covering every trigger
+    /// the node's own behaviour drives. Leader-local, never persisted.
+    ledger_pull_starts: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
     /// When each (check index, node name) last completed a check, so the pass
     /// knows when the next one is due. Leader-local and transient (like
     /// `node_dispatch_cooldowns`): reset on failover, which at worst re-runs one
@@ -610,6 +636,7 @@ impl ClusterManager {
             planned_job_starts: RwLock::new(HashMap::new()),
             interactive_last_seen: RwLock::new(HashMap::new()),
             node_dispatch_cooldowns: RwLock::new(HashMap::new()),
+            ledger_pull_starts: parking_lot::Mutex::new(HashMap::new()),
             health_last_check: parking_lot::Mutex::new(HashMap::new()),
             dispatch_tracker: Arc::new(crate::dispatch_tracker::DispatchTracker::default()),
             agent_sessions: Arc::new(crate::agent_sessions::AgentSessions::default()),
@@ -647,6 +674,16 @@ impl ClusterManager {
         self.node_dispatch_cooldowns
             .write()
             .insert(name.to_string(), until);
+    }
+
+    /// Shared by every trigger a node can drive, so one node cannot earn two
+    /// pulls in a cooldown by refusing a dispatch and asking to be reconciled.
+    pub fn claim_ledger_pull_slot(&self, node: &str) -> bool {
+        claim_ledger_pull_slot(
+            &mut self.ledger_pull_starts.lock(),
+            node,
+            std::time::Instant::now(),
+        )
     }
 
     /// Remaining dispatch cooldown. An expired entry reads as `None`, so a read
@@ -8979,6 +9016,34 @@ mod tests {
     use spur_core::resource::{ResourceAllocations, ResourceSet};
     use spur_metrics::job::JobMetricsSnapshot;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_nodes_pull_is_paced_and_its_entry_does_not_outlive_the_cooldown() {
+        let mut started_at = HashMap::new();
+        let t0 = std::time::Instant::now();
+
+        assert!(claim_ledger_pull_slot(&mut started_at, "n1", t0));
+        assert!(
+            !claim_ledger_pull_slot(
+                &mut started_at,
+                "n1",
+                t0 + LEDGER_PULL_COOLDOWN - std::time::Duration::from_secs(1)
+            ),
+            "triggering again inside the cooldown is the pull-per-refusal storm"
+        );
+        assert!(
+            claim_ledger_pull_slot(&mut started_at, "n2", t0),
+            "one node's cooldown must not pace another's"
+        );
+
+        let lapsed = t0 + LEDGER_PULL_COOLDOWN;
+        assert!(claim_ledger_pull_slot(&mut started_at, "n1", lapsed));
+        assert_eq!(
+            started_at.keys().collect::<Vec<_>>(),
+            vec!["n1"],
+            "n2 stopped triggering, so its entry goes; otherwise the map grows without bound"
+        );
+    }
 
     #[test]
     fn submission_size_accepts_normal_script() {
