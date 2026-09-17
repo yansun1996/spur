@@ -65,6 +65,7 @@ async fn sync_taint_state(name: &str, entry: &mut NodeTaintState, client: &mut C
     };
 
     let req = UpdateNodeRequest {
+        caller: String::new(),
         reconcile: false,
         name: name.into(),
         state: Some(state),
@@ -185,6 +186,7 @@ pub async fn run(
                 hb.untrack(&name).await;
 
                 let req = UpdateNodeRequest {
+                    caller: String::new(),
                     reconcile: false,
                     name: name.clone(),
                     state: Some(NodeState::NodeDown as i32),
