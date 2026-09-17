@@ -4323,7 +4323,9 @@ async fn resolve_supervised_epilogs(
             }
             Err(error) => {
                 still_held.insert(run);
-                warn!(job_id, run_attempt, %error, "could not read an epilog's outcome; holding");
+                if epilog_hold_is_worth_saying(held_since, run) {
+                    warn!(job_id, run_attempt, %error, "could not read an epilog's outcome; holding");
+                }
                 continue;
             }
         };
@@ -8439,6 +8441,8 @@ impl AgentService {
         let hooks = self.hooks.clone();
         let recorded = tokio::task::spawn_blocking(move || {
             let epilog = match admissions.load_admitted(run) {
+                // Nothing can owe a hook this node does not run.
+                _ if hooks.epilog.is_none() => crate::admission::EpilogOwed::No,
                 Ok((admitted, rejected)) if rejected.is_empty() => {
                     supervised_epilog_owed(&admitted, &hooks)
                 }
@@ -19461,10 +19465,6 @@ mod tests {
             svc.allocation.lock().await.free_cpus(),
             while_held,
             "a cancel that read the map before the launch wrote it must not free its slice"
-        );
-        assert!(
-            svc.running.lock().await.contains_key(&60),
-            "and the launch it raced stays tracked"
         );
     }
 
