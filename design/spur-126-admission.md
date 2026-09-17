@@ -804,7 +804,18 @@ predicate itself has to change.
   apply arm now accepts the report, frees that one slice, and returns without
   re-deriving an outcome the job already has. `node_complete` lets a gated node
   through its terminal check for the same reason. This is `make_node_idle()`, and
-  it is the only thing that frees a gated slice (I1).
+  it is the only thing that frees a gated slice *while the record still exists*
+  (I1). Two things destroy the record instead, and both hand the slice back as
+  they do it: a requeue, and `NodeRemove`. Nothing else, and never a timer.
+- **Epoch.** The report carries `run_attempt` and the apply re-checks it against
+  the job's. The propose-side check alone is not enough: a requeue and
+  re-dispatch can commit in between, and the report would then discharge the
+  *next* run's live epilog debt (I4).
+- **Confirmation is narrower than charge.** `reserve_placement` proposes
+  `JobStart` while the job is still `Pending`, so the gate is written before any
+  agent has confirmed the launch. `is_confirmed_on` therefore admits a gated run
+  only once it is *finalized*; a `Pending` reservation is charged but not
+  confirmed, and Direction B must not be able to disown it.
 
 **The termination sites.** `JobPreemptCancel` carried an inline copy of the
 deallocation loop that did not call `deallocate_job_slices`; gating that function
@@ -826,20 +837,40 @@ survives. Exempting entries instead would resurrect a hold for a node that had
 returns before reaching them, so a cancelled job keeps the outcome the cancel gave
 it.
 
-**Deliberately not gated: the requeue paths** (`JobDispatchBackoff`,
-`JobPreemptRequeue`, `JobUserRequeue`). Forced by the code, not a shortcut. Those
-arms call `clear_run_state_for_requeue`, which clears `allocated_nodes`,
-`allocated_resources` and `per_node_alloc` so the job can be re-placed. Skipping
-the subtract there would hold nothing: with no `allocated_nodes` the job fails
-`is_held_on`, and the next `derive_node_allocations` drift-corrects the node back
-down. Holding across a requeue needs a charge carrier independent of the
-placement — a second ledger — and a re-dispatch onto the same node would then
-double-charge. Deferred as its own design. `clear_run_state_for_requeue` clears
-`epilog_gated_nodes` so no gate outlives the record that justified it, and
-`JobUserRequeue`'s *terminal* path — the one case where a requeue can meet a live
-gate, since the other two are reachable only from `Pending`/`Running` — hands the
-held slice back as it drops the gate, instead of assuming completion already freed
-it.
+**The requeue paths: not gated, but they must settle up.** Four arms re-pend a
+job — `JobStateChange → Pending` (the automatic requeue behind `Timeout` /
+`NodeFail` / launch failure), `JobDispatchBackoff`, `JobPreemptRequeue`, and
+`JobUserRequeue`. All call `clear_run_state_for_requeue`, which wipes
+`allocated_nodes`, `allocated_resources`, `per_node_alloc` and
+`epilog_gated_nodes` so the job can be re-placed.
+
+*Why they cannot hold.* Skipping the subtract there would hold nothing: with no
+`allocated_nodes` the job fails `is_held_on`. Holding across a requeue needs a
+charge carrier independent of the placement — a second ledger — and a re-dispatch
+onto the same node would then double-charge. Deferred as its own design.
+
+*What they must do instead.* The right question about these arms is not "do they
+subtract?" but **"do they assume a previous subtract already happened?"**. They
+do: before this change `JobComplete` had freed every node, so a requeue could
+inherit a zeroed slate and clear the record safely. `slices_to_keep` broke that
+inheritance — the gated node is still charged when the requeue runs, and the
+requeue then destroys the only record naming it. There is no steady-state rebuild
+to notice: `derive_node_allocations` runs at leadership gain, snapshot install and
+fresh node registration, none of which a stuck cluster reaches.
+
+So every re-pend arm now frees exactly what the run still holds, using one shared
+reading — `slices_no_longer_held`, the complement of `is_held_on` — taken *before*
+the transition and clear that rewrite what it depends on. That replaces four
+divergent hand-rolled formulas with one, and the arm that had none at all
+(`JobStateChange → Pending`) gets it.
+
+**Scope: this covers controller-cancel, not preemption.** `JobPreemptRequeue`,
+`JobUserRequeue`'s live path and `JobDispatchBackoff` all kill a `Running` job and
+free its slice immediately. They are correct in the accounting sense — nothing
+strands — but the *original* defect survives on them verbatim: the next job can
+take the cores while the epilog runs. Preemption drives that far more often than
+`scancel` does. Closing it needs the placement-independent carrier above, so it
+moves with that design, not this one.
 
 **Reach and collection.**
 
@@ -850,7 +881,13 @@ it.
   because the same `node_complete` change accepts the report.
 - **`EvictTerminalJobs`** skips a job with a non-empty `epilog_gated_nodes`.
   Collecting the record that carries the gate would strand the charge with no
-  owner left to release it (I3).
+  owner left to release it (I3). The *proposer* applies the same filter, not just
+  the apply: without it a permanently-gated job keeps the candidate list non-empty
+  and the pass commits a replicated no-op entry on every scheduler wake.
+  Accepted cost: a gate that never ends defeats the retention bound for that one
+  record, so controller memory is no longer bounded by
+  `terminal_job_retention_secs` alone. That is the price of I3, and it is why the
+  hold has to be visible — see below.
 - **Backfill.** `running_jobs_busy_until` filters on `Running`, so a gated slice
   had no entry and fell to the flat unlimited placeholder, inflating every
   projected start behind it. Gated nodes are seeded at `now` — the tightest honest
@@ -865,6 +902,24 @@ registers, its ledger cut drives Direction B, which either confirms the hold or
 settles it. Permanent node loss stays deferred; `NodeRemove` is the operator's
 escape and clears the gate for that node across every job explicitly.
 
+**Decision: a node going `Down` does not end the hold.** `Down` means the
+controller stopped hearing from the node, which is not evidence the hook returned
+(I6) — and the same arm already keeps a *live* job's gated slice charged through
+`slices_to_keep`, so releasing a finished one would be inconsistent as well as
+wrong. The hold therefore survives `Down`, and what ends it is the node's own
+report once it is back, a requeue of the job, or `NodeRemove`. If a node never
+returns and is never removed, an operator ends it; there is no automatic path,
+by design.
+
+**Operator-visible symptom.** A node still owing an epilog reports `drng` with a
+nonzero `CPUAlloc` and refuses an unforced removal. Both surfaces read the
+*charge* now rather than job state: `drain_node` used to count only
+`Running|Completing|Suspended` and would call such a node fully `Drain` while it
+still reported allocated cores, and the health pass would resume it to `Idle` on
+the same blind spot. Both were already reachable through the `Pending`
+reservation window; the gate widens them from a dispatch round trip to the length
+of a hook, which is what makes them worth fixing here.
+
 **Compatibility, both directions.** A new controller with an old agent sees the
 field default to false, so `epilog_gated_nodes` is empty and `is_held_on` reduces
 to exactly today's expression — bit-for-bit current behaviour. An old controller
@@ -872,9 +927,10 @@ with a new agent ignores an appended proto tag. Unlike the `SettleRun` change,
 this needs no particular upgrade order.
 
 **Invariants.** I1 and I5 are what the change implements; I2 and I6 are what it
-declines to violate by refusing a timeout; I3 is `EvictTerminalJobs`. I4 is
-unchanged — the agent's report obligation is still immortal, and is now the only
-thing that ends the hold.
+declines to violate by refusing a timeout, and what settles the `Down` decision.
+I3 is `EvictTerminalJobs`, proposer and apply alike. I4 is why the report carries
+`run_attempt`: an obligation that a superseded report could discharge would not be
+immortal.
 
 ### 8 — `feat(proto,spurd,spurctld): reconcile on a refused dispatch`
 

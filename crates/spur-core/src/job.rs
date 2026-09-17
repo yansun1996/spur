@@ -924,8 +924,8 @@ pub struct Job {
     #[serde(default)]
     pub node_completions: HashMap<String, NodeCompletion>,
 
-    /// Allocated nodes that run an epilog, recorded when the run starts. A node
-    /// leaves this set when it reports, which is the only thing that frees it.
+    /// Allocated nodes that run an epilog, recorded when the run starts. The
+    /// node's own report clears it; a requeue and deregistration also drop it.
     #[serde(default)]
     pub epilog_gated_nodes: HashSet<String>,
 
@@ -1012,9 +1012,10 @@ impl Job {
     }
 
     /// Whether this node's agent has confirmed the launch, so its ledger can be
-    /// expected to name the job. A reservation is charged while still Pending.
+    /// expected to name the job. A Pending reservation is charged, not confirmed.
     pub fn is_confirmed_on(&self, node: &str) -> bool {
-        (self.state.is_active() || self.is_epilog_gated_on(node)) && self.is_held_on(node)
+        (self.state.is_active() || (self.state.is_finalized() && self.is_epilog_gated_on(node)))
+            && self.is_held_on(node)
     }
 
     pub fn new(job_id: JobId, spec: JobSpec) -> Self {
@@ -1605,6 +1606,18 @@ mod tests {
             "a hold no reconcile pass can reach is a hold with no way out"
         );
         assert!(!job.is_confirmed_on("n2"));
+    }
+
+    // A reservation is charged while still Pending, and the gate is written with
+    // it. Reading that as a confirmed launch lets a reconcile pass disown it.
+    #[test]
+    fn a_reservation_still_pending_is_not_confirmed_by_its_gate() {
+        let job = placed_job(JobState::Pending, &["n1"]);
+        assert!(job.is_held_on("n1"), "the reservation holds the slice");
+        assert!(
+            !job.is_confirmed_on("n1"),
+            "no agent has confirmed this launch; the cut cannot disown it"
+        );
     }
 
     #[test]

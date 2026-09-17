@@ -7284,6 +7284,25 @@ mod tests {
         );
     }
 
+    fn declare_epilog_on_n1(cluster: &Arc<ClusterManager>) {
+        cluster.apply_operation(&spur_core::wal::WalOperation::NodeUpdate {
+            name: "n1".into(),
+            hostname: "n1".into(),
+            resources: spur_core::resource::ResourceSet {
+                cpus: 8,
+                memory_mb: 16000,
+                ..Default::default()
+            },
+            address: "127.0.0.1".into(),
+            port: a_port_nothing_listens_on(),
+            wg_pubkey: String::new(),
+            version: String::new(),
+            source: spur_core::node::NodeSource::NativeHost,
+            reconcile_pending: None,
+            runs_job_epilog: Some(true),
+        });
+    }
+
     fn ledger(complete: bool, entries: Vec<(u32, u32)>) -> spur_proto::proto::NodeLedger {
         spur_proto::proto::NodeLedger {
             agent_session_id: "session-a".into(),
@@ -8039,6 +8058,45 @@ mod tests {
             cluster.get_job(8).map(|j| j.state),
             Some(spur_core::job::JobState::Pending),
             "settling would finalize a job that never ran"
+        );
+    }
+
+    // The gate is written at placement, while the job is still Pending. Reading it
+    // as a confirmed launch lets the cut disown a reservation about to be launched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_epilog_declaration_does_not_make_a_reservation_disownable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        declare_epilog_on_n1(&cluster);
+        reserve_pending_job_on_n1(&cluster, 8);
+        assert!(
+            cluster
+                .get_job(8)
+                .is_some_and(|j| j.is_epilog_gated_on("n1")),
+            "the placement must have recorded the gate for this to be the real case"
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.settled,
+            Vec::<u32>::new(),
+            "an unconfirmed launch is not something the cut can disown"
+        );
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 8),
+            "subtracting here undercharges the node the job is about to launch on"
+        );
+        assert_eq!(
+            cluster.get_job(8).map(|j| j.state),
+            Some(spur_core::job::JobState::Pending),
         );
     }
 

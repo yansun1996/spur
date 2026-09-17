@@ -1858,6 +1858,7 @@ impl ClusterManager {
 
         let resp = self
             .propose(WalOperation::JobNodeComplete {
+                run_attempt,
                 at: None,
                 job_id,
                 node_name: node_name.to_string(),
@@ -3572,15 +3573,9 @@ impl ClusterManager {
             let node = nodes
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("node '{}' not found", name))?;
-            let count = jobs
-                .values()
-                .filter(|j| {
-                    matches!(
-                        j.state,
-                        JobState::Running | JobState::Completing | JobState::Suspended
-                    ) && j.allocated_nodes.iter().any(|n| n == name)
-                })
-                .count() as u32;
+            // Charge, not liveness: a run whose epilog still owns the slice would
+            // otherwise read as drained while the node reports cores allocated.
+            let count = jobs.values().filter(|j| j.is_held_on(name)).count() as u32;
             (node.state, count)
         };
         let target_state = if running_count > 0 {
@@ -3603,17 +3598,11 @@ impl ClusterManager {
         Ok((target_state, running_count))
     }
 
-    /// Whether `name` has any job holding an allocation (Running/Completing/Suspended). Shared by
-    /// `remove_node` (inventory) and `cluster_remove_nodes` (k0s membership) so both refuse to yank a
-    /// busy node without `--force` using the same rule.
+    /// Whether `name` still owes any job a slice. Shared by `remove_node` and
+    /// `cluster_remove_nodes` so both refuse to yank a busy node without `--force`.
     pub fn node_has_running_jobs(&self, name: &str) -> bool {
         let jobs = self.jobs.read();
-        jobs.values().any(|j| {
-            matches!(
-                j.state,
-                JobState::Running | JobState::Completing | JobState::Suspended
-            ) && j.allocated_nodes.iter().any(|n| n == name)
-        })
+        jobs.values().any(|j| j.is_held_on(name))
     }
 
     /// Remove a node from the cluster. If `force`, evict running jobs first.
@@ -4771,7 +4760,21 @@ impl ClusterManager {
             .terminal_job_retention_secs
             .max(crate::accounting::RECONCILE_INTERVAL_SECS);
         let before = Utc::now() - chrono::Duration::seconds(retention as i64);
-        let jobs = self.jobs.read();
+        let job_ids = Self::expired_terminal_job_ids(&self.jobs.read(), before);
+        if job_ids.is_empty() {
+            return;
+        }
+        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs { job_ids }) {
+            warn!(error = %e, "failed to evict expired terminal jobs");
+        }
+    }
+
+    /// Which finished jobs may be collected. Separate from the propose so the
+    /// rule can be read against the apply's, which must refuse the same ids.
+    fn expired_terminal_job_ids(
+        jobs: &HashMap<JobId, Job>,
+        before: chrono::DateTime<Utc>,
+    ) -> Vec<JobId> {
         // Spare a target still referenced by a live job's dependency: dropping it
         // makes resolve_target_state return None, which cancels/early-releases dependents.
         let mut referenced: HashSet<JobId> = HashSet::new();
@@ -4784,23 +4787,18 @@ impl ClusterManager {
         }
         // is_finalized is load-bearing, not redundant: end_time survives a
         // requeue, so a re-dispatched job's stale end_time alone would reap it.
-        let job_ids: Vec<JobId> = jobs
-            .iter()
+        jobs.iter()
             .filter(|(id, j)| {
                 j.state.is_finalized()
+                    // Mirrors the apply's refusal to collect a job still holding a
+                    // slice: without it every pass re-proposes the same no-op.
+                    && j.epilog_gated_nodes.is_empty()
                     && j.end_time.is_some_and(|t| t < before)
                     && !referenced.contains(id)
                     && j.spec.array_job_id.is_none_or(|p| !referenced.contains(&p))
             })
             .map(|(&id, _)| id)
-            .collect();
-        drop(jobs);
-        if job_ids.is_empty() {
-            return;
-        }
-        if let Err(e) = self.propose(WalOperation::EvictTerminalJobs { job_ids }) {
-            warn!(error = %e, "failed to evict expired terminal jobs");
-        }
+            .collect()
     }
 
     /// Cancel running jobs whose reservation window has ended (after optional grace).
@@ -5678,6 +5676,16 @@ impl ClusterManager {
             .collect()
     }
 
+    /// Nodes a requeue must not hand back, because this run is no longer charged
+    /// there. Read before a transition or clear rewrites what decides it.
+    fn slices_no_longer_held(job: &Job) -> Vec<String> {
+        job.allocated_nodes
+            .iter()
+            .filter(|name| !job.is_held_on(name))
+            .cloned()
+            .collect()
+    }
+
     /// Return a finished job's per-node slice to each node it held, skipping any
     /// in `keep_charged`; pass `allocated_resources = None` if freed already.
     fn deallocate_job_slices(
@@ -6041,6 +6049,9 @@ impl ClusterManager {
                 ..
             } => {
                 if let Some(job) = jobs.get_mut(job_id) {
+                    // Read before the transition: what this run still holds turns
+                    // on the state it is leaving, which the transition rewrites.
+                    let keep_charged = Self::slices_no_longer_held(job);
                     let outcome = match job.apply_transition(*new_state) {
                         Ok(outcome) => outcome,
                         Err(e) => {
@@ -6051,6 +6062,16 @@ impl ClusterManager {
                     // Gated on a real transition so a replay doesn't re-wipe
                     // fields or double-count requeue_count.
                     if outcome == TransitionOutcome::Applied && *new_state == JobState::Pending {
+                        // The requeue erases the record naming these nodes, so
+                        // nothing after it could hand their slice back.
+                        Self::deallocate_job_slices(
+                            &mut nodes,
+                            &job.allocated_nodes,
+                            job.allocated_resources.as_ref(),
+                            &job.per_node_alloc,
+                            &keep_charged,
+                            *job_id,
+                        );
                         let max = self.config().controller.max_batch_requeue;
                         if job.requeue_count < max {
                             Self::reset_job_for_requeue(job);
@@ -6085,7 +6106,7 @@ impl ClusterManager {
                 let freed_nodes = job.allocated_nodes.clone();
                 let allocated_resources = job.allocated_resources.clone();
                 let per_node_map = job.per_node_alloc.clone();
-                let already: Vec<String> = job.node_completions.keys().cloned().collect();
+                let already = Self::slices_no_longer_held(job);
                 Self::reset_job_for_requeue(job);
                 job.spec.begin_time = Some(*begin_time);
                 job.set_pending_reason(PendingReason::JobLaunchFailure);
@@ -6110,6 +6131,7 @@ impl ClusterManager {
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
+                let keep_charged;
                 {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
@@ -6117,6 +6139,9 @@ impl ClusterManager {
                     if job.state != JobState::Running {
                         return ClientResponse::default();
                     }
+                    // Read before the transition below rewrites the state that
+                    // decides where this run is still charged.
+                    keep_charged = Self::slices_no_longer_held(job);
                     // Route through Preempted so the state machine and accounting
                     // see a finished run, then requeue to Pending — one atomic
                     // apply; the intermediate Preempted never escapes the lock.
@@ -6132,7 +6157,6 @@ impl ClusterManager {
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
-                    job.node_completions.clear();
 
                     if let Err(e) = job.transition(JobState::Pending) {
                         warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
@@ -6159,7 +6183,7 @@ impl ClusterManager {
                     &freed_nodes,
                     allocated_resources.as_ref(),
                     &per_node_map,
-                    &[],
+                    &keep_charged,
                     *job_id,
                 );
                 drop(jobs);
@@ -6196,33 +6220,20 @@ impl ClusterManager {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
                     };
+                    // Read before the requeue transition below, which rewrites the
+                    // state that decides where this run is still charged.
+                    keep_charged = Self::slices_no_longer_held(job);
+                    freed_nodes = job.allocated_nodes.clone();
+                    allocated_resources = job.allocated_resources.clone();
+                    per_node_map = job.per_node_alloc.clone();
                     match job.state {
                         JobState::Running | JobState::Suspended => {
                             was_live = true;
                             if let Some(since) = job.suspended_at.take() {
                                 job.suspended_secs += (timestamp - since).num_seconds().max(0);
                             }
-                            // The live run still holds its allocation; capture it
-                            // to free below (reset clears node_completions).
-                            freed_nodes = job.allocated_nodes.clone();
-                            allocated_resources = job.allocated_resources.clone();
-                            per_node_map = job.per_node_alloc.clone();
-                            keep_charged = Vec::new();
                         }
-                        s if s.is_terminal() => {
-                            // Every node but one still owing an epilog was freed at
-                            // completion, and the requeue drops the record holding it.
-                            was_live = false;
-                            keep_charged = job
-                                .allocated_nodes
-                                .iter()
-                                .filter(|n| !job.epilog_gated_nodes.contains(*n))
-                                .cloned()
-                                .collect();
-                            freed_nodes = job.allocated_nodes.clone();
-                            allocated_resources = job.allocated_resources.clone();
-                            per_node_map = job.per_node_alloc.clone();
-                        }
+                        s if s.is_terminal() => was_live = false,
                         _ => {
                             // Pending, Completing, or an in-flight finalized
                             // state: nothing to requeue.
@@ -6469,16 +6480,24 @@ impl ClusterManager {
                 node_name,
                 exit_code,
                 signal,
+                run_attempt,
                 ..
             } => {
                 let finalized = {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
                     };
+                    // Re-checked here, not just where this was proposed: a requeue
+                    // can commit in between and a stale report discharge its debt.
+                    if *run_attempt != 0 && job.run_attempt != 0 && *run_attempt < job.run_attempt {
+                        return ClientResponse::default();
+                    }
                     // The epilog outlives the run, so a finalized job still takes
                     // the report that ends the hook — it just frees the one slice.
                     if !job.state.is_active() {
-                        if !job.epilog_gated_nodes.remove(node_name) {
+                        let owed =
+                            job.state.is_finalized() && job.epilog_gated_nodes.remove(node_name);
+                        if !owed {
                             return ClientResponse::default();
                         }
                         job.node_completions.insert(
@@ -6895,6 +6914,8 @@ impl ClusterManager {
                     node.admin_locked = *admin_locked;
                 }
                 if *new_state == NodeState::Down {
+                    // Down means unheard from, which is no evidence the hook ended,
+                    // so a gate stands here until the node reports or is removed.
                     Self::evict_jobs_on_node(name, &mut jobs, &mut nodes, timestamp, &mut response);
                 }
             }
@@ -7256,10 +7277,8 @@ impl ClusterManager {
                 }
             }
             WalOperation::EvictTerminalJobs { job_ids } => {
-                // Re-check finalized: spare an id requeued between propose and
-                // apply. Deterministic — every replica applies in the same order.
-                // A job still gating a node owns that charge; collecting it would
-                // strand the slice with no record left to release it.
+                // Spare an id requeued between propose and apply, and one still
+                // gating a node: collecting it would strand that node's slice.
                 let evicted: HashSet<JobId> = job_ids
                     .iter()
                     .filter(|id| {
@@ -9130,8 +9149,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let raft_dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
+        // An upper bound on this machine electing and applying, not a measurement:
+        // it returns as soon as the log is caught up, so a loaded box cannot flake it.
         assert!(
-            cm.state_machine_ready(std::time::Duration::from_secs(5))
+            cm.state_machine_ready(std::time::Duration::from_secs(60))
                 .await
         );
 
@@ -11726,6 +11747,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "worker1".into(),
@@ -11770,6 +11792,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "worker1".into(),
@@ -11815,6 +11838,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n1".into(),
@@ -11828,6 +11852,7 @@ mod tests {
         assert!(cm.get_node("n2").unwrap().alloc_resources.cpus > 0);
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n2".into(),
@@ -11837,6 +11862,7 @@ mod tests {
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n3".into(),
@@ -11911,6 +11937,7 @@ mod tests {
 
         // Batch script exits 2 -> ExitCode=2:0, DerivedExitCode preserved at 7.
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n1".into(),
@@ -11973,6 +12000,7 @@ mod tests {
             exit_code: 3,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n1".into(),
@@ -12037,6 +12065,7 @@ mod tests {
             exit_code: 5,
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n1".into(),
@@ -12134,6 +12163,7 @@ mod tests {
         });
 
         let r1 = cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n1".into(),
@@ -12144,6 +12174,7 @@ mod tests {
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
 
         let r2 = cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n2".into(),
@@ -12290,6 +12321,7 @@ mod tests {
             at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n1".into(),
@@ -12636,6 +12668,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n1".into(),
@@ -12665,6 +12698,7 @@ mod tests {
         }
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n2".into(),
@@ -12706,6 +12740,7 @@ mod tests {
             at: Some(chrono::Utc::now()),
         });
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n1".into(),
@@ -14887,6 +14922,7 @@ mod tests {
         let job_id = preempted_job_on(&cm, "late-nodecomplete", "worker1");
 
         let resp = cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id,
             node_name: "worker1".into(),
@@ -22202,6 +22238,7 @@ mod tests {
                 // A single-node job would finalize here, duplicating branch 3.
                 2 if targets.len() > 1 => {
                     cm.apply_operation(&WalOperation::JobNodeComplete {
+                        run_attempt: 0,
                         at: None,
                         job_id,
                         node_name: targets[0].clone(),
@@ -22217,6 +22254,7 @@ mod tests {
                 3 => {
                     for name in &targets {
                         cm.apply_operation(&WalOperation::JobNodeComplete {
+                            run_attempt: 0,
                             at: None,
                             job_id,
                             node_name: name.clone(),
@@ -22582,6 +22620,7 @@ mod tests {
 
     fn report_node_done(cm: &ClusterManager, job_id: JobId, node: &str) {
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id,
             node_name: node.into(),
@@ -22848,6 +22887,239 @@ mod tests {
             alloc_cpus(&cm, "n2"),
             4,
             "the node that has not reported holds"
+        );
+    }
+
+    fn re_pend(cm: &ClusterManager, job_id: JobId, from: JobState) {
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id,
+            old_state: from,
+            new_state: JobState::Pending,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+    }
+
+    // The requeue erases the record naming the gated node, so if it does not hand
+    // the slice back here nothing ever can: no pass rebuilds totals in steady state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_auto_requeue_hands_back_the_slice_its_gate_was_holding() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::Timeout,
+        });
+        assert_eq!(alloc_cpus(&cm, "n1"), 6, "the epilog still owns the cores");
+
+        re_pend(&cm, 1, JobState::Timeout);
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            0,
+            "the requeue drops the gate, so it must hand back what the gate held"
+        );
+        cm.recompute_node_allocations();
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            0,
+            "and no rebuild could have found the charge to correct it"
+        );
+    }
+
+    // Three ways a node can already be off this run's books -- it reported, the
+    // completion freed it, or it was never gated -- against one that is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_auto_requeue_frees_only_what_the_run_still_holds() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        register_epilog_node(&cm, "n2", false);
+        register_epilog_node(&cm, "n3", false);
+        start_run_on(&cm, 1, &["n1", "n2", "n3"], scalar_alloc(4, 2000));
+        // Canaries: a second run on each node a double-free would rob.
+        start_run_on(&cm, 2, &["n2"], scalar_alloc(4, 2000));
+        start_run_on(&cm, 3, &["n3"], scalar_alloc(4, 2000));
+
+        report_node_done(&cm, 1, "n3");
+        cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::NodeFail,
+        });
+        assert_eq!(alloc_cpus(&cm, "n1"), 4, "gated, so the completion held it");
+        assert_eq!(
+            alloc_cpus(&cm, "n2"),
+            4,
+            "freed at completion; job 2 remains"
+        );
+        assert_eq!(alloc_cpus(&cm, "n3"), 4, "freed on report; job 3 remains");
+
+        re_pend(&cm, 1, JobState::NodeFail);
+        assert_eq!(alloc_cpus(&cm, "n1"), 0, "the gate's charge must come back");
+        assert_eq!(alloc_cpus(&cm, "n2"), 4, "a second free would rob job 2");
+        assert_eq!(alloc_cpus(&cm, "n3"), 4, "a second free would rob job 3");
+    }
+
+    // The apply already spares a gated record; without the same rule here the
+    // pass re-proposes a committed no-op for as long as the gate stands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_eviction_pass_does_not_select_a_job_it_cannot_collect() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        register_epilog_node(&cm, "n2", false);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        start_run_on(&cm, 2, &["n2"], scalar_alloc(6, 1000));
+        cancel(&cm, 1);
+        cancel(&cm, 2);
+
+        let horizon = chrono::Utc::now() + chrono::Duration::seconds(1);
+        let selected = ClusterManager::expired_terminal_job_ids(&cm.jobs.read(), horizon);
+        assert_eq!(
+            selected,
+            vec![2],
+            "a gated job the apply will refuse must not be proposed at all"
+        );
+
+        report_node_done(&cm, 1, "n1");
+        let selected = ClusterManager::expired_terminal_job_ids(&cm.jobs.read(), horizon);
+        assert!(selected.contains(&1), "released, so collectable");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_going_down_keeps_a_hold_it_cannot_disprove() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        cancel(&cm, 1);
+
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            at: None,
+            name: "n1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("not responding".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+        });
+        assert!(
+            cm.epilog_held_nodes().contains("n1"),
+            "unheard from is not evidence the hook returned"
+        );
+        cm.recompute_node_allocations();
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            6,
+            "dropping the gate here would leave the charge with no record to free it"
+        );
+
+        report_node_done(&cm, 1, "n1");
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            0,
+            "the node's own report still ends it once the node is back"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_report_from_a_superseded_run_does_not_discharge_the_live_one() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        cancel(&cm, 1);
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
+            job_id: 1,
+            hold: false,
+            begin_time: None,
+        });
+
+        re_dispatch(&cm, 1, &["n1"], scalar_alloc(6, 1000), 2);
+        cancel(&cm, 1);
+        assert_eq!(alloc_cpus(&cm, "n1"), 6);
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 1,
+            at: None,
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 0,
+            signal: 0,
+        });
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            6,
+            "a report for the run before this one cannot end this run's debt"
+        );
+
+        cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 2,
+            at: None,
+            job_id: 1,
+            node_name: "n1".into(),
+            exit_code: 0,
+            signal: 0,
+        });
+        assert_eq!(alloc_cpus(&cm, "n1"), 0);
+    }
+
+    fn re_dispatch(
+        cm: &ClusterManager,
+        job_id: JobId,
+        nodes: &[&str],
+        slice: ResourceAllocations,
+        run_attempt: u32,
+    ) {
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id,
+            nodes: nodes.iter().map(|n| (*n).to_string()).collect(),
+            resources: slice.clone(),
+            per_node_alloc: per_node_for(nodes, slice),
+            srun_step_dispatch: false,
+            run_attempt,
+            at: Some(chrono::Utc::now()),
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_node_mid_epilog_reports_it_as_still_draining() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        cancel(&cm, 1);
+
+        assert!(
+            cm.node_has_running_jobs("n1"),
+            "a node whose cores are still charged is not free to yank"
+        );
+        let (state, held) = cm
+            .drain_node("n1", Some("maintenance".into()), None)
+            .expect("drain");
+        assert_eq!(held, 1, "the epilog still owns a slice here");
+        assert_eq!(
+            state,
+            NodeState::Draining,
+            "a node reporting allocated cores must not be called fully drained"
         );
     }
 
@@ -24312,6 +24584,7 @@ mod tests {
         );
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: job_a,
             node_name: "n1".into(),
@@ -27071,6 +27344,7 @@ mod tests {
         });
 
         cm.apply_operation(&WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: id,
             node_name: "n1".into(),

@@ -328,9 +328,17 @@ committed the job's completion — not when the job's processes exit. The agent
 reports the exit, waits for the controller to acknowledge it, and only then frees
 the slice.
 
-The visible effect is a short lag: for a moment after a job finishes, ``sinfo``
-and ``scontrol show node`` still count its resources as allocated on a node where
-nothing is running. Normally this is one round trip and you will rarely catch it.
+The visible effect is a lag: for a moment after a job finishes, ``sinfo`` and
+``scontrol show node`` still count its resources as allocated on a node where
+nothing is running. With no epilog configured this is one round trip and you will
+rarely catch it. Where the node runs an epilog, the slice stays booked for as long
+as that hook takes, so the next job cannot start on top of the cleanup.
+
+A node still running a finished job's epilog reports as ``drng`` (draining) with a
+nonzero ``CPUAlloc``. If a node stays that way, its hook has not returned. The
+hold ends when the node reports, when the job is requeued, or when the node is
+removed from the cluster — never on a timer, and not merely because the node
+stopped answering.
 
 If the controller is unreachable, the lag lasts as long as the outage. The agent
 keeps retrying the completion report — backing off to at most a minute between

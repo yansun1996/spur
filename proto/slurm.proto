@@ -871,7 +871,7 @@ message RegisterAgentRequest {
   // from an agent that predates it, which asserts no evidence and is not gated.
   optional NodeLedger ledger = 9;
   // Whether a run's tasks exiting leaves an epilog still running here, so the
-  // controller must await this node's report before reusing its slice.
+  // controller holds this node's slice past the run's end instead of reusing it.
   bool runs_job_epilog = 10;
 }
 

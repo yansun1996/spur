@@ -76,6 +76,10 @@ pub enum WalOperation {
         node_name: String,
         exit_code: i32,
         signal: i32,
+        /// The run this report speaks for, re-checked on apply so a report that
+        /// lost to a requeue cannot discharge the next run's debt. 0 is legacy.
+        #[serde(default)]
+        run_attempt: u32,
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
@@ -936,6 +940,7 @@ mod tests {
     #[test]
     fn job_node_complete_signal_round_trips() {
         let op = WalOperation::JobNodeComplete {
+            run_attempt: 0,
             at: None,
             job_id: 1,
             node_name: "n0".into(),
