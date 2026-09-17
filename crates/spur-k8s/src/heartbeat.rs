@@ -65,6 +65,9 @@ impl HeartbeatManager {
                             node_token: String::new(),
                             wg_pubkey: String::new(), // virtual agents are not on the mesh
                             k0s_status: None,         // virtual agents run no k0s unit
+                            // A virtual agent holds no slice of its own, so it
+                            // has no claim it could be in conflict over.
+                            needs_reconcile: false,
                         };
                         match client.heartbeat(req).await {
                             Ok(_) => debug!(node = %name, "heartbeat sent"),
@@ -110,6 +113,7 @@ mod tests {
 
     fn make_req(hostname: &str) -> RegisterAgentRequest {
         RegisterAgentRequest {
+            ledger: None,
             hostname: hostname.into(),
             resources: None,
             version: "test".into(),
