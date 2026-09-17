@@ -4,6 +4,8 @@
 """The controller reconciles what a node is holding against its own log, on an
 operator's word."""
 
+import pytest
+
 from cluster import job_state, wait_until
 from test_admission_ledger import (
     read_run_record,
@@ -27,16 +29,8 @@ def reconcile(cluster, node_name: str, extra_env: dict[str, str] | None = None):
 
 
 def start_authenticated(cluster):
-    """Reconcile needs a named admin, so every test here runs on a JWT cluster."""
     cluster.start(config_overrides={"auth": {"plugin": "jwt", "jwt_key": JWT_KEY}})
     return cluster
-
-
-def admin_reconcile(cluster, node_name: str):
-    return reconcile(
-        cluster, node_name,
-        extra_env={"SPUR_AUTH_TOKEN": mint_token(cluster, "e2e-admin", admin=True)},
-    )
 
 
 def mint_token(cluster, user: str, admin: bool = False) -> str:
@@ -51,9 +45,8 @@ def mint_token(cluster, user: str, admin: bool = False) -> str:
 
 class TestOperatorReconcile:
     def test_reconciling_a_healthy_node_pulls_its_ledger_and_cancels_nothing(
-        self, unstarted_cluster
+        self, cluster
     ):
-        cluster = start_authenticated(unstarted_cluster)
         node = cluster.node_names[0]
         job_ids = [
             submit_holder(cluster, f"rec-keep-{i}", cpus=1, seconds=30)
@@ -66,7 +59,7 @@ class TestOperatorReconcile:
         before_pulls = ledger_pulls(cluster)
         before_supervisors = {j: run_supervisors(cluster, j) for j in job_ids}
 
-        code, out = admin_reconcile(cluster, node)
+        code, out = reconcile(cluster, node)
         assert code == 0, f"an admin reconcile must succeed:\n{out}"
 
         wait_until(
@@ -89,16 +82,34 @@ class TestOperatorReconcile:
         for job_id in job_ids:
             cluster.scancel(str(job_id))
 
+    # The authz bar must hold on a cluster that authenticates nobody, without
+    # locking its operators out — see the root case in the tests above.
+    def test_a_non_admin_is_refused_on_a_cluster_with_no_authentication(self, cluster):
+        submit_user = cluster.nodes[0].user
+        if submit_user == "root":
+            pytest.skip("need a non-root SSH user to test non-admin rejection")
+        probe = cluster.cli_as_user("root", ["scontrol", "show", "config"])
+        if "sudo" in probe.lower() and (
+            "password" in probe.lower() or "not allowed" in probe.lower()
+        ):
+            pytest.skip(f"sudo -u unavailable in this environment: {probe.strip()}")
+
+        node = cluster.node_names[0]
+        before = ledger_pulls(cluster)
+        out = cluster.cli_as_user(
+            submit_user,
+            ["scontrol", "update", f"NodeName={node}", "Reconcile=yes"],
+        )
+        assert "requires cluster admin" in out.lower(), (
+            f"a non-admin reconcile must be denied even with auth off: {out}"
+        )
+        assert ledger_pulls(cluster) == before, (
+            "a refused reconcile must not reach the node"
+        )
+
     def test_only_an_admin_may_ask_a_node_to_reconcile(self, unstarted_cluster):
         cluster = start_authenticated(unstarted_cluster)
         node = cluster.node_names[0]
-
-        before_anon = ledger_pulls(cluster)
-        code, out = reconcile(cluster, node)
-        assert code != 0, f"an unidentified caller must be refused:\n{out}"
-        assert ledger_pulls(cluster) == before_anon, (
-            "a refused reconcile must not reach the node"
-        )
 
         before_pulls = ledger_pulls(cluster)
         code, out = reconcile(
@@ -123,9 +134,8 @@ class TestOperatorReconcile:
 
 class TestUnrecordedClaim:
     def test_a_claim_the_controller_has_no_record_of_is_ended_and_its_cores_freed(
-        self, unstarted_cluster
+        self, cluster
     ):
-        cluster = start_authenticated(unstarted_cluster)
         node = cluster.node_names[0]
         job_id = submit_holder(cluster, "rec-orphan", cpus=3, seconds=120)
         wait_run_record(cluster, job_id)
@@ -141,7 +151,7 @@ class TestUnrecordedClaim:
             f"the node stopped holding the run before any reconcile: {record}"
         )
 
-        code, out = admin_reconcile(cluster, node)
+        code, out = reconcile(cluster, node)
         assert code == 0, f"an admin reconcile must succeed:\n{out}"
 
         wait_until(

@@ -847,17 +847,29 @@ impl ControllerService {
         }
     }
 
-    /// Rejects anyone the controller cannot name as an admin, anonymous included. For an operation
-    /// that can end running work, where `require_admin`'s trust of an unidentified caller is too
-    /// wide: on a cluster with no authentication, anyone who can reach the port is that caller.
+    /// Admin bar for an operation that can end running work, on a cluster that may authenticate
+    /// nobody. A verified identity settles it; failing that the client's own word does, which is
+    /// an operator-error guard and not a boundary — the same trade `is_k0s_admin` documents.
     #[allow(clippy::result_large_err)]
-    fn require_named_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
-        let identity = Self::verified_identity(request);
-        if identity.is_some() && self.caller_is_admin(identity) {
+    fn require_admin_by_assertion<T>(
+        &self,
+        request: &Request<T>,
+        asserted: &str,
+        op: &str,
+    ) -> Result<(), Status> {
+        let allowed = match Self::verified_identity(request) {
+            Some(identity) => self.caller_is_admin(Some(identity)),
+            // Empty is refused rather than waved through: the field is client-supplied, so
+            // treating "unset" as admin would make the check bypassable by omitting it.
+            None => {
+                !asserted.is_empty() && is_k0s_admin(self.cluster.association_cache(), asserted)
+            }
+        };
+        if allowed {
             return Ok(());
         }
         Err(Status::permission_denied(format!(
-            "{op} requires an authenticated cluster admin"
+            "{op} requires cluster admin"
         )))
     }
 
@@ -2309,10 +2321,11 @@ impl SlurmController for ControllerService {
         self.require_admin(&request, "update node")?;
 
         let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
-        // Held to a stricter bar than the rest of this RPC: a reconcile can cancel
-        // running work, where State= and Reason= only change what runs next.
+        // Held to a stricter bar than the rest of this RPC: a reconcile can end running
+        // work, where State= and Reason= only change what is allowed to start next.
         if request.get_ref().reconcile {
-            self.require_named_admin(&request, "reconciling a node")?;
+            let asserted = request.get_ref().caller.clone();
+            self.require_admin_by_assertion(&request, &asserted, "reconciling a node")?;
         }
         let req = request.into_inner();
         if req.reconcile {
@@ -6501,10 +6514,8 @@ mod tests {
         assert!(resolve_step_container(Some(ContainerSpec::default()), &job).is_none());
     }
 
-    // Every other node update trusts a caller it cannot name, so that a cluster
-    // with auth off still works. A reconcile can end running work, so it does not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn only_a_named_admin_may_reconcile_a_node() {
+    async fn a_reconcile_takes_the_admin_bar_with_or_without_authentication() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
 
@@ -6515,18 +6526,26 @@ mod tests {
             }
             r
         };
+        let allowed = |id, asserted| {
+            svc.require_admin_by_assertion(&req(id), asserted, "reconciling a node")
+                .is_ok()
+        };
 
+        // A verified identity settles it, and the assertion beside it is ignored.
+        assert!(allowed(Some(viewer("root", true)), ""));
+        assert!(!allowed(Some(viewer("bob", false)), "root"));
+
+        // With nobody authenticated the client's own word is all there is. This is
+        // the case that must keep working: a no-auth cluster still has operators.
         assert!(
-            svc.require_named_admin(&req(None), "reconciling a node")
-                .is_err(),
-            "with auth off anyone reaching the port is this caller"
+            allowed(None, "root"),
+            "refusing here would leave a no-auth cluster unable to reconcile at all"
         );
-        assert!(svc
-            .require_named_admin(&req(Some(viewer("bob", false))), "reconciling a node")
-            .is_err());
-        assert!(svc
-            .require_named_admin(&req(Some(viewer("root", true))), "reconciling a node")
-            .is_ok());
+        assert!(!allowed(None, "bob"));
+        assert!(
+            !allowed(None, ""),
+            "an omitted caller must not be admin, or the check is bypassable by omission"
+        );
 
         assert!(
             svc.require_admin(&req(None), "update node").is_ok(),
