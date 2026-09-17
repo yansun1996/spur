@@ -301,6 +301,11 @@ may nonetheless be skipped by the scheduler, and says so in the same field
        no new work until the controller has compared that against its own
        records. Usually immediate, but a controller still replaying its own log
        waits for that first, and the whole pass is capped at a minute.
+   * - ``holding claims the controller has no record of: <ids>``
+     - The node is holding resources for runs the controller cannot place, and
+       could not resolve them itself. The node keeps working; the named runs are
+       what an operator should look at. It clears itself once the node reports
+       them or they are otherwise settled.
    * - ``dispatch cooldown after a failed launch (<n>s remaining)``
      - A launch failed on this node, so the scheduler skips it for
        ``controller.dispatch_reject_cooldown_secs`` instead of re-picking it
@@ -334,8 +339,9 @@ nothing is running. With no epilog configured this is one round trip and you wil
 rarely catch it. Where the node runs an epilog, the slice stays booked for as long
 as that hook takes, so the next job cannot start on top of the cleanup.
 
-A node still running a finished job's epilog reports as ``drng`` (draining) with a
-nonzero ``CPUAlloc``. If a node stays that way, its hook has not returned. The
+A node still running a finished job's epilog reports as ``mix`` or ``alloc`` with
+a nonzero ``CPUAlloc`` and nothing for it in ``squeue`` — the tasks are gone, the
+hook is not. It reads as ``drng`` only if an operator has also drained it. The
 hold ends when the node reports, when the job is requeued, or when the node is
 removed from the cluster — never on a timer, and not merely because the node
 stopped answering.
@@ -999,6 +1005,13 @@ but no settlements.
 Whether a reconcile may cancel and settle, or only report what it found, depends
 on ``[admission] mode`` for the registration case; see
 :doc:`/admin-guide/configuration`. Every other trigger above acts in either mode.
+
+Asking for one by hand requires admin rights, because it can end running work::
+
+    scontrol update NodeName=node01 Reconcile=yes
+
+The command returns once the pass is done. It reports nothing about what the pass
+found — read the controller log, or the node's reason, for that.
 
 The reconcile a node runs as part of registering gates that node: it reports a
 reason of ``reconciling with the controller`` and accepts no new work until the

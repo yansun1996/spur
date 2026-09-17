@@ -416,18 +416,16 @@ what it is holding against its own record and resolves the difference, and a
 job's resources are freed on the controller's acknowledgement rather than when
 the job's processes exit. See :doc:`/user-guide/monitoring-jobs` for both.
 
-**This change inverts step 2 of** :ref:`Safe Upgrade Order <safe-upgrade-order>`
-**— upgrade agents before controllers.** Every other step of that order still
-applies: rebuild all binaries together, roll forward only.
+**This change adds no ordering rule.** :ref:`Safe Upgrade Order
+<safe-upgrade-order>` applies unchanged — controllers before agents, one
+controller at a time to preserve quorum, rebuild all binaries together, roll
+forward only.
 
-The reason is where the refusal lives. When the controller tells a node it is not
-accounting for a run the node still holds, only the node can see whether an
-epilog is still running on those cores, so only the node can refuse. An agent
-that predates that refusal answers every such request by releasing, whatever is
-still running under the run — so a controller that asks paired with an agent that
-cannot say no is what hands a job's cores to a second job while the operator's
-epilog is still on them. Upgrading agents first never creates that pairing; its
-cost is the capacity stall described below, which loses no work.
+A controller asks a node to release a run it is no longer accounting for, and
+only the node can see whether an epilog is still running on those cores. An
+agent that predates that exchange does not answer it at all: it reports the
+request as unimplemented, which the controller reads as the node still holding.
+The pairing is safe in both directions, so neither side has to go first.
 
 **Reconciliation stays inert until the agents are upgraded.** A pre-upgrade agent
 sends no ledger with its registration, so the controller builds no comparison and
@@ -466,9 +464,10 @@ immediately, and the pass is capped at a minute, after which the node is let bac
 in regardless. A rolling upgrade will show this on each node as its agent comes
 back.
 
-**Expect a brief allocated-but-empty window after each job.** Resources return on
-the controller's acknowledgement, so ``sinfo`` can show them allocated for a
-round trip after the work is done, and for the length of any controller outage.
+**Expect an allocated-but-empty window after each job.** Resources return on the
+controller's acknowledgement, so ``sinfo`` can show them allocated for a round
+trip after the work is done — and where the node runs an epilog, for however long
+that hook takes, plus the length of any controller outage.
 Held resources on an unreachable node are not schedulable anyway, and are
 resolved when it reconnects.
 
