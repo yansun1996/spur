@@ -4259,6 +4259,12 @@ pub(crate) fn epilog_owed(hooks: &HooksConfig) -> crate::admission::EpilogOwed {
     }
 }
 
+/// What this node declares at registration. One reading of the hook config, so
+/// the controller's gate and the agent's own debt cannot disagree.
+pub fn runs_job_epilog(hooks: &HooksConfig) -> bool {
+    epilog_owed(hooks) == crate::admission::EpilogOwed::Yes
+}
+
 /// The step whose supervisor runs this run's epilog. A numbered step never runs
 /// one, so only the step owning the job's lifetime can answer for it.
 fn hook_owner_step(admitted: &crate::admission::AdmittedRun) -> Option<spur_core::step::StepId> {
@@ -13318,6 +13324,7 @@ mod tests {
             String::new(),
             std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
+            false,
         ))
     }
 
@@ -16106,6 +16113,7 @@ mod tests {
             "spur0".into(),
             std::path::PathBuf::from("/etc/wireguard"),
             new_running_jobs(),
+            false,
         ))
     }
 
@@ -17371,6 +17379,7 @@ mod tests {
             String::new(),
             String::new(),
             running.clone(),
+            false,
         ));
         AgentService::with_cluster_config(
             reporter,
@@ -17796,6 +17805,7 @@ mod tests {
             String::new(),
             String::new(),
             running.clone(),
+            false,
         ));
         let svc = AgentService::with_cluster_config(
             reporter.clone(),
@@ -17862,6 +17872,7 @@ mod tests {
             String::new(),
             String::new(),
             running.clone(),
+            false,
         ));
         let svc = AgentService::with_cluster_config(
             reporter.clone(),
@@ -18508,6 +18519,7 @@ mod tests {
             String::new(),
             String::new(),
             new_running_jobs(),
+            false,
         ))
     }
 
@@ -18564,6 +18576,7 @@ mod tests {
             String::new(),
             std::path::PathBuf::from("/etc/wireguard"),
             running.clone(),
+            false,
         ));
         let svc = AgentService::with_cluster_config(
             reporter.clone(),

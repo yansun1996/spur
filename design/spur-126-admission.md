@@ -756,6 +756,126 @@ appears as `CompletionAcknowledged` without `ResourcesReleased`.
 Takes the `!`: resources become free one round trip later, and under controller
 unavailability stay held rather than being freed locally.
 
+### 7b — `feat(proto,spur-core,spurctld): hold a cancelled run's slice until its epilog ends`
+
+Commit 7 is entirely agent-side. It makes the *agent* withhold a node's completion
+report until that node's epilog has finished, and that is enough for the one path
+where the controller waits to be told: normal completion, where `JobNodeComplete`
+frees each node's slice as that node reports and `node_completions` is the
+`make_node_idle()` ledger. Nothing in this document said the controller must wait
+for an epilog, so nothing did.
+
+**The gap.** A controller-initiated termination never solicits a report.
+`cancel_job` proposes `JobComplete` directly — deliberately, so deallocation
+fires — and its apply frees *every* allocated node at once, while the epilog on
+those nodes is still running. Measured: a second job took all six cores 321 ms
+after the cancel, with 29 s of cleanup left. A report arriving later is dropped
+twice over: `node_complete` answers `AlreadyTerminal`, and the apply arm
+early-returns on a non-active job. The agent-side withholding cannot help, because
+nothing was waiting for it.
+
+**Why not-deallocating is not the fix.** `derive_node_allocations` rebuilds node
+totals from the job records that own them and skips anything failing
+`Job::is_held_on`, whose first clause was `!is_finalized()`. Leaving the slice
+charged at the termination site would survive only until the next leadership gain,
+snapshot install, or node re-registration, and then be silently zeroed. The
+predicate itself has to change.
+
+**The design.**
+
+- **Declaration.** `RegisterAgentRequest` gains an appended `runs_job_epilog`
+  bool, set from the same `epilog_owed` reading of the hook config the agent uses
+  for its own debt, so the two cannot disagree. It lands on `Node` and is carried
+  by `NodeRegister` (plain bool) and `NodeUpdate` (`Option<bool>`, `None` = leave
+  alone, mirroring `reconcile_pending` so a gate-only entry cannot clear it).
+  Hooks are static per-agent config and there is no agent-side reconfigure, so a
+  registration-time declaration cannot go stale.
+- **Marked once, at allocation.** `JobStart` records `Job::epilog_gated_nodes`
+  from the allocated nodes that advertise. Recording it where the placement is
+  written, rather than at each termination site, means one write instead of six
+  and no site that can forget.
+- **One predicate.** `is_held_on` becomes `allocated && !reported && (!finalized
+  || gated)`. It is the single definition behind both `derive_node_allocations`
+  and `jobs_allocated_on_node`, so the rebuild and the reconciler agree by
+  construction: a held slice is charged *and* is named to the agent as
+  controller-recorded, which is what I5 asks for.
+- **The release.** A node leaves `epilog_gated_nodes` only when its report is
+  applied. On a still-active job that is the existing path; on a finalized one the
+  apply arm now accepts the report, frees that one slice, and returns without
+  re-deriving an outcome the job already has. `node_complete` lets a gated node
+  through its terminal check for the same reason. This is `make_node_idle()`, and
+  it is the only thing that frees a gated slice (I1).
+
+**The termination sites.** `JobPreemptCancel` carried an inline copy of the
+deallocation loop that did not call `deallocate_job_slices`; gating that function
+alone would have covered five of six paths and silently missed it. It is folded in
+first, which also fixes a latent double-free there — it passed no already-freed
+list, so a node that had already reported was subtracted twice. The finalizing
+sites (`evict_job_locked`, `JobComplete`, `JobPreemptCancel`) now share one
+`slices_to_keep` helper reading both the reported set and the gated set before any
+clear.
+
+**Decision: `JobComplete` still clears `node_completions`, unchanged.** The
+alternative — exempting gated entries from the clear — is actively wrong. Because
+a node leaves `epilog_gated_nodes` at the moment its report is applied, a node
+that has already reported is no longer gated by the time any termination site
+runs, so the new predicate reads it as free whether or not its completion entry
+survives. Exempting entries instead would resurrect a hold for a node that had
+*already* been freed, re-charging a slice nobody will ever report again.
+`all_nodes_completed` and `derived_completion` are untouched: a late gated report
+returns before reaching them, so a cancelled job keeps the outcome the cancel gave
+it.
+
+**Deliberately not gated: the requeue paths** (`JobDispatchBackoff`,
+`JobPreemptRequeue`, `JobUserRequeue`). Forced by the code, not a shortcut. Those
+arms call `clear_run_state_for_requeue`, which clears `allocated_nodes`,
+`allocated_resources` and `per_node_alloc` so the job can be re-placed. Skipping
+the subtract there would hold nothing: with no `allocated_nodes` the job fails
+`is_held_on`, and the next `derive_node_allocations` drift-corrects the node back
+down. Holding across a requeue needs a charge carrier independent of the
+placement — a second ledger — and a re-dispatch onto the same node would then
+double-charge. Deferred as its own design. `clear_run_state_for_requeue` clears
+`epilog_gated_nodes` so no gate outlives the record that justified it, and
+`JobUserRequeue`'s *terminal* path — the one case where a requeue can meet a live
+gate, since the other two are reachable only from `Pending`/`Running` — hands the
+held slice back as it drops the gate, instead of assuming completion already freed
+it.
+
+**Reach and collection.**
+
+- **Direction B** iterates `jobs_confirmed_on_node`, whose predicate required
+  `is_active()`. A job finalized by cancel is not active, so a gated hold would
+  have been invisible to every reconcile pass — held forever with no path out.
+  `is_confirmed_on` now also admits a gated run; its call site needs nothing else,
+  because the same `node_complete` change accepts the report.
+- **`EvictTerminalJobs`** skips a job with a non-empty `epilog_gated_nodes`.
+  Collecting the record that carries the gate would strand the charge with no
+  owner left to release it (I3).
+- **Backfill.** `running_jobs_busy_until` filters on `Running`, so a gated slice
+  had no entry and fell to the flat unlimited placeholder, inflating every
+  projected start behind it. Gated nodes are seeded at `now` — the tightest honest
+  bound for a hook expected to end imminently, and a projection only; placement is
+  still refused by the live allocation.
+
+**When the epilog never completes.** A *failed* epilog releases: it returned. A
+hook whose owner died reads `Unknown`, which `settled_after_owner_loss` treats as
+settled, so the report goes out. A node that dies and never returns holds its
+slice — no timer, no inference from node liveness (I2, I6); when it comes back and
+registers, its ledger cut drives Direction B, which either confirms the hold or
+settles it. Permanent node loss stays deferred; `NodeRemove` is the operator's
+escape and clears the gate for that node across every job explicitly.
+
+**Compatibility, both directions.** A new controller with an old agent sees the
+field default to false, so `epilog_gated_nodes` is empty and `is_held_on` reduces
+to exactly today's expression — bit-for-bit current behaviour. An old controller
+with a new agent ignores an appended proto tag. Unlike the `SettleRun` change,
+this needs no particular upgrade order.
+
+**Invariants.** I1 and I5 are what the change implements; I2 and I6 are what it
+declines to violate by refusing a timeout; I3 is `EvictTerminalJobs`. I4 is
+unchanged — the agent's report obligation is still immortal, and is now the only
+thing that ends the hold.
+
 ### 8 — `feat(proto,spurd,spurctld): reconcile on a refused dispatch`
 
 `LaunchJobResponse` gains a structured refusal (append-only): a reason enum plus

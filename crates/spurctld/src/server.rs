@@ -2592,6 +2592,7 @@ impl SlurmController for ControllerService {
                 source,
                 req.labels,
                 caller_privileged,
+                req.runs_job_epilog,
             )
             .map_err(register_node_rpc_status)?;
 
@@ -2741,6 +2742,14 @@ impl SlurmController for ControllerService {
                         }
                     }
                 }
+                Ok(Response::new(()))
+            }
+            Some(Ok(NodeCompleteResult::EpilogReleased)) => {
+                info!(
+                    job_id = req.job_id,
+                    node = %req.reporting_node,
+                    "epilog reported for a finished run; the node's slice is free"
+                );
                 Ok(Response::new(()))
             }
             Some(Ok(NodeCompleteResult::AlreadyTerminal)) => {
@@ -7193,6 +7202,7 @@ mod tests {
 
     fn seed_a_job_on_a_node(cluster: &Arc<ClusterManager>) {
         cluster.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
+            runs_job_epilog: false,
             name: "n1".into(),
             hostname: "n1".into(),
             resources: spur_core::resource::ResourceSet {
@@ -7488,6 +7498,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("point the node at its probe agent");
 
@@ -7690,6 +7701,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let cluster = Arc::new(ClusterManager::new(step_test_config(), dir.path()).unwrap());
         cluster.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
+            runs_job_epilog: false,
             name: "n1".into(),
             hostname: "n1".into(),
             resources: spur_core::resource::ResourceSet {
@@ -8150,6 +8162,7 @@ mod tests {
     /// the node has somewhere real to land.
     fn point_node_at(cluster: &Arc<ClusterManager>, node: &str, addr: std::net::SocketAddr) {
         cluster.apply_operation(&spur_core::wal::WalOperation::NodeUpdate {
+            runs_job_epilog: None,
             name: node.into(),
             hostname: node.into(),
             resources: spur_core::resource::ResourceSet {
@@ -9823,6 +9836,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("update recovery probe address");
     }
@@ -9846,6 +9860,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("point the node at its probe agent");
         for _ in 0..200 {
@@ -10130,6 +10145,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("point n1 at its live probe agent");
 
@@ -10150,6 +10166,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .expect("register the untouched peer");
         for name in ["n1", "n2"] {
@@ -10471,6 +10488,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -10633,6 +10651,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -10802,6 +10821,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -11206,6 +11226,7 @@ mod tests {
                     spur_core::node::NodeSource::NativeHost,
                     std::collections::HashMap::new(),
                     true,
+                    false,
                 )
                 .unwrap();
         }
@@ -11312,6 +11333,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -11618,6 +11640,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         for _ in 0..200 {
@@ -11702,6 +11725,7 @@ mod tests {
                     NodeSource::NativeHost,
                     std::collections::HashMap::new(),
                     true,
+                    false,
                 )
                 .unwrap();
             svc.cluster
@@ -11837,6 +11861,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
         svc.cluster
@@ -11871,6 +11896,7 @@ mod tests {
                 spur_core::node::NodeSource::NativeHost,
                 std::collections::HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
     }
@@ -13228,6 +13254,7 @@ mod tests {
                     spur_core::node::NodeSource::NativeHost,
                     std::collections::HashMap::new(),
                     true,
+                    false,
                 )
                 .unwrap();
         }

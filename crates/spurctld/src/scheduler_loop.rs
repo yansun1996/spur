@@ -752,7 +752,21 @@ fn running_jobs_busy_until(cluster: &ClusterManager) -> HashMap<String, DateTime
         states: &[spur_core::job::JobState::Running],
         ..Default::default()
     });
-    busy_until_from_running_jobs(&running)
+    let mut busy_until = busy_until_from_running_jobs(&running);
+    add_epilog_held_nodes(&mut busy_until, &cluster.epilog_held_nodes(), Utc::now());
+    busy_until
+}
+
+/// A node holding a finished run's slice for its epilog has no running job to be
+/// derived from, and would otherwise fall to the flat unlimited placeholder.
+fn add_epilog_held_nodes(
+    busy_until: &mut HashMap<String, DateTime<Utc>>,
+    held: &HashSet<String>,
+    now: DateTime<Utc>,
+) {
+    for node in held {
+        busy_until.entry(node.clone()).or_insert(now);
+    }
 }
 
 /// Pure core of [`running_jobs_busy_until`], split out so it's testable
@@ -3073,6 +3087,37 @@ mod tests {
     }
 
     #[test]
+    fn a_node_held_for_an_epilog_is_free_now_not_at_the_unlimited_placeholder() {
+        let now = Utc::now();
+        let mut busy_until = busy_until_from_running_jobs(&[running_job_on("node001", now, 60)]);
+
+        add_epilog_held_nodes(
+            &mut busy_until,
+            &HashSet::from(["node002".to_string()]),
+            now,
+        );
+        assert_eq!(
+            busy_until.get("node002"),
+            Some(&now),
+            "without an entry backfill would inflate every start behind this node"
+        );
+    }
+
+    #[test]
+    fn an_epilog_hold_never_shortens_a_running_job_on_the_same_node() {
+        let now = Utc::now();
+        let mut busy_until = busy_until_from_running_jobs(&[running_job_on("node001", now, 60)]);
+        let running_end = busy_until["node001"];
+
+        add_epilog_held_nodes(
+            &mut busy_until,
+            &HashSet::from(["node001".to_string()]),
+            now,
+        );
+        assert_eq!(busy_until["node001"], running_end);
+    }
+
+    #[test]
     fn busy_until_saturates_instead_of_panicking_on_an_extreme_suspended_secs() {
         let now = Utc::now();
         let mut job = running_job_on("node001", now, 60);
@@ -4127,6 +4172,7 @@ mod tests {
                 NodeSource::NativeHost,
                 HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
             let n = name.to_string();
@@ -4139,6 +4185,7 @@ mod tests {
             use spur_core::wal::WalOperation;
 
             cm.apply_operation(&WalOperation::NodeRegister {
+                runs_job_epilog: false,
                 name: name.into(),
                 hostname: name.into(),
                 resources: ResourceSet {
@@ -5279,6 +5326,7 @@ mod tests {
                 },
                 HashMap::new(),
                 true,
+                false,
             )
             .unwrap();
             let n = name.to_string();

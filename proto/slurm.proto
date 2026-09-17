@@ -870,6 +870,9 @@ message RegisterAgentRequest {
   // One immutable cut of this agent's ledger, taken at registration. Absent
   // from an agent that predates it, which asserts no evidence and is not gated.
   optional NodeLedger ledger = 9;
+  // Whether a run's tasks exiting leaves an epilog still running here, so the
+  // controller must await this node's report before reusing its slice.
+  bool runs_job_epilog = 10;
 }
 
 // What an agent believes it is entitled to. Absence and emptiness differ: only
