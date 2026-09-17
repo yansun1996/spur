@@ -1002,6 +1002,29 @@ named is evidence whether or not the rest of the account is complete. So a node
 with a damaged spool is not uniformly left alone: expect cancellations from it,
 but no settlements.
 
+The other direction is a job the controller records on the node that the node
+did not list. A complete ledger that omits it is evidence the node let it go, so
+the run is settled as ``NODE_FAIL`` — the same state a job reaches when the node
+under it goes ``DOWN``, and for the same reason: it did not report an exit
+status, it stopped being there. A job submitted with ``--requeue`` therefore
+goes back to the queue and is retried, up to ``[controller] max_batch_requeue``
+attempts, after which it is held with a reason of ``JobHoldMaxRequeue``. Each
+retry is deferred by the same growing hold a launch failure gets, capped by
+``[controller] max_launch_backoff_secs``, so expect a future ``BeginTime``
+rather than an immediate re-dispatch.
+
+A multi-node job is settled whole: the ranks on the node that lost it are gone,
+so it cannot finish on the peers either. The controller kills it on every peer
+still running it and releases their slices; a node that had already reported, or
+that still owes a cleanup hook, keeps its slice until that hook answers. Where
+the run had already finished and the node owed only its epilog, the record is
+settled by releasing that slice rather than by ending the job again. The job's
+reason names the node it was lost from:
+
+.. code-block:: text
+
+   Reason=JobLaunchFailure (node node01 no longer holds this job)
+
 Whether a reconcile may cancel and settle, or only report what it found, depends
 on ``[admission] mode`` for the registration case; see
 :doc:`/admin-guide/configuration`. Every other trigger above acts in either mode.

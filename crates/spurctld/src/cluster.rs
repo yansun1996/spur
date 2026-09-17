@@ -2624,27 +2624,28 @@ impl ClusterManager {
         job_id: JobId,
         detail: Option<String>,
     ) -> anyhow::Result<()> {
-        self.evict_job_attempt(job_id, None, detail)
+        self.evict_job_attempt(job_id, None, detail).map(|_| ())
     }
 
     /// Evict only while `run_attempt` is still the job's current one. A caller
     /// that awaited anything may be holding an epoch the job has already left.
+    /// False where the record refused it, which no caller may read as settled.
     pub fn evict_job_attempt(
         &self,
         job_id: JobId,
         run_attempt: Option<u32>,
         detail: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         {
             let jobs = self.jobs.read();
             let job = jobs
                 .get(&job_id)
                 .ok_or_else(|| anyhow::anyhow!("job {} not found", job_id))?;
             if job.state.is_terminal() {
-                return Ok(());
+                return Ok(false);
             }
             if run_attempt.is_some_and(|attempt| job.run_attempt != attempt) {
-                return Ok(());
+                return Ok(false);
             }
         }
         let resp = self.propose(WalOperation::JobEvict {
@@ -2652,8 +2653,9 @@ impl ClusterManager {
             detail,
             at: None,
         })?;
+        let evicted = !resp.jobs_finalized.is_empty();
         self.run_all_finalized_side_effects(&resp);
-        Ok(())
+        Ok(evicted)
     }
 
     /// Gets (creating if absent) the per-node lock `register_node` serializes on.
@@ -6453,15 +6455,25 @@ impl ClusterManager {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.launch_failure_detail = detail.clone();
                 }
-                if let Some(fin) = Self::evict_job_locked(
+                let Some(fin) = Self::evict_job_locked(
                     *job_id,
                     &mut jobs,
                     &mut nodes,
                     timestamp,
                     PendingReason::JobLaunchFailure,
-                ) {
-                    response.jobs_finalized.push(fin);
-                }
+                ) else {
+                    return ClientResponse::default();
+                };
+                drop(jobs);
+                drop(nodes);
+                // Nothing reports a step of a run the record has stopped placing,
+                // so an unfinalized one stays Running for as long as the job lives.
+                self.complete_job_steps(job_id, fin.exit_code, timestamp);
+                self.next_job_id.store(next_id, Ordering::Relaxed);
+                return ClientResponse {
+                    jobs_finalized: vec![fin],
+                    ..Default::default()
+                };
             }
             WalOperation::JobLaunchFailureDetail { job_id, detail } => {
                 if let Some(job) = jobs.get_mut(job_id) {
@@ -17895,6 +17907,56 @@ mod tests {
             !cm.pending_jobs().iter().any(|j| j.job_id == job_id),
             "the hold must keep the job out of the very next dispatch"
         );
+    }
+
+    // An eviction takes the record's nodes away, so nothing is left to report
+    // the steps that were running on them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evicting_a_job_finalizes_the_steps_it_was_running() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+
+        let job_id = submit_and_wait(&cm, basic_spec("evict-steps"));
+        let alloc = scalar_alloc(2, 4000);
+        cm.start_job(
+            job_id,
+            vec!["n1".into()],
+            alloc.clone(),
+            per_node_for(&["n1"], alloc),
+        )
+        .unwrap();
+        settle(&cm, job_id, JobState::Running);
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(JobStep {
+                job_id,
+                step_id: 0,
+                name: "hostname".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: ResourceAllocations::default(),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: Some(Utc::now()),
+                end_time: None,
+                exit_code: None,
+            }),
+        });
+
+        cm.evict_job(job_id).unwrap();
+
+        let step = cm
+            .get_steps(job_id)
+            .into_iter()
+            .next()
+            .expect("the step stays on record");
+        assert!(
+            step.state.is_terminal(),
+            "a step of an evicted run must not stay Running, got {:?}",
+            step.state
+        );
+        assert!(step.end_time.is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

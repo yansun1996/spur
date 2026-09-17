@@ -1132,8 +1132,8 @@ async fn reconcile_node_ledger_after(
     let raced_the_cut = dispatched.observed();
     for run in cluster.jobs_confirmed_on_node(node) {
         let (job_id, run_attempt) = (run.job_id(), run.attempt().unwrap_or_default());
-        // Direction A awaits a round trip per kill, so by here the premises this
-        // pass opened on are at least that stale and have to be taken again.
+        // Every settle below awaits a round trip, so the premises this pass
+        // opened on are at least that stale and have to be taken again.
         if let Some(reason) = license.lapsed(cluster, node) {
             warn!(node = %node, reason, "leaving the rest of this node's records alone");
             break;
@@ -1171,18 +1171,8 @@ async fn reconcile_node_ledger_after(
             );
             continue;
         }
-        match cluster.node_complete(job_id, node, -1, 0, run_attempt) {
-            Ok(
-                crate::cluster::NodeCompleteResult::AlreadyTerminal
-                | crate::cluster::NodeCompleteResult::StaleReport,
-            ) => warn!(
-                node = %node,
-                job_id, "the report was not applied; this job stays recorded on the node"
-            ),
-            Ok(_) => outcome.settled.push(job_id),
-            Err(error) => {
-                warn!(node = %node, job_id, ?error, "could not settle a job the node no longer holds")
-            }
+        if settle_vanished_run(cluster, node, job_id, run_attempt).await {
+            outcome.settled.push(job_id);
         }
     }
 
@@ -1205,6 +1195,89 @@ async fn reconcile_node_ledger_after(
         name_unresolved_claims_on_node(cluster, node, &outcome);
     }
     outcome
+}
+
+/// End a run the node stopped holding, reporting whether the record took it.
+/// A refusal leaves the job placed here, which is not a settlement.
+async fn settle_vanished_run(
+    cluster: &Arc<ClusterManager>,
+    node: &str,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+) -> bool {
+    if only_the_epilog_is_owed(cluster, job_id, node) {
+        return release_the_owed_epilog(cluster, node, job_id, run_attempt);
+    }
+    // The job ends on every node it spans, so the ranks still running on its
+    // peers have to be told before the record stops accounting for them.
+    let peers = peers_still_holding(cluster, job_id, node);
+    if !peers.is_empty() {
+        crate::scheduler_loop::cancel_job_on_nodes(cluster, job_id, run_attempt, &peers, 9).await;
+    }
+    // A run the node dropped reported no exit, so it is an eviction and not a
+    // failure: only that reading is eligible for the node-fault retry.
+    let detail = format!("node {node} no longer holds this job");
+    match cluster.evict_job_attempt(job_id, Some(run_attempt), Some(detail)) {
+        Ok(true) => true,
+        Ok(false) => {
+            warn!(node = %node, job_id, "the eviction was not applied; this job stays recorded on the node");
+            false
+        }
+        Err(error) => {
+            warn!(node = %node, job_id, ?error, "could not settle a job the node no longer holds");
+            false
+        }
+    }
+}
+
+/// Whether the run is over and only the hook this node owes keeps its slice
+/// charged. Such a record has no eviction left to take, just a debt to discharge.
+fn only_the_epilog_is_owed(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    node: &str,
+) -> bool {
+    cluster
+        .get_job(job_id)
+        .is_some_and(|job| job.state.is_terminal() && job.is_epilog_gated_on(node))
+}
+
+/// The other nodes this run is still charged to, which a whole-job settle ends
+/// the work on.
+fn peers_still_holding(
+    cluster: &ClusterManager,
+    job_id: spur_core::job::JobId,
+    node: &str,
+) -> Vec<String> {
+    let Some(job) = cluster.get_job(job_id) else {
+        return Vec::new();
+    };
+    job.allocated_nodes
+        .iter()
+        .filter(|peer| peer.as_str() != node && job.is_held_on(peer))
+        .cloned()
+        .collect()
+}
+
+/// Answer the epilog a finalized run is still gated on here. Only the completion
+/// path ends that debt; an eviction has nothing left to evict.
+fn release_the_owed_epilog(
+    cluster: &ClusterManager,
+    node: &str,
+    job_id: spur_core::job::JobId,
+    run_attempt: u32,
+) -> bool {
+    match cluster.node_complete(job_id, node, -1, 0, run_attempt) {
+        Ok(crate::cluster::NodeCompleteResult::EpilogReleased) => true,
+        Ok(result) => {
+            warn!(node = %node, job_id, ?result, "the report was not applied; this job stays recorded on the node");
+            false
+        }
+        Err(error) => {
+            warn!(node = %node, job_id, ?error, "could not release an epilog the node no longer owes");
+            false
+        }
+    }
 }
 
 /// Marks the reason this pass owns, so a later pass can tell its own stale text
@@ -7223,10 +7296,26 @@ mod tests {
     }
 
     fn seed_a_job_on_a_node(cluster: &Arc<ClusterManager>) {
+        seed_a_job_on_a_node_with(cluster, a_one_node_spec());
+    }
+
+    fn a_one_node_spec() -> spur_core::job::JobSpec {
+        spur_core::job::JobSpec {
+            name: "j".into(),
+            user: "testuser".into(),
+            num_nodes: 1,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            work_dir: "/tmp".into(),
+            ..Default::default()
+        }
+    }
+
+    fn register_a_node(cluster: &Arc<ClusterManager>, name: &str) {
         cluster.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
             runs_job_epilog: false,
-            name: "n1".into(),
-            hostname: "n1".into(),
+            name: name.into(),
+            hostname: name.into(),
             resources: spur_core::resource::ResourceSet {
                 cpus: 8,
                 memory_mb: 16000,
@@ -7239,19 +7328,21 @@ mod tests {
             labels: std::collections::HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
         });
+    }
+
+    fn seed_a_job_on_a_node_with(cluster: &Arc<ClusterManager>, spec: spur_core::job::JobSpec) {
+        register_a_node(cluster, "n1");
         cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
             at: None,
             job_id: 7,
-            spec: Box::new(spur_core::job::JobSpec {
-                name: "j".into(),
-                user: "testuser".into(),
-                num_nodes: 1,
-                num_tasks: 1,
-                cpus_per_task: 1,
-                work_dir: "/tmp".into(),
-                ..Default::default()
-            }),
+            spec: Box::new(spec),
         });
+        place_job_7_on_n1(cluster, 1);
+    }
+
+    /// Put job 7 back on `n1` under `run_attempt`, the way a fresh dispatch of
+    /// an already-submitted job would.
+    fn place_job_7_on_n1(cluster: &Arc<ClusterManager>, run_attempt: u32) {
         cluster.apply_operation(&spur_core::wal::WalOperation::JobStateChange {
             job_id: 7,
             old_state: spur_core::job::JobState::Pending,
@@ -7268,7 +7359,7 @@ mod tests {
             resources: slice.clone(),
             per_node_alloc: [("n1".to_string(), slice)].into_iter().collect(),
             srun_step_dispatch: false,
-            run_attempt: 1,
+            run_attempt,
             at: Some(chrono::Utc::now()),
         });
     }
@@ -7779,14 +7870,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
 
-        let outcome = reconcile_node_ledger(
-            &cluster,
-            "n1",
-            ledger(true, Vec::new()),
-            &no_launch_in_flight(&cluster, "n1"),
-            CutProvenance::Pulled,
-        )
-        .await;
+        let outcome = take_a_cut_that_holds_nothing(&cluster).await;
 
         assert_eq!(
             outcome.settled,
@@ -7794,6 +7878,251 @@ mod tests {
             "a complete ledger that omits a confirmed run is evidence the node let it go"
         );
         assert!(!holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+    }
+
+    /// A complete cut naming nothing, which is the whole of Direction B's case.
+    async fn take_a_cut_that_holds_nothing(cluster: &Arc<ClusterManager>) -> ReconcileOutcome {
+        reconcile_node_ledger(
+            cluster,
+            "n1",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direction_b_settles_a_vanished_job_as_node_fail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        take_a_cut_that_holds_nothing(&cluster).await;
+
+        let job = cluster.get_job(7).expect("job 7 stays on record");
+        assert_eq!(
+            job.state,
+            spur_core::job::JobState::NodeFail,
+            "a run the node stopped holding never reported an exit status to fail on"
+        );
+        assert_eq!(job.exit_code, Some(-1));
+    }
+
+    // Nothing else in the record says where the job went, so without this an
+    // operator sees a node-fault eviction naming no node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settled_job_says_which_node_let_it_go() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        take_a_cut_that_holds_nothing(&cluster).await;
+
+        assert_eq!(
+            cluster
+                .get_job(7)
+                .expect("job 7 stays on record")
+                .state_reason(),
+            "JobLaunchFailure (node n1 no longer holds this job)",
+            "this is the reason the documentation quotes"
+        );
+    }
+
+    // The completion path is the only one that answers an epilog debt: an
+    // eviction skips a finalized record and leaves the slice charged for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_job_still_owing_an_epilog_has_its_slice_released() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        declare_epilog_on_n1(&cluster);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
+            job_id: 7,
+            spec: Box::new(a_one_node_spec()),
+        });
+        place_job_7_on_n1(&cluster, 1);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobComplete {
+            at: None,
+            job_id: 7,
+            exit_code: 0,
+            state: spur_core::job::JobState::Completed,
+        });
+        assert_eq!(
+            cpus_charged_to(&cluster, "n1"),
+            2,
+            "the epilog gate is what still holds this slice"
+        );
+
+        let outcome = take_a_cut_that_holds_nothing(&cluster).await;
+
+        assert_eq!(outcome.settled, vec![7]);
+        assert_eq!(
+            cpus_charged_to(&cluster, "n1"),
+            0,
+            "a node that dropped the run will never report the hook that frees it"
+        );
+    }
+
+    fn config_capping_requeues_at(max: u32) -> spur_core::config::SlurmConfig {
+        spur_core::config::SlurmConfig::load_from_str(&format!(
+            "cluster_name = \"test\"\n\
+             [controller]\nfirst_job_id = 1\nmax_batch_requeue = {max}\n\
+             [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n"
+        ))
+        .unwrap()
+    }
+
+    // The label is cosmetic; this is the cost. Only a node-fault reading feeds
+    // the auto-requeue, so anything else drops the job on the floor in silence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_vanished_job_stays_eligible_for_retry() {
+        use spur_core::job::{JobState, PendingReason};
+
+        const CAP: u32 = 2;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with(&dir, config_capping_requeues_at(CAP)).await;
+        let cluster = svc.cluster.clone();
+        seed_a_job_on_a_node_with(
+            &cluster,
+            spur_core::job::JobSpec {
+                requeue: true,
+                ..a_one_node_spec()
+            },
+        );
+
+        for attempt in 1..=CAP {
+            take_a_cut_that_holds_nothing(&cluster).await;
+            let job = cluster.get_job(7).expect("job 7 stays on record");
+            assert_eq!(
+                job.state,
+                JobState::Pending,
+                "the job has to go back in line"
+            );
+            assert_eq!(job.requeue_count, attempt);
+            place_job_7_on_n1(&cluster, attempt + 1);
+        }
+
+        take_a_cut_that_holds_nothing(&cluster).await;
+        let job = cluster.get_job(7).expect("job 7 stays on record");
+        assert_eq!(
+            job.requeue_count, CAP,
+            "the cap has to stop the retries rather than let them run on"
+        );
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.pending_reason, PendingReason::JobHoldMaxRequeue);
+    }
+
+    /// Job 7 across three nodes, with `nB` already done and a second job holding
+    /// a slice there: whatever frees `nB` twice takes that second job's slice.
+    fn seed_a_three_node_job(cluster: &Arc<ClusterManager>) {
+        for name in ["nA", "nB", "nC"] {
+            register_a_node(cluster, name);
+        }
+        let slice = spur_core::resource::ResourceAllocations::with_scalar(2, 1000);
+        for (job_id, nodes) in [(7u32, vec!["nA", "nB", "nC"]), (8, vec!["nB"])] {
+            cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+                at: None,
+                job_id,
+                spec: Box::new(spur_core::job::JobSpec {
+                    num_nodes: nodes.len() as u32,
+                    ..a_one_node_spec()
+                }),
+            });
+            cluster.apply_operation(&spur_core::wal::WalOperation::JobStateChange {
+                job_id,
+                old_state: spur_core::job::JobState::Pending,
+                new_state: spur_core::job::JobState::Running,
+                pending_reason: None,
+                pending_priority: None,
+                begin_time: None,
+                pending_reason_desc: None,
+            });
+            let total = spur_core::resource::ResourceAllocations::with_scalar(
+                2 * nodes.len() as u32,
+                1000 * nodes.len() as u64,
+            );
+            cluster.apply_operation(&spur_core::wal::WalOperation::JobStart {
+                job_id,
+                nodes: nodes.iter().map(|n| (*n).to_string()).collect(),
+                resources: total,
+                per_node_alloc: nodes
+                    .iter()
+                    .map(|n| ((*n).to_string(), slice.clone()))
+                    .collect(),
+                srun_step_dispatch: false,
+                run_attempt: 1,
+                at: Some(chrono::Utc::now()),
+            });
+        }
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobNodeComplete {
+            job_id: 7,
+            node_name: "nB".into(),
+            exit_code: 0,
+            signal: 0,
+            run_attempt: 1,
+            at: None,
+        });
+    }
+
+    fn cpus_charged_to(cluster: &Arc<ClusterManager>, node: &str) -> u32 {
+        cluster
+            .get_node(node)
+            .expect("the node is registered")
+            .alloc_resources
+            .cpus
+    }
+
+    // A kill aimed at a node that already reported would land on whatever took
+    // its place, since the slice it names went back to the free pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_peers_still_running_the_job_are_told_to_end_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        seed_a_three_node_job(&svc.cluster);
+
+        assert_eq!(
+            super::peers_still_holding(&svc.cluster, 7, "nA"),
+            vec!["nC".to_string()],
+            "nB reported already; only nC is still running this job"
+        );
+    }
+
+    // Letting the job run on its peers would hang: the lost node's ranks are
+    // gone, so the all-nodes-reported condition can never come true again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_node_losing_a_job_evicts_the_whole_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        seed_a_three_node_job(&cluster);
+        assert_eq!(cpus_charged_to(&cluster, "nB"), 2, "job 8's slice is left");
+
+        reconcile_node_ledger(
+            &cluster,
+            "nA",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(&cluster, "nA"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            cluster.get_job(7).map(|job| job.state),
+            Some(spur_core::job::JobState::NodeFail)
+        );
+        assert_eq!(cpus_charged_to(&cluster, "nA"), 0);
+        assert_eq!(
+            cpus_charged_to(&cluster, "nC"),
+            0,
+            "a peer's slice is freed too"
+        );
+        assert_eq!(
+            cpus_charged_to(&cluster, "nB"),
+            2,
+            "nB was freed as it reported; freeing it again eats job 8's slice"
+        );
     }
 
     /// Register `n1` as a fresh agent lifetime, the way a restarted agent does.
