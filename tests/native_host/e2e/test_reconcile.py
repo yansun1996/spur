@@ -26,6 +26,19 @@ def reconcile(cluster, node_name: str, extra_env: dict[str, str] | None = None):
     )
 
 
+def start_authenticated(cluster):
+    """Reconcile needs a named admin, so every test here runs on a JWT cluster."""
+    cluster.start(config_overrides={"auth": {"plugin": "jwt", "jwt_key": JWT_KEY}})
+    return cluster
+
+
+def admin_reconcile(cluster, node_name: str):
+    return reconcile(
+        cluster, node_name,
+        extra_env={"SPUR_AUTH_TOKEN": mint_token(cluster, "e2e-admin", admin=True)},
+    )
+
+
 def mint_token(cluster, user: str, admin: bool = False) -> str:
     args = ["spur", "token", "user", "--user", user]
     if admin:
@@ -38,8 +51,9 @@ def mint_token(cluster, user: str, admin: bool = False) -> str:
 
 class TestOperatorReconcile:
     def test_reconciling_a_healthy_node_pulls_its_ledger_and_cancels_nothing(
-        self, cluster
+        self, unstarted_cluster
     ):
+        cluster = start_authenticated(unstarted_cluster)
         node = cluster.node_names[0]
         job_ids = [
             submit_holder(cluster, f"rec-keep-{i}", cpus=1, seconds=30)
@@ -52,7 +66,7 @@ class TestOperatorReconcile:
         before_pulls = ledger_pulls(cluster)
         before_supervisors = {j: run_supervisors(cluster, j) for j in job_ids}
 
-        code, out = reconcile(cluster, node)
+        code, out = admin_reconcile(cluster, node)
         assert code == 0, f"an admin reconcile must succeed:\n{out}"
 
         wait_until(
@@ -76,11 +90,15 @@ class TestOperatorReconcile:
             cluster.scancel(str(job_id))
 
     def test_only_an_admin_may_ask_a_node_to_reconcile(self, unstarted_cluster):
-        cluster = unstarted_cluster
-        cluster.start(
-            config_overrides={"auth": {"plugin": "jwt", "jwt_key": JWT_KEY}}
-        )
+        cluster = start_authenticated(unstarted_cluster)
         node = cluster.node_names[0]
+
+        before_anon = ledger_pulls(cluster)
+        code, out = reconcile(cluster, node)
+        assert code != 0, f"an unidentified caller must be refused:\n{out}"
+        assert ledger_pulls(cluster) == before_anon, (
+            "a refused reconcile must not reach the node"
+        )
 
         before_pulls = ledger_pulls(cluster)
         code, out = reconcile(
@@ -105,8 +123,9 @@ class TestOperatorReconcile:
 
 class TestUnrecordedClaim:
     def test_a_claim_the_controller_has_no_record_of_is_ended_and_its_cores_freed(
-        self, cluster
+        self, unstarted_cluster
     ):
+        cluster = start_authenticated(unstarted_cluster)
         node = cluster.node_names[0]
         job_id = submit_holder(cluster, "rec-orphan", cpus=3, seconds=120)
         wait_run_record(cluster, job_id)
@@ -122,7 +141,7 @@ class TestUnrecordedClaim:
             f"the node stopped holding the run before any reconcile: {record}"
         )
 
-        code, out = reconcile(cluster, node)
+        code, out = admin_reconcile(cluster, node)
         assert code == 0, f"an admin reconcile must succeed:\n{out}"
 
         wait_until(

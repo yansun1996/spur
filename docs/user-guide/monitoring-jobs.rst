@@ -1006,7 +1006,10 @@ Whether a reconcile may cancel and settle, or only report what it found, depends
 on ``[admission] mode`` for the registration case; see
 :doc:`/admin-guide/configuration`. Every other trigger above acts in either mode.
 
-Asking for one by hand requires admin rights, because it can end running work:
+Asking for one by hand requires an **authenticated** cluster admin, because it
+can end running work. ``State=`` and ``Reason=`` accept an unidentified caller
+where authentication is disabled; ``Reconcile=yes`` does not, so it is refused
+on a cluster that cannot name its callers:
 
 .. code-block:: bash
 

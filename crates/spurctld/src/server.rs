@@ -846,6 +846,20 @@ impl ControllerService {
         }
     }
 
+    /// Rejects anyone the controller cannot name as an admin, anonymous included. For an operation
+    /// that can end running work, where `require_admin`'s trust of an unidentified caller is too
+    /// wide: on a cluster with no authentication, anyone who can reach the port is that caller.
+    #[allow(clippy::result_large_err)]
+    fn require_named_admin<T>(&self, request: &Request<T>, op: &str) -> Result<(), Status> {
+        let identity = Self::verified_identity(request);
+        if identity.is_some() && self.caller_is_admin(identity) {
+            return Ok(());
+        }
+        Err(Status::permission_denied(format!(
+            "{op} requires an authenticated cluster admin"
+        )))
+    }
+
     /// Whether a caller is exempt from the non-admin restrictions (the priority ceiling): an admin,
     /// or a caller with no verified identity. The latter keeps the pre-auth behaviour — `disabled`,
     /// or `permissive` with no credential, trusts the client — so restricting it would break no-auth
@@ -2174,6 +2188,11 @@ impl SlurmController for ControllerService {
         self.require_admin(&request, "update node")?;
 
         let reason_uid = Self::verified_identity(&request).map(|id| id.uid);
+        // Held to a stricter bar than the rest of this RPC: a reconcile can cancel
+        // running work, where State= and Reason= only change what runs next.
+        if request.get_ref().reconcile {
+            self.require_named_admin(&request, "reconciling a node")?;
+        }
         let req = request.into_inner();
         if req.reconcile {
             crate::scheduler_loop::pull_node_ledger(&self.cluster, &req.name, "operator audit")
@@ -6359,6 +6378,39 @@ mod tests {
         let job = owned_job("u", "/w");
         assert!(resolve_step_container(None, &job).is_none());
         assert!(resolve_step_container(Some(ContainerSpec::default()), &job).is_none());
+    }
+
+    // Every other node update trusts a caller it cannot name, so that a cluster
+    // with auth off still works. A reconcile can end running work, so it does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_a_named_admin_may_reconcile_a_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+
+        let req = |id: Option<spur_core::auth::Identity>| {
+            let mut r = Request::new(());
+            if let Some(id) = id {
+                r.extensions_mut().insert(id);
+            }
+            r
+        };
+
+        assert!(
+            svc.require_named_admin(&req(None), "reconciling a node")
+                .is_err(),
+            "with auth off anyone reaching the port is this caller"
+        );
+        assert!(svc
+            .require_named_admin(&req(Some(viewer("bob", false))), "reconciling a node")
+            .is_err());
+        assert!(svc
+            .require_named_admin(&req(Some(viewer("root", true))), "reconciling a node")
+            .is_ok());
+
+        assert!(
+            svc.require_admin(&req(None), "update node").is_ok(),
+            "the ordinary node update must keep accepting an unnamed caller"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
