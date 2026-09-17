@@ -1873,10 +1873,10 @@ impl ClusterManager {
             let job = jobs
                 .get(&job_id)
                 .ok_or(NodeCompleteError::JobNotFound { job_id })?;
-            // A node still owing this run's epilog is the one caller a terminal
-            // job must still hear from: its report is what frees that slice.
-            was_gated = job.state.is_terminal() && job.is_epilog_gated_on(node_name);
-            if job.state.is_terminal() && !was_gated {
+            // Finalized, not terminal: a preempted run rests here mid-epilog, and
+            // its gated node's report is the one a finished job must still take.
+            was_gated = job.state.is_finalized() && job.is_epilog_gated_on(node_name);
+            if job.state.is_finalized() && !was_gated {
                 return Ok(NodeCompleteResult::AlreadyTerminal);
             }
             // Drop a report from a superseded run (older epoch); e.g. the
@@ -2040,11 +2040,8 @@ impl ClusterManager {
                 Ok(PreemptOutcome::Killed)
             }
             PreemptMode::Requeue => {
-                // Single atomic op: free nodes, end the run for accounting, and
-                // return to Pending with an eligibility hold. A two-proposal
-                // sequence could strand the job in PREEMPTED if the second
-                // proposal failed after the first committed (leadership change /
-                // restart), which nothing scans for or recovers.
+                // One op: the apply ends the run and returns it to Pending, or
+                // parks it until the last epilog answers (see JobPreemptRequeue).
                 //
                 // Requeue-by-preemption intentionally ignores spec.requeue and
                 // the maybe_requeue MAX_REQUEUE cap: Slurm always requeues a
@@ -2624,17 +2621,19 @@ impl ClusterManager {
         job_id: JobId,
         detail: Option<String>,
     ) -> anyhow::Result<()> {
-        self.evict_job_attempt(job_id, None, detail).map(|_| ())
+        self.evict_job_attempt(job_id, None, detail, PendingReason::JobLaunchFailure)
+            .map(|_| ())
     }
 
     /// Evict only while `run_attempt` is still the job's current one. A caller
     /// that awaited anything may be holding an epoch the job has already left.
-    /// False where the record refused it, which no caller may read as settled.
+    /// `reason` decides the retry: only a real launch failure earns the backoff.
     pub fn evict_job_attempt(
         &self,
         job_id: JobId,
         run_attempt: Option<u32>,
         detail: Option<String>,
+        reason: PendingReason,
     ) -> anyhow::Result<bool> {
         {
             let jobs = self.jobs.read();
@@ -2651,6 +2650,7 @@ impl ClusterManager {
         let resp = self.propose(WalOperation::JobEvict {
             job_id,
             detail,
+            reason,
             at: None,
         })?;
         let evicted = !resp.jobs_finalized.is_empty();
@@ -4839,6 +4839,33 @@ impl ClusterManager {
         }
     }
 
+    /// Finish the requeue of a job parked mid-preemption once no node is left to
+    /// answer its epilog. Collection never takes such a job, so this is its way out.
+    pub fn requeue_stranded_preempted_jobs(&self) {
+        let now = Utc::now();
+        let stranded: Vec<(JobId, Option<JobId>, Option<String>)> = {
+            let jobs = self.jobs.read();
+            let nodes = self.nodes.read();
+            jobs.values()
+                .filter(|j| j.state == JobState::Preempted)
+                .filter(|j| !Self::epilog_gate_still_binds(j, &nodes))
+                .map(|j| (j.job_id, j.preempted_by, j.preempt_qos.clone()))
+                .collect()
+        };
+        for (job_id, preempted_by, preempt_qos) in stranded {
+            let op = WalOperation::JobPreemptRequeue {
+                at: None,
+                job_id,
+                begin_time: now,
+                preempted_by,
+                preempt_qos,
+            };
+            if let Err(e) = self.propose(op) {
+                warn!(job_id, error = %e, "failed to requeue a job stranded mid-preemption");
+            }
+        }
+    }
+
     /// Whether a finished job's epilog hold still protects anything. A node that
     /// is gone or unheard from runs no hook this could be shielding, and a node
     /// that returns re-presents the claim through the normal reconcile path.
@@ -4878,7 +4905,9 @@ impl ClusterManager {
         // Spare a target still referenced by a live job's dependency: dropping it
         // makes resolve_target_state return None, which cancels/early-releases dependents.
         let mut referenced: HashSet<JobId> = HashSet::new();
-        for j in jobs.values().filter(|j| !j.state.is_finalized()) {
+        // Not is_finalized: a job resting in Preempted or Requeued is on its way
+        // back to Pending, and its dependency still has to protect its target.
+        for j in jobs.values().filter(|j| !j.state.is_terminal()) {
             for dep in spur_core::dependency::parse_dependencies(&j.spec.dependency) {
                 if let Some(id) = dep.target_job_id() {
                     referenced.insert(id);
@@ -4890,6 +4919,9 @@ impl ClusterManager {
         jobs.iter()
             .filter(|(id, j)| {
                 j.state.is_finalized()
+                    // A parked preemption owes the user a run, so collecting it
+                    // destroys a job that was promised a requeue, not a record.
+                    && j.state != JobState::Preempted
                     // Mirrors the apply's refusal to collect a job still holding a
                     // slice: without it every pass re-proposes the same no-op.
                     && !Self::epilog_gate_still_binds(j, nodes)
@@ -6014,6 +6046,25 @@ impl ClusterManager {
         Self::clear_run_state_for_requeue(job);
     }
 
+    /// Return a job whose preempted run has ended to Pending. Split out because
+    /// an epilog defers it past the apply that ended the run.
+    fn finish_preempt_requeue(job: &mut Job) {
+        if let Err(e) = job.transition(JobState::Pending) {
+            warn!(job_id = job.job_id, error = %e, "invalid requeue transition in WAL apply");
+            return;
+        }
+        // Provenance survives the reset, which only clears run state.
+        Self::reset_job_for_preempt_requeue(job);
+        let desc = match job.preempted_by {
+            Some(by) => match job.preempt_qos.as_deref() {
+                Some(qos) => format!("preempted by job {by} (QOS: {qos})"),
+                None => format!("preempted by job {by}"),
+            },
+            None => "preempted".to_string(),
+        };
+        job.set_pending_reason_desc(PendingReason::Preempted, desc);
+    }
+
     /// Requeue by admin action (`scontrol requeue`): tracked separately since it
     /// is an operator decision, never a failure, and must never contribute to
     /// the `max_batch_requeue` hold.
@@ -6226,15 +6277,25 @@ impl ClusterManager {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
                     };
+                    // A parked job re-enters from the sweep. Re-checked, not taken
+                    // on trust: a node can come back between propose and apply.
+                    if job.state == JobState::Preempted {
+                        if Self::epilog_gate_still_binds(job, &nodes) {
+                            return ClientResponse::default();
+                        }
+                        Self::release_gates_of_collected_job(job, &mut nodes);
+                        job.spec.begin_time = Some(*begin_time);
+                        Self::finish_preempt_requeue(job);
+                        return ClientResponse::default();
+                    }
                     if job.state != JobState::Running {
                         return ClientResponse::default();
                     }
                     // Read before the transition below rewrites the state that
                     // decides where this run is still charged.
-                    keep_charged = Self::slices_no_longer_held(job);
+                    keep_charged = Self::slices_to_keep(job);
                     // Route through Preempted so the state machine and accounting
-                    // see a finished run, then requeue to Pending — one atomic
-                    // apply; the intermediate Preempted never escapes the lock.
+                    // see a finished run.
                     if let Err(e) = job.transition(JobState::Preempted) {
                         warn!(job_id = *job_id, error = %e, "invalid preempt transition in WAL apply");
                         return ClientResponse::default();
@@ -6248,25 +6309,26 @@ impl ClusterManager {
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
 
-                    if let Err(e) = job.transition(JobState::Pending) {
-                        warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
-                        return ClientResponse::default();
-                    }
-                    Self::reset_job_for_preempt_requeue(job);
-                    job.spec.begin_time = Some(*begin_time);
-                    // Provenance fields are set after reset_job_for_preempt_requeue
-                    // clears run state so they survive into the pending phase.
                     job.preempted_by = *preempted_by;
                     job.preempt_mode = Some("Requeue".to_string());
                     job.preempt_qos = preempt_qos.clone();
-                    let desc = match preempted_by {
-                        Some(by) => match preempt_qos.as_deref() {
-                            Some(qos) => format!("preempted by job {by} (QOS: {qos})"),
-                            None => format!("preempted by job {by}"),
-                        },
-                        None => "preempted".to_string(),
-                    };
-                    job.set_pending_reason_desc(PendingReason::Preempted, desc);
+                    // Stashed here, not at the requeue: the last epilog report is
+                    // what completes it, and that apply never sees this entry.
+                    job.spec.begin_time = Some(*begin_time);
+                    // Nothing else records that the dealloc below hands these back,
+                    // and a later whole-job settle would free them a second time.
+                    for name in freed_nodes.iter().filter(|n| !keep_charged.contains(n)) {
+                        job.node_completions.insert(
+                            name.clone(),
+                            spur_core::job::NodeCompletion {
+                                code: -1,
+                                signal: 0,
+                            },
+                        );
+                    }
+                    if job.epilog_gated_nodes.is_empty() {
+                        Self::finish_preempt_requeue(job);
+                    }
                 }
                 Self::deallocate_job_slices(
                     &mut nodes,
@@ -6482,7 +6544,12 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobEvict { job_id, detail, .. } => {
+            WalOperation::JobEvict {
+                job_id,
+                detail,
+                reason,
+                ..
+            } => {
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.launch_failure_detail = detail.clone();
                 }
@@ -6491,10 +6558,19 @@ impl ClusterManager {
                     &mut jobs,
                     &mut nodes,
                     timestamp,
-                    PendingReason::JobLaunchFailure,
+                    reason.clone(),
                 ) else {
                     return ClientResponse::default();
                 };
+                // Only JobLaunchFailure renders its detail from the reason code,
+                // so any other eviction has to name the node itself.
+                let named = detail
+                    .as_ref()
+                    .filter(|_| *reason != PendingReason::JobLaunchFailure);
+                if let (Some(detail), Some(job)) = (named, jobs.get_mut(job_id)) {
+                    let desc = format!("{} ({detail})", reason.display());
+                    job.set_pending_reason_desc(reason.clone(), desc);
+                }
                 drop(jobs);
                 drop(nodes);
                 // Nothing reports a step of a run the record has stopped placing,
@@ -6625,6 +6701,11 @@ impl ClusterManager {
                             node = %node_name,
                             "node finished this run's epilog; releasing its slice"
                         );
+                        // The preempted run is only now fully off its nodes, so
+                        // this is where the deferred half of the requeue lands.
+                        if job.state == JobState::Preempted && job.epilog_gated_nodes.is_empty() {
+                            Self::finish_preempt_requeue(job);
+                        }
                         return ClientResponse::default();
                     }
 
@@ -6843,12 +6924,14 @@ impl ClusterManager {
                         "JobStepCreate: skipping step for unknown job"
                     );
                 }
-                Some(job) if job.state.is_terminal() => {
+                // Finalized, not terminal: the run this step belongs to has ended
+                // even where the job itself is on its way back to Pending.
+                Some(job) if job.state.is_finalized() => {
                     warn!(
                         job_id = step.job_id,
                         step_id = step.step_id,
                         state = ?job.state,
-                        "JobStepCreate: skipping step for terminal job"
+                        "JobStepCreate: skipping step for a run that has ended"
                     );
                 }
                 Some(_) => {
@@ -7377,13 +7460,15 @@ impl ClusterManager {
                 }
             }
             WalOperation::EvictTerminalJobs { job_ids } => {
-                // Spare an id requeued between propose and apply, and one still
-                // gating a node: collecting it would strand that node's slice.
+                // Refuse an id requeued between propose and apply, one still gating
+                // a node, and one parked mid-preemption: that owes the user a run.
                 let evicted: HashSet<JobId> = job_ids
                     .iter()
                     .filter(|id| {
                         jobs.get(id).is_some_and(|j| {
-                            j.state.is_finalized() && !Self::epilog_gate_still_binds(j, &nodes)
+                            j.state.is_finalized()
+                                && j.state != JobState::Preempted
+                                && !Self::epilog_gate_still_binds(j, &nodes)
                         })
                     })
                     .copied()
@@ -10850,8 +10935,8 @@ mod tests {
             job_id: 3,
             spec: Box::new(basic_spec("pending")),
         });
-        // A job stranded in Preempted (a rare requeue-strand): finalized with an
-        // end_time, so it must be reapable even though it isn't is_terminal().
+        // A job resting in Preempted between the two halves of its requeue. It
+        // is finalized with an end_time, but the user is still owed a run.
         cm.apply_operation(&WalOperation::JobSubmit {
             at: None,
             job_id: 4,
@@ -10897,8 +10982,8 @@ mod tests {
         assert!(cm.get_job(2).is_some(), "running job must be spared");
         assert!(cm.get_job(3).is_some(), "pending job must be spared");
         assert!(
-            cm.get_job(4).is_none(),
-            "named finalized (Preempted) job must be evicted"
+            cm.get_job(4).is_some(),
+            "collecting a job parked mid-preemption destroys a promised run"
         );
         assert!(
             cm.steps.read().get(&(1, 0)).is_none(),
@@ -22849,6 +22934,276 @@ mod tests {
         );
         cm.recompute_node_allocations();
         assert_eq!(alloc_cpus(&cm, "n1"), 0, "and the rebuild must agree");
+    }
+
+    fn preempt_requeue(cm: &ClusterManager, job_id: JobId, begin_time: DateTime<Utc>) {
+        cm.apply_operation(&WalOperation::JobPreemptRequeue {
+            at: None,
+            job_id,
+            begin_time,
+            preempted_by: Some(99),
+            preempt_qos: None,
+        });
+    }
+
+    // No hook is the default configuration, so a requeue that waited for one
+    // would leave every preempted job on such a cluster parked in Preempted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preempting_a_run_no_node_owes_a_hook_for_requeues_in_one_apply() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", false);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+
+        let begin = Utc::now() + chrono::Duration::seconds(5);
+        preempt_requeue(&cm, 1, begin);
+
+        let job = cm.get_job(1).expect("job 1");
+        assert_eq!(
+            job.state,
+            JobState::Pending,
+            "nothing owes a hook, so nothing defers the requeue"
+        );
+        assert_eq!(job.spec.begin_time, Some(begin));
+        assert_eq!(job.preempt_requeue_count, 1);
+        assert_eq!(job.pending_reason, PendingReason::Preempted);
+        assert_eq!(alloc_cpus(&cm, "n1"), 0, "and the slice comes back");
+    }
+
+    // The tasks are gone but the hook is not, and a node handed to the next job
+    // while its epilog still runs is oversubscribed for as long as that takes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preempted_run_keeps_the_slice_a_hook_is_still_using() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+
+        preempt_requeue(&cm, 1, Utc::now() + chrono::Duration::seconds(5));
+
+        let job = cm.get_job(1).expect("job 1");
+        assert_eq!(job.state, JobState::Preempted, "the requeue waits");
+        assert_eq!(alloc_cpus(&cm, "n1"), 6, "the hook is still on the node");
+        assert!(job.epilog_gated_nodes.contains("n1"));
+        assert_eq!(job.allocated_nodes, vec!["n1".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_last_hook_to_answer_finishes_a_deferred_preempt_requeue() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        register_epilog_node(&cm, "n2", true);
+        start_run_on(&cm, 1, &["n1", "n2"], scalar_alloc(6, 1000));
+
+        let begin = Utc::now() + chrono::Duration::seconds(5);
+        preempt_requeue(&cm, 1, begin);
+
+        report_node_done(&cm, 1, "n1");
+        assert_eq!(
+            cm.get_job(1).expect("job 1").state,
+            JobState::Preempted,
+            "one node of two answered; the other is still running its hook"
+        );
+        assert_eq!(alloc_cpus(&cm, "n1"), 0, "but that one's slice is back");
+        assert_eq!(alloc_cpus(&cm, "n2"), 6);
+
+        report_node_done(&cm, 1, "n2");
+        let job = cm.get_job(1).expect("job 1");
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.preempt_requeue_count, 1);
+        assert_eq!(job.requeue_count, 0, "preemption is not a failure");
+        assert_eq!(job.state_reason(), "preempted by job 99");
+        assert_eq!(job.spec.begin_time, Some(begin));
+        assert!(job.allocated_nodes.is_empty());
+        assert!(job.epilog_gated_nodes.is_empty());
+        assert_eq!(alloc_cpus(&cm, "n2"), 0);
+    }
+
+    // The propose side decides what the agent is told; reading Preempted as
+    // unfinished sends spurious cancels to peers still running their hooks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_report_for_a_preempted_run_reads_as_an_epilog_release() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        preempt_requeue(&cm, 1, Utc::now());
+
+        assert_eq!(
+            cm.node_complete(1, "n1", 0, 0, 1).expect("report accepted"),
+            NodeCompleteResult::EpilogReleased
+        );
+        assert_eq!(cm.get_job(1).expect("job 1").state, JobState::Pending);
+    }
+
+    // The park frees the nodes that owe nothing but keeps allocated_nodes whole,
+    // so a later settle has to be told those slices are already back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_a_parked_run_leaves_a_peer_job_its_charge() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        register_epilog_node(&cm, "n2", false);
+        start_run_on(&cm, 1, &["n1", "n2"], scalar_alloc(3, 1000));
+        start_run_on(&cm, 2, &["n2"], scalar_alloc(2, 1000));
+        assert_eq!(alloc_cpus(&cm, "n2"), 5);
+
+        preempt_requeue(&cm, 1, Utc::now() + chrono::Duration::seconds(5));
+        assert_eq!(alloc_cpus(&cm, "n2"), 2, "n2 owes no hook, so it is freed");
+
+        cancel(&cm, 1);
+        assert_eq!(
+            alloc_cpus(&cm, "n2"),
+            2,
+            "freeing n2 twice silently eats the other job's charge"
+        );
+        assert_eq!(alloc_cpus(&cm, "n1"), 3, "the cancel does not end the hook");
+        report_node_done(&cm, 1, "n1");
+        assert_eq!(alloc_cpus(&cm, "n1"), 0);
+    }
+
+    // Phase 1 already ended this run's steps, so a step created afterwards has
+    // nothing left to finalize it and sits Running on a job that is requeuing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_step_is_refused_on_a_run_parked_mid_preemption() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        preempt_requeue(&cm, 1, Utc::now());
+
+        cm.apply_operation(&WalOperation::JobStepCreate {
+            step: Box::new(JobStep {
+                job_id: 1,
+                step_id: 0,
+                name: "s".into(),
+                state: StepState::Running,
+                num_tasks: 1,
+                cpus_per_task: 1,
+                resources: scalar_alloc(1, 0),
+                nodes: vec!["n1".into()],
+                distribution: spur_core::step::TaskDistribution::Block,
+                start_time: None,
+                end_time: None,
+                exit_code: None,
+            }),
+        });
+
+        assert!(cm.steps.read().get(&(1, 0)).is_none());
+    }
+
+    // The sweep samples propose-side; by apply time the node can be back, and
+    // freeing then is the oversubscription this whole split exists to prevent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sweep_entry_is_refused_while_the_gate_still_binds() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        preempt_requeue(&cm, 1, Utc::now());
+
+        preempt_requeue(&cm, 1, Utc::now());
+
+        let job = cm.get_job(1).expect("job 1");
+        assert_eq!(job.state, JobState::Preempted);
+        assert_eq!(job.preempt_requeue_count, 0);
+        assert_eq!(alloc_cpus(&cm, "n1"), 6, "the hook is still running");
+    }
+
+    // Dropping the target makes resolve_target_state return None, which cancels
+    // the dependent — a preemption must not turn into that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_run_still_protects_the_target_it_waits_on() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
+            job_id: 9,
+            spec: Box::new(basic_spec("target")),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            9,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
+            job_id: 9,
+            exit_code: 0,
+            state: JobState::Completed,
+        });
+        assert_eq!(cm.get_job(9).expect("job 9").state, JobState::Completed);
+        let mut spec = basic_spec("dependent");
+        spec.dependency = vec!["afterok:9".into()];
+        cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
+            job_id: 1,
+            spec: Box::new(spec),
+        });
+        cm.apply_operation(&WalOperation::job_state_change(
+            1,
+            JobState::Pending,
+            JobState::Running,
+        ));
+        let alloc = scalar_alloc(6, 1000);
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: alloc.clone(),
+            per_node_alloc: per_node_for(&["n1"], alloc),
+            srun_step_dispatch: false,
+            run_attempt: 1,
+            at: Some(Utc::now()),
+        });
+        preempt_requeue(&cm, 1, Utc::now());
+        assert_eq!(cm.get_job(1).expect("job 1").state, JobState::Preempted);
+
+        let horizon = Utc::now() + chrono::Duration::seconds(1);
+        let selected =
+            ClusterManager::expired_terminal_job_ids(&cm.jobs.read(), &cm.nodes.read(), horizon);
+        assert!(
+            !selected.contains(&9),
+            "the parked job still needs its target on record"
+        );
+    }
+
+    // Collection would return the slice but destroy the run the user was
+    // promised, so the sweep has to be the only way out of Preempted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_preempted_run_whose_node_died_is_requeued_not_collected() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        preempt_requeue(&cm, 1, Utc::now());
+        assert_eq!(cm.get_job(1).expect("job 1").state, JobState::Preempted);
+
+        cm.apply_operation(&WalOperation::NodeStateChange {
+            at: None,
+            name: "n1".into(),
+            old_state: NodeState::Allocated,
+            new_state: NodeState::Down,
+            reason: Some("not responding".into()),
+            admin_locked: false,
+            reason_uid: None,
+            reason_time: None,
+        });
+
+        let horizon = Utc::now() + chrono::Duration::seconds(1);
+        assert!(
+            ClusterManager::expired_terminal_job_ids(&cm.jobs.read(), &cm.nodes.read(), horizon)
+                .is_empty(),
+            "aged out and holding a gate nothing can answer, and still not collectable"
+        );
+
+        cm.requeue_stranded_preempted_jobs();
+        let job = cm.get_job(1).expect("the record must survive its node");
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.preempt_requeue_count, 1);
+        assert!(job.epilog_gated_nodes.is_empty());
+        assert_eq!(alloc_cpus(&cm, "n1"), 0, "the stranded slice comes back");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

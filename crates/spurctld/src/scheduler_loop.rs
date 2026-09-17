@@ -221,6 +221,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         cluster.drive_bb_stage_in();
         cluster.purge_expired_reservations();
         cluster.enforce_reservation_end_times();
+        cluster.requeue_stranded_preempted_jobs();
         cluster.evict_expired_terminal_jobs();
 
         // Submit due node health checks as exclusive whole-node jobs and enforce
@@ -616,9 +617,12 @@ async fn process_assignment(
             "job started but was not released on every node ({})",
             dispatch_nodes.join(",")
         );
-        if let Err(e) =
-            cluster.evict_job_attempt(job_id, Some(prospective_run_attempt), Some(detail))
-        {
+        if let Err(e) = cluster.evict_job_attempt(
+            job_id,
+            Some(prospective_run_attempt),
+            Some(detail),
+            spur_core::job::PendingReason::JobLaunchFailure,
+        ) {
             error!(job_id, error = %e, "failed to evict a job that could not be released");
         }
         return false;
@@ -6006,8 +6010,13 @@ mod tests {
             );
             let current = cm.get_job(job_id).unwrap().run_attempt;
 
-            cm.evict_job_attempt(job_id, Some(current.wrapping_sub(1)), Some("stale".into()))
-                .expect("a stale eviction must be a no-op, not an error");
+            cm.evict_job_attempt(
+                job_id,
+                Some(current.wrapping_sub(1)),
+                Some("stale".into()),
+                spur_core::job::PendingReason::JobLaunchFailure,
+            )
+            .expect("a stale eviction must be a no-op, not an error");
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(

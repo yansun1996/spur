@@ -1032,10 +1032,10 @@ the run is settled as ``NODE_FAIL`` — the same state a job reaches when the no
 under it goes ``DOWN``, and for the same reason: it did not report an exit
 status, it stopped being there. A job submitted with ``--requeue`` therefore
 goes back to the queue and is retried, up to ``[controller] max_batch_requeue``
-attempts, after which it is held with a reason of ``JobHoldMaxRequeue``. Each
-retry is deferred by the same growing hold a launch failure gets, capped by
-``[controller] max_launch_backoff_secs``, so expect a future ``BeginTime``
-rather than an immediate re-dispatch.
+attempts, after which it is held with a reason of ``JobHoldMaxRequeue``. The
+retry is immediate. The growing hold capped by ``[controller]
+max_launch_backoff_secs`` is for a job that never started; this one ran, so it
+is re-dispatched on the next cycle with no ``BeginTime`` in its future.
 
 A multi-node job is settled whole: the ranks on the node that lost it are gone,
 so it cannot finish on the peers either. The controller kills it on every peer
@@ -1047,7 +1047,7 @@ reason names the node it was lost from:
 
 .. code-block:: text
 
-   Reason=JobLaunchFailure (node node01 no longer holds this job)
+   Reason=NodeDown (node node01 no longer holds this job)
 
 Whether a reconcile may cancel and settle, or only report what it found, depends
 on ``[admission] mode`` for the registration case; see

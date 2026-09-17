@@ -1218,7 +1218,12 @@ async fn settle_vanished_run(
     // A run the node dropped reported no exit, so it is an eviction and not a
     // failure: only that reading is eligible for the node-fault retry.
     let detail = format!("node {node} no longer holds this job");
-    match cluster.evict_job_attempt(job_id, Some(run_attempt), Some(detail)) {
+    match cluster.evict_job_attempt(
+        job_id,
+        Some(run_attempt),
+        Some(detail),
+        spur_core::job::PendingReason::NodeDown,
+    ) {
         Ok(true) => true,
         Ok(false) => {
             warn!(node = %node, job_id, "the eviction was not applied; this job stays recorded on the node");
@@ -1240,7 +1245,7 @@ fn only_the_epilog_is_owed(
 ) -> bool {
     cluster
         .get_job(job_id)
-        .is_some_and(|job| job.state.is_terminal() && job.is_epilog_gated_on(node))
+        .is_some_and(|job| job.state.is_finalized() && job.is_epilog_gated_on(node))
 }
 
 /// The other nodes this run is still charged to, which a whole-job settle ends
@@ -7965,8 +7970,33 @@ mod tests {
                 .get_job(7)
                 .expect("job 7 stays on record")
                 .state_reason(),
-            "JobLaunchFailure (node n1 no longer holds this job)",
+            "NodeDown (node n1 no longer holds this job)",
             "this is the reason the documentation quotes"
+        );
+    }
+
+    // The launch backoff exists for a job that never started. This one ran, so
+    // charging it the backoff defers a retry that has nothing to wait for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settled_job_retries_at_once_instead_of_serving_a_launch_backoff() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        seed_a_job_on_a_node_with(
+            &cluster,
+            spur_core::job::JobSpec {
+                requeue: true,
+                ..a_one_node_spec()
+            },
+        );
+
+        take_a_cut_that_holds_nothing(&cluster).await;
+
+        let job = cluster.get_job(7).expect("job 7 stays on record");
+        assert_eq!(job.state, spur_core::job::JobState::Pending);
+        assert_eq!(
+            job.spec.begin_time, None,
+            "a run that launched did not fail to launch"
         );
     }
 
@@ -8004,6 +8034,45 @@ mod tests {
             cpus_charged_to(&cluster, "n1"),
             0,
             "a node that dropped the run will never report the hook that frees it"
+        );
+    }
+
+    // A parked preemption is a finished run with a hook still owed. Reading it
+    // as unfinished settles the whole job and SIGKILLs peers mid-hook.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_run_parked_mid_preemption_has_its_slice_released() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        let cluster = svc.cluster.clone();
+        register_a_node(&cluster, "n1");
+        declare_epilog_on_n1(&cluster);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
+            job_id: 7,
+            spec: Box::new(a_one_node_spec()),
+        });
+        place_job_7_on_n1(&cluster, 1);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobPreemptRequeue {
+            at: None,
+            job_id: 7,
+            begin_time: chrono::Utc::now(),
+            preempted_by: Some(99),
+            preempt_qos: None,
+        });
+        assert_eq!(
+            cluster.get_job(7).expect("job 7").state,
+            spur_core::job::JobState::Preempted
+        );
+        assert_eq!(cpus_charged_to(&cluster, "n1"), 2);
+
+        let outcome = take_a_cut_that_holds_nothing(&cluster).await;
+
+        assert_eq!(outcome.settled, vec![7]);
+        assert_eq!(cpus_charged_to(&cluster, "n1"), 0);
+        assert_eq!(
+            cluster.get_job(7).expect("job 7").state,
+            spur_core::job::JobState::Pending,
+            "releasing the last hook is what completes the requeue"
         );
     }
 
