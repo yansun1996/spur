@@ -5897,6 +5897,7 @@ impl SlurmAgent for AgentService {
             complete = cut.inventory_complete,
             "answered a ledger pull"
         );
+        self.reporter.note_ledger_pulled();
         Ok(Response::new(RequestNodeLedgerResponse {
             ledger: Some(crate::reporter::ledger_to_proto(cut)),
         }))
