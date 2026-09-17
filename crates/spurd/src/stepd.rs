@@ -527,6 +527,11 @@ impl StepdObligationLog {
         Self { path }
     }
 
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn append(&self, obligation: &StepdObligation) -> io::Result<()> {
         let mut entry = serde_json::to_vec(obligation).map_err(|error| {
             io::Error::new(

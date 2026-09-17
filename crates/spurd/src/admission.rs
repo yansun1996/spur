@@ -655,7 +655,7 @@ impl AdmissionStore {
         &self.root
     }
 
-    fn participant_path(&self, run_key: RunKey, step_id: StepId) -> io::Result<PathBuf> {
+    pub(crate) fn participant_path(&self, run_key: RunKey, step_id: StepId) -> io::Result<PathBuf> {
         Ok(self
             .participants_dir(run_key)?
             .join(format!("{step_id}.json")))
@@ -910,22 +910,28 @@ impl AdmissionStore {
         Ok(true)
     }
 
-    /// One run and everything admitted under it, for a caller that has to reason
-    /// about its supervisors rather than only its own fields.
-    pub fn load_admitted(&self, run_key: RunKey) -> io::Result<AdmittedRun> {
+    /// One run and everything admitted under it, plus what could not be read: a
+    /// damaged participant file otherwise reads as a run that never had one.
+    pub fn load_admitted(
+        &self,
+        run_key: RunKey,
+    ) -> io::Result<(AdmittedRun, Vec<RejectedAdmission>)> {
         let run = self.load_run(run_key)?;
-        let (participants, _) = self.participants(run_key)?;
-        Ok(AdmittedRun { run, participants })
+        let (participants, rejected) = self.participants(run_key)?;
+        Ok((AdmittedRun { run, participants }, rejected))
     }
 
-    /// Settle every hook left in flight by a process that is gone. Sound only at
-    /// startup: nothing this process started can already be recorded as running.
-    pub fn settle_hooks_whose_owner_is_gone(&self) -> io::Result<usize> {
+    /// Settle every hook whose owner `owner_is_gone` proves cannot still be running
+    /// it. Supervisors outlive an agent restart, so the restart alone proves nothing.
+    pub fn settle_hooks_whose_owner_is_gone(
+        &self,
+        owner_is_gone: impl Fn(&AdmittedRun) -> bool,
+    ) -> io::Result<usize> {
         let loaded = self.load_all()?;
         let mut settled = 0;
         let mut failure = None;
         for admitted in loaded.runs {
-            if !admitted.run.cleanup.epilog.is_in_flight() {
+            if !admitted.run.cleanup.epilog.is_in_flight() || !owner_is_gone(&admitted) {
                 continue;
             }
             let Some(run_key) = admitted.run.key() else {
@@ -1389,6 +1395,12 @@ mod tests {
 
     fn store(dir: &tempfile::TempDir) -> AdmissionStore {
         AdmissionStore::new(dir.path(), "n1")
+    }
+
+    /// The half of the agent's owner-loss proof this crate can express: a run
+    /// that named no supervisor had the previous agent's own hook.
+    fn no_supervisor_was_recorded(admitted: &AdmittedRun) -> bool {
+        admitted.recorded_supervisors().next().is_none()
     }
 
     fn run_with(job_id: u32, attempt: u32, created_at: u64) -> RunAdmission {
@@ -2324,8 +2336,8 @@ mod tests {
         ));
     }
 
-    // Nothing re-runs a hook, and the mark is only ever written by the agent's
-    // own monitor, so a hook still in flight at startup is one nobody owns.
+    // Nothing re-runs a hook, so one whose owner the caller proves gone would
+    // otherwise hold its slice for as long as the record survives.
     #[test]
     fn a_hook_left_in_flight_by_a_dead_agent_is_settled_at_startup() {
         let dir = tempfile::tempdir().unwrap();
@@ -2338,7 +2350,12 @@ mod tests {
         store.admit_run(&run_with(9, 1, 1)).unwrap();
         store.record_epilog(key(9, 1), HookState::Failed).unwrap();
 
-        assert_eq!(store.settle_hooks_whose_owner_is_gone().unwrap(), 2);
+        assert_eq!(
+            store
+                .settle_hooks_whose_owner_is_gone(no_supervisor_was_recorded)
+                .unwrap(),
+            2
+        );
 
         for job_id in [7, 8] {
             assert_eq!(
@@ -2352,6 +2369,31 @@ mod tests {
             HookState::Failed,
             "an outcome already recorded is evidence, not something to overwrite"
         );
+    }
+
+    // The sweep's whole safety now rests on the caller's proof, so a run it
+    // cannot vouch for must come through untouched rather than settled.
+    #[test]
+    fn a_hook_the_caller_cannot_prove_is_ownerless_survives_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::Yes).unwrap();
+
+        assert_eq!(
+            store.settle_hooks_whose_owner_is_gone(|_| false).unwrap(),
+            0
+        );
+
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap().cleanup.epilog,
+            HookState::Pending,
+            "a hook whose owner may still be running it keeps its slice"
+        );
+        assert!(matches!(
+            store.settle_permit(key(7, 1)).unwrap(),
+            SettlePermit::NotQuiescent
+        ));
     }
 
     // Settling licenses the release; it is not the release. A cut that drops the
