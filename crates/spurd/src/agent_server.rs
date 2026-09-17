@@ -6033,7 +6033,8 @@ impl SlurmAgent for AgentService {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("missing job spec"))?;
-        // A pty launch stays on the legacy path: its terminal is the agent's to own.
+        // Only the batch fallback reaches here with a pty; supervising it would put
+        // the script's terminal in custody, where a reclaim hands it to any client.
         let stepd_enabled = !spec.pty;
         #[cfg(test)]
         let stepd_enabled = stepd_enabled && !self.force_legacy_launch;
