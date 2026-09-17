@@ -1281,6 +1281,8 @@ pub(crate) fn monitor_recovered_stepds(
         // durable driver is the record; this only paces and surfaces the retry.
         let mut attempts: HashMap<(u32, spur_core::step::StepId), (u32, std::time::Instant)> =
             HashMap::new();
+        let mut hooking_since: HashMap<(u32, spur_core::step::StepId), std::time::Instant> =
+            HashMap::new();
         let hostname = hostname::get()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_else(|_| "localhost".into());
@@ -1317,10 +1319,12 @@ pub(crate) fn monitor_recovered_stepds(
                             false
                         }
                     };
-                let exit = if inactive {
-                    match durable_runtime_exit(&store, descriptor) {
-                        Ok(exit) => exit,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                let progress = if inactive {
+                    match recovered_session_progress(&store, descriptor) {
+                        Ok(progress) => progress,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            RecoveredSession::Unfinished
+                        }
                         Err(error) => {
                             warn!(
                                 job_id,
@@ -1328,34 +1332,49 @@ pub(crate) fn monitor_recovered_stepds(
                                 %error,
                                 "failed to read durable recovered runtime completion"
                             );
-                            None
+                            RecoveredSession::Unfinished
                         }
                     }
                 } else {
-                    None
+                    RecoveredSession::Unfinished
                 };
-                if let Some((exit_code, signal)) = exit {
-                    match settle_recovered_stepd(
-                        &running,
-                        &allocation,
-                        &stepds,
-                        &completions,
-                        &store,
-                        descriptor,
-                        exit_code,
-                        signal,
-                    )
-                    .await
-                    {
-                        Some(completion) => newly_completed.push((*key, completion)),
-                        None => released.push(*key),
+                match progress {
+                    RecoveredSession::Ended { exit_code, signal } => {
+                        match settle_recovered_stepd(
+                            &running,
+                            &allocation,
+                            &stepds,
+                            &completions,
+                            &store,
+                            descriptor,
+                            exit_code,
+                            signal,
+                        )
+                        .await
+                        {
+                            Some(completion) => newly_completed.push((*key, completion)),
+                            None => released.push(*key),
+                        }
                     }
-                } else if !tracked {
-                    released.push(*key);
+                    // Held pending rather than released: the report is what frees
+                    // the slice, and the hook is still standing on it.
+                    RecoveredSession::Hooking => {
+                        if epilog_hold_is_worth_saying(&mut hooking_since, *key) {
+                            warn!(
+                                job_id,
+                                run_attempt = descriptor.run_attempt,
+                                step_id = descriptor.step_id,
+                                "an epilog is still running; holding this run's completion report"
+                            );
+                        }
+                    }
+                    RecoveredSession::Unfinished if !tracked => released.push(*key),
+                    RecoveredSession::Unfinished => {}
                 }
             }
             for key in released {
                 pending.remove(&key);
+                hooking_since.remove(&key);
             }
             for (key, completion) in newly_completed {
                 completed.insert(key, completion);
@@ -1432,6 +1451,7 @@ pub(crate) fn monitor_recovered_stepds(
             for key in acknowledged {
                 completed.remove(&key);
                 pending.remove(&key);
+                hooking_since.remove(&key);
             }
         }
     });
@@ -1800,6 +1820,38 @@ fn durable_runtime_exit(
         descriptor.run_attempt,
         descriptor.step_id,
     )
+}
+
+/// How far a recovered supervisor's own ledger says its session has got. The
+/// exit is recorded before the epilog runs, so an exit alone is not the end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveredSession {
+    Unfinished,
+    /// Exited, with the hook that follows it yet to say how it ended.
+    Hooking,
+    Ended {
+        exit_code: i32,
+        signal: i32,
+    },
+}
+
+fn recovered_session_progress(
+    store: &crate::stepd::StepdStore,
+    descriptor: &crate::stepd::StepdDescriptor,
+) -> std::io::Result<RecoveredSession> {
+    let Some((exit_code, signal)) = durable_runtime_exit(store, descriptor)? else {
+        return Ok(RecoveredSession::Unfinished);
+    };
+    // Only the hook's own record proves it ended: a hook can outlive the process
+    // that started it, so nothing about the supervisor answers for it.
+    match store.epilog_result(
+        descriptor.job_id,
+        descriptor.run_attempt,
+        descriptor.step_id,
+    )? {
+        Some(_) => Ok(RecoveredSession::Ended { exit_code, signal }),
+        None => Ok(RecoveredSession::Hooking),
+    }
 }
 
 /// One runtime session: a step of one attempt of one job. Two sessions of the
@@ -4260,12 +4312,12 @@ const EPILOG_HOLD_STUCK_AFTER: std::time::Duration = std::time::Duration::from_s
 
 /// Whether this hold has gone on long enough to say so, restarting its clock when
 /// it has. A hook has no deadline, so the only thing that can be periodic is this.
-fn epilog_hold_is_worth_saying(
-    held_since: &mut HashMap<RunKey, std::time::Instant>,
-    run: RunKey,
+fn epilog_hold_is_worth_saying<K: std::hash::Hash + Eq>(
+    held_since: &mut HashMap<K, std::time::Instant>,
+    held: K,
 ) -> bool {
     let since = held_since
-        .entry(run)
+        .entry(held)
         .or_insert_with(std::time::Instant::now);
     if since.elapsed() < EPILOG_HOLD_STUCK_AFTER {
         return false;
@@ -14374,6 +14426,123 @@ mod tests {
             .expect("a step settled before the re-attach must still report its exit");
 
         assert_eq!(response.into_inner().exit_code, 0);
+    }
+
+    fn append_obligation(
+        store: &crate::stepd::StepdStore,
+        descriptor: &crate::stepd::StepdDescriptor,
+        obligation: &crate::stepd::StepdObligation,
+    ) {
+        store
+            .obligations(
+                descriptor.job_id,
+                descriptor.run_attempt,
+                descriptor.step_id,
+            )
+            .append(obligation)
+            .expect("append the session's obligation");
+    }
+
+    fn record_epilog_completed(
+        store: &crate::stepd::StepdStore,
+        descriptor: &crate::stepd::StepdDescriptor,
+        failed: bool,
+    ) {
+        append_obligation(
+            store,
+            descriptor,
+            &crate::stepd::StepdObligation::EpilogCompleted { failed },
+        );
+    }
+
+    /// The batch step, the one whose supervisor actually runs the node epilog.
+    fn recovered_batch_session(
+        store: &crate::stepd::StepdStore,
+        exit: Option<i32>,
+    ) -> crate::stepd::StepdDescriptor {
+        publish_session(store, spur_core::step::STEP_BATCH, exit)
+    }
+
+    #[test]
+    fn a_recovered_session_with_no_recorded_exit_is_unfinished() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = recovered_batch_session(&store, None);
+
+        assert_eq!(
+            recovered_session_progress(&store, &descriptor).expect("read the session's ledger"),
+            RecoveredSession::Unfinished,
+            "a session that recorded no exit has not reached its hook"
+        );
+    }
+
+    #[test]
+    fn a_recovered_session_is_not_reportable_while_its_epilog_runs() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = recovered_batch_session(&store, Some(0));
+
+        assert_eq!(
+            recovered_session_progress(&store, &descriptor).expect("read the session's ledger"),
+            RecoveredSession::Hooking,
+            "the exit is recorded before the hook runs, so an exit alone must not be reported"
+        );
+    }
+
+    #[test]
+    fn a_recovered_session_reports_once_its_epilog_has_ended() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = recovered_batch_session(&store, Some(4));
+        record_epilog_completed(&store, &descriptor, false);
+
+        assert_eq!(
+            recovered_session_progress(&store, &descriptor).expect("read the session's ledger"),
+            RecoveredSession::Ended {
+                exit_code: 4,
+                signal: 0
+            },
+            "a hook that has said how it ended is no longer on the cores"
+        );
+    }
+
+    #[test]
+    fn a_recovered_session_reports_an_epilog_that_failed() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = recovered_batch_session(&store, Some(0));
+        record_epilog_completed(&store, &descriptor, true);
+
+        assert_eq!(
+            recovered_session_progress(&store, &descriptor).expect("read the session's ledger"),
+            RecoveredSession::Ended {
+                exit_code: 0,
+                signal: 0
+            },
+            "a failed hook has returned; holding its report would strand the run"
+        );
+    }
+
+    #[test]
+    fn an_epilog_recorded_before_a_newer_exit_does_not_report_that_exit() {
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let store = crate::stepd::StepdStore::new(state_dir.path());
+        let descriptor = recovered_batch_session(&store, Some(0));
+        record_epilog_completed(&store, &descriptor, false);
+        append_obligation(
+            &store,
+            &descriptor,
+            &crate::stepd::StepdObligation::ExitObserved {
+                exit_code: 9,
+                signal: 0,
+            },
+        );
+
+        assert_eq!(
+            recovered_session_progress(&store, &descriptor).expect("read the session's ledger"),
+            RecoveredSession::Hooking,
+            "an older hook result cannot speak for an exit recorded after it"
+        );
     }
 
     #[tokio::test]
