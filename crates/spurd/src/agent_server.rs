@@ -4827,11 +4827,13 @@ pub(crate) async fn settle_acknowledged_completion(
     run: RunKey,
     step_id: spur_core::step::StepId,
 ) -> bool {
-    let _ = admissions.record_controller_ack(run, 1);
+    // Scoped to the step: a user step's exit settles its own participation, and
+    // the store refuses the run-level writes below to anything but the owner.
+    let _ = admissions.record_controller_ack(run, step_id, 1);
     let _ = admissions.record_report_acknowledged(run, step_id);
     // Settling a hook still in flight is the teardown's to do, never an
     // acknowledgement's: the controller cannot see whose hook is still running.
-    let _ = admissions.mark_acknowledged_run_cleaned(run);
+    let _ = admissions.mark_acknowledged_run_cleaned(run, step_id);
     release_acknowledged_allocation(allocation, admissions, run, step_id).await
         == ReleaseOutcome::Freed
 }
@@ -17411,7 +17413,7 @@ mod tests {
         assert_eq!(svc.allocation.lock().await.free_cpus(), 6);
 
         svc.admissions()
-            .record_controller_ack(key(7, 1), 42)
+            .record_controller_ack(key(7, 1), spur_core::step::STEP_BATCH, 42)
             .expect("ack");
         assert_eq!(
             release_acknowledged_allocation(
@@ -17424,6 +17426,59 @@ mod tests {
             ReleaseOutcome::Freed
         );
         assert_eq!(svc.allocation.lock().await.free_cpus(), 8);
+    }
+
+    // A killed `srun --pty` client ends the terminal step, not the allocation.
+    // That step's exit used to write the *run's* acknowledgement, which let the
+    // settle sweep free a slice the controller was still charging for.
+    #[tokio::test]
+    async fn a_user_steps_exit_cannot_acknowledge_the_run_that_hosts_it() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(49, 1, 2, 1000, &[]).unwrap();
+            alloc.commit_job(49, 1);
+        }
+        let mut run = crate::admission::RunAdmission::new(
+            49,
+            1,
+            "n1",
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_EXTERN);
+        admissions.admit_run(&run).expect("admit the allocation");
+
+        let freed =
+            settle_acknowledged_completion(&svc.allocation, &admissions, key(49, 1), 0).await;
+
+        assert!(!freed, "a terminal step's exit frees no slice");
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            6,
+            "the allocation is still charged"
+        );
+        let recorded = admissions
+            .load_run(key(49, 1))
+            .expect("the record survives");
+        assert!(
+            !recorded.controller_ack.is_given(),
+            "the controller acknowledged a step, never this run"
+        );
+        assert!(
+            !recorded.slice_released,
+            "a slice the controller still charges for was handed back"
+        );
+        // The sweep reads this; a run wrongly marked Cleaned is one it will free
+        // on the forged acknowledgement above.
+        assert_eq!(
+            admissions
+                .settle_permit(key(49, 1))
+                .expect("the record is readable"),
+            crate::admission::SettlePermit::NotQuiescent
+        );
     }
 
     // One owner nobody can name used to stop collection for the whole node, so

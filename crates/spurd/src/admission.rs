@@ -643,6 +643,13 @@ pub struct AdmissionStore {
     node: String,
 }
 
+/// Whether this step answers for the run's lifetime. A run that named an owner
+/// is answered for by it alone; one that named none has only itself to speak.
+fn step_answers_for_run(run: &RunAdmission, step_id: StepId) -> bool {
+    run.lifecycle_owner_step
+        .is_none_or(|owner| owner == step_id)
+}
+
 impl AdmissionStore {
     pub fn new(state_dir: impl Into<PathBuf>, node: impl Into<String>) -> Self {
         Self {
@@ -912,12 +919,19 @@ impl AdmissionStore {
 
     /// Settle a run the controller has answered, sparing a hook the record still
     /// has in flight: only the teardown that owns one may call it lost.
-    pub fn mark_acknowledged_run_cleaned(&self, run_key: RunKey) -> io::Result<bool> {
+    pub fn mark_acknowledged_run_cleaned(
+        &self,
+        run_key: RunKey,
+        answered_by: StepId,
+    ) -> io::Result<bool> {
         let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
+        if !step_answers_for_run(&run, answered_by) {
+            return Ok(false);
+        }
         if run.state == RunState::Cleaned {
             return Ok(true);
         }
@@ -1094,10 +1108,7 @@ impl AdmissionStore {
         };
         // Without this the release fires for whichever participant happens to be
         // acknowledged first, which for a multi-step run is not the owner.
-        if run
-            .lifecycle_owner_step
-            .is_some_and(|owner| owner != step_id)
-        {
+        if !step_answers_for_run(&run, step_id) {
             return Ok(None);
         }
         if run.cleanup.epilog.is_in_flight() {
@@ -1158,22 +1169,25 @@ impl AdmissionStore {
     pub fn record_controller_ack(
         &self,
         run_key: RunKey,
+        answered_by: StepId,
         release_raft_index: u64,
     ) -> io::Result<bool> {
-        self.take_controller_ack(run_key, |ack| {
+        self.take_controller_ack(run_key, Some(answered_by), |ack| {
             ack.release_raft_index = Some(release_raft_index)
         })
     }
 
     /// Record the controller's answer to a claim it has no record of. An answer
     /// and not a commit, so the release names it as such rather than an index.
+    /// It answers for the whole run, so no step speaks for it.
     pub fn record_settled_claim(&self, run_key: RunKey) -> io::Result<bool> {
-        self.take_controller_ack(run_key, |ack| ack.settled_unrecorded_claim = true)
+        self.take_controller_ack(run_key, None, |ack| ack.settled_unrecorded_claim = true)
     }
 
     fn take_controller_ack(
         &self,
         run_key: RunKey,
+        answered_by: Option<StepId>,
         record: impl FnOnce(&mut ControllerAck),
     ) -> io::Result<bool> {
         let mut run = match self.load_run(run_key) {
@@ -1181,6 +1195,11 @@ impl AdmissionStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
+        // A step that does not answer for the run cannot acknowledge it: its own
+        // exit is not the controller's word that the run is over.
+        if answered_by.is_some_and(|step_id| !step_answers_for_run(&run, step_id)) {
+            return Ok(false);
+        }
         record(&mut run.controller_ack);
         // An acknowledged completion resolves exactly what a hold taken for an
         // untracked claim was preserving, and nothing else would ever clear it.
@@ -2539,7 +2558,9 @@ mod tests {
             .unwrap();
         assert!(store.load_run(key(7, 1)).unwrap().conflict_hold.is_some());
 
-        store.record_controller_ack(key(7, 1), 9).unwrap();
+        store
+            .record_controller_ack(key(7, 1), STEP_BATCH, 9)
+            .unwrap();
         assert!(store.load_run(key(7, 1)).unwrap().conflict_hold.is_none());
     }
 
@@ -2550,7 +2571,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
-        store.record_controller_ack(key(7, 1), 9).unwrap();
+        store
+            .record_controller_ack(key(7, 1), STEP_BATCH, 9)
+            .unwrap();
 
         assert_eq!(
             store
@@ -2642,7 +2665,9 @@ mod tests {
         }
         store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
         store.mark_controller_cancelled(key(8, 1)).unwrap();
-        store.record_controller_ack(key(9, 1), 42).unwrap();
+        store
+            .record_controller_ack(key(9, 1), STEP_BATCH, 42)
+            .unwrap();
 
         assert_eq!(
             store.ledger_cut("session-a").entries.len(),
@@ -2753,7 +2778,9 @@ mod tests {
                 .is_none(),
             "an exit is not a completion"
         );
-        store.record_controller_ack(key(7, 1), 42).unwrap();
+        store
+            .record_controller_ack(key(7, 1), STEP_BATCH, 42)
+            .unwrap();
         assert!(store
             .release_is_due(key(7, 1), STEP_BATCH)
             .unwrap()
@@ -2769,7 +2796,9 @@ mod tests {
         let mut run = run_with(7, 1, 1);
         run.lifecycle_owner_step = Some(STEP_BATCH);
         store.admit_run(&run).unwrap();
-        store.record_controller_ack(key(7, 1), 42).unwrap();
+        store
+            .record_controller_ack(key(7, 1), STEP_BATCH, 42)
+            .unwrap();
 
         assert!(store.release_is_due(key(7, 1), 3).unwrap().is_none());
         assert!(store
@@ -2787,7 +2816,9 @@ mod tests {
         let mut run = run_with(7, 1, 1);
         run.lifecycle_owner_step = Some(STEP_BATCH);
         store.admit_run(&run).unwrap();
-        store.record_controller_ack(key(7, 1), 42).unwrap();
+        store
+            .record_controller_ack(key(7, 1), STEP_BATCH, 42)
+            .unwrap();
 
         store.record_epilog(key(7, 1), HookState::Running).unwrap();
         assert!(store
@@ -2813,7 +2844,9 @@ mod tests {
             let mut run = run_with(7, 1, 1);
             run.lifecycle_owner_step = Some(STEP_BATCH);
             store.admit_run(&run).unwrap();
-            store.record_controller_ack(key(7, 1), 42).unwrap();
+            store
+                .record_controller_ack(key(7, 1), STEP_BATCH, 42)
+                .unwrap();
             store.record_epilog(key(7, 1), settled).unwrap();
 
             assert!(
