@@ -626,6 +626,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_runtime_state_dir(stepd_state_dir.clone());
     agent_service.adopt_stepds(&recovered_stepds).await;
+    // Recovers/reaps a standalone container step, which has no adopt_stepds
+    // supervisor of its own.
+    agent_service.sweep_orphaned_container_steps().await;
     // The admission records are exact where a descriptor rebuild under-counts;
     // sessions predating them fall back to the descriptor path inside this.
     let adopted = agent_service
