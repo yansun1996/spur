@@ -2649,23 +2649,33 @@ pub async fn pull_node_ledger(cluster: &Arc<ClusterManager>, node: &str, reason:
     match pulled {
         Ok(Ok(response)) => {
             if let Some(ledger) = response.into_inner().ledger {
-                let outcome = crate::server::reconcile_node_ledger(
-                    cluster,
-                    node,
-                    ledger,
-                    &dispatched,
-                    crate::server::CutProvenance::Pulled,
+                // Budgeted as the registration path is: every act in here awaits an
+                // agent, and a pass that never returns is one nothing else can follow.
+                let reconciled = tokio::time::timeout(
+                    crate::server::RECONCILE_BUDGET,
+                    crate::server::reconcile_node_ledger(
+                        cluster,
+                        node,
+                        ledger,
+                        &dispatched,
+                        crate::server::CutProvenance::Pulled,
+                    ),
                 )
                 .await;
-                info!(
-                    node = %node,
-                    reason,
-                    cancelled = outcome.cancelled.len(),
-                    settled = outcome.settled.len(),
-                    released = outcome.released.len(),
-                    unresolved = outcome.unresolved.len(),
-                    "reconciled this node's ledger"
-                );
+                match reconciled {
+                    Ok(outcome) => info!(
+                        node = %node,
+                        reason,
+                        cancelled = outcome.cancelled.len(),
+                        settled = outcome.settled.len(),
+                        released = outcome.released.len(),
+                        unresolved = outcome.unresolved.len(),
+                        "reconciled this node's ledger"
+                    ),
+                    Err(_) => {
+                        warn!(node = %node, reason, "reconcile did not finish within its budget")
+                    }
+                }
             }
         }
         // An agent that predates the pull keeps its pre-upgrade behaviour.
