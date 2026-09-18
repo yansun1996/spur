@@ -72,14 +72,18 @@ fn launch_backoff_secs(interval_secs: u32, cap: u64, requeue_count: u32) -> u64 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeCompleteResult {
     /// Node recorded; waiting for remaining nodes.
-    Completing,
+    Completing { raft_index: u64 },
     /// All allocated nodes have reported; job is now terminal.
-    AllDone { state: JobState, exit_code: i32 },
+    AllDone {
+        state: JobState,
+        exit_code: i32,
+        raft_index: u64,
+    },
     /// Job was already in a terminal state (duplicate or race with cancel/timeout).
     AlreadyTerminal,
     /// The job had finalized but this node still owed its epilog; the report
     /// ended that debt and freed the node's slice.
-    EpilogReleased,
+    EpilogReleased { raft_index: u64 },
     /// Report came from a superseded run (older `run_attempt`); ignored so it
     /// cannot fail a job that has since been requeued and re-dispatched.
     StaleReport,
@@ -2039,8 +2043,8 @@ impl ClusterManager {
             }
         }
 
-        let resp = self
-            .propose(WalOperation::JobNodeComplete {
+        let (resp, raft_index) = self
+            .propose_indexed(WalOperation::JobNodeComplete {
                 run_attempt,
                 at: None,
                 job_id,
@@ -2052,12 +2056,13 @@ impl ClusterManager {
 
         self.run_all_finalized_side_effects(&resp);
         if was_gated {
-            return Ok(NodeCompleteResult::EpilogReleased);
+            return Ok(NodeCompleteResult::EpilogReleased { raft_index });
         }
         if let Some(f) = resp.jobs_finalized.first() {
             return Ok(NodeCompleteResult::AllDone {
                 state: f.state,
                 exit_code: f.exit_code,
+                raft_index,
             });
         }
 
@@ -2066,7 +2071,7 @@ impl ClusterManager {
             return Ok(NodeCompleteResult::AlreadyTerminal);
         }
 
-        Ok(NodeCompleteResult::Completing)
+        Ok(NodeCompleteResult::Completing { raft_index })
     }
 
     /// Complete a job (controller-initiated or force-finish from COMPLETING timeout).
@@ -5999,6 +6004,21 @@ impl ClusterManager {
             tokio::runtime::Handle::current().block_on(async { raft.client_write(op).await })
         })
         .map(|res| res.data)
+        .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn propose_indexed(&self, mut op: WalOperation) -> anyhow::Result<(ClientResponse, u64)> {
+        op.stamp_occurred_at(Utc::now());
+        let raft = self
+            .raft
+            .read()
+            .clone()
+            .expect("raft must be set before propose is called");
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async { raft.client_write(op).await })
+        })
+        .map(|res| (res.data, res.log_id.index))
         .map_err(|e| anyhow::anyhow!("raft propose failed: {}", e))
     }
 
@@ -12869,7 +12889,7 @@ mod tests {
         });
 
         let result = cm.node_complete(1, "n2", 0, 0, 0).unwrap();
-        assert_eq!(result, NodeCompleteResult::Completing);
+        assert!(matches!(result, NodeCompleteResult::Completing { .. }));
         assert_eq!(cm.get_job(1).unwrap().state, JobState::Completing);
     }
 
@@ -23648,10 +23668,10 @@ mod tests {
         start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
         preempt_requeue(&cm, 1, Utc::now());
 
-        assert_eq!(
+        assert!(matches!(
             cm.node_complete(1, "n1", 0, 0, 1).expect("report accepted"),
-            NodeCompleteResult::EpilogReleased
-        );
+            NodeCompleteResult::EpilogReleased { .. }
+        ));
         assert_eq!(cm.get_job(1).expect("job 1").state, JobState::Pending);
     }
 
@@ -23947,7 +23967,7 @@ mod tests {
         );
         assert!(matches!(
             cm.node_complete(1, "n1", 0, 0, 1),
-            Ok(NodeCompleteResult::EpilogReleased)
+            Ok(NodeCompleteResult::EpilogReleased { .. })
         ));
     }
 

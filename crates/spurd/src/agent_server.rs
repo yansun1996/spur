@@ -1153,8 +1153,8 @@ async fn run_completion_hooks_and_report(
             },
         )
         .await
-        .settled();
-        if !acknowledged {
+        .raft_index();
+        let Some(raft_index) = acknowledged else {
             // Held, not freed: the controller has not committed this
             // completion, so this node is still the only thing that
             // knows the work stopped. Reconcile resolves it.
@@ -1164,10 +1164,16 @@ async fn run_completion_hooks_and_report(
                 "completion unacknowledged; holding this run's resources"
             );
             continue;
-        }
+        };
         if let Some(run) = named_run(c.job_id, c.run_attempt) {
-            settle_acknowledged_completion(allocation, admissions, run, spur_core::step::STEP_BATCH)
-                .await;
+            settle_acknowledged_completion(
+                allocation,
+                admissions,
+                run,
+                spur_core::step::STEP_BATCH,
+                raft_index,
+            )
+            .await;
         }
     }
 }
@@ -2005,7 +2011,7 @@ pub(crate) fn monitor_recovered_stepds(
             let mut acknowledged = Vec::new();
             for completion in completed.values() {
                 let key = (completion.job_id, completion.step_id);
-                if report_completion(
+                if let Some(raft_index) = report_completion(
                     &controller_addr,
                     CompletionReport {
                         job_id: completion.job_id,
@@ -2021,7 +2027,7 @@ pub(crate) fn monitor_recovered_stepds(
                     },
                 )
                 .await
-                .settled()
+                .raft_index()
                 {
                     if let Err(error) = store.acknowledge_completion(completion) {
                         warn!(
@@ -2044,6 +2050,7 @@ pub(crate) fn monitor_recovered_stepds(
                                 &admissions,
                                 run,
                                 completion.step_id,
+                                raft_index,
                             )
                             .await;
                         }
@@ -2229,14 +2236,20 @@ async fn fence_dead_stepd(
             payload: PayloadEvidence::Supervised(store),
         },
     )
-    .await
-    .settled();
-    if reported {
+    .await;
+    let raft_index = reported.raft_index();
+    if let Some(idx) = raft_index {
         if let Err(error) =
             obligations.append(&crate::stepd::StepdObligation::CompletionAcknowledged)
         {
             warn!(job_id = descriptor.job_id, run_attempt = descriptor.run_attempt, %error,
                 "failed to record the acknowledged completion of a dead stepd");
+        }
+        release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
+        if let Some(run) = named_run(descriptor.job_id, descriptor.run_attempt) {
+            record_run_epilog(admissions, run, descriptor.step_id, recorded_epilog);
+            settle_acknowledged_completion(allocation, admissions, run, descriptor.step_id, idx)
+                .await;
         }
     } else {
         warn!(
@@ -2244,14 +2257,7 @@ async fn fence_dead_stepd(
             run_attempt = descriptor.run_attempt,
             "could not report a dead stepd's completion; the retry loop will replay it"
         );
-    }
-
-    release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
-    if reported {
-        if let Some(run) = named_run(descriptor.job_id, descriptor.run_attempt) {
-            record_run_epilog(admissions, run, descriptor.step_id, recorded_epilog);
-            settle_acknowledged_completion(allocation, admissions, run, descriptor.step_id).await;
-        }
+        release_stepd_tracking(running, allocation, stepds, &descriptor, "stepd crash").await;
     }
 
     // The supervisor is gone, so no completion push is coming; without this the
@@ -2375,7 +2381,7 @@ async fn handle_completion_notification(
             crate::stepd::AgentNotificationResponse::Acknowledged
         }
         Some(descriptor) => {
-            let reported = report_completion(
+            let raft_index = report_completion(
                 &context.controller_addr,
                 CompletionReport {
                     job_id,
@@ -2391,7 +2397,7 @@ async fn handle_completion_notification(
                 },
             )
             .await
-            .settled();
+            .raft_index();
             release_stepd_tracking(
                 &context.running,
                 &context.allocation,
@@ -2407,9 +2413,15 @@ async fn handle_completion_notification(
                 record_run_epilog(&admissions, run, step_id, epilog_outcome(epilog_failed));
                 // The acknowledgement, and only it, unlocks the slice. Without
                 // this the exit path holds and nothing ever frees it again.
-                if reported {
-                    settle_acknowledged_completion(&context.allocation, &admissions, run, step_id)
-                        .await;
+                if let Some(idx) = raft_index {
+                    settle_acknowledged_completion(
+                        &context.allocation,
+                        &admissions,
+                        run,
+                        step_id,
+                        idx,
+                    )
+                    .await;
                 }
             }
             // A user step's exit ends the RPC that launched it, not the job, so
@@ -2423,7 +2435,7 @@ async fn handle_completion_notification(
                     crate::step_completion::StepOutcome { exit_code, signal },
                 )
                 .await;
-            if reported {
+            if raft_index.is_some() {
                 crate::stepd::AgentNotificationResponse::Acknowledged
             } else {
                 crate::stepd::AgentNotificationResponse::Deferred
@@ -2498,7 +2510,7 @@ pub async fn replay_unacknowledged_stepd_completions(
 ) -> anyhow::Result<Vec<SessionIdentity>> {
     let mut reconciled = Vec::new();
     for completion in store.discover_unacknowledged_completions()? {
-        if report_completion(
+        if let Some(raft_index) = report_completion(
             controller_addr,
             CompletionReport {
                 job_id: completion.job_id,
@@ -2514,7 +2526,7 @@ pub async fn replay_unacknowledged_stepd_completions(
             },
         )
         .await
-        .settled()
+        .raft_index()
         {
             store.acknowledge_completion(&completion)?;
             if let Some(run) = named_run(completion.job_id, completion.run_attempt) {
@@ -2526,8 +2538,14 @@ pub async fn replay_unacknowledged_stepd_completions(
                 );
                 // A late delivery frees the slice here, like every other settled
                 // report: leaving it to a later sweep frees it with nothing said.
-                settle_acknowledged_completion(allocation, admissions, run, completion.step_id)
-                    .await;
+                settle_acknowledged_completion(
+                    allocation,
+                    admissions,
+                    run,
+                    completion.step_id,
+                    raft_index,
+                )
+                .await;
             }
             reconciled.push((
                 completion.job_id,
@@ -2643,7 +2661,7 @@ fn runs_nothing_can_speak_for(
 ) -> Vec<crate::admission::AdmittedRun> {
     runs.into_iter()
         .filter(|admitted| {
-            !admitted.run.controller_ack.is_given()
+            !admitted.run.controller_ack.is_committed()
                 && admitted.owes_a_report()
                 && recorded_supervisor_liveness(admitted) == Liveness::Gone
                 && !an_exit_is_still_on_disk(store, admitted)
@@ -2680,15 +2698,15 @@ async fn report_runs_nothing_can_speak_for(
             },
         )
         .await
-        .settled();
-        if !acknowledged {
+        .raft_index();
+        let Some(raft_index) = acknowledged else {
             debug!(
                 job_id,
                 run_attempt, "a lost run's completion is not acknowledged yet; holding its slice"
             );
             continue;
-        }
-        settle_acknowledged_completion(allocation, admissions, run, step_id).await;
+        };
+        settle_acknowledged_completion(allocation, admissions, run, step_id, raft_index).await;
         // The run's completion is committed, so no sibling's report will ever be
         // answered, and one left owed keeps the record forever.
         if let Err(error) = admissions.discharge_owed_reports(run) {
@@ -5089,7 +5107,7 @@ async fn settle_cancelled_runs(
         let run = &admitted.run;
         if !run.cancelled_by_controller
             || run.state != crate::admission::RunState::Cleaned
-            || run.controller_ack.is_given()
+            || run.controller_ack.is_committed()
         {
             continue;
         }
@@ -5352,6 +5370,7 @@ pub(crate) async fn settle_acknowledged_completion(
     admissions: &crate::admission::AdmissionStore,
     run: RunKey,
     step_id: spur_core::step::StepId,
+    raft_index: u64,
 ) -> bool {
     let store = admissions.clone();
     // Both records are fsynced, and this runs on the completion RPC's own
@@ -5359,7 +5378,7 @@ pub(crate) async fn settle_acknowledged_completion(
     let recorded = tokio::task::spawn_blocking(move || {
         // Scoped to the step: a user step's exit settles its own participation,
         // and the store refuses the run-level write to anything but the owner.
-        let _ = store.record_acknowledged_completion(run, step_id, 1);
+        let _ = store.record_acknowledged_completion(run, step_id, raft_index);
         let _ = store.record_report_acknowledged(run, step_id);
     })
     .await;
@@ -5750,16 +5769,22 @@ mod controller_rpc_tests {
     }
 
     /// Only the controller's own "no such job" settles a run. Everything else,
-    /// including a rejection no retry can fix, leaves the slice held.
+    /// A real Raft index is the only thing that settles a completion. `NotFound`
+    /// `NoSuchRun` settles with raft_index=0 (not a real commit but frees slice).
+    /// Other errors do not settle.
     #[test]
-    fn only_a_definite_no_such_job_settles_a_completion() {
+    fn raft_index_distinguishes_settlement_from_retry() {
         use super::CompletionOutcome;
-        assert!(
+        // NotFound (NoSuchRun) settles with 0: controller has no record, so
+        // no retry can succeed, and holding resources is pointless.
+        assert_eq!(
             CompletionOutcome::for_error(&ControllerRpcError::Rpc(Status::not_found(
                 "job 5 not found"
             )))
-            .settled()
+            .raft_index(),
+            Some(0)
         );
+        // Other errors do NOT settle: retry is still owed.
         for status in [
             Status::invalid_argument("node n1 is not allocated to job 5"),
             Status::unavailable("not the Raft leader"),
@@ -5767,10 +5792,15 @@ mod controller_rpc_tests {
         ] {
             let outcome = CompletionOutcome::for_error(&ControllerRpcError::Rpc(status.clone()));
             assert!(
-                !outcome.settled(),
-                "{status:?} is not the controller saying it has no record"
+                outcome.raft_index().is_none(),
+                "{status:?} should not yield a Raft index"
             );
         }
+        // Acknowledged has the real Raft index
+        assert_eq!(
+            CompletionOutcome::Acknowledged { raft_index: 42 }.raft_index(),
+            Some(42)
+        );
     }
 
     /// Drive the retry loop with one scripted outcome per attempt, reporting how
@@ -6269,8 +6299,8 @@ fn payload_still_executing(report: &CompletionReport<'_>) -> bool {
 /// What the controller said when handed one node's account of a finished run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompletionOutcome {
-    /// The controller committed the completion.
-    Acknowledged,
+    /// The controller committed the completion at this Raft log index.
+    Acknowledged { raft_index: u64 },
     /// The controller answered that it has no record of the run.
     NoSuchRun,
     /// Nothing that settles the run; the report is still owed.
@@ -6289,10 +6319,17 @@ impl CompletionOutcome {
         }
     }
 
-    /// Whether the controller has settled this run, so its slice may go. A run
-    /// the controller has no record of will never be acknowledged by anything.
-    pub(crate) fn settled(self) -> bool {
-        matches!(self, Self::Acknowledged | Self::NoSuchRun)
+    /// The Raft index to record for this outcome, if any.
+    /// - `Acknowledged` carries the real Raft index from the controller.
+    /// - `NoSuchRun` settles with 0: the controller has no record, so no commit,
+    ///   but the run should be settled locally (no point holding resources).
+    /// - `Undelivered` returns None: retry is still owed.
+    pub(crate) fn raft_index(self) -> Option<u64> {
+        match self {
+            Self::Acknowledged { raft_index } => Some(raft_index),
+            Self::NoSuchRun => Some(0),
+            Self::Undelivered => None,
+        }
     }
 }
 
@@ -6360,35 +6397,38 @@ pub(crate) async fn report_completion(
     })
     .await;
 
-    let Err(error) = result else {
-        info!(
-            job_id,
-            exit_code,
-            controller = %controller_addr,
-            "reported completion to controller"
-        );
-        return CompletionOutcome::Acknowledged;
-    };
-
-    let outcome = CompletionOutcome::for_error(&error);
-    if outcome == CompletionOutcome::NoSuchRun {
-        warn!(
-            job_id,
-            exit_code,
-            controller = %controller_addr,
-            "controller has no record of this run; no acknowledgement will ever come for it"
-        );
-        return outcome;
+    match result {
+        Ok(response) => {
+            let raft_index = response.into_inner().release_raft_index;
+            info!(
+                job_id,
+                exit_code,
+                raft_index,
+                controller = %controller_addr,
+                "reported completion to controller"
+            );
+            CompletionOutcome::Acknowledged { raft_index }
+        }
+        Err(error) => {
+            let outcome = CompletionOutcome::for_error(&error);
+            if outcome == CompletionOutcome::NoSuchRun {
+                warn!(
+                    job_id,
+                    exit_code,
+                    controller = %controller_addr,
+                    "controller has no record of this run; no acknowledgement will ever come for it"
+                );
+            } else {
+                error!(
+                    job_id,
+                    exit_code,
+                    error = %error,
+                    "controller did not accept this completion; the report stays owed"
+                );
+            }
+            outcome
+        }
     }
-    // Deliberately not called non-retryable: every caller replays or holds
-    // until the controller takes it, whatever the code says about one attempt.
-    error!(
-        job_id,
-        exit_code,
-        error = %error,
-        "controller did not accept this completion; the report stays owed"
-    );
-    outcome
 }
 
 fn warn_mpi_mpirun_skipped_affinity(job_id: u32, source: &HashMap<String, String>) {
@@ -18594,7 +18634,7 @@ mod tests {
         admissions.admit_run(&run).expect("admit the allocation");
 
         let freed =
-            settle_acknowledged_completion(&svc.allocation, &admissions, key(49, 1), 0).await;
+            settle_acknowledged_completion(&svc.allocation, &admissions, key(49, 1), 0, 1).await;
 
         assert!(!freed, "a terminal step's exit frees no slice");
         assert_eq!(
@@ -18606,7 +18646,7 @@ mod tests {
             .load_run(key(49, 1))
             .expect("the record survives");
         assert!(
-            !recorded.controller_ack.is_given(),
+            !recorded.controller_ack.is_committed(),
             "the controller acknowledged a step, never this run"
         );
         assert!(
@@ -18732,6 +18772,7 @@ mod tests {
                 &admissions,
                 key(77, 1),
                 spur_core::step::STEP_BATCH,
+                42,
             )
             .await,
             "the late delivery must free the slice it settled"
@@ -21262,13 +21303,15 @@ mod tests {
                 async fn report_job_status(
                     &self,
                     request: tonic::Request<spur_proto::proto::ReportJobStatusRequest>,
-                ) -> Result<tonic::Response<()>, tonic::Status> {
+                ) -> Result<tonic::Response<spur_proto::proto::ReportJobStatusResponse>, tonic::Status> {
                     let report = request.into_inner();
                     let job_id = report.job_id;
                     self.reports.lock().expect("completion reports").push(report);
                     match self.refusal {
                         Some(code) => Err(tonic::Status::new(code, format!("job {job_id} not found"))),
-                        None => Ok(tonic::Response::new(())),
+                        None => Ok(tonic::Response::new(spur_proto::proto::ReportJobStatusResponse {
+                            release_raft_index: 42,
+                        })),
                     }
                 }
                 $(
@@ -23118,6 +23161,7 @@ mod tests {
             &admissions,
             key(72, 1),
             spur_core::step::STEP_BATCH,
+            42,
         )
         .await;
 
@@ -23156,6 +23200,7 @@ mod tests {
             &admissions,
             key(73, 1),
             spur_core::step::STEP_BATCH,
+            42,
         )
         .await;
         assert_eq!(

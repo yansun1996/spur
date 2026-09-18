@@ -409,7 +409,7 @@ mock_controller_impl! {
         create_token(proto::CreateTokenRequest) -> proto::CreateTokenResponse;
         list_tokens(proto::ListTokensRequest) -> proto::ListTokensResponse;
         revoke_token(proto::RevokeTokenRequest) -> proto::RevokeTokenResponse;
-        report_job_status(proto::ReportJobStatusRequest) -> ();
+        report_job_status(proto::ReportJobStatusRequest) -> proto::ReportJobStatusResponse;
         report_stepd_recovery(proto::StepdRecoveryRequest) -> proto::StepdRecoveryResponse;
         create_reservation(proto::CreateReservationRequest) -> ();
         update_reservation(proto::UpdateReservationRequest) -> ();
