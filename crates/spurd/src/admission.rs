@@ -919,10 +919,8 @@ impl AdmissionStore {
 
     /// Settle a run the controller has answered, sparing a hook the record still
     /// has in flight: only the teardown that owns one may call it lost.
-    /// Take the controller's answer to a completed run, and the cleaned state
-    /// that answer settles, under one read and one write. Split across two
-    /// writes this costs the completion path a second fsync pair for a record
-    /// that is only ever read whole.
+    /// The controller's answer and the cleaned state it settles, under one read
+    /// and one write; split, they cost the completion path a second fsync pair.
     pub fn record_acknowledged_completion(
         &self,
         run_key: RunKey,
