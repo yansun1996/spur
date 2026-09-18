@@ -5,7 +5,9 @@ use crate::env_defaults::{apply_csv, apply_flag, apply_str, apply_string};
 use anyhow::{Context, Result};
 use clap::{ArgMatches, CommandFactory, Parser};
 use spur_core::spur_env::SpurEnv;
-use spur_proto::proto::{CancelJobRequest, GetJobRequest, JobSpec, SubmitJobRequest};
+use spur_proto::proto::{
+    CancelJobRequest, CompleteJobRequest, GetJobRequest, JobSpec, SubmitJobRequest,
+};
 use std::collections::HashMap;
 
 /// Allocate resources for an interactive job.
@@ -251,17 +253,38 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
 
     drop(_keepalive);
 
-    // Shell exited — cancel allocation
+    // A graceful finish, not a cancel: CompleteJob lets the release skip the
+    // stale-launch fence a real cancel needs.
     eprintln!("salloc: Relinquishing job allocation {}", job_id);
-    let _ = client
-        .cancel_job(CancelJobRequest {
+    let exit_code = status.code().unwrap_or(0);
+    if let Err(e) = client
+        .complete_job(CompleteJobRequest {
             job_id,
-            signal: 0,
-            user: owner,
+            exit_code,
+            user: owner.clone(),
         })
-        .await;
+        .await
+    {
+        eprintln!(
+            "salloc: warning: failed to release allocation for job {}: {}",
+            job_id, e
+        );
+        if let Err(ce) = client
+            .cancel_job(CancelJobRequest {
+                job_id,
+                signal: 0,
+                user: owner,
+            })
+            .await
+        {
+            eprintln!(
+                "salloc: warning: failed to cancel job {} after CompleteJob failure: {}",
+                job_id, ce
+            );
+        }
+    }
 
-    std::process::exit(status.code().unwrap_or(0));
+    std::process::exit(exit_code);
 }
 
 fn build_salloc_job_spec(

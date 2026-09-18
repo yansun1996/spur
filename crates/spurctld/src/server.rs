@@ -2174,27 +2174,18 @@ impl SlurmController for ControllerService {
                 self.caller_is_operator(__identity.as_ref()),
             )
             .map_err(|e| match e {
-                crate::cluster::SrunCompleteError::NotFound(id) => {
-                    Status::not_found(format!("job {id} not found"))
+                crate::cluster::SrunCompleteError::NotFound(_) => Status::not_found(e.to_string()),
+                crate::cluster::SrunCompleteError::NotSrunJob(_)
+                | crate::cluster::SrunCompleteError::NotStepDispatch(_)
+                | crate::cluster::SrunCompleteError::NotRunning { .. }
+                | crate::cluster::SrunCompleteError::AlreadyTerminal { .. } => {
+                    Status::failed_precondition(e.to_string())
                 }
-                crate::cluster::SrunCompleteError::NotSrunJob(id) => {
-                    Status::failed_precondition(format!("job {id} is not an srun allocation"))
+                crate::cluster::SrunCompleteError::NotOwner { .. } => {
+                    Status::permission_denied(e.to_string())
                 }
-                crate::cluster::SrunCompleteError::NotStepDispatch(id) => {
-                    Status::failed_precondition(format!(
-                        "job {id} does not use native step dispatch"
-                    ))
-                }
-                crate::cluster::SrunCompleteError::AlreadyTerminal { job_id, state } => {
-                    Status::failed_precondition(format!("job {job_id} is already {state:?}"))
-                }
-                crate::cluster::SrunCompleteError::NotOwner { job_id, user } => {
-                    Status::permission_denied(format!(
-                        "user {user} is not permitted to complete job {job_id}"
-                    ))
-                }
-                crate::cluster::SrunCompleteError::Internal { job_id, message } => {
-                    Status::internal(format!("job {job_id}: {message}"))
+                crate::cluster::SrunCompleteError::Internal { .. } => {
+                    Status::internal(e.to_string())
                 }
             })?;
 
