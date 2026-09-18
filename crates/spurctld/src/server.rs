@@ -911,6 +911,15 @@ pub(crate) enum CutProvenance {
     Registered,
 }
 
+impl CutProvenance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pulled => "pulled",
+            Self::Registered => "registered",
+        }
+    }
+}
+
 /// Diff an agent's asserted ledger against Raft and resolve the differences.
 /// `dispatched` must predate the cut: it names launches that could postdate it.
 pub(crate) async fn reconcile_node_ledger(
@@ -964,15 +973,12 @@ impl ReconcileLicense<'_> {
     /// Whether the controller can attest whoever produced this cut. Read per act
     /// rather than fixed at the open: a mode revoked mid-pass licenses no more.
     fn teardown_is_licensed(&self, cluster: &ClusterManager) -> bool {
-        match self.provenance {
-            CutProvenance::Pulled => true,
-            // Open admission lets any reachable host assert any hostname, so the
-            // cut names a node the controller has no way to place the caller at.
-            CutProvenance::Registered => matches!(
-                cluster.config().admission.mode,
-                spur_core::config::AdmissionMode::Token
-            ),
-        }
+        // Open admission attests neither provenance. A caller that can register can
+        // repoint the comm address a pull dials, so dialing it proves nothing either.
+        matches!(
+            cluster.config().admission.mode,
+            spur_core::config::AdmissionMode::Token
+        )
     }
 }
 
@@ -1065,7 +1071,8 @@ async fn answer_unrecorded_claims(
                 node = %node,
                 job_id = entry.job_id,
                 run_attempt = entry.run_attempt,
-                "unattested registration cannot license answering a claim; leaving it alone"
+                provenance = license.provenance.as_str(),
+                "an unattested cut cannot license answering a claim; leaving it alone"
             );
             answered_every_claim = false;
             continue;
@@ -1185,7 +1192,8 @@ async fn reconcile_node_ledger_after(
             warn!(
                 node = %node,
                 job_id,
-                "unattested registration cannot license settling a job; leaving its record alone"
+                provenance = license.provenance.as_str(),
+                "an unattested cut cannot license settling a job; leaving its record alone"
             );
             continue;
         }
@@ -7371,8 +7379,20 @@ mod tests {
         .unwrap()
     }
 
-    /// A node holding one running job, as Raft records it.
+    /// A node holding one running job, as Raft records it. Under token admission:
+    /// no cut licenses a teardown without it, whichever way the controller came by it.
     async fn service_with_a_job_on_a_node(
+        dir: &tempfile::TempDir,
+    ) -> (ControllerService, Arc<ClusterManager>) {
+        let svc = test_service_with_token_admission(dir).await;
+        let cluster = svc.cluster.clone();
+        seed_a_job_on_a_node(&cluster);
+        (svc, cluster)
+    }
+
+    /// The same fixture under the default admission mode, where the controller can
+    /// place no caller at the node a cut names.
+    async fn service_with_a_job_on_a_node_under_open_admission(
         dir: &tempfile::TempDir,
     ) -> (ControllerService, Arc<ClusterManager>) {
         let svc = test_service(dir).await;
@@ -7620,7 +7640,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unattested_registration_cancels_nothing() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        let (svc, cluster) = service_with_a_job_on_a_node_under_open_admission(&dir).await;
         assert_eq!(
             svc.cluster.config().admission.mode,
             spur_core::config::AdmissionMode::Open,
@@ -7646,7 +7666,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unattested_registration_settles_nothing() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        let (_svc, cluster) = service_with_a_job_on_a_node_under_open_admission(&dir).await;
         assert!(holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
 
         let outcome = reconcile_node_ledger(
@@ -7663,6 +7683,47 @@ mod tests {
             Vec::<u32>::new(),
             "an empty cut from an unplaceable caller is not proof the node let go"
         );
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
+            "the job must still be recorded on the node"
+        );
+    }
+
+    // The controller dialed the address, but under open admission a caller that can
+    // register can repoint it, so dialing proves no more than being called does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unattested_pull_cancels_and_settles_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node_under_open_admission(&dir).await;
+        assert_eq!(
+            svc.cluster.config().admission.mode,
+            spur_core::config::AdmissionMode::Open,
+            "fixture assumption: default admission mode is Open"
+        );
+
+        let cancelling = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+        assert_eq!(
+            cancelling.cancelled,
+            Vec::<u32>::new(),
+            "an address an unattested caller can repoint must not license a kill"
+        );
+
+        let settling = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+        assert_eq!(settling.settled, Vec::<u32>::new());
         assert!(
             holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
             "the job must still be recorded on the node"
@@ -7692,13 +7753,13 @@ mod tests {
 
     // A revoked licence has to stop the pass it opened. Reconfigure swaps the
     // whole config, so admission can reopen while a reconcile is still killing.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn admission_reopened_under_a_pass_licenses_no_more_of_it() {
-        let dir = tempfile::TempDir::new().unwrap();
+    /// A leader whose admission mode can be rewritten under a running pass, which
+    /// takes a config path the fixtures that build a config in memory cannot have.
+    async fn cluster_with_switchable_admission(
+        dir: &tempfile::TempDir,
+    ) -> (Arc<ClusterManager>, std::path::PathBuf) {
         let conf_path = dir.path().join("spur.conf");
-        let conf = |mode| format!("cluster_name = \"test\"\n[admission]\nmode = \"{mode}\"\n");
-        std::fs::write(&conf_path, conf("token")).unwrap();
-
+        std::fs::write(&conf_path, admission_conf("token")).unwrap();
         let config = spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap();
         let cluster = Arc::new(
             ClusterManager::new_with_config_path(config, dir.path(), Some(conf_path.clone()))
@@ -7714,6 +7775,22 @@ mod tests {
             .await
             .unwrap();
         cluster.set_raft(handle.raft);
+        (cluster, conf_path)
+    }
+
+    fn admission_conf(mode: &str) -> String {
+        format!("cluster_name = \"test\"\n[admission]\nmode = \"{mode}\"\n")
+    }
+
+    fn reopen_admission(conf_path: &std::path::Path, cluster: &Arc<ClusterManager>) {
+        std::fs::write(conf_path, admission_conf("open")).unwrap();
+        cluster.reconfigure().expect("reopen admission");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admission_reopened_under_a_pass_licenses_no_more_of_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (cluster, conf_path) = cluster_with_switchable_admission(&dir).await;
 
         let (agent, release, mut fences) = spawn_gated_probe_agent_watching_fences().await;
         seed_a_job_on_a_node(&cluster);
@@ -7749,8 +7826,7 @@ mod tests {
 
         // The pass is provably mid-flight: one kill is held on the agent.
         let first = fences.recv().await.expect("a fence reaches the agent");
-        std::fs::write(&conf_path, conf("open")).unwrap();
-        cluster.reconfigure().expect("reopen admission");
+        reopen_admission(&conf_path, &cluster);
         release.notify_one();
         release.notify_one();
         let outcome = reconcile.await.expect("reconcile");
@@ -8035,7 +8111,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_settled_job_retries_at_once_instead_of_serving_a_launch_backoff() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = test_service_with_token_admission(&dir).await;
         let cluster = svc.cluster.clone();
         seed_a_job_on_a_node_with(
             &cluster,
@@ -8060,7 +8136,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dropped_job_still_owing_an_epilog_has_its_slice_released() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = test_service_with_token_admission(&dir).await;
         let cluster = svc.cluster.clone();
         register_a_node(&cluster, "n1");
         declare_epilog_on_n1(&cluster);
@@ -8097,7 +8173,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dropped_run_parked_mid_preemption_has_its_slice_released() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = test_service_with_token_admission(&dir).await;
         let cluster = svc.cluster.clone();
         register_a_node(&cluster, "n1");
         declare_epilog_on_n1(&cluster);
@@ -8135,6 +8211,7 @@ mod tests {
         spur_core::config::SlurmConfig::load_from_str(&format!(
             "cluster_name = \"test\"\n\
              [controller]\nfirst_job_id = 1\nmax_batch_requeue = {max}\n\
+             [admission]\nmode = \"token\"\n\
              [[partitions]]\nname = \"default\"\ndefault = true\nnodes = \"ALL\"\n"
         ))
         .unwrap()
@@ -8261,7 +8338,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_node_losing_a_job_evicts_the_whole_job() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = test_service_with_token_admission(&dir).await;
         let cluster = svc.cluster.clone();
         seed_a_three_node_job(&cluster);
         assert_eq!(cpus_charged_to(&cluster, "nB"), 2, "job 8's slice is left");
@@ -8297,11 +8374,13 @@ mod tests {
     async fn register_lifetime(svc: &ControllerService, session: &str) {
         let mut cut = ledger(false, Vec::new());
         cut.agent_session_id = session.into();
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
         svc.register_agent(Request::new(RegisterAgentRequest {
             hostname: "n1".into(),
             address: "127.0.0.1".into(),
             port: a_port_nothing_listens_on().into(),
             ledger: Some(cut),
+            join_token,
             ..Default::default()
         }))
         .await
@@ -8524,12 +8603,14 @@ mod tests {
 
         let mut cut = ledger(false, Vec::new());
         cut.agent_session_id = "session-b".into();
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
         let mut rejected = Request::new(RegisterAgentRequest {
             hostname: "n1".into(),
             address: "127.0.0.1".into(),
             port: a_port_nothing_listens_on().into(),
             labels: [("pool".to_string(), "stolen".to_string())].into(),
             ledger: Some(cut),
+            join_token,
             ..Default::default()
         });
         rejected.extensions_mut().insert(viewer("mallory", false));
@@ -9431,7 +9512,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unresolvable_claim_takes_the_node_out_of_the_scheduler() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = test_service_with_token_admission(&dir).await;
         let cluster = svc.cluster.clone();
         register_a_node(&cluster, "n1");
         assert!(
@@ -9511,7 +9592,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_incomplete_cut_cannot_lift_the_hold() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
+        let svc = test_service_with_token_admission(&dir).await;
         let cluster = svc.cluster.clone();
         register_a_node(&cluster, "n1");
         assert!(
@@ -9543,27 +9624,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unattested_cut_cannot_lift_the_hold() {
         let dir = tempfile::TempDir::new().unwrap();
-        let svc = test_service(&dir).await;
-        let cluster = svc.cluster.clone();
+        let (cluster, conf_path) = cluster_with_switchable_admission(&dir).await;
         register_a_node(&cluster, "n1");
         assert!(
             cluster
                 .state_machine_ready(std::time::Duration::from_secs(5))
                 .await
         );
-        assert_eq!(
-            cluster.config().admission.mode,
-            spur_core::config::AdmissionMode::Open
-        );
         reconcile_an_unresolvable_claim(&cluster, "n1", Vec::new()).await;
         let held = node_hold(&cluster, "n1");
 
+        reopen_admission(&conf_path, &cluster);
         reconcile_node_ledger(
             &cluster,
             "n1",
             ledger(true, Vec::new()),
             &no_launch_in_flight(&cluster, "n1"),
-            CutProvenance::Registered,
+            CutProvenance::Pulled,
         )
         .await;
 

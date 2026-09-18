@@ -1128,8 +1128,8 @@ node's account of what it is holding may be acted on destructively.
      - ``"open"``
      - Node admission mode. ``open`` lets any node register; ``token`` requires a
        registering ``spurd`` to present a valid admission token. Also decides
-       whether a ledger arriving with a registration may license the controller
-       to cancel work — see below.
+       whether a node's ledger may license the controller to cancel work — see
+       below.
 
 See :doc:`accounting` for managing admission tokens with ``spur token``.
 
@@ -1146,22 +1146,22 @@ them; or it is left alone and named in the node's reason for an operator. A job
 the node no longer holds is settled as failed. See
 :doc:`/user-guide/monitoring-jobs` for what a reconcile does and when one runs.
 
-``mode`` decides whether a ledger that arrives *with a registration* may license
-those two destructive halves:
+``mode`` decides whether any ledger may license those two destructive halves:
 
 * ``token`` — the registering agent presented a valid admission token, so the
-  controller acts on what it sent: unrecorded claims are answered, and jobs the
-  node no longer holds are settled.
+  controller acts on what a node sends: unrecorded claims are answered, and jobs
+  the node no longer holds are settled.
 * ``open`` (the default) — any host able to reach the controller's port may
   assert any hostname, so the controller cannot place the caller at the node the
   ledger names. Drift is still detected and written to the controller log, naming
-  the node and job each time, but nothing is cancelled or settled on the strength
-  of that registration.
+  the node and job each time, and a claim nobody can account for still drains the
+  node, but nothing is cancelled, settled or released.
 
-A ledger the controller *pulled* is licensed in either mode, because the
-controller chose to dial the node rather than being called by it. So an ``open``
-cluster still repairs itself — it just waits for the next pull instead of
-repairing at the moment a node registers.
+This holds for a ledger the controller *pulled* as well as for one that arrives
+with a registration. Dialing the node is not independent evidence: under ``open``
+a caller that can register can re-register under an existing node's hostname and
+repoint the address the controller dials, so the pull reaches whoever did that.
+An ``open`` cluster therefore reports drift but does not repair it.
 
 .. note::
 
@@ -1171,10 +1171,11 @@ repairing at the moment a node registers.
    admission was never a trust boundary and ``token`` does not turn it into one.
    Keep the control-plane port reachable only from hosts you trust either way.
 
-   What ``token`` buys is that the controller acts on a registering node's word
-   immediately. What the default costs is the wait for a pulled ledger: until one
-   comes around, drift is visible in the controller log but unrepaired, and the
-   resources it describes stay booked.
+   What ``token`` buys is that the controller acts on a node's word at all. What
+   the default costs is that reconciliation reports rather than repairs: drift is
+   visible in the controller log and in a drained node's reason, but the
+   resources it describes stay booked until an operator intervenes or the cluster
+   moves to ``token``.
 
 ``[devices]``
 -------------

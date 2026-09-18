@@ -999,10 +999,8 @@ overwrite, and the drain only where the node is not already held by someone
 else. A node carrying any other reason — an operator's, or one the controller
 set for something else such as a missed heartbeat — keeps it untouched, and the
 drift is reported in the controller log instead. Both naming and lifting need an
-attested reconcile: under the default ``open`` node admission a ledger that
-arrives with a registration cannot license either, so on those clusters both are
-done by a reconcile the controller initiated. See
-:doc:`/admin-guide/configuration` for how ``admission.mode`` decides that.
+attested reconcile, which under the default ``open`` node admission no reconcile
+is — see `What a reconcile may act on`_ below.
 
 The controller already reconciles a node on its own:
 
@@ -1049,16 +1047,32 @@ reason names the node it was lost from:
 
    Reason=NodeDown (node node01 no longer holds this job)
 
+What a reconcile may act on
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
 Whether a reconcile may cancel and settle, or only report what it found, depends
-on ``[admission] mode`` for the registration case; see
-:doc:`/admin-guide/configuration`. Every other trigger above acts in either mode.
+on ``[admission] mode`` — for every trigger, including one an operator asks for
+and one the controller initiated. Under the default ``open`` mode any host that
+can reach the controller may register under any hostname, including one already
+registered, and that rebinds the address a controller-initiated pull dials. So
+dialing a node is no more proof of who answered than being called by one is, and
+neither licenses cancelling work or settling a job.
+
+Under ``open``, reconciliation therefore **reports only**. Drift is written to
+the controller log, a claim the controller cannot explain is still named and the
+node still drained for it, and nothing is killed, settled or released. Set
+``[admission] mode = "token"`` so each node proves its identity when it
+registers; that restores the acting half for every trigger. See
+:doc:`/admin-guide/configuration`.
 
 Asking for one by hand requires a cluster admin, because it can end running
 work. Where authentication is configured the verified identity decides it. Where
 it is not, the admin check falls back to the username the client sends, which is
 an operator-error guard and not a security boundary — on such a cluster anyone
-who can reach the controller can claim any name. An omitted username is refused
-rather than trusted:
+who can reach the controller can claim any name. A cluster that names no
+administrators at all — no accounting, or accounting with no user at
+``AdminLevel=Admin`` — bars nobody, since there is no membership a caller could
+be asked to prove. An omitted username is refused rather than trusted:
 
 .. code-block:: bash
 
