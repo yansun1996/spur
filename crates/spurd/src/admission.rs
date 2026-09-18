@@ -131,17 +131,19 @@ pub enum HoldOutcome {
 pub struct ControllerAck {
     #[serde(default)]
     pub release_raft_index: Option<u64>,
-    /// The controller answered a claim it had no record of. That answer is an
-    /// acknowledgement in its own right, and no committed index lies behind it.
-    #[serde(default)]
+    /// Legacy: the controller answered a claim it had no record of. Retained
+    /// for on-disk compatibility with records written before this field was
+    /// removed. New code ignores it: only a real Raft index counts.
+    #[serde(default, skip_serializing)]
     pub settled_unrecorded_claim: bool,
 }
 
 impl ControllerAck {
-    /// Whether the controller has spoken for this run's completion, by either
-    /// route. Only one of the two has an index to name.
-    pub fn is_given(&self) -> bool {
-        self.release_raft_index.is_some() || self.settled_unrecorded_claim
+    /// Whether the controller has committed this run's completion. Only a real
+    /// Raft index counts; zero means the controller had no record (so no commit),
+    /// and `None` means no acknowledgement at all.
+    pub fn is_committed(&self) -> bool {
+        self.release_raft_index.is_some_and(|idx| idx > 0)
     }
 }
 
@@ -222,7 +224,7 @@ impl RunAdmission {
     pub fn is_over(&self) -> bool {
         self.state == RunState::Cleaned
             || self.cancelled_by_controller
-            || self.controller_ack.is_given()
+            || self.controller_ack.is_committed()
     }
 
     /// When this run stops being interesting if nothing else ever happens to it.
@@ -710,7 +712,9 @@ impl AdmissionStore {
                     .max_launch_expiry_unix_ms
                     .max(existing.max_launch_expiry_unix_ms);
                 // Carried forward only while this write is not itself clearing it.
-                if run.conflict_hold.is_none() && !run.controller_ack.is_given() {
+                // Any acknowledgement (real commit or "no record" with index 0) clears
+                // the hold; only the absence of an ack preserves it.
+                if run.conflict_hold.is_none() && run.controller_ack.release_raft_index.is_none() {
                     run.conflict_hold = existing.conflict_hold;
                 }
             }
@@ -1045,7 +1049,7 @@ impl AdmissionStore {
         };
         // A release landing after the caller read its snapshot would otherwise
         // leave a record claiming to hold a core it has already given back.
-        if run.controller_ack.is_given() {
+        if run.controller_ack.is_committed() {
             return Ok(HoldOutcome::AlreadyReleased);
         }
         if run.conflict_hold.is_some() {
@@ -1121,9 +1125,6 @@ impl AdmissionStore {
         if run.cleanup.epilog.is_in_flight() {
             return Ok(None);
         }
-        if run.controller_ack.settled_unrecorded_claim {
-            return Ok(Some(ReleaseWarrant::settled_unrecorded_claim(run_key)));
-        }
         Ok(run
             .controller_ack
             .release_raft_index
@@ -1185,10 +1186,15 @@ impl AdmissionStore {
     }
 
     /// Record the controller's answer to a claim it has no record of. An answer
-    /// and not a commit, so the release names it as such rather than an index.
+    /// and not a commit, so the release names it as such rather than a real index.
     /// It answers for the whole run, so no step speaks for it.
     pub fn record_settled_claim(&self, run_key: RunKey) -> io::Result<bool> {
-        self.take_controller_ack(run_key, None, |ack| ack.settled_unrecorded_claim = true)
+        self.take_controller_ack(run_key, None, |ack| {
+            ack.settled_unrecorded_claim = true;
+            // Zero means "no record at controller" - not a real commit, but the
+            // run should be settled locally to free resources.
+            ack.release_raft_index = Some(0);
+        })
     }
 
     fn take_controller_ack(
@@ -2520,24 +2526,54 @@ mod tests {
         assert!(store.ledger_cut("session-a").entries.is_empty());
     }
 
-    // The settle is the acknowledgement, so it must free the slice -- but the
-    // audit has to be able to tell it from a completion Raft actually committed.
+    // A NoSuchRun (controller has no record) still releases the slice - holding
+    // resources for a run the controller cannot acknowledge is pointless. But it
+    // does not count as "committed" because no Raft write happened.
     #[test]
-    fn a_settled_claim_releases_on_its_own_ground_not_a_borrowed_index() {
+    fn a_nosuchrun_releases_the_slice_but_is_not_committed() {
         let dir = tempfile::tempdir().unwrap();
         let store = store(&dir);
         store.admit_run(&run_with(7, 1, 1)).unwrap();
         store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+        // Legacy settle path (NoSuchRun) — sets release_raft_index = Some(0).
         store.settle_acknowledged_run(key(7, 1)).unwrap();
+
+        // A warrant IS issued (to free the slice), but with index 0.
+        let warrant = store
+            .release_is_due(key(7, 1), spur_core::step::STEP_BATCH)
+            .unwrap()
+            .expect("a NoSuchRun answer licenses a release to free resources");
+        assert!(matches!(
+            warrant.ground(),
+            spur_sched::cons_tres::ReleaseGround::Acknowledged(0)
+        ));
+        // But it does NOT count as committed (no real Raft write).
+        assert!(!store
+            .load_run(key(7, 1))
+            .unwrap()
+            .controller_ack
+            .is_committed());
+    }
+
+    // With a real Raft index, the release is licensed.
+    #[test]
+    fn a_real_raft_index_releases_the_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+        store
+            .record_acknowledged_completion(key(7, 1), spur_core::step::STEP_BATCH, 42)
+            .unwrap();
 
         let warrant = store
             .release_is_due(key(7, 1), spur_core::step::STEP_BATCH)
             .unwrap()
-            .expect("an answered claim is a release the record licenses");
-        assert_eq!(
+            .expect("a real Raft index licenses the release");
+        assert!(matches!(
             warrant.ground(),
-            spur_sched::cons_tres::ReleaseGround::SettledUnrecordedClaim
-        );
+            spur_sched::cons_tres::ReleaseGround::Acknowledged(_)
+        ));
     }
 
     #[test]

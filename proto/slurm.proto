@@ -438,7 +438,7 @@ service SlurmController {
   rpc RevokeToken(RevokeTokenRequest) returns (RevokeTokenResponse);
 
   // K8s operator callback: report job completion from Pod watcher
-  rpc ReportJobStatus(ReportJobStatusRequest) returns (google.protobuf.Empty);
+  rpc ReportJobStatus(ReportJobStatusRequest) returns (ReportJobStatusResponse);
 
   // Partition management
   rpc CreatePartition(CreatePartitionRequest) returns (google.protobuf.Empty);
@@ -1649,6 +1649,13 @@ message ReportJobStatusRequest {
   // Step whose supervisor is reporting. Absent from a legacy agent, and from a
   // report that speaks for the whole node rather than one step.
   optional uint32 step_id = 10;
+}
+
+message ReportJobStatusResponse {
+  // Raft log index at which this completion was committed.
+  // Agents use this to confirm the controller has durably recorded the exit.
+  // 0 = not committed (legacy response, NotFound, or non-completion path).
+  uint64 release_raft_index = 1;
 }
 
 // ============================================================
