@@ -687,12 +687,8 @@ async fn shutdown_run_supervisors(
     supervised
 }
 
-/// Whether the run exists only to host its client, so the client leaving ends
-/// it. `is_allocation_only` cannot answer this alone: a supervised run keeps its
-/// processes in the supervisor, so every one of them reads as allocation-only at
-/// the agent. The step the run was launched under is what separates them — an
-/// srun allocation owns the extern step, a batch script (salloc's included) its
-/// own, and a terminal on that is one of its steps rather than its whole reason.
+/// Whether the run exists only to host its client. Every supervised job reads as
+/// allocation-only, so the step it was launched under is what separates them.
 fn run_hosts_only_its_client(
     tracked: &TrackedJob,
     supervisors: &[crate::stepd::StepdDescriptor],
@@ -10895,9 +10891,8 @@ impl AgentService {
 
         if end == PtyBridgeEnd::ClientGone && !child_exited {
             let _ = crate::pty::signal_foreground(master_raw, child_pid, libc::SIGHUP);
-            // A closed output channel is the one case where nobody can receive an
-            // exit status, and the payload can block writing into a terminal nobody
-            // drains — so waiting for it here is a wait that never ends.
+            // Nobody can receive a status, and the payload can block on the
+            // terminal forever, so waiting here is a wait with no end.
             if tx.is_closed() {
                 return end;
             }
@@ -21408,9 +21403,8 @@ mod tests {
         (served, rx)
     }
 
-    /// A supervisor of `job_id` launched under `step_id`. Every supervised run
-    /// reads as allocation-only at the agent, so the step is the only thing that
-    /// says whether the run is an srun allocation or a script of its own.
+    /// A supervisor of `job_id` under `step_id` — the step is the only thing
+    /// separating an srun allocation from a script of its own.
     fn a_run_supervisor(
         dir: &std::path::Path,
         job_id: u32,
@@ -21469,9 +21463,8 @@ mod tests {
         supervisor.abort();
     }
 
-    // The same allocation, entered a second time with `--overlap` (what `sattach`
-    // and `srun --jobid` do). That terminal is not why the job exists, so losing
-    // it must not end the allocation the first one is still sitting in.
+    // Entered a second time with `--overlap` (`sattach`, `srun --jobid`): that
+    // terminal is not why the job exists.
     #[tokio::test]
     async fn an_abandoned_overlapping_terminal_leaves_the_allocation_it_joined() {
         let _unbounded = crate::stepd::UnboundedRequests::new();
@@ -21528,9 +21521,8 @@ mod tests {
         supervisor.abort();
     }
 
-    // An `salloc` shell and the `srun --pty` a user runs inside it are one job.
-    // Killing the inner client must not take the shell, or the allocation the
-    // user is standing in disappears under them.
+    // An salloc shell and an inner `srun --pty` are one job; killing the inner
+    // client must not take the shell the user is standing in.
     #[tokio::test]
     async fn an_abandoned_terminal_inside_an_salloc_leaves_the_allocation_standing() {
         let _unbounded = crate::stepd::UnboundedRequests::new();
@@ -24476,13 +24468,8 @@ mod tests {
         assert_eq!(bridge.await.expect("bridge task"), PtyBridgeEnd::ClientGone);
     }
 
-    // The shape the broken-stream test cannot reach: a client killed while output
-    // is flowing is noticed on the *send*, not the input stream. The payload here
-    // ignores SIGHUP and never exits, which is what a real one does once it blocks
-    // writing into a terminal nobody drains — so a bridge that waits for its exit
-    // before reporting the client gone never reports at all, and the run stays
-    // charged. Nothing here is time-bounded: the fixed bridge returns without
-    // waiting on the child, and the unfixed one is the hang this pins.
+    // A client lost while output flows is noticed on the send, not the input
+    // stream; this payload ignores SIGHUP, so a bridge that waits for it hangs.
     #[tokio::test]
     async fn a_client_lost_while_output_flows_ends_the_bridge_without_waiting_for_the_payload() {
         let (bridge, _in_tx, out_rx) =

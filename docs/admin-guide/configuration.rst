@@ -2148,10 +2148,11 @@ submitting host on each invocation.
 
 .. note::
 
-   Every hook runs in a process group of its own, so a signal sent to the
-   process that started it does not reach it. For the client-side hooks this is
-   visible: ``Ctrl-C`` on ``srun`` no longer interrupts ``srun_prolog`` or
-   ``srun_epilog``, which run to completion or until ``srun`` itself exits. A
+   The job-lifecycle hooks above — every one except ``job_submit`` and
+   ``job_submit_lua`` — run in a process group of their own, so a signal sent to
+   the process that started them does not reach them. For the client-side hooks
+   this is visible: ``Ctrl-C`` on ``srun`` no longer interrupts ``srun_prolog``
+   or ``srun_epilog``, which run to completion or until ``srun`` itself exits. A
    hook that can hang should carry its own bound — for example:
 
    .. code-block:: bash
