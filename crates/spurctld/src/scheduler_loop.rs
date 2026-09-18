@@ -21,7 +21,7 @@ use spur_proto::proto::{
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
 
-use crate::cluster::{ClusterManager, JobFilter, RequeueCharge};
+use crate::cluster::{ClusterManager, JobFilter, PlacementDisposition, RequeueCharge};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 
@@ -584,6 +584,7 @@ async fn process_assignment(
                 abort_placement(&cluster, job_id);
                 return false;
             }
+            DispatchConfirmOutcome::AbortedAndSettled => return false,
             DispatchConfirmOutcome::Confirmed => {}
         }
     }
@@ -1797,7 +1798,22 @@ pub async fn release_srun_allocation_on_agents(
 /// already been settled (requeued, held, or cancelled as appropriate).
 enum DispatchConfirmOutcome {
     Confirmed,
+    /// The placement this dispatch charged is still held, so the caller gives
+    /// it up.
     Aborted,
+    /// Aborted after the backoff that frees the placement was already proposed.
+    /// Giving it up again proposes a second one and both apply, so a single
+    /// failure spends two of the job's retries — and spares neither.
+    AbortedAndSettled,
+}
+
+/// Which abort a settled job leaves the caller. The backoff that settles the job
+/// is also what frees its placement, so the two are one decision.
+fn abort_after(disposition: PlacementDisposition) -> DispatchConfirmOutcome {
+    match disposition {
+        PlacementDisposition::Released => DispatchConfirmOutcome::AbortedAndSettled,
+        PlacementDisposition::StillHeld => DispatchConfirmOutcome::Aborted,
+    }
 }
 
 fn abort_pending_pmix_dispatch(
@@ -1806,12 +1822,13 @@ fn abort_pending_pmix_dispatch(
     detail: String,
 ) -> DispatchConfirmOutcome {
     let _ = cluster.set_job_launch_failure_detail(job_id, detail);
-    if let Err(e) =
-        cluster.backoff_pending_job_after_dispatch_failure(job_id, RequeueCharge::Charged)
-    {
-        error!(job_id, error = %e, "failed to back off after PMIx dispatch failure");
+    match cluster.backoff_pending_job_after_dispatch_failure(job_id, RequeueCharge::Charged) {
+        Ok(disposition) => abort_after(disposition),
+        Err(e) => {
+            error!(job_id, error = %e, "failed to back off after PMIx dispatch failure");
+            DispatchConfirmOutcome::Aborted
+        }
     }
-    DispatchConfirmOutcome::Aborted
 }
 
 /// Dispatch a batch job to every assigned node and *wait* for every LaunchJob
@@ -2209,8 +2226,11 @@ async fn confirm_dispatch_on_nodes(
         } else {
             RequeueCharge::Charged
         };
-        if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id, charge) {
-            error!(job_id, error = %e, "failed to back off after dispatch confirmation failure");
+        match cluster.backoff_pending_job_after_dispatch_failure(job_id, charge) {
+            Ok(disposition) => return abort_after(disposition),
+            Err(e) => {
+                error!(job_id, error = %e, "failed to back off after dispatch confirmation failure")
+            }
         }
     }
 
@@ -4444,7 +4464,7 @@ mod tests {
             )
             .await;
 
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
 
             // The job must never have been visible as Running — admission
             // failed before that transition, not after it (unlike the old
@@ -4680,7 +4700,7 @@ mod tests {
             )
             .await;
 
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
 
             let job = cm.get_job(job_id).unwrap();
             assert!(
@@ -4735,7 +4755,7 @@ mod tests {
             )
             .await;
 
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
 
             let job = cm.get_job(job_id).unwrap();
             assert!(
@@ -4796,7 +4816,7 @@ mod tests {
             )
             .await;
 
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
             assert_eq!(
                 cancel_calls.load(Ordering::SeqCst),
                 1,
@@ -4870,7 +4890,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("no-comm-addr", 1));
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
             assert!(
                 cm.get_job(job_id)
                     .unwrap()
@@ -4891,7 +4911,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("unreachable-agent", 1));
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
             assert!(
                 cm.get_job(job_id)
                     .unwrap()
@@ -5056,7 +5076,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("prolog-retry", 1));
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
 
             // nohold_on_prolog_fail: retry rather than hold, but "retry" is the
             // same bounded backoff as any dispatch failure, not an immediate one.
@@ -5115,7 +5135,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("overlap", 1));
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
 
             assert_eq!(
                 pulls_reaching(&pulls, 1).await,
@@ -5151,7 +5171,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("residual", 1));
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
 
             assert_eq!(
                 pulls_reaching(&pulls, 1).await,
@@ -5175,7 +5195,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("misaddressed", 1));
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
 
             // The unclaimed slot settles it with no waiting: a pull stamps the
             // slot before it spawns, so an untaken slot means none was started.
@@ -5193,9 +5213,28 @@ mod tests {
             );
         }
 
+        /// A conflicted node pinned by `--nodelist`: the shape with the fewest
+        /// brakes left on it, since a pinned job is exempt from the node
+        /// dispatch cooldown and this agent's ledger names no claim to drain on.
+        async fn a_job_pinned_to_a_refusing_node(
+            cm: &Arc<ClusterManager>,
+            name: &str,
+        ) -> spur_core::job::JobId {
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureLocalOverlap,
+            ))
+            .await;
+            register_node_at(cm, "n1", addr);
+            let mut spec = batch_spec(name, 1);
+            spec.nodelist = Some("n1".into());
+            submit_and_wait(cm, spec)
+        }
+
         // A node refusing work it already holds is controller-vs-node drift the
         // job neither caused nor can influence. Charging its retry budget for
         // that buries a healthy job at priority 0 for an operator to dig out.
+        // Driven through `process_assignment`, because the second backoff that
+        // used to charge the job anyway is the caller's, not the dispatch's.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn a_node_side_conflict_never_spends_the_job_s_requeue_budget() {
             use spur_core::job::{JobState, PendingReason};
@@ -5203,44 +5242,84 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let cm = test_cluster(&dir).await;
             let budget = cm.config().controller.max_batch_requeue;
+            let job_id = a_job_pinned_to_a_refusing_node(&cm, "conflict-exempt").await;
 
-            let (addr, _) = spawn_mock_agent_rejecting(Some(
-                spur_proto::proto::LaunchFailureKind::LaunchFailureLocalOverlap,
-            ))
-            .await;
-            register_node_at(&cm, "n1", addr);
-
-            let job_id = submit_and_wait(&cm, batch_spec("conflict-exempt", 1));
-            for attempt in 1..=budget + 2 {
-                let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-                assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            let mut previous_hold = chrono::Duration::zero();
+            for refusal in 1..=budget {
+                assert!(
+                    !process_assignment(cm.clone(), assignment(job_id, &["n1"])).await,
+                    "refusal {refusal} must not start the job"
+                );
 
                 let job = cm.get_job(job_id).unwrap();
                 assert_eq!(
-                    job.requeue_count,
-                    0,
-                    "refusal {attempt} of {} must not spend a retry",
-                    budget + 2
+                    job.requeue_count, 0,
+                    "refusal {refusal} of {budget} must not spend a retry"
                 );
-                assert_eq!(job.state, JobState::Pending, "refusal {attempt}");
+                assert_eq!(
+                    job.spared_requeue_count, refusal,
+                    "refusal {refusal} must be counted as spared, so the hold still grows"
+                );
+                assert_eq!(job.state, JobState::Pending, "refusal {refusal}");
                 assert_eq!(
                     job.pending_reason,
                     PendingReason::JobLaunchFailure,
-                    "refusal {attempt}"
+                    "refusal {refusal}"
                 );
+                let hold = job
+                    .spec
+                    .begin_time
+                    .expect("the hold must still defer the retry; only the charge is waived")
+                    - chrono::Utc::now();
+                // A spared refusal that left the hold at the floor would retry
+                // every few seconds for as long as the conflict stands.
                 assert!(
-                    job.spec.begin_time.is_some_and(|t| t > chrono::Utc::now()),
-                    "refusal {attempt}: the hold must still defer the retry, only the charge is waived"
+                    hold > previous_hold,
+                    "refusal {refusal}: an uncharged refusal must still lengthen the hold, got {hold} after {previous_hold}"
+                );
+                previous_hold = hold;
+                assert!(
+                    job.priority > 0,
+                    "refusal {refusal}: the job stays schedulable"
                 );
             }
+        }
 
-            let job = cm.get_job(job_id).unwrap();
-            assert_ne!(
-                job.pending_reason,
-                PendingReason::JobHoldMaxRequeue,
-                "a budget that is never spent cannot run out"
+        // The terminator behind the exemption. A pinned job against a node no
+        // drain ever takes out of candidacy would retry at the floor forever if
+        // the exemption were unbounded, so the exemption is bounded: the hold
+        // grows with every spared refusal, and past a budget's worth of them the
+        // job is charged again and ends up parked for an operator.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_standing_conflict_stops_retrying_even_though_nothing_drains_the_node() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let budget = cm.config().controller.max_batch_requeue;
+            let job_id = a_job_pinned_to_a_refusing_node(&cm, "conflict-forever").await;
+
+            // Spared and charged refusals, plus the one that trips the hold.
+            for _ in 1..=budget * 2 + 1 {
+                assert!(!process_assignment(cm.clone(), assignment(job_id, &["n1"])).await);
+            }
+
+            assert!(
+                cm.get_node("n1").is_some_and(|node| node.state.is_up()),
+                "the premise: nothing drained the node, so candidacy cannot be the terminator"
             );
-            assert!(job.priority > 0, "the job must stay schedulable");
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(
+                job.priority, 0,
+                "a refusal that never stops must still stop the job, or it retries forever"
+            );
+            assert!(
+                job.requeue_count >= budget,
+                "past the spared bound the refusals are charged: got {}",
+                job.requeue_count
+            );
+            assert_eq!(
+                job.spared_requeue_count, budget,
+                "the exemption covers a bounded number of refusals and no more"
+            );
         }
 
         // The exemption is for the conflict alone: a run that also hit a real
@@ -5259,7 +5338,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("mixed-failure", 2));
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1", "n2"]).await;
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
 
             assert_eq!(
                 cm.get_job(job_id).unwrap().requeue_count,
@@ -5288,7 +5367,7 @@ mod tests {
             let job_id = submit_and_wait(&cm, batch_spec("standing-conflict", 1));
             for _ in 0..4 {
                 let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-                assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+                assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
             }
 
             assert_eq!(
@@ -5320,7 +5399,7 @@ mod tests {
 
             let job_id = submit_and_wait(&cm, batch_spec("unclassified", 1));
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
 
             let job = cm.get_job(job_id).unwrap();
             assert_eq!(job.state, JobState::Pending);
@@ -5365,7 +5444,7 @@ mod tests {
 
             for attempt in 1..=2u32 {
                 let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-                assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+                assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
                 let job = cm.get_job(job_id).unwrap();
                 assert_eq!(job.state, JobState::Pending);
                 assert_eq!(job.requeue_count, attempt, "attempt {attempt}");
@@ -6366,7 +6445,7 @@ mod tests {
 
             assert!(cm.nodes_on_dispatch_cooldown().is_empty());
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
             assert!(
                 cm.nodes_on_dispatch_cooldown().contains("n1"),
                 "a resources-unavailable reject must put the node on cooldown"

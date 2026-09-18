@@ -907,6 +907,12 @@ pub struct Job {
     /// toward `max_batch_requeue`.
     #[serde(default)]
     pub user_requeue_count: u32,
+    /// Number of dispatch refusals this job was not charged for, because the
+    /// node refused work it already held. Paces the launch backoff like a real
+    /// requeue does, and bounds the exemption: past `max_batch_requeue` spared
+    /// refusals the job is charged again, so a standing conflict still ends.
+    #[serde(default)]
+    pub spared_requeue_count: u32,
 
     /// Monotonic run epoch, bumped on each dispatch (first dispatch = 1). Lets
     /// the controller drop a completion report from a superseded run.
@@ -1063,6 +1069,7 @@ impl Job {
             requeue_count: 0,
             preempt_requeue_count: 0,
             user_requeue_count: 0,
+            spared_requeue_count: 0,
             run_attempt: 0,
             het_job_id: None,
             het_group: None,

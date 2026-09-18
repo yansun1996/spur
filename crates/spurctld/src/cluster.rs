@@ -591,6 +591,17 @@ pub(crate) enum RequeueCharge {
     Spared,
 }
 
+/// What a dispatch-failure backoff left the placement the job had reserved in.
+/// Only the backoff's own apply frees it, so a caller that is told
+/// [`StillHeld`](PlacementDisposition::StillHeld) still owns giving it up —
+/// and one told [`Released`](PlacementDisposition::Released) must not, or the
+/// second release charges the job a second retry for one failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlacementDisposition {
+    Released,
+    StillHeld,
+}
+
 /// A latch is only good for the term it was taken in: a controller that lost
 /// and regained leadership replayed nothing in between. Term 0 means never.
 fn readiness_latch_holds(latched_term: u64, current_term: u64) -> bool {
@@ -2624,36 +2635,44 @@ impl ClusterManager {
     /// flaky node's job would be reassigned to it every tick, forever unbounded.
     ///
     /// `charge` decides whether the hold also spends a slot of the job's
-    /// `max_batch_requeue` budget; see [`RequeueCharge`].
+    /// `max_batch_requeue` budget; see [`RequeueCharge`]. Returns whether the
+    /// backoff it proposed is what frees the job's placement.
     pub(crate) fn backoff_pending_job_after_dispatch_failure(
         &self,
         job_id: JobId,
         charge: RequeueCharge,
-    ) -> anyhow::Result<()> {
-        let begin_time = {
+    ) -> anyhow::Result<PlacementDisposition> {
+        let max_requeue = self.config().controller.max_batch_requeue;
+        let (begin_time, spare_requeue_budget) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
-                return Ok(());
+                return Ok(PlacementDisposition::StillHeld);
             };
             if job.state != JobState::Pending {
                 // Moved on already (e.g. cancelled concurrently) between the
                 // failed confirmation and this call — nothing to back off.
-                return Ok(());
+                return Ok(PlacementDisposition::StillHeld);
             }
-            if job.requeue_count >= self.config().controller.max_batch_requeue {
+            // The exemption is generous, not unlimited: a job that has already
+            // ridden out a whole budget's worth of refusals it did not cause is
+            // facing drift no retry will clear, and pays from here on so that it
+            // still reaches the hold an operator can see.
+            let spare = charge == RequeueCharge::Spared && job.spared_requeue_count < max_requeue;
+            if !spare && job.requeue_count >= max_requeue {
                 drop(jobs);
-                return self.hold_job_at_max_requeue(job_id);
+                self.hold_job_at_max_requeue(job_id)?;
+                return Ok(PlacementDisposition::StillHeld);
             }
-            self.launch_backoff_until(job)
+            (self.launch_backoff_until(job), spare)
         };
 
         self.propose(WalOperation::JobDispatchBackoff {
             job_id,
             begin_time,
-            spare_requeue_budget: charge == RequeueCharge::Spared,
+            spare_requeue_budget,
         })?;
         info!(job_id, hold_until = %begin_time, "job's batch dispatch failed before it started; backing off");
-        Ok(())
+        Ok(PlacementDisposition::Released)
     }
 
     /// Instant until which a job requeued after a launch failure is held. A user
@@ -2662,10 +2681,12 @@ impl ClusterManager {
     /// one verbatim instant rather than reading its own clock.
     fn launch_backoff_until(&self, job: &Job) -> DateTime<Utc> {
         let config = self.config();
+        // Both counts, so a refusal the job is not charged for still paces the
+        // retry: an exempt failure that never grew the hold would spin at `base`.
         let hold_secs = launch_backoff_secs(
             config.scheduler.interval_secs,
             config.controller.max_launch_backoff_secs,
-            job.requeue_count,
+            job.requeue_count.saturating_add(job.spared_requeue_count),
         );
         let hold = Utc::now() + chrono::Duration::seconds(hold_secs as i64);
         job.spec.begin_time.map_or(hold, |user| user.max(hold))
@@ -6166,6 +6187,13 @@ impl ClusterManager {
         Self::clear_run_state_for_requeue(job);
     }
 
+    /// Requeue after a refusal the job did not cause: paces the next retry like
+    /// a charged one, and bounds how many refusals the exemption covers.
+    fn reset_job_for_spared_requeue(job: &mut Job) {
+        job.spared_requeue_count += 1;
+        Self::clear_run_state_for_requeue(job);
+    }
+
     /// Requeue after preemption: tracked separately since it isn't a failure
     /// signal and must never contribute to the `max_batch_requeue` hold.
     fn reset_job_for_preempt_requeue(job: &mut Job) {
@@ -6380,7 +6408,7 @@ impl ClusterManager {
                 let per_node_map = job.per_node_alloc.clone();
                 let already = Self::slices_no_longer_held(job);
                 if *spare_requeue_budget {
-                    Self::clear_run_state_for_requeue(job);
+                    Self::reset_job_for_spared_requeue(job);
                 } else {
                     Self::reset_job_for_requeue(job);
                 }
@@ -7103,6 +7131,9 @@ impl ClusterManager {
                     }
                     if *reset_requeue_count {
                         job.requeue_count = 0;
+                        // Cleared with it: an operator releasing the job would
+                        // otherwise hand back a budget the exemption cannot use.
+                        job.spared_requeue_count = 0;
                     }
                     if *clear_reservation {
                         job.spec.reservation = None;
