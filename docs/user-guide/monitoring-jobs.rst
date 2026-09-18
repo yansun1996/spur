@@ -980,7 +980,7 @@ still running other work reports ``drng`` until that work finishes, then
 
 Both the drain and the reason are lifted by the first reconcile that finds no
 claim left. Lifting them takes a complete ledger from the node's current agent,
-and takes it in either node admission mode, since the drain is a signal rather
+and takes it whatever the node admission mode, since the drain is a signal rather
 than an act on anyone's work. A node that cannot enumerate its own records
 stays drained. Where the node had also gone ``down`` in the
 meantime, the reconcile releases the hold but leaves the state alone — the
@@ -1000,8 +1000,7 @@ overwrite, and the drain only where the node is not already held by someone
 else. A node carrying any other reason — an operator's, or one the controller
 set for something else such as a missed heartbeat — keeps it untouched, and the
 drift is reported in the controller log instead. Naming and lifting both happen
-whatever the node admission mode; what that mode decides is whether the claim
-itself may be answered — see `What a reconcile may act on`_ below.
+whatever the node admission mode — see `What a reconcile may act on`_ below.
 
 The controller already reconciles a node on its own:
 
@@ -1051,22 +1050,25 @@ reason names the node it was lost from:
 What a reconcile may act on
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Whether a reconcile may cancel and settle, or only report what it found, depends
-on ``[admission] mode`` — for every trigger, including one an operator asks for
-and one the controller initiated. Under the default ``open`` mode any host that
-can reach the controller may register under any hostname, including one already
-registered, and that rebinds the address a controller-initiated pull dials. So
-dialing a node is no more proof of who answered than being called by one is, and
-neither licenses cancelling work or settling a job.
+A reconcile cancels and settles on any cluster, whatever ``[admission] mode`` is
+set to, for every trigger in the list above bar one. All of those are pulls: the
+controller went out and asked the node. A stock cluster therefore repairs itself,
+and the paragraphs above describe what it does there.
 
-Under ``open``, reconciliation therefore **reports only**. Drift is written to
-the controller log, and *every* claim the controller has no record of — running
-or finished — is named in the node's reason and drains it, since none of them
-may be answered. Nothing is killed, settled or released. The hold is not
-permanent: it lifts on the first complete cut from that node's current agent
-that no longer names the claim. Set ``[admission] mode = "token"`` so each node proves its
-identity when it registers; that restores the acting half for every trigger. See
-:doc:`/admin-guide/configuration`.
+The exception is the ledger a registering agent sends unasked. Under
+``[admission] mode = "token"`` that cut is acted on as it arrives. Under the
+default ``open`` it is read and reported but not acted on, because the caller
+chose both the moment and the hostname and proved neither; the repair waits for
+the next pull, which the registration schedules anyway. A claim the controller
+cannot explain is named in the node's reason and drains it in both cases.
+
+``open`` admission means the controller cannot tell a node from a host claiming
+to be one. That is a property of the mode, not of this feature, and
+reconciliation is not the way in: the per-node completion report already acts on
+a node name the caller asserts with no credential, and reporting completion for
+each of a job's nodes ends that job and frees its resources everywhere. Set
+``[admission] mode = "token"`` to make node identity provable, and restrict the
+control-plane port either way. See :doc:`/admin-guide/configuration`.
 
 Asking for one by hand requires a cluster admin, because it can end running
 work. Where authentication is configured the verified identity decides it. Where

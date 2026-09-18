@@ -1128,8 +1128,8 @@ node's account of what it is holding may be acted on destructively.
      - ``"open"``
      - Node admission mode. ``open`` lets any node register; ``token`` requires a
        registering ``spurd`` to present a valid admission token. Also decides
-       whether a node's ledger may license the controller to cancel work — see
-       below.
+       whether a ledger arriving *with a registration* may license the controller
+       to cancel work — see below.
 
 See :doc:`accounting` for managing admission tokens with ``spur token``.
 
@@ -1146,36 +1146,33 @@ them; or it is left alone and named in the node's reason for an operator. A job
 the node no longer holds is settled as failed. See
 :doc:`/user-guide/monitoring-jobs` for what a reconcile does and when one runs.
 
-``mode`` decides whether any ledger may license those two destructive halves:
+Reconciliation acts in **either** mode when the controller went out and pulled the
+ledger itself — which is every trigger except one, so a stock cluster repairs
+itself. What ``mode`` decides is the remaining case, a ledger a caller *pushes*
+at the controller as part of registering:
 
 * ``token`` — the registering agent presented a valid admission token, so the
-  controller acts on what a node sends: unrecorded claims are answered, and jobs
-  the node no longer holds are settled.
-* ``open`` (the default) — any host able to reach the controller's port may
-  assert any hostname, so the controller cannot place the caller at the node the
-  ledger names. Drift is still detected and written to the controller log, and
-  every claim the controller has no record of is named in the node's reason and
-  drains it, but nothing is cancelled, settled or released.
-
-This holds for a ledger the controller *pulled* as well as for one that arrives
-with a registration. Dialing the node is not independent evidence: under ``open``
-a caller that can register can re-register under an existing node's hostname and
-repoint the address the controller dials, so the pull reaches whoever did that.
-An ``open`` cluster therefore reports drift but does not repair it.
+  controller acts on the cut it arrived with: unrecorded claims are answered, and
+  jobs the node no longer holds are settled, at the moment the node registers.
+* ``open`` (the default) — the caller picked both the moment and the hostname and
+  proved neither, so that cut is read but not acted on. The drift it shows is
+  written to the controller log, and a claim the controller has no record of is
+  still named in the node's reason and drains it. The repair itself waits for the
+  next pull, which a registration schedules anyway.
 
 .. note::
 
-   Treat this as a misconfiguration guard, not a security boundary. Other
-   agent-facing RPCs — the per-node completion report among them — already act on
-   a node name the caller asserts, with no credential required, so ``open``
-   admission was never a trust boundary and ``token`` does not turn it into one.
-   Keep the control-plane port reachable only from hosts you trust either way.
+   ``mode`` is a misconfiguration guard, not a security boundary, and the
+   reconciler is not where that boundary would go. Other agent-facing RPCs — the
+   per-node completion report among them — already act on a node name the caller
+   asserts with no credential required, and reporting completion for each of a
+   job's nodes ends that job and frees its resources everywhere. Nothing in
+   reconciliation is reachable that is not already reachable there.
 
-   What ``token`` buys is that the controller acts on a node's word at all. What
-   the default costs is that reconciliation reports rather than repairs: drift is
-   visible in the controller log and in a drained node's reason, but the
-   resources it describes stay booked until an operator intervenes or the cluster
-   moves to ``token``.
+   What ``token`` buys is that a node's identity is provable, so the controller
+   can tell a node from a host claiming to be one. That is worth having on any
+   cluster whose control-plane port is not already restricted to hosts you trust
+   — which is the control that actually bounds this, in either mode.
 
 ``[devices]``
 -------------

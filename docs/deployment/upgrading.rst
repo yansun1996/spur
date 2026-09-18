@@ -434,12 +434,10 @@ gates nothing; a controller that pulls one from such an agent gets "not
 implemented" back and leaves the node alone. Reconciliation therefore starts
 working node by node as each agent is replaced, in either order.
 
-**Under the default** ``[admission] mode = "open"`` **it reports rather than
-repairs.** No cut licenses cancelling or settling in that mode, however the
-controller came by it, so an upgraded cluster logs the drift it finds and drains
-a node holding a claim nobody can account for, but frees nothing. Set
-``mode = "token"`` to turn the acting half on; see
-:doc:`/admin-guide/configuration`.
+**A ledger sent unasked with a registration waits for a pull under the default**
+``[admission] mode = "open"``\ **.** Every other trigger acts in either mode, so
+a stock cluster repairs itself; that one case is reported and repaired on the
+next pull instead. See :doc:`/admin-guide/configuration`.
 
 **A pre-upgrade controller can clear a node's unresolved-claim reason while the
 claim is still held.** It counts only the claims an agent released, so an agent's
