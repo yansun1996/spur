@@ -21,7 +21,7 @@ use spur_proto::proto::{
 use spur_sched::backfill::{self, BackfillScheduler};
 use spur_sched::traits::{ClusterState, Scheduler};
 
-use crate::cluster::{ClusterManager, JobFilter};
+use crate::cluster::{ClusterManager, JobFilter, RequeueCharge};
 use crate::pmix_dispatch::{self, PmixPrepareNode};
 use crate::raft::RaftHandle;
 
@@ -461,7 +461,9 @@ async fn process_assignment(
                 cancel_job_on_nodes(&cluster, job_id, prospective_run_attempt, &all_nodes, 9).await;
                 // The job never left Pending, so plain requeue is a no-op here — the same
                 // Pending-aware backoff the launch path uses is what actually throttles a retry.
-                if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
+                if let Err(e) = cluster
+                    .backoff_pending_job_after_dispatch_failure(job_id, RequeueCharge::Charged)
+                {
                     error!(job_id, error = %e, "failed to back off after registration failure");
                 }
                 return false;
@@ -1792,7 +1794,9 @@ fn abort_pending_pmix_dispatch(
     detail: String,
 ) -> DispatchConfirmOutcome {
     let _ = cluster.set_job_launch_failure_detail(job_id, detail);
-    if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
+    if let Err(e) =
+        cluster.backoff_pending_job_after_dispatch_failure(job_id, RequeueCharge::Charged)
+    {
         error!(job_id, error = %e, "failed to back off after PMIx dispatch failure");
     }
     DispatchConfirmOutcome::Aborted
@@ -1863,6 +1867,7 @@ async fn confirm_dispatch_on_nodes(
     let mut successes = 0u32;
     let mut failures = 0u32;
     let mut prolog_failed: Vec<(String, String)> = Vec::new();
+    let mut reconcile_conflicts = 0u32;
     let mut failure_categories: std::collections::BTreeMap<&'static str, u32> = Default::default();
     let total = dispatch_nodes.len() as u32;
 
@@ -2088,6 +2093,7 @@ async fn confirm_dispatch_on_nodes(
                     // The node holds something Raft cannot explain: look before
                     // sending it anything else.
                     DispatchError::NeedsReconcile(_) => {
+                        reconcile_conflicts += 1;
                         cluster.cool_down_node(&node_name);
                         // Paced: a node that refuses every dispatch would
                         // otherwise earn a pull per refusal.
@@ -2183,8 +2189,17 @@ async fn confirm_dispatch_on_nodes(
         {
             error!(job_id, error = %e, "failed to hold job after prolog failure");
         }
-    } else if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id) {
-        error!(job_id, error = %e, "failed to back off after dispatch confirmation failure");
+    } else {
+        // Only when nothing else went wrong: a run that also hit a real failure
+        // has something to answer for, and the budget is what answers for it.
+        let charge = if reconcile_conflicts == failures {
+            RequeueCharge::Spared
+        } else {
+            RequeueCharge::Charged
+        };
+        if let Err(e) = cluster.backoff_pending_job_after_dispatch_failure(job_id, charge) {
+            error!(job_id, error = %e, "failed to back off after dispatch confirmation failure");
+        }
     }
 
     DispatchConfirmOutcome::Aborted
@@ -5163,6 +5178,81 @@ mod tests {
                 job.state_reason().contains("agent rejected launch"),
                 "got {:?}",
                 job.state_reason()
+            );
+        }
+
+        // A node refusing work it already holds is controller-vs-node drift the
+        // job neither caused nor can influence. Charging its retry budget for
+        // that buries a healthy job at priority 0 for an operator to dig out.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_node_side_conflict_never_spends_the_job_s_requeue_budget() {
+            use spur_core::job::{JobState, PendingReason};
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let budget = cm.config().controller.max_batch_requeue;
+
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureLocalOverlap,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("conflict-exempt", 1));
+            for attempt in 1..=budget + 2 {
+                let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
+                assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+                let job = cm.get_job(job_id).unwrap();
+                assert_eq!(
+                    job.requeue_count,
+                    0,
+                    "refusal {attempt} of {} must not spend a retry",
+                    budget + 2
+                );
+                assert_eq!(job.state, JobState::Pending, "refusal {attempt}");
+                assert_eq!(
+                    job.pending_reason,
+                    PendingReason::JobLaunchFailure,
+                    "refusal {attempt}"
+                );
+                assert!(
+                    job.spec.begin_time.is_some_and(|t| t > chrono::Utc::now()),
+                    "refusal {attempt}: the hold must still defer the retry, only the charge is waived"
+                );
+            }
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_ne!(
+                job.pending_reason,
+                PendingReason::JobHoldMaxRequeue,
+                "a budget that is never spent cannot run out"
+            );
+            assert!(job.priority > 0, "the job must stay schedulable");
+        }
+
+        // The exemption is for the conflict alone: a run that also hit a real
+        // failure has something the budget must still answer for.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_conflict_alongside_a_real_failure_still_spends_the_budget() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+
+            let (conflicted, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureLocalOverlap,
+            ))
+            .await;
+            register_node_at(&cm, "n1", conflicted);
+            register_node_at(&cm, "n2", unreachable_addr().await);
+
+            let job_id = submit_and_wait(&cm, batch_spec("mixed-failure", 2));
+            let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1", "n2"]).await;
+            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+
+            assert_eq!(
+                cm.get_job(job_id).unwrap().requeue_count,
+                1,
+                "an unreachable node beside the conflict is still a failure the job wears"
             );
         }
 

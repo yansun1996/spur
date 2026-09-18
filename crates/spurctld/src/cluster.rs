@@ -580,6 +580,17 @@ pub struct RequeueOutcome {
     pub skipped: Vec<String>,
 }
 
+/// Whether a dispatch backoff spends one of the job's `max_batch_requeue`
+/// retries. A node refusing work it already holds is a controller-vs-node
+/// drift the job neither caused nor can influence, so that refusal is
+/// [`Spared`](RequeueCharge::Spared): it still waits out the backoff, but the
+/// budget is reserved for failures the job is actually implicated in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequeueCharge {
+    Charged,
+    Spared,
+}
+
 /// A latch is only good for the term it was taken in: a controller that lost
 /// and regained leadership replayed nothing in between. Term 0 means never.
 fn readiness_latch_holds(latched_term: u64, current_term: u64) -> bool {
@@ -1787,7 +1798,11 @@ impl ClusterManager {
             return Ok(());
         };
         let begin_time = self.launch_backoff_until(&job);
-        self.propose(WalOperation::JobDispatchBackoff { job_id, begin_time })?;
+        self.propose(WalOperation::JobDispatchBackoff {
+            job_id,
+            begin_time,
+            spare_requeue_budget: false,
+        })?;
         Ok(())
     }
 
@@ -2607,9 +2622,13 @@ impl ClusterManager {
     /// Pending. `requeue_after_launch_failure` can't be reused: its `requeue_count`
     /// bookkeeping is gated on a real transition out of Running, so without this a
     /// flaky node's job would be reassigned to it every tick, forever unbounded.
+    ///
+    /// `charge` decides whether the hold also spends a slot of the job's
+    /// `max_batch_requeue` budget; see [`RequeueCharge`].
     pub(crate) fn backoff_pending_job_after_dispatch_failure(
         &self,
         job_id: JobId,
+        charge: RequeueCharge,
     ) -> anyhow::Result<()> {
         let begin_time = {
             let jobs = self.jobs.read();
@@ -2628,7 +2647,11 @@ impl ClusterManager {
             self.launch_backoff_until(job)
         };
 
-        self.propose(WalOperation::JobDispatchBackoff { job_id, begin_time })?;
+        self.propose(WalOperation::JobDispatchBackoff {
+            job_id,
+            begin_time,
+            spare_requeue_budget: charge == RequeueCharge::Spared,
+        })?;
         info!(job_id, hold_until = %begin_time, "job's batch dispatch failed before it started; backing off");
         Ok(())
     }
@@ -6337,7 +6360,11 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+            WalOperation::JobDispatchBackoff {
+                job_id,
+                begin_time,
+                spare_requeue_budget,
+            } => {
                 // NoOp if the job left Pending since the leader proposed this
                 // (e.g. a concurrent cancel).
                 let Some(job) = jobs.get_mut(job_id) else {
@@ -6352,7 +6379,11 @@ impl ClusterManager {
                 let allocated_resources = job.allocated_resources.clone();
                 let per_node_map = job.per_node_alloc.clone();
                 let already = Self::slices_no_longer_held(job);
-                Self::reset_job_for_requeue(job);
+                if *spare_requeue_budget {
+                    Self::clear_run_state_for_requeue(job);
+                } else {
+                    Self::reset_job_for_requeue(job);
+                }
                 job.spec.begin_time = Some(*begin_time);
                 job.set_pending_reason(PendingReason::JobLaunchFailure);
                 Self::deallocate_job_slices(
@@ -24494,7 +24525,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
-        assert!(cm.backoff_pending_job_after_dispatch_failure(999).is_ok());
+        assert!(cm
+            .backoff_pending_job_after_dispatch_failure(999, RequeueCharge::Charged)
+            .is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -24505,7 +24538,9 @@ mod tests {
         cm.cancel_job(id, "testuser").unwrap();
         settle(&cm, id, JobState::Cancelled);
 
-        assert!(cm.backoff_pending_job_after_dispatch_failure(id).is_ok());
+        assert!(cm
+            .backoff_pending_job_after_dispatch_failure(id, RequeueCharge::Charged)
+            .is_ok());
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Cancelled);
     }
 
@@ -24515,7 +24550,8 @@ mod tests {
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("backoff-applies"));
 
-        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id, RequeueCharge::Charged)
+            .unwrap();
         wait_for("backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
         });
@@ -24534,7 +24570,8 @@ mod tests {
         cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
             .unwrap();
 
-        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id, RequeueCharge::Charged)
+            .unwrap();
         wait_for("backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
         });
@@ -24559,14 +24596,16 @@ mod tests {
 
         cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n1: timeout".into())
             .unwrap();
-        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id, RequeueCharge::Charged)
+            .unwrap();
         wait_for("first backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
         });
 
         cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
             .unwrap();
-        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id, RequeueCharge::Charged)
+            .unwrap();
         wait_for("second backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 2)
         });
@@ -24598,6 +24637,7 @@ mod tests {
         cm.apply_operation(&WalOperation::JobDispatchBackoff {
             job_id: 999,
             begin_time: Utc::now(),
+            spare_requeue_budget: false,
         });
         assert!(cm.get_job(999).is_none());
     }
@@ -24614,6 +24654,7 @@ mod tests {
         cm.apply_operation(&WalOperation::JobDispatchBackoff {
             job_id: id,
             begin_time: Utc::now(),
+            spare_requeue_budget: false,
         });
 
         let job = cm.get_job(id).unwrap();

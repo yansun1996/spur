@@ -135,6 +135,10 @@ pub enum WalOperation {
     JobDispatchBackoff {
         job_id: JobId,
         begin_time: chrono::DateTime<chrono::Utc>,
+        /// Hold without charging `max_batch_requeue`, for a refusal the job did
+        /// not cause. Defaults to `false`: every pre-upgrade entry charged.
+        #[serde(default)]
+        spare_requeue_budget: bool,
     },
     /// End a running job's run as PREEMPTED and return it to Pending, held until
     /// the leader-computed `begin_time`. Deferred while an epilog owes a slice.
@@ -744,13 +748,44 @@ mod job_state_change_wal_tests {
         let op = WalOperation::JobDispatchBackoff {
             job_id: 8,
             begin_time: hold,
+            spare_requeue_budget: true,
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
         match back {
-            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+            WalOperation::JobDispatchBackoff {
+                job_id,
+                begin_time,
+                spare_requeue_budget,
+            } => {
                 assert_eq!(job_id, 8);
                 assert_eq!(begin_time, hold);
+                assert!(
+                    spare_requeue_budget,
+                    "the exemption decides a job's fate, so it must survive the WAL verbatim"
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // A pre-upgrade entry charged the job's requeue budget. Replaying it as
+    // spared would silently extend a retry budget the old leader had spent.
+    #[test]
+    fn pre_upgrade_job_dispatch_backoff_replays_as_charging_the_requeue_budget() {
+        let json = r#"{"JobDispatchBackoff":{"job_id":8,"begin_time":"2026-01-02T03:04:05Z"}}"#;
+        let back: WalOperation = serde_json::from_str(json).unwrap();
+        match back {
+            WalOperation::JobDispatchBackoff {
+                job_id,
+                spare_requeue_budget,
+                ..
+            } => {
+                assert_eq!(job_id, 8);
+                assert!(
+                    !spare_requeue_budget,
+                    "an entry with no field must keep the meaning it was written with"
+                );
             }
             _ => panic!("wrong variant"),
         }

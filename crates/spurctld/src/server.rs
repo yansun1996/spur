@@ -9649,6 +9649,80 @@ mod tests {
         );
     }
 
+    /// Ask the real scheduler where a job would go, so a candidacy assertion
+    /// pins the filter placement actually runs rather than one beside it.
+    fn scheduler_places(cluster: &Arc<ClusterManager>, job: &spur_core::job::Job) -> Vec<String> {
+        use spur_sched::traits::Scheduler as _;
+        let nodes = cluster.get_nodes();
+        let partitions = cluster.get_partitions();
+        let reservations = cluster.get_reservations();
+        let cluster_state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+            topology: None,
+        };
+        spur_sched::backfill::BackfillScheduler::new(10)
+            .schedule(std::slice::from_ref(job), &cluster_state)
+            .into_iter()
+            .filter(|a| a.job_id == job.job_id)
+            .flat_map(|a| a.nodes)
+            .collect()
+    }
+
+    // The terminator behind the dispatch-refusal requeue exemption: a job whose
+    // budget is never charged retries forever unless naming the claim takes the
+    // node out of candidacy. `-w n1` is the worst case -- it also waives the
+    // dispatch cooldown, so the hold is the only thing left standing between
+    // this job and the same conflicted node every tick.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn naming_an_unresolved_claim_takes_the_node_out_of_the_scheduler_s_candidate_set() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
+            job_id: 8,
+            spec: Box::new(spur_core::job::JobSpec {
+                nodelist: Some("n1".into()),
+                ..a_one_node_spec()
+            }),
+        });
+        let pinned = cluster.get_job(8).expect("the pinned job");
+        assert_eq!(
+            scheduler_places(&cluster, &pinned),
+            vec!["n1".to_string()],
+            "the pin must actually reach n1 while the node is healthy, or the check below proves nothing"
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+        assert_eq!(outcome.unresolved, vec![99]);
+
+        let held = cluster.get_node("n1").expect("node");
+        assert!(
+            held.state.is_admin_hold(),
+            "the claim must put the node on a hold, got {:?}",
+            held.state
+        );
+        assert!(
+            scheduler_places(&cluster, &pinned).is_empty(),
+            "a held node must leave candidacy, or a spared retry budget has no terminator"
+        );
+    }
+
     // The ids come out of a map. An unsorted list rewrites the same fact in a
     // different order each pass, proposing a state change through Raft every time.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
