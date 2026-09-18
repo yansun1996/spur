@@ -990,17 +990,29 @@ async fn teardown_completed_job(
         if let Err(error) = admissions.mark_run_cleaned(run, epilog) {
             warn!(job_id, %error, "failed to settle the admission record after teardown");
         } else {
-            // The durable write succeeded, so the record now says `Cleaned`. Free
-            // the in-memory slice: the cores are idle and a restart would skip
-            // re-charging them. The record stays on disk until an ack clears it.
-            let warrant = ReleaseWarrant::teardown_complete(run);
-            let released = allocation.lock().await.release_job(warrant);
-            if released {
-                info!(
-                    job_id,
-                    run_attempt = completed.run_attempt,
-                    "freed slice on teardown"
-                );
+            // `Cleaned` alone does not mean the cores are idle: an owed epilog
+            // hook still runs on them. Only free where `settle_permit` would
+            // also let the controller settle the run — the same gate the
+            // ack-driven path already gets via `release_is_due`.
+            match admissions.settle_permit(run) {
+                Ok(crate::admission::SettlePermit::Due(_)) => {
+                    let warrant = ReleaseWarrant::teardown_complete(run);
+                    let released = allocation.lock().await.release_job(warrant);
+                    if released {
+                        info!(
+                            job_id,
+                            run_attempt = completed.run_attempt,
+                            "freed slice on teardown"
+                        );
+                    }
+                }
+                Ok(_) => {
+                    // An owed epilog (or no record) means the ack-driven path
+                    // is still the one to free this slice, unchanged.
+                }
+                Err(error) => {
+                    warn!(job_id, %error, "could not read the settle permit after teardown");
+                }
             }
         }
     }
@@ -3674,17 +3686,20 @@ impl AgentService {
                 self.gather_run_evidence(admitted, descriptors, &store, boot_id.as_deref());
             let disposition = crate::admission::classify_run(&evidence);
 
-            // A slice already handed back, or one whose teardown finished: neither
-            // should re-charge. A `Cleaned` record says the cores are idle.
-            let skip_charge =
-                run.slice_released || run.state == crate::admission::RunState::Cleaned;
+            // A slice already handed back, or one whose teardown finished with no
+            // epilog left owing, was freed at teardown and must not be re-charged.
+            // A `Cleaned` record with an epilog still in flight is not idle: the
+            // hook may still be running on these cores.
+            let cleaned_and_quiescent = run.state == crate::admission::RunState::Cleaned
+                && !run.cleanup.epilog.is_in_flight();
+            let skip_charge = run.slice_released || cleaned_and_quiescent;
             if skip_charge {
                 tracing::debug!(
                     job_id = run.job_id,
                     run_attempt = run.run_attempt,
                     ?disposition,
                     slice_released = run.slice_released,
-                    cleaned = run.state == crate::admission::RunState::Cleaned,
+                    cleaned_and_quiescent,
                     "an admitted run's slice is free; not re-charging it"
                 );
             } else {
@@ -19196,17 +19211,31 @@ mod tests {
     }
 
     // The one answer that unsticks a run whose completion never landed: the
-    // controller's word that it is not accounting for it.
+    // controller's word that it is not accounting for it. An epilog hook is
+    // what makes this genuinely stranded post-teardown-frees-immediately: the
+    // hook was owed when teardown ran, so teardown itself left the slice
+    // charged, and nothing re-checks it once the hook finishes on its own.
     #[tokio::test]
     async fn a_settle_from_the_controller_releases_a_run_nothing_else_can_free() {
         let state = tempfile::tempdir().expect("state dir");
-        let svc = svc_with_state_dir(state.path()).await;
+        let svc = svc_with_state_dir(state.path())
+            .await
+            .with_epilog_hook("/usr/local/sbin/spur-epilog");
         let admissions = svc.admissions();
         admit_a_launch(&svc, 7);
         let while_held = charge_a_slice(&svc, 7).await;
-        // The stranded shape: teardown done, no acknowledgement, slice charged.
-        // Driven through the teardown so the record says what this node owes.
+        // Teardown with an epilog owed must not free the slice.
         tear_down_a_finished_run(&svc, 7, state.path()).await;
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held,
+            "an owed epilog must keep teardown from freeing the slice"
+        );
+        // The hook finishes on its own, with nothing watching to release the
+        // slice on its behalf: the record is quiescent, but still charged.
+        admissions
+            .record_epilog(key(7, 1), crate::admission::HookState::Succeeded)
+            .expect("epilog settled");
         admissions
             .take_conflict_hold(key(7, 1), "held with no tracked job on this agent")
             .expect("hold");
@@ -19253,6 +19282,11 @@ mod tests {
             svc.allocation.lock().await.free_cpus(),
             before_charge,
             "teardown must free the in-memory slice, so cores are schedulable"
+        );
+        assert_eq!(
+            svc.allocation.lock().await.claimable_cpu_ids(99, &[0, 1]),
+            vec![0, 1],
+            "the exact cores job 7 held, not merely the same count, must be free"
         );
         let run = admissions
             .load_run(key(7, 1))
