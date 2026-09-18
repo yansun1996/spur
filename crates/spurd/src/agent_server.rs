@@ -634,6 +634,26 @@ async fn shutdown_run_supervisors(
     supervised
 }
 
+/// Whether the run exists only to host its client, so the client leaving ends
+/// it. `is_allocation_only` cannot answer this alone: a supervised run keeps its
+/// processes in the supervisor, so every one of them reads as allocation-only at
+/// the agent. The step the run was launched under is what separates them — an
+/// srun allocation owns the extern step, a batch script (salloc's included) its
+/// own, and a terminal on that is one of its steps rather than its whole reason.
+fn run_hosts_only_its_client(
+    tracked: &TrackedJob,
+    supervisors: &[crate::stepd::StepdDescriptor],
+) -> bool {
+    match supervisors
+        .iter()
+        .map(|descriptor| descriptor.step_id)
+        .find(|step_id| !spur_core::step::is_user_step(*step_id))
+    {
+        Some(own_step) => own_step == spur_core::step::STEP_EXTERN,
+        None => tracked.job.is_allocation_only(),
+    }
+}
+
 /// End an srun allocation whose terminal client vanished. The allocation exists
 /// only to host that client, and nothing else will ever report it complete: the
 /// supervisor's own completion is what hands the slice back to the controller.
@@ -642,13 +662,27 @@ async fn end_abandoned_srun_allocation(
     stepds: &Arc<Mutex<StepdMap>>,
     job_id: u32,
     run_attempt: u32,
+    overlap: bool,
 ) -> bool {
-    // A job with a payload of its own outlives any terminal attached to it, so
-    // only an allocation-only run — and only the attempt that was served — ends.
-    let hosted_the_terminal = running.lock().await.get(&job_id).is_some_and(|tracked| {
-        tracked.job.is_allocation_only() && tracked.run_attempt == run_attempt
+    // A terminal that joined a job already running is never the reason that job
+    // exists; `sattach` and `srun --jobid --overlap` both arrive this way.
+    if overlap {
+        return false;
+    }
+    let supervisors = stepds_for_attempt(&*stepds.lock().await, job_id, run_attempt);
+    // Only the attempt that was served: a stale bridge must not end the run that
+    // replaced it.
+    let ends_with_its_client = running.lock().await.get(&job_id).is_some_and(|tracked| {
+        tracked.run_attempt == run_attempt && run_hosts_only_its_client(tracked, &supervisors)
     });
-    if !hosted_the_terminal {
+    if !ends_with_its_client {
+        return false;
+    }
+    if supervisors.is_empty() {
+        warn!(
+            job_id,
+            run_attempt, "terminal client is gone but the allocation has no supervisor to end it"
+        );
         return false;
     }
     info!(
@@ -8871,6 +8905,7 @@ impl SlurmAgent for AgentService {
             .map(|tracked| tracked.run_attempt)
             .unwrap_or_default();
 
+        let overlap = init.overlap;
         self.live_ptys.lock().await.insert(init.job_id);
         let live_ptys = self.live_ptys.clone();
         let running = self.running.clone();
@@ -8897,7 +8932,8 @@ impl SlurmAgent for AgentService {
                 }
             }
             if end == PtyBridgeEnd::ClientGone {
-                end_abandoned_srun_allocation(&running, &stepds, job_id, run_attempt).await;
+                end_abandoned_srun_allocation(&running, &stepds, job_id, run_attempt, overlap)
+                    .await;
             }
         });
 
@@ -9871,19 +9907,13 @@ impl AgentService {
                             }
                         }
                         Some(Err(_)) => {
-                            // Broken input stream: the client is gone. Hang up.
-                            let _ = crate::pty::signal_foreground(
-                                master_raw, child_pid, libc::SIGHUP,
-                            );
+                            // Broken input stream: the client is gone.
                             end = PtyBridgeEnd::ClientGone;
                             break;
                         }
                         None => {
                             if interactive {
-                                // The terminal went away — hang the step up.
-                                let _ = crate::pty::signal_foreground(
-                                    master_raw, child_pid, libc::SIGHUP,
-                                );
+                                // The terminal went away.
                                 end = PtyBridgeEnd::ClientGone;
                                 break;
                             }
@@ -9900,6 +9930,16 @@ impl AgentService {
                     exit_code = code;
                     child_exited = true;
                 }
+            }
+        }
+
+        if end == PtyBridgeEnd::ClientGone && !child_exited {
+            let _ = crate::pty::signal_foreground(master_raw, child_pid, libc::SIGHUP);
+            // A closed output channel is the one case where nobody can receive an
+            // exit status, and the payload can block writing into a terminal nobody
+            // drains — so waiting for it here is a wait that never ends.
+            if tx.is_closed() {
+                return end;
             }
         }
 
@@ -20198,24 +20238,36 @@ mod tests {
         (served, rx)
     }
 
-    fn a_terminal_allocation_supervisor(
+    /// A supervisor of `job_id` launched under `step_id`. Every supervised run
+    /// reads as allocation-only at the agent, so the step is the only thing that
+    /// says whether the run is an srun allocation or a script of its own.
+    fn a_run_supervisor(
         dir: &std::path::Path,
         job_id: u32,
         run_attempt: u32,
+        step_id: spur_core::step::StepId,
     ) -> (tokio::net::UnixListener, crate::stepd::StepdDescriptor) {
-        let socket_path = dir.join(format!("runtime-{job_id}.sock"));
+        let socket_path = dir.join(format!("runtime-{job_id}-{step_id}.sock"));
         let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind runtime socket");
         let mut descriptor = crate::stepd::StepdDescriptor::new(
             job_id,
             run_attempt,
-            spur_core::step::STEP_EXTERN,
+            step_id,
             0,
             0,
             socket_path,
             std::path::PathBuf::new(),
         );
-        descriptor.capability = format!("abandoned-terminal-{job_id}");
+        descriptor.capability = format!("abandoned-terminal-{job_id}-{step_id}");
         (listener, descriptor)
+    }
+
+    fn a_terminal_allocation_supervisor(
+        dir: &std::path::Path,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> (tokio::net::UnixListener, crate::stepd::StepdDescriptor) {
+        a_run_supervisor(dir, job_id, run_attempt, spur_core::step::STEP_EXTERN)
     }
 
     // An `srun --pty` client that is killed never reports its step, so the node is
@@ -20237,7 +20289,7 @@ mod tests {
         running.lock().await.insert(910, an_allocation_only_job(4));
 
         assert!(
-            end_abandoned_srun_allocation(&running, &stepds, 910, 4).await,
+            end_abandoned_srun_allocation(&running, &stepds, 910, 4, false).await,
             "an allocation held only for a vanished terminal must be ended"
         );
         assert!(matches!(
@@ -20247,12 +20299,14 @@ mod tests {
         supervisor.abort();
     }
 
-    // The other half: `sattach` to a batch job ends the terminal, not the job.
+    // The same allocation, entered a second time with `--overlap` (what `sattach`
+    // and `srun --jobid` do). That terminal is not why the job exists, so losing
+    // it must not end the allocation the first one is still sitting in.
     #[tokio::test]
-    async fn an_abandoned_terminal_leaves_a_job_with_its_own_payload_running() {
+    async fn an_abandoned_overlapping_terminal_leaves_the_allocation_it_joined() {
         let _unbounded = crate::stepd::UnboundedRequests::new();
         let dir = tempfile::tempdir().expect("runtime socket directory");
-        let (listener, descriptor) = a_terminal_allocation_supervisor(dir.path(), 911, 4);
+        let (listener, descriptor) = a_terminal_allocation_supervisor(dir.path(), 914, 4);
         let (supervisor, mut served) = a_listening_supervisor(listener, descriptor.clone());
 
         let stepds: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
@@ -20261,12 +20315,40 @@ mod tests {
             .await
             .insert(stepd_key(&descriptor), descriptor.clone());
         let running: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
-        let mut batch = TrackedJob::dummy(0);
-        batch.run_attempt = 4;
-        running.lock().await.insert(911, batch);
+        running.lock().await.insert(914, an_allocation_only_job(4));
 
         assert!(
-            !end_abandoned_srun_allocation(&running, &stepds, 911, 4).await,
+            !end_abandoned_srun_allocation(&running, &stepds, 914, 4, true).await,
+            "a terminal that joined the job is not the reason the job exists"
+        );
+        assert!(
+            served.try_recv().is_err(),
+            "no supervisor may be asked to shut down for an overlapping terminal"
+        );
+        supervisor.abort();
+    }
+
+    // The other half: `sattach` to a batch job ends the terminal, not the job.
+    // The job's processes live in its supervisor, so the agent's own handle reads
+    // as allocation-only here exactly as it does for an srun allocation.
+    #[tokio::test]
+    async fn an_abandoned_terminal_leaves_a_job_with_its_own_payload_running() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let dir = tempfile::tempdir().expect("runtime socket directory");
+        let (listener, descriptor) =
+            a_run_supervisor(dir.path(), 911, 4, spur_core::step::STEP_BATCH);
+        let (supervisor, mut served) = a_listening_supervisor(listener, descriptor.clone());
+
+        let stepds: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
+        stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let running: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        running.lock().await.insert(911, an_allocation_only_job(4));
+
+        assert!(
+            !end_abandoned_srun_allocation(&running, &stepds, 911, 4, false).await,
             "a batch job outlives any terminal attached to it"
         );
         assert!(
@@ -20274,6 +20356,60 @@ mod tests {
             "no supervisor of a batch job may be asked to shut down"
         );
         supervisor.abort();
+    }
+
+    // An `salloc` shell and the `srun --pty` a user runs inside it are one job.
+    // Killing the inner client must not take the shell, or the allocation the
+    // user is standing in disappears under them.
+    #[tokio::test]
+    async fn an_abandoned_terminal_inside_an_salloc_leaves_the_allocation_standing() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let dir = tempfile::tempdir().expect("runtime socket directory");
+        let (shell_listener, shell) =
+            a_run_supervisor(dir.path(), 912, 4, spur_core::step::STEP_BATCH);
+        let (inner_listener, inner) = a_run_supervisor(dir.path(), 912, 4, 0);
+        let (shell_supervisor, mut shell_served) =
+            a_listening_supervisor(shell_listener, shell.clone());
+        let (inner_supervisor, mut inner_served) =
+            a_listening_supervisor(inner_listener, inner.clone());
+
+        let stepds: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut sessions = stepds.lock().await;
+            sessions.insert(stepd_key(&shell), shell.clone());
+            sessions.insert(stepd_key(&inner), inner.clone());
+        }
+        let running: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        running.lock().await.insert(912, an_allocation_only_job(4));
+
+        assert!(
+            !end_abandoned_srun_allocation(&running, &stepds, 912, 4, false).await,
+            "an salloc allocation outlives a step run inside it"
+        );
+        assert!(
+            shell_served.try_recv().is_err(),
+            "the salloc shell's supervisor must not be asked to shut down"
+        );
+        assert!(
+            inner_served.try_recv().is_err(),
+            "the inner step is the terminal's own to end, not this path's"
+        );
+        shell_supervisor.abort();
+        inner_supervisor.abort();
+    }
+
+    // An allocation nothing supervises has nobody to report it complete, so
+    // claiming it was ended would leave its cores charged with no way back.
+    #[tokio::test]
+    async fn an_abandoned_terminal_reports_nothing_ended_when_no_supervisor_holds_the_run() {
+        let stepds: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let running: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        running.lock().await.insert(913, an_allocation_only_job(4));
+
+        assert!(
+            !end_abandoned_srun_allocation(&running, &stepds, 913, 4, false).await,
+            "nothing was ended, so nothing may be reported as ended"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -22327,7 +22463,10 @@ mod tests {
         cmd.args(&argv[1..])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            // A payload the bridge stops waiting on is otherwise left spinning on
+            // a closed terminal for the rest of the run, starving its siblings.
+            .kill_on_drop(true);
         unsafe {
             cmd.pre_exec(move || raw.wire());
         }
@@ -22366,6 +22505,25 @@ mod tests {
             .send(Err(tonic::Status::unavailable("client connection reset")))
             .await
             .expect("deliver the broken stream");
+
+        assert_eq!(bridge.await.expect("bridge task"), PtyBridgeEnd::ClientGone);
+    }
+
+    // The shape the broken-stream test cannot reach: a client killed while output
+    // is flowing is noticed on the *send*, not the input stream. The payload here
+    // ignores SIGHUP and never exits, which is what a real one does once it blocks
+    // writing into a terminal nobody drains — so a bridge that waits for its exit
+    // before reporting the client gone never reports at all, and the run stays
+    // charged. Nothing here is time-bounded: the fixed bridge returns without
+    // waiting on the child, and the unfixed one is the hang this pins.
+    #[tokio::test]
+    async fn a_client_lost_while_output_flows_ends_the_bridge_without_waiting_for_the_payload() {
+        let (bridge, _in_tx, out_rx) =
+            a_bridged_terminal(&["/bin/sh", "-c", "trap '' HUP; while :; do echo line; done"]);
+
+        // The client is gone: the next write the payload forces fails, which is
+        // the only notice the bridge gets.
+        drop(out_rx);
 
         assert_eq!(bridge.await.expect("bridge task"), PtyBridgeEnd::ClientGone);
     }
