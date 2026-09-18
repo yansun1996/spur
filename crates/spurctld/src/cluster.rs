@@ -144,6 +144,7 @@ pub enum SrunCompleteError {
     NotFound(JobId),
     NotSrunJob(JobId),
     NotStepDispatch(JobId),
+    NotRunning { job_id: JobId, state: JobState },
     AlreadyTerminal { job_id: JobId, state: JobState },
     NotOwner { job_id: JobId, user: String },
     Internal { job_id: JobId, message: String },
@@ -153,12 +154,15 @@ impl std::fmt::Display for SrunCompleteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound(id) => write!(f, "job {id} not found"),
-            Self::NotSrunJob(id) => write!(f, "job {id} is not an srun allocation"),
+            Self::NotSrunJob(id) => write!(f, "job {id} is not an srun or salloc allocation"),
             Self::NotStepDispatch(id) => {
                 write!(
                     f,
                     "job {id} does not use native step dispatch (CompleteJob is not valid)"
                 )
+            }
+            Self::NotRunning { job_id, state } => {
+                write!(f, "job {job_id} is {state:?}, not running or tearing down")
             }
             Self::AlreadyTerminal { job_id, state } => {
                 write!(f, "job {job_id} is already {state:?}")
@@ -1674,7 +1678,8 @@ impl ClusterManager {
         Ok((true, snapshot))
     }
 
-    /// Complete a standalone srun allocation after its step finishes.
+    /// Complete a standalone srun allocation or a salloc session: both are
+    /// client-owned, so only the client can report they are done.
     #[cfg(test)]
     pub fn finish_srun_job(
         &self,
@@ -1698,11 +1703,21 @@ impl ClusterManager {
             let job = jobs
                 .get(&job_id)
                 .ok_or(SrunCompleteError::NotFound(job_id))?;
-            if !job.spec.srun_job {
+            if !job.spec.srun_job && !job.spec.interactive {
                 return Err(SrunCompleteError::NotSrunJob(job_id));
             }
-            if !job.srun_step_dispatch {
+            // A salloc session never uses step dispatch, so this narrows the
+            // srun shape only.
+            if job.spec.srun_job && !job.srun_step_dispatch {
                 return Err(SrunCompleteError::NotStepDispatch(job_id));
+            }
+            // srun_job gets this for free above (step dispatch implies Running);
+            // interactive has no such proxy and needs its own check.
+            if job.spec.interactive && !job.state.is_active() {
+                return Err(SrunCompleteError::NotRunning {
+                    job_id,
+                    state: job.state,
+                });
             }
             if job.state.is_terminal() {
                 return Err(SrunCompleteError::AlreadyTerminal {
@@ -9806,6 +9821,12 @@ mod tests {
     fn srun_spec(name: &str) -> JobSpec {
         let mut spec = basic_spec(name);
         spec.srun_job = true;
+        spec
+    }
+
+    fn interactive_spec(name: &str) -> JobSpec {
+        let mut spec = basic_spec(name);
+        spec.interactive = true;
         spec
     }
 
@@ -29030,6 +29051,39 @@ mod tests {
         assert!(matches!(
             cm.finish_srun_job(id, 0, "testuser"),
             Err(SrunCompleteError::NotStepDispatch(j)) if j == id
+        ));
+    }
+
+    // A salloc session holds its placeholder through the ordinary batch-launch
+    // mechanism (srun_step_dispatch stays false), unlike raw srun's native step
+    // dispatch — so it must not be rejected by the step-dispatch check that
+    // guards the srun shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_completes_an_interactive_salloc_session() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 4, 8000);
+        let id = submit_and_wait(&cm, interactive_spec("salloc-session"));
+        start_job_on(&cm, id, "n1");
+
+        let returned = cm.finish_srun_job(id, 0, "testuser").unwrap();
+        assert_eq!(returned.job_id, id);
+        settle(&cm, id, JobState::Completed);
+        assert_eq!(cm.get_job(id).unwrap().exit_code, Some(0));
+    }
+
+    // An interactive session has no `srun_step_dispatch` proxy for "has this
+    // actually started" the way raw srun does, so a still-Pending salloc job
+    // must be rejected on its own, not silently accepted as complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finish_srun_job_rejects_pending_interactive_session() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        let id = submit_and_wait(&cm, interactive_spec("salloc-pending"));
+
+        assert!(matches!(
+            cm.finish_srun_job(id, 0, "testuser"),
+            Err(SrunCompleteError::NotRunning { job_id, state: JobState::Pending }) if job_id == id
         ));
     }
 

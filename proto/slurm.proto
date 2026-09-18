@@ -377,7 +377,7 @@ service SlurmController {
   rpc GetJobs(GetJobsRequest) returns (GetJobsResponse);
   rpc GetJob(GetJobRequest) returns (JobInfo);
   rpc CancelJob(CancelJobRequest) returns (google.protobuf.Empty);
-  // Finish a standalone srun allocation after its step completes.
+  // Finish a standalone srun allocation or a salloc session the client owns.
   rpc CompleteJob(CompleteJobRequest) returns (google.protobuf.Empty);
   // Keepalive from an interactive client so an abandoned allocation can be reaped.
   rpc JobKeepalive(JobKeepaliveRequest) returns (JobKeepaliveResponse);
