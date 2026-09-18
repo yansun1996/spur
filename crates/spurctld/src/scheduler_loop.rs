@@ -544,7 +544,19 @@ async fn process_assignment(
         assignment.per_node_alloc.clone(),
         srun_step_dispatch,
     ) {
-        debug!(job_id, error = %e, "could not reserve the placement");
+        warn!(job_id, error = %e, "could not reserve the placement");
+        // Only this path put anything on a node, and nothing is charged for the
+        // sweep to find the node holding it by. The batch path has yet to touch one.
+        if srun_step_dispatch {
+            cancel_job_on_nodes(
+                &cluster,
+                job_id,
+                prospective_run_attempt,
+                &dispatch_nodes,
+                0,
+            )
+            .await;
+        }
         return false;
     }
 
@@ -5905,6 +5917,43 @@ mod tests {
                 job.srun_step_dispatch,
                 "the pure interactive path must record itself as step-dispatch, \
                  not the batch-script fallback"
+            );
+        }
+
+        // By the time the reservation is attempted the interactive path has a
+        // real allocation on the node -- cpu_ids, memory, GPUs and a cgroup. A
+        // failure here commits nothing, so `abort_orphaned_placements` cannot
+        // see the node holding it either: without a cancel the slice is stranded
+        // until the hourly ledger sweep.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_reservation_that_fails_gives_the_registered_allocation_back() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, cancel_calls) = spawn_mock_agent().await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("reserve-fails", 1);
+            spec.srun_job = true;
+            spec.interactive = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            // The job leaving Pending is what `reserve_placement` refuses on, and
+            // it is the likeliest way this arm is reached with the leader alive.
+            cm.cancel_job(job_id, "testuser").unwrap();
+            wait_for("job cancelled", || {
+                cm.get_job(job_id)
+                    .is_some_and(|j| j.state == JobState::Cancelled)
+            });
+
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+
+            assert!(!started, "a job that left Pending cannot be reserved");
+            assert_eq!(
+                cancel_calls.load(Ordering::SeqCst),
+                1,
+                "the node registered the allocation and must be told to release it"
             );
         }
 
