@@ -918,6 +918,11 @@ async fn release_srun_allocation(
         })
         .await
     {
+        // The step's own exit can end the job before this call reaches the
+        // controller; that is the release already done, not a failure.
+        if e.code() == tonic::Code::AlreadyExists {
+            return;
+        }
         eprintln!(
             "srun: warning: failed to release allocation for job {}: {}",
             job_id, e
@@ -2921,6 +2926,37 @@ mod tests {
             capture.complete_step_calls().is_empty(),
             "no step exists, so nothing may be reported complete"
         );
+    }
+
+    /// The job's own task step can end it before this client's own
+    /// `CompleteJob` call lands; that race must read as done, not a failure.
+    #[tokio::test]
+    async fn release_srun_allocation_is_silent_when_the_job_already_ended() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_complete_job_error(tonic::Code::AlreadyExists);
+        let mut client = crate::mock_controller::client(addr).await;
+
+        release_srun_allocation(&mut client, 42, "tester", 0).await;
+
+        assert_eq!(capture.complete_job_calls(), vec![(42, 0)]);
+        assert!(
+            capture.cancel_job_calls().is_empty(),
+            "the allocation is already gone; nothing here may fall back to cancel"
+        );
+    }
+
+    /// A genuine `CompleteJob` failure (not a race with the job's own step)
+    /// must still fall back to `CancelJob`, exactly as before this fix.
+    #[tokio::test]
+    async fn release_srun_allocation_falls_back_to_cancel_on_a_real_failure() {
+        let (addr, capture) = crate::mock_controller::spawn().await;
+        capture.set_complete_job_error(tonic::Code::Unavailable);
+        let mut client = crate::mock_controller::client(addr).await;
+
+        release_srun_allocation(&mut client, 43, "tester", 0).await;
+
+        assert_eq!(capture.complete_job_calls(), vec![(43, 0)]);
+        assert_eq!(capture.cancel_job_calls(), vec![(43, 2)]);
     }
 
     /// A controller whose created step points at a mock agent that refuses to

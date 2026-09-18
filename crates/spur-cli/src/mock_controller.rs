@@ -9,9 +9,9 @@
 //! caller back the address plus a shared record of what the server observed.
 //! Only a handful of RPCs are implemented (`SubmitJob`, `GetJob`,
 //! `JobKeepalive`, `CreateJobStep`, `CompleteJobStep`, `RunStep`, `GetNode`,
-//! `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`); every other RPC
-//! reports `unimplemented` so an unexpected call fails loudly instead of
-//! silently returning a default.
+//! `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`, `CompleteJob`,
+//! `CancelJob`); every other RPC reports `unimplemented` so an unexpected
+//! call fails loudly instead of silently returning a default.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -53,6 +53,10 @@ pub(crate) struct StepCapture {
     deregister_node_calls: Arc<Mutex<Vec<(String, bool)>>>,
     /// Node names that `update_node` should reject with `NotFound`.
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
+    complete_job_calls: Arc<Mutex<Vec<(u32, i32)>>>,
+    /// When set, `complete_job` returns this error instead of succeeding.
+    complete_job_error: Arc<Mutex<Option<tonic::Code>>>,
+    cancel_job_calls: Arc<Mutex<Vec<(u32, i32)>>>,
 }
 
 impl StepCapture {
@@ -139,6 +143,18 @@ impl StepCapture {
 
     pub(crate) fn set_update_node_fail_names(&self, names: HashSet<String>) {
         *self.update_node_fail_names.lock().unwrap() = names;
+    }
+
+    pub(crate) fn complete_job_calls(&self) -> Vec<(u32, i32)> {
+        self.complete_job_calls.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_complete_job_error(&self, code: tonic::Code) {
+        *self.complete_job_error.lock().unwrap() = Some(code);
+    }
+
+    pub(crate) fn cancel_job_calls(&self) -> Vec<(u32, i32)> {
+        self.cancel_job_calls.lock().unwrap().clone()
     }
 }
 
@@ -320,11 +336,38 @@ mock_controller_impl! {
                 .push((request.name, request.force));
             Ok(tonic::Response::new(proto::DeregisterNodeResponse::default()))
         }
+
+        async fn complete_job(
+            &self,
+            request: tonic::Request<proto::CompleteJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            let request = request.into_inner();
+            self.capture
+                .complete_job_calls
+                .lock()
+                .unwrap()
+                .push((request.job_id, request.exit_code));
+            if let Some(code) = *self.capture.complete_job_error.lock().unwrap() {
+                return Err(tonic::Status::new(code, "mock complete_job failure"));
+            }
+            Ok(tonic::Response::new(()))
+        }
+
+        async fn cancel_job(
+            &self,
+            request: tonic::Request<proto::CancelJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            let request = request.into_inner();
+            self.capture
+                .cancel_job_calls
+                .lock()
+                .unwrap()
+                .push((request.job_id, request.signal));
+            Ok(tonic::Response::new(()))
+        }
     }
     unimplemented {
         get_jobs(proto::GetJobsRequest) -> proto::GetJobsResponse;
-        cancel_job(proto::CancelJobRequest) -> ();
-        complete_job(proto::CompleteJobRequest) -> ();
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();

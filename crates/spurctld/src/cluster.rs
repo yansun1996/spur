@@ -1233,6 +1233,20 @@ impl ClusterManager {
         self.jobs.read().get(&job_id).cloned()
     }
 
+    /// The handful of fields a step-completion report needs to decide
+    /// whether it ends the job, read without paying for a full `Job` clone
+    /// on every report — only the rare ones that end up needing the rest of
+    /// the job (to release its allocation) go on to call `get_job`.
+    pub(crate) fn job_shape_for_step_completion(
+        &self,
+        job_id: JobId,
+    ) -> Option<(bool, bool, spur_core::job::JobState)> {
+        self.jobs
+            .read()
+            .get(&job_id)
+            .map(|job| (job.spec.srun_job, job.srun_step_dispatch, job.state))
+    }
+
     /// Next id this controller would assign. Ids at or above it were never
     /// issued here; ids below it were not necessarily issued either.
     pub fn peek_next_job_id(&self) -> JobId {
@@ -2952,7 +2966,6 @@ impl ClusterManager {
         self.interactive_last_seen.write().clear();
     }
 
-    #[cfg(test)]
     pub(crate) fn keepalive_last_seen(&self, job_id: JobId) -> Option<DateTime<Utc>> {
         self.interactive_last_seen.read().get(&job_id).copied()
     }
