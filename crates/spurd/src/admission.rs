@@ -919,26 +919,35 @@ impl AdmissionStore {
 
     /// Settle a run the controller has answered, sparing a hook the record still
     /// has in flight: only the teardown that owns one may call it lost.
-    pub fn mark_acknowledged_run_cleaned(
+    /// Take the controller's answer to a completed run, and the cleaned state
+    /// that answer settles, under one read and one write. Split across two
+    /// writes this costs the completion path a second fsync pair for a record
+    /// that is only ever read whole.
+    pub fn record_acknowledged_completion(
         &self,
         run_key: RunKey,
         answered_by: StepId,
+        release_raft_index: u64,
     ) -> io::Result<bool> {
         let mut run = match self.load_run(run_key) {
             Ok(run) => run,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
+        // A step that does not answer for the run cannot acknowledge it: its own
+        // exit is not the controller's word that the run is over.
         if !step_answers_for_run(&run, answered_by) {
             return Ok(false);
         }
-        if run.state == RunState::Cleaned {
-            return Ok(true);
+        run.controller_ack.release_raft_index = Some(release_raft_index);
+        // An acknowledged completion resolves exactly what a hold taken for an
+        // untracked claim was preserving, and nothing else would ever clear it.
+        run.conflict_hold = None;
+        // Settling a hook still in flight is the teardown's to do, never an
+        // acknowledgement's: the controller cannot see whose hook is still running.
+        if !run.cleanup.epilog.is_in_flight() {
+            run.state = RunState::Cleaned;
         }
-        if run.cleanup.epilog.is_in_flight() {
-            return Ok(false);
-        }
-        run.state = RunState::Cleaned;
         self.admit_run(&run)?;
         Ok(true)
     }
@@ -2785,6 +2794,74 @@ mod tests {
             .release_is_due(key(7, 1), STEP_BATCH)
             .unwrap()
             .is_some());
+    }
+
+    // The acknowledgement and the cleaned state it settles share one write, so
+    // every guard either of them had has to still bite on its own.
+    #[test]
+    fn an_acknowledged_completion_records_the_answer_and_the_cleanup_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let mut run = run_with(7, 1, 1);
+        run.lifecycle_owner_step = Some(STEP_BATCH);
+        store.admit_run(&run).unwrap();
+        // A hold taken while the controller was unreachable. Nothing else ever
+        // clears one, so a record that keeps it never settles and never ages out.
+        store
+            .take_conflict_hold(key(7, 1), "held with no tracked job")
+            .unwrap();
+
+        assert!(store
+            .record_acknowledged_completion(key(7, 1), STEP_BATCH, 42)
+            .unwrap());
+
+        let settled = store.load_run(key(7, 1)).unwrap();
+        assert_eq!(settled.controller_ack.release_raft_index, Some(42));
+        assert_eq!(settled.state, RunState::Cleaned);
+        assert!(settled.conflict_hold.is_none());
+    }
+
+    // A hook still running is the teardown's to settle. The answer is still the
+    // controller's word, so losing it to the same write would strand the slice.
+    #[test]
+    fn an_acknowledged_completion_leaves_a_live_epilog_uncleaned_but_still_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let mut run = run_with(7, 1, 1);
+        run.lifecycle_owner_step = Some(STEP_BATCH);
+        store.admit_run(&run).unwrap();
+        store.record_epilog(key(7, 1), HookState::Running).unwrap();
+
+        assert!(store
+            .record_acknowledged_completion(key(7, 1), STEP_BATCH, 42)
+            .unwrap());
+
+        let settled = store.load_run(key(7, 1)).unwrap();
+        assert_eq!(settled.controller_ack.release_raft_index, Some(42));
+        assert_ne!(
+            settled.state,
+            RunState::Cleaned,
+            "a run whose epilog is still running is not cleaned up"
+        );
+    }
+
+    // A numbered step's own exit is not the controller's word that the run is
+    // over, so neither half of the write may land on its say-so.
+    #[test]
+    fn an_acknowledged_completion_from_a_step_that_does_not_own_the_run_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let mut run = run_with(7, 1, 1);
+        run.lifecycle_owner_step = Some(STEP_BATCH);
+        store.admit_run(&run).unwrap();
+
+        assert!(!store
+            .record_acknowledged_completion(key(7, 1), 3, 42)
+            .unwrap());
+
+        let untouched = store.load_run(key(7, 1)).unwrap();
+        assert_eq!(untouched.controller_ack.release_raft_index, None);
+        assert_ne!(untouched.state, RunState::Cleaned);
     }
 
     #[test]

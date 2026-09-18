@@ -4782,11 +4782,17 @@ async fn release_acknowledged_allocation(
     run: RunKey,
     step_id: spur_core::step::StepId,
 ) -> ReleaseOutcome {
-    let warrant = match admissions.release_is_due(run, step_id) {
-        Ok(Some(warrant)) => warrant,
-        Ok(None) => return ReleaseOutcome::NotDue,
-        Err(error) => {
+    let store = admissions.clone();
+    let due = tokio::task::spawn_blocking(move || store.release_is_due(run, step_id)).await;
+    let warrant = match due {
+        Ok(Ok(Some(warrant))) => warrant,
+        Ok(Ok(None)) => return ReleaseOutcome::NotDue,
+        Ok(Err(error)) => {
             warn!(%run, %error, "could not tell whether a release is due; holding");
+            return ReleaseOutcome::NotDue;
+        }
+        Err(error) => {
+            warn!(%run, %error, "the task reading the release gate failed; holding");
             return ReleaseOutcome::NotDue;
         }
     };
@@ -4796,8 +4802,11 @@ async fn release_acknowledged_allocation(
     let released = allocation.lock().await.release_job(warrant);
     // The cut is driven off this, so a slice given back without it recorded
     // stays advertised as a claim the node no longer holds.
-    if let Err(error) = admissions.record_slice_released(run) {
-        warn!(%run, %error, "failed to record a released slice");
+    let store = admissions.clone();
+    match tokio::task::spawn_blocking(move || store.record_slice_released(run)).await {
+        Ok(Err(error)) => warn!(%run, %error, "failed to record a released slice"),
+        Err(error) => warn!(%run, %error, "the task recording a released slice failed"),
+        Ok(Ok(_)) => {}
     }
     if !released {
         // The audit reads the line below as the release; without this one, a
@@ -4861,13 +4870,20 @@ pub(crate) async fn settle_acknowledged_completion(
     run: RunKey,
     step_id: spur_core::step::StepId,
 ) -> bool {
-    // Scoped to the step: a user step's exit settles its own participation, and
-    // the store refuses the run-level writes below to anything but the owner.
-    let _ = admissions.record_controller_ack(run, step_id, 1);
-    let _ = admissions.record_report_acknowledged(run, step_id);
-    // Settling a hook still in flight is the teardown's to do, never an
-    // acknowledgement's: the controller cannot see whose hook is still running.
-    let _ = admissions.mark_acknowledged_run_cleaned(run, step_id);
+    let store = admissions.clone();
+    // Both records are fsynced, and this runs on the completion RPC's own
+    // worker: kept here they stall every other task that worker is driving.
+    let recorded = tokio::task::spawn_blocking(move || {
+        // Scoped to the step: a user step's exit settles its own participation,
+        // and the store refuses the run-level write to anything but the owner.
+        let _ = store.record_acknowledged_completion(run, step_id, 1);
+        let _ = store.record_report_acknowledged(run, step_id);
+    })
+    .await;
+    if let Err(error) = recorded {
+        warn!(%run, %error, "the task recording an acknowledged completion failed");
+        return false;
+    }
     release_acknowledged_allocation(allocation, admissions, run, step_id).await
         == ReleaseOutcome::Freed
 }
