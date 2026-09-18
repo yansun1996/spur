@@ -629,6 +629,123 @@ fn stepd_confirmed_dead(descriptor: &crate::stepd::StepdDescriptor) -> bool {
         )
 }
 
+/// Why a terminal bridge stopped. The client is the only thing that reports an
+/// srun step's completion, so one that vanished leaves nobody to end the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtyBridgeEnd {
+    ChildExited,
+    ClientGone,
+}
+
+/// Ask every supervisor of this run to shut down, escalating to SIGKILL for any
+/// that outlives the grace period. Returns whether one owns the job's teardown.
+async fn shutdown_run_supervisors(
+    stepds: &Arc<Mutex<StepdMap>>,
+    job_id: u32,
+    run_attempt: u32,
+) -> bool {
+    let runtimes = stepds_for_attempt(&*stepds.lock().await, job_id, run_attempt);
+    let supervised = supervisor_owns_teardown(&runtimes);
+    for descriptor in runtimes {
+        match crate::stepd::shutdown_allocation(&descriptor, uuid::Uuid::new_v4().to_string()).await
+        {
+            Ok(()) => {
+                let stepds = stepds.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    let still_current = stepds
+                        .lock()
+                        .await
+                        .get(&stepd_key(&descriptor))
+                        .is_some_and(|current| stepd_is_current(current, &descriptor));
+                    if !still_current {
+                        return;
+                    }
+                    info!(
+                        job_id,
+                        run_attempt = descriptor.run_attempt,
+                        "runtime grace period expired, sending SIGKILL"
+                    );
+                    if let Err(error) = crate::stepd::signal_allocation(
+                        &descriptor,
+                        uuid::Uuid::new_v4().to_string(),
+                        nix::sys::signal::Signal::SIGKILL as i32,
+                    )
+                    .await
+                    {
+                        warn!(job_id, run_attempt = descriptor.run_attempt, %error,
+                            "failed to SIGKILL stepd after grace period");
+                    }
+                });
+            }
+            Err(error) => {
+                warn!(job_id, step_id = descriptor.step_id, %error,
+                    "runtime termination request failed");
+            }
+        }
+    }
+    supervised
+}
+
+/// Whether the run exists only to host its client, so the client leaving ends
+/// it. `is_allocation_only` cannot answer this alone: a supervised run keeps its
+/// processes in the supervisor, so every one of them reads as allocation-only at
+/// the agent. The step the run was launched under is what separates them — an
+/// srun allocation owns the extern step, a batch script (salloc's included) its
+/// own, and a terminal on that is one of its steps rather than its whole reason.
+fn run_hosts_only_its_client(
+    tracked: &TrackedJob,
+    supervisors: &[crate::stepd::StepdDescriptor],
+) -> bool {
+    match supervisors
+        .iter()
+        .map(|descriptor| descriptor.step_id)
+        .find(|step_id| !spur_core::step::is_user_step(*step_id))
+    {
+        Some(own_step) => own_step == spur_core::step::STEP_EXTERN,
+        None => tracked.job.is_allocation_only(),
+    }
+}
+
+/// End an srun allocation whose terminal client vanished. The allocation exists
+/// only to host that client, and nothing else will ever report it complete: the
+/// supervisor's own completion is what hands the slice back to the controller.
+async fn end_abandoned_srun_allocation(
+    running: &RunningJobs,
+    stepds: &Arc<Mutex<StepdMap>>,
+    job_id: u32,
+    run_attempt: u32,
+    overlap: bool,
+) -> bool {
+    // A terminal that joined a job already running is never the reason that job
+    // exists; `sattach` and `srun --jobid --overlap` both arrive this way.
+    if overlap {
+        return false;
+    }
+    let supervisors = stepds_for_attempt(&*stepds.lock().await, job_id, run_attempt);
+    // Only the attempt that was served: a stale bridge must not end the run that
+    // replaced it.
+    let ends_with_its_client = running.lock().await.get(&job_id).is_some_and(|tracked| {
+        tracked.run_attempt == run_attempt && run_hosts_only_its_client(tracked, &supervisors)
+    });
+    if !ends_with_its_client {
+        return false;
+    }
+    if supervisors.is_empty() {
+        warn!(
+            job_id,
+            run_attempt, "terminal client is gone but the allocation has no supervisor to end it"
+        );
+        return false;
+    }
+    info!(
+        job_id,
+        run_attempt, "terminal client is gone; ending the srun allocation it held"
+    );
+    shutdown_run_supervisors(stepds, job_id, run_attempt).await;
+    true
+}
+
 async fn fence_displaced_stepd(
     stepds: &Arc<Mutex<StepdMap>>,
     job_id: u32,
@@ -963,23 +1080,16 @@ async fn run_completion_hooks_and_report(
                 cpus: c.cpus,
                 memory_mb: c.memory_mb,
             };
-            // Marked before the hook: an agent that dies inside one
-            // leaves a `Running` that reloads as unknowable.
-            let hooked = named_run(c.job_id, c.run_attempt);
-            if let Some(run) = hooked {
-                let _ = admissions.record_epilog(run, crate::admission::HookState::Running);
-            }
-            let outcome = spur_core::hooks::run_hook(epilog_script, &ctx).await;
-            if let Some(run) = hooked {
-                let _ = admissions.record_epilog(run, epilog_outcome(outcome.is_err()));
-            }
-            if let Err(e) = outcome {
-                error!(
-                    job_id = c.job_id,
-                    error = %e,
-                    "epilog hook failed — requesting node drain"
-                );
-                drain_jobs.insert(c.job_id, "epilog script failed".into());
+            let drain = crate::epilog::run_job_epilog(
+                admissions,
+                epilog_script,
+                &ctx,
+                named_run(c.job_id, c.run_attempt),
+                hooks.epilog_timeout_secs,
+            )
+            .await;
+            if let Some(reason) = drain {
+                drain_jobs.insert(c.job_id, reason);
             }
         }
     }
@@ -2488,18 +2598,32 @@ fn an_exit_is_still_on_disk(
     })
 }
 
+/// Read every run's record off the runtime's worker threads. A scan plus a read
+/// per run is real blocking I/O, and the callers below are on 2-second loops.
+async fn load_admitted_runs(
+    admissions: &crate::admission::AdmissionStore,
+) -> Vec<crate::admission::AdmittedRun> {
+    let store = admissions.clone();
+    match tokio::task::spawn_blocking(move || store.load_all()).await {
+        Ok(Ok(loaded)) => loaded.runs,
+        Ok(Err(error)) => {
+            warn!(%error, "could not read the admission records");
+            Vec::new()
+        }
+        Err(error) => {
+            warn!(%error, "admission record read task failed");
+            Vec::new()
+        }
+    }
+}
+
 /// Runs no session is left to speak for; without this nothing ever asks, and the
 /// record charges the node's cores for good.
 fn runs_nothing_can_speak_for(
     store: &crate::stepd::StepdStore,
-    admissions: &crate::admission::AdmissionStore,
+    runs: Vec<crate::admission::AdmittedRun>,
 ) -> Vec<crate::admission::AdmittedRun> {
-    let Ok(loaded) = admissions.load_all() else {
-        return Vec::new();
-    };
-    loaded
-        .runs
-        .into_iter()
+    runs.into_iter()
         .filter(|admitted| {
             !admitted.run.controller_ack.is_given()
                 && admitted.owes_a_report()
@@ -2518,7 +2642,8 @@ async fn report_runs_nothing_can_speak_for(
     controller_addr: &str,
     reporting_node: &str,
 ) {
-    for admitted in runs_nothing_can_speak_for(store, admissions) {
+    let runs = load_admitted_runs(admissions).await;
+    for admitted in runs_nothing_can_speak_for(store, runs) {
         let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
         let (Some(run), Some(step_id)) = (admitted.run.key(), admitted.lifecycle_step()) else {
             continue;
@@ -4842,14 +4967,23 @@ impl AgentService {
                         )
                     };
                     drop(jobs);
+                    // One scan for all three: each re-reads the record it acts on
+                    // under its own gate, so this only has to enumerate.
+                    let admitted_runs = load_admitted_runs(&admissions).await;
                     // Strictly before the two sweeps below, which read the record
                     // this writes to decide whether a hook still holds the cores.
-                    resolve_supervised_epilogs(&stepd_store, &admissions, &mut epilog_held_since)
-                        .await;
+                    resolve_supervised_epilogs(
+                        &admitted_runs,
+                        &stepd_store,
+                        &admissions,
+                        &mut epilog_held_since,
+                    )
+                    .await;
                     // Record-driven, so a report path that records an
                     // acknowledgement without releasing cannot strand a slice.
-                    settle_cancelled_runs(&lifecycle, &allocation, &admissions).await;
-                    release_due_allocations(&allocation, &admissions).await;
+                    settle_cancelled_runs(&admitted_runs, &lifecycle, &allocation, &admissions)
+                        .await;
+                    release_due_allocations(&admitted_runs, &allocation, &admissions).await;
                     flag_unbacked_allocations(&unbacked, &admissions).await;
                     // Strictly after the releases above: collecting a record
                     // before its slice is freed destroys the instruction to free it.
@@ -4921,14 +5055,12 @@ async fn flag_unbacked_allocations(
 /// Settle runs the controller cancelled, once their teardown has finished. A
 /// completion for a run it has forgotten is never acknowledged, so nothing frees it.
 async fn settle_cancelled_runs(
+    runs: &[crate::admission::AdmittedRun],
     lifecycle: &crate::job_lifecycle::JobLifecycle,
     allocation: &Arc<Mutex<NodeAllocation>>,
     admissions: &crate::admission::AdmissionStore,
 ) {
-    let Ok(loaded) = admissions.load_all() else {
-        return;
-    };
-    for admitted in loaded.runs {
+    for admitted in runs {
         let run = &admitted.run;
         if !run.cancelled_by_controller
             || run.state != crate::admission::RunState::Cleaned
@@ -4959,13 +5091,11 @@ async fn settle_cancelled_runs(
 /// Free every run the records say is due. Record-driven and idempotent, so a
 /// report that acknowledges without releasing cannot strand a slice.
 async fn release_due_allocations(
+    runs: &[crate::admission::AdmittedRun],
     allocation: &Arc<Mutex<NodeAllocation>>,
     admissions: &crate::admission::AdmissionStore,
 ) {
-    let Ok(loaded) = admissions.load_all() else {
-        return;
-    };
-    for admitted in loaded.runs {
+    for admitted in runs {
         let (Some(run), Some(step_id)) = (admitted.run.key(), admitted.lifecycle_step()) else {
             continue;
         };
@@ -5110,11 +5240,17 @@ async fn release_acknowledged_allocation(
     run: RunKey,
     step_id: spur_core::step::StepId,
 ) -> ReleaseOutcome {
-    let warrant = match admissions.release_is_due(run, step_id) {
-        Ok(Some(warrant)) => warrant,
-        Ok(None) => return ReleaseOutcome::NotDue,
-        Err(error) => {
+    let store = admissions.clone();
+    let due = tokio::task::spawn_blocking(move || store.release_is_due(run, step_id)).await;
+    let warrant = match due {
+        Ok(Ok(Some(warrant))) => warrant,
+        Ok(Ok(None)) => return ReleaseOutcome::NotDue,
+        Ok(Err(error)) => {
             warn!(%run, %error, "could not tell whether a release is due; holding");
+            return ReleaseOutcome::NotDue;
+        }
+        Err(error) => {
+            warn!(%run, %error, "the task reading the release gate failed; holding");
             return ReleaseOutcome::NotDue;
         }
     };
@@ -5124,8 +5260,11 @@ async fn release_acknowledged_allocation(
     let released = allocation.lock().await.release_job(warrant);
     // The cut is driven off this, so a slice given back without it recorded
     // stays advertised as a claim the node no longer holds.
-    if let Err(error) = admissions.record_slice_released(run) {
-        warn!(%run, %error, "failed to record a released slice");
+    let store = admissions.clone();
+    match tokio::task::spawn_blocking(move || store.record_slice_released(run)).await {
+        Ok(Err(error)) => warn!(%run, %error, "failed to record a released slice"),
+        Err(error) => warn!(%run, %error, "the task recording a released slice failed"),
+        Ok(Ok(_)) => {}
     }
     if !released {
         // The audit reads the line below as the release; without this one, a
@@ -5189,11 +5328,20 @@ pub(crate) async fn settle_acknowledged_completion(
     run: RunKey,
     step_id: spur_core::step::StepId,
 ) -> bool {
-    let _ = admissions.record_controller_ack(run, 1);
-    let _ = admissions.record_report_acknowledged(run, step_id);
-    // Settling a hook still in flight is the teardown's to do, never an
-    // acknowledgement's: the controller cannot see whose hook is still running.
-    let _ = admissions.mark_acknowledged_run_cleaned(run);
+    let store = admissions.clone();
+    // Both records are fsynced, and this runs on the completion RPC's own
+    // worker: kept here they stall every other task that worker is driving.
+    let recorded = tokio::task::spawn_blocking(move || {
+        // Scoped to the step: a user step's exit settles its own participation,
+        // and the store refuses the run-level write to anything but the owner.
+        let _ = store.record_acknowledged_completion(run, step_id, 1);
+        let _ = store.record_report_acknowledged(run, step_id);
+    })
+    .await;
+    if let Err(error) = recorded {
+        warn!(%run, %error, "the task recording an acknowledged completion failed");
+        return false;
+    }
     release_acknowledged_allocation(allocation, admissions, run, step_id).await
         == ReleaseOutcome::Freed
 }
@@ -5326,15 +5474,13 @@ fn epilog_hold_is_worth_saying<K: std::hash::Hash + Eq>(
 /// Mirror each in-flight epilog's outcome from the supervisor's own ledger into
 /// the record the gate reads. The hook's owner writes it, so a cancel cannot.
 async fn resolve_supervised_epilogs(
+    runs: &[crate::admission::AdmittedRun],
     store: &crate::stepd::StepdStore,
     admissions: &crate::admission::AdmissionStore,
     held_since: &mut HashMap<RunKey, std::time::Instant>,
 ) {
-    let Ok(loaded) = admissions.load_all() else {
-        return;
-    };
     let mut still_held = HashSet::new();
-    for admitted in loaded.runs {
+    for admitted in runs {
         if !admitted.run.cleanup.epilog.is_in_flight() {
             continue;
         }
@@ -5344,7 +5490,7 @@ async fn resolve_supervised_epilogs(
         let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
         // No owner was ever named, so no ledger can answer for the hook. The
         // hold ends at the restart that proves the owner did not survive.
-        let Some(step_id) = hook_owner_step(&admitted) else {
+        let Some(step_id) = hook_owner_step(admitted) else {
             still_held.insert(run);
             if epilog_hold_is_worth_saying(held_since, run) {
                 warn!(
@@ -5358,7 +5504,7 @@ async fn resolve_supervised_epilogs(
             Ok(Some(failed)) => epilog_outcome(failed),
             // Nothing the ledger can be read as; only proof the owner is gone
             // may settle it, never the wait itself.
-            Ok(None) if recorded_supervisor_liveness(&admitted) == Liveness::Gone => {
+            Ok(None) if recorded_supervisor_liveness(admitted) == Liveness::Gone => {
                 warn!(
                     job_id,
                     run_attempt, "settling an epilog whose supervisor is gone"
@@ -5377,7 +5523,7 @@ async fn resolve_supervised_epilogs(
             }
             // A ledger that cannot be read is never proof the hook ended, but a
             // hold it takes must still end when nothing is left to end it.
-            Err(error) if recorded_supervisor_liveness(&admitted) == Liveness::Gone => {
+            Err(error) if recorded_supervisor_liveness(admitted) == Liveness::Gone => {
                 warn!(job_id, run_attempt, %error,
                     "settling an unreadable epilog whose supervisor is gone");
                 crate::admission::HookState::Unknown
@@ -9416,8 +9562,9 @@ impl SlurmAgent for AgentService {
                         .await
                         .unwrap_or(128)
                 };
-                Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx)
-                    .await;
+                let _ =
+                    Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx)
+                        .await;
             });
 
             return Ok(Response::new(ReceiverStream::new(rx)));
@@ -9480,8 +9627,21 @@ impl SlurmAgent for AgentService {
                 })?,
         };
 
+        // Read before the bridge detaches: after it ends the tracking may already
+        // be gone, and a stale attempt must not tear down a re-dispatched run.
+        let run_attempt = self
+            .running
+            .lock()
+            .await
+            .get(&init.job_id)
+            .map(|tracked| tracked.run_attempt)
+            .unwrap_or_default();
+
+        let overlap = init.overlap;
         self.live_ptys.lock().await.insert(init.job_id);
         let live_ptys = self.live_ptys.clone();
+        let running = self.running.clone();
+        let stepds = self.stepds.clone();
         let job_id = init.job_id;
         let child_pid = terminal.pid;
         let bridge = Self::run_pty_bridge(
@@ -9493,7 +9653,7 @@ impl SlurmAgent for AgentService {
             tx,
         );
         tokio::spawn(async move {
-            bridge.await;
+            let end = bridge.await;
             live_ptys.lock().await.remove(&job_id);
             if let Some(dir) = legacy_custody_dir
                 .as_deref()
@@ -9502,6 +9662,10 @@ impl SlurmAgent for AgentService {
                 if let Err(error) = crate::stepd::release_pty_master(dir, child_pid as u32).await {
                     warn!(job_id, child_pid, %error, "failed to release a closed terminal");
                 }
+            }
+            if end == PtyBridgeEnd::ClientGone {
+                end_abandoned_srun_allocation(&running, &stepds, job_id, run_attempt, overlap)
+                    .await;
             }
         });
 
@@ -10612,7 +10776,8 @@ impl AgentService {
         interactive: bool,
         mut inbound: S,
         tx: tokio::sync::mpsc::Sender<Result<InteractiveOutput, Status>>,
-    ) where
+    ) -> PtyBridgeEnd
+    where
         S: tokio_stream::Stream<Item = Result<InteractiveInput, Status>> + Unpin + Send,
         F: std::future::Future<Output = i32> + Send,
     {
@@ -10632,7 +10797,7 @@ impl AgentService {
                 let _ = tx
                     .send(Err(Status::internal(format!("AsyncFd setup: {e}"))))
                     .await;
-                return;
+                return PtyBridgeEnd::ChildExited;
             }
         };
 
@@ -10642,6 +10807,7 @@ impl AgentService {
         // a non-interactive stdin-EOF doesn't spin the select.
         let mut input_open = true;
         let mut exit_code: i32 = 128;
+        let mut end = PtyBridgeEnd::ChildExited;
 
         loop {
             tokio::select! {
@@ -10658,6 +10824,7 @@ impl AgentService {
                                         )),
                                     };
                                     if tx.send(Ok(msg)).await.is_err() {
+                                        end = PtyBridgeEnd::ClientGone;
                                         break;
                                     }
                                 }
@@ -10700,18 +10867,14 @@ impl AgentService {
                             }
                         }
                         Some(Err(_)) => {
-                            // Broken input stream: the client is gone. Hang up.
-                            let _ = crate::pty::signal_foreground(
-                                master_raw, child_pid, libc::SIGHUP,
-                            );
+                            // Broken input stream: the client is gone.
+                            end = PtyBridgeEnd::ClientGone;
                             break;
                         }
                         None => {
                             if interactive {
-                                // The terminal went away — hang the step up.
-                                let _ = crate::pty::signal_foreground(
-                                    master_raw, child_pid, libc::SIGHUP,
-                                );
+                                // The terminal went away.
+                                end = PtyBridgeEnd::ClientGone;
                                 break;
                             }
                             // Non-interactive stdin-EOF: the client still wants the
@@ -10730,15 +10893,30 @@ impl AgentService {
             }
         }
 
+        if end == PtyBridgeEnd::ClientGone && !child_exited {
+            let _ = crate::pty::signal_foreground(master_raw, child_pid, libc::SIGHUP);
+            // A closed output channel is the one case where nobody can receive an
+            // exit status, and the payload can block writing into a terminal nobody
+            // drains — so waiting for it here is a wait that never ends.
+            if tx.is_closed() {
+                return end;
+            }
+        }
+
         if !child_exited {
             exit_code = (&mut wait_exit).await;
         }
 
-        let _ = tx
+        if tx
             .send(Ok(InteractiveOutput {
                 msg: Some(interactive_output::Msg::ExitStatus(exit_code)),
             }))
-            .await;
+            .await
+            .is_err()
+        {
+            end = PtyBridgeEnd::ClientGone;
+        }
+        end
     }
 
     /// Non-blocking read from a PTY master via an AsyncFd ready guard.
@@ -18353,7 +18531,7 @@ mod tests {
         assert_eq!(svc.allocation.lock().await.free_cpus(), 6);
 
         svc.admissions()
-            .record_controller_ack(key(7, 1), 42)
+            .record_controller_ack(key(7, 1), spur_core::step::STEP_BATCH, 42)
             .expect("ack");
         assert_eq!(
             release_acknowledged_allocation(
@@ -18366,6 +18544,59 @@ mod tests {
             ReleaseOutcome::Freed
         );
         assert_eq!(svc.allocation.lock().await.free_cpus(), 8);
+    }
+
+    // A killed `srun --pty` client ends the terminal step, not the allocation.
+    // That step's exit used to write the *run's* acknowledgement, which let the
+    // settle sweep free a slice the controller was still charging for.
+    #[tokio::test]
+    async fn a_user_steps_exit_cannot_acknowledge_the_run_that_hosts_it() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        {
+            let mut alloc = svc.allocation.lock().await;
+            alloc.allocate_for_job(49, 1, 2, 1000, &[]).unwrap();
+            alloc.commit_job(49, 1);
+        }
+        let mut run = crate::admission::RunAdmission::new(
+            49,
+            1,
+            "n1",
+            crate::admission::AdmittedResources::default(),
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_EXTERN);
+        admissions.admit_run(&run).expect("admit the allocation");
+
+        let freed =
+            settle_acknowledged_completion(&svc.allocation, &admissions, key(49, 1), 0).await;
+
+        assert!(!freed, "a terminal step's exit frees no slice");
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            6,
+            "the allocation is still charged"
+        );
+        let recorded = admissions
+            .load_run(key(49, 1))
+            .expect("the record survives");
+        assert!(
+            !recorded.controller_ack.is_given(),
+            "the controller acknowledged a step, never this run"
+        );
+        assert!(
+            !recorded.slice_released,
+            "a slice the controller still charges for was handed back"
+        );
+        // The sweep reads this; a run wrongly marked Cleaned is one it will free
+        // on the forged acknowledgement above.
+        assert_eq!(
+            admissions
+                .settle_permit(key(49, 1))
+                .expect("the record is readable"),
+            crate::admission::SettlePermit::NotQuiescent
+        );
     }
 
     // One owner nobody can name used to stop collection for the whole node, so
@@ -18453,7 +18684,12 @@ mod tests {
 
         // The controller is unreachable, so the report stays owed.
         collect_settled_admissions(&svc.allocation, &admissions).await;
-        release_due_allocations(&svc.allocation, &admissions).await;
+        release_due_allocations(
+            &load_admitted_runs(&admissions).await,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
         assert!(
             admissions.load_run(key(77, 1)).is_ok(),
             "an owed report must keep its record"
@@ -18483,7 +18719,12 @@ mod tests {
         );
 
         // The record-driven safety net finds nothing left to do, and collects.
-        release_due_allocations(&svc.allocation, &admissions).await;
+        release_due_allocations(
+            &load_admitted_runs(&admissions).await,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
         collect_settled_admissions(&svc.allocation, &admissions).await;
         assert!(
             admissions.load_run(key(77, 1)).is_err(),
@@ -19967,7 +20208,13 @@ mod tests {
         .await
         .expect("cancel");
 
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
             while_held,
@@ -19979,7 +20226,13 @@ mod tests {
         admissions
             .mark_run_cleaned(key(7, 1), crate::admission::EpilogOwed::No)
             .expect("cleaned");
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -21111,6 +21364,224 @@ mod tests {
         );
     }
 
+    /// A supervisor that answers control requests, publishing each one *before*
+    /// it acknowledges: a caller that has its answer has already been recorded,
+    /// so a test can read the record without waiting on anything.
+    fn a_listening_supervisor(
+        listener: tokio::net::UnixListener,
+        descriptor: crate::stepd::StepdDescriptor,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::stepd::StepdRequest>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let served = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) =
+                    crate::stepd::accept_hello(&listener, &descriptor, &descriptor.capability)
+                        .await
+                else {
+                    return;
+                };
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                if BufReader::new(reader).read_line(&mut line).await.is_err() {
+                    return;
+                }
+                let request = serde_json::from_str(&line).expect("decode runtime request");
+                if tx.send(request).is_err() {
+                    return;
+                }
+                let _ = writer
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            serde_json::to_string(&crate::stepd::StepdResponse::Acknowledged)
+                                .expect("encode acknowledgement")
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        (served, rx)
+    }
+
+    /// A supervisor of `job_id` launched under `step_id`. Every supervised run
+    /// reads as allocation-only at the agent, so the step is the only thing that
+    /// says whether the run is an srun allocation or a script of its own.
+    fn a_run_supervisor(
+        dir: &std::path::Path,
+        job_id: u32,
+        run_attempt: u32,
+        step_id: spur_core::step::StepId,
+    ) -> (tokio::net::UnixListener, crate::stepd::StepdDescriptor) {
+        let socket_path = dir.join(format!("runtime-{job_id}-{step_id}.sock"));
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind runtime socket");
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            step_id,
+            0,
+            0,
+            socket_path,
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = format!("abandoned-terminal-{job_id}-{step_id}");
+        (listener, descriptor)
+    }
+
+    fn a_terminal_allocation_supervisor(
+        dir: &std::path::Path,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> (tokio::net::UnixListener, crate::stepd::StepdDescriptor) {
+        a_run_supervisor(dir, job_id, run_attempt, spur_core::step::STEP_EXTERN)
+    }
+
+    // An `srun --pty` client that is killed never reports its step, so the node is
+    // the only thing that can end the run. Without this the allocation's supervisor
+    // idles forever and the controller keeps charging its cores.
+    #[tokio::test]
+    async fn an_abandoned_terminal_ends_the_srun_allocation_it_held() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let dir = tempfile::tempdir().expect("runtime socket directory");
+        let (listener, descriptor) = a_terminal_allocation_supervisor(dir.path(), 910, 4);
+        let (supervisor, mut served) = a_listening_supervisor(listener, descriptor.clone());
+
+        let stepds: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
+        stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let running: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        running.lock().await.insert(910, an_allocation_only_job(4));
+
+        assert!(
+            end_abandoned_srun_allocation(&running, &stepds, 910, 4, false).await,
+            "an allocation held only for a vanished terminal must be ended"
+        );
+        assert!(matches!(
+            served.try_recv(),
+            Ok(crate::stepd::StepdRequest::Shutdown)
+        ));
+        supervisor.abort();
+    }
+
+    // The same allocation, entered a second time with `--overlap` (what `sattach`
+    // and `srun --jobid` do). That terminal is not why the job exists, so losing
+    // it must not end the allocation the first one is still sitting in.
+    #[tokio::test]
+    async fn an_abandoned_overlapping_terminal_leaves_the_allocation_it_joined() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let dir = tempfile::tempdir().expect("runtime socket directory");
+        let (listener, descriptor) = a_terminal_allocation_supervisor(dir.path(), 914, 4);
+        let (supervisor, mut served) = a_listening_supervisor(listener, descriptor.clone());
+
+        let stepds: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
+        stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let running: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        running.lock().await.insert(914, an_allocation_only_job(4));
+
+        assert!(
+            !end_abandoned_srun_allocation(&running, &stepds, 914, 4, true).await,
+            "a terminal that joined the job is not the reason the job exists"
+        );
+        assert!(
+            served.try_recv().is_err(),
+            "no supervisor may be asked to shut down for an overlapping terminal"
+        );
+        supervisor.abort();
+    }
+
+    // The other half: `sattach` to a batch job ends the terminal, not the job.
+    // The job's processes live in its supervisor, so the agent's own handle reads
+    // as allocation-only here exactly as it does for an srun allocation.
+    #[tokio::test]
+    async fn an_abandoned_terminal_leaves_a_job_with_its_own_payload_running() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let dir = tempfile::tempdir().expect("runtime socket directory");
+        let (listener, descriptor) =
+            a_run_supervisor(dir.path(), 911, 4, spur_core::step::STEP_BATCH);
+        let (supervisor, mut served) = a_listening_supervisor(listener, descriptor.clone());
+
+        let stepds: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
+        stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let running: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        running.lock().await.insert(911, an_allocation_only_job(4));
+
+        assert!(
+            !end_abandoned_srun_allocation(&running, &stepds, 911, 4, false).await,
+            "a batch job outlives any terminal attached to it"
+        );
+        assert!(
+            served.try_recv().is_err(),
+            "no supervisor of a batch job may be asked to shut down"
+        );
+        supervisor.abort();
+    }
+
+    // An `salloc` shell and the `srun --pty` a user runs inside it are one job.
+    // Killing the inner client must not take the shell, or the allocation the
+    // user is standing in disappears under them.
+    #[tokio::test]
+    async fn an_abandoned_terminal_inside_an_salloc_leaves_the_allocation_standing() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let dir = tempfile::tempdir().expect("runtime socket directory");
+        let (shell_listener, shell) =
+            a_run_supervisor(dir.path(), 912, 4, spur_core::step::STEP_BATCH);
+        let (inner_listener, inner) = a_run_supervisor(dir.path(), 912, 4, 0);
+        let (shell_supervisor, mut shell_served) =
+            a_listening_supervisor(shell_listener, shell.clone());
+        let (inner_supervisor, mut inner_served) =
+            a_listening_supervisor(inner_listener, inner.clone());
+
+        let stepds: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut sessions = stepds.lock().await;
+            sessions.insert(stepd_key(&shell), shell.clone());
+            sessions.insert(stepd_key(&inner), inner.clone());
+        }
+        let running: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        running.lock().await.insert(912, an_allocation_only_job(4));
+
+        assert!(
+            !end_abandoned_srun_allocation(&running, &stepds, 912, 4, false).await,
+            "an salloc allocation outlives a step run inside it"
+        );
+        assert!(
+            shell_served.try_recv().is_err(),
+            "the salloc shell's supervisor must not be asked to shut down"
+        );
+        assert!(
+            inner_served.try_recv().is_err(),
+            "the inner step is the terminal's own to end, not this path's"
+        );
+        shell_supervisor.abort();
+        inner_supervisor.abort();
+    }
+
+    // An allocation nothing supervises has nobody to report it complete, so
+    // claiming it was ended would leave its cores charged with no way back.
+    #[tokio::test]
+    async fn an_abandoned_terminal_reports_nothing_ended_when_no_supervisor_holds_the_run() {
+        let stepds: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let running: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        running.lock().await.insert(913, an_allocation_only_job(4));
+
+        assert!(
+            !end_abandoned_srun_allocation(&running, &stepds, 913, 4, false).await,
+            "nothing was ended, so nothing may be reported as ended"
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn graceful_cancel_stepd_escalates_to_sigkill() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -22181,7 +22652,13 @@ mod tests {
             .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: true })
             .expect("record the epilog");
 
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
         assert_eq!(
             admissions
                 .load_run(key(53, 1))
@@ -22190,7 +22667,13 @@ mod tests {
                 .epilog,
             crate::admission::HookState::Failed
         );
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -22235,13 +22718,57 @@ mod tests {
             .obligations(55, 1, spur_core::step::STEP_BATCH)
             .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
             .expect("record the epilog");
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
             while_held + 2,
             "the slice comes back on the supervisor's own word"
+        );
+    }
+
+    // The tick scans the records once and hands the same snapshot to every sweep,
+    // so a sweep that trusted the scan would hold a slice a whole tick too long.
+    #[tokio::test]
+    async fn a_cancelled_run_settles_on_an_epilog_that_landed_after_the_scan() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_supervised_run(&svc, 57, a_live_supervisor()).await;
+        svc.drop_tracked_job(57, 1).await;
+
+        let scanned = load_admitted_runs(&admissions).await;
+        assert!(
+            scanned
+                .iter()
+                .any(|admitted| admitted.run.job_id == 57
+                    && admitted.run.cleanup.epilog.is_in_flight()),
+            "the scan has to predate the epilog for this to test anything"
+        );
+
+        admissions
+            .record_epilog(key(57, 1), crate::admission::HookState::Succeeded)
+            .expect("record the epilog");
+
+        settle_cancelled_runs(&scanned, &svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "the gate reads the record, not the scan that predates it"
         );
     }
 
@@ -22265,7 +22792,13 @@ mod tests {
         admissions
             .settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart)
             .expect("settle the hooks of a previous agent");
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -22287,7 +22820,13 @@ mod tests {
         admissions
             .settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart)
             .expect("sweep the hooks of a previous agent");
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             admissions
@@ -22366,7 +22905,13 @@ mod tests {
         admissions
             .settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart)
             .expect("sweep the hooks of a previous agent");
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -22526,8 +23071,19 @@ mod tests {
         obligations
             .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
             .expect("record the finished epilog");
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
-        release_due_allocations(&svc.allocation, &admissions).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
+        release_due_allocations(
+            &load_admitted_runs(&admissions).await,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -22639,7 +23195,13 @@ mod tests {
             spur_core::step::STEP_BATCH,
             Some(a_live_supervisor()),
         );
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -22791,8 +23353,20 @@ mod tests {
             .obligations(62, 1, 0)
             .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
             .expect("record the step's epilog");
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -22829,8 +23403,20 @@ mod tests {
         contents.insert_str(0, "{not json\n");
         std::fs::write(&path, contents).expect("corrupt the log");
 
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -22915,8 +23501,20 @@ mod tests {
             .obligations(71, 1, spur_core::step::STEP_EXTERN)
             .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
             .expect("record the epilog's outcome");
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -22959,8 +23557,20 @@ mod tests {
         );
         assert!(admitted.run.cleanup.epilog.is_in_flight());
 
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -23794,6 +24404,108 @@ mod tests {
                 assert_eq!(waitpid_exit_code(child), 128 + libc::SIGKILL);
             }
         }
+    }
+
+    /// A bridge over a PTY running `argv`, with handles on both ends of the
+    /// client's streams so a test can take either of them away.
+    #[allow(clippy::type_complexity)]
+    fn a_bridged_terminal(
+        argv: &[&str],
+    ) -> (
+        tokio::task::JoinHandle<PtyBridgeEnd>,
+        tokio::sync::mpsc::Sender<Result<spur_proto::proto::InteractiveInput, tonic::Status>>,
+        tokio::sync::mpsc::Receiver<Result<spur_proto::proto::InteractiveOutput, tonic::Status>>,
+    ) {
+        let (master, slave) = crate::pty::openpty_with_winsize(None).expect("openpty");
+        nix::fcntl::fcntl(
+            &master,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("O_NONBLOCK");
+        let raw = crate::executor::JobIoRaw::Pty {
+            master: std::os::fd::AsRawFd::as_raw_fd(&master),
+            slave: std::os::fd::AsRawFd::as_raw_fd(&slave),
+        };
+        let mut cmd = tokio::process::Command::new(argv[0]);
+        cmd.args(&argv[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            // A payload the bridge stops waiting on is otherwise left spinning on
+            // a closed terminal for the rest of the run, starving its siblings.
+            .kill_on_drop(true);
+        unsafe {
+            cmd.pre_exec(move || raw.wire());
+        }
+        let mut child = cmd.spawn().expect("spawn terminal payload");
+        let child_pid = child.id().expect("child pid") as i32;
+        drop(slave);
+
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel(64);
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
+        let wait_exit = async move {
+            child
+                .wait()
+                .await
+                .ok()
+                .and_then(|status| status.code())
+                .unwrap_or(128)
+        };
+        let bridge = tokio::spawn(AgentService::run_pty_bridge(
+            master,
+            wait_exit,
+            child_pid,
+            true,
+            tokio_stream::wrappers::ReceiverStream::new(in_rx),
+            out_tx,
+        ));
+        (bridge, in_tx, out_rx)
+    }
+
+    // A `kill -9` on the client breaks the stream mid-session. The bridge has to
+    // say so: it is the only signal that nobody will report this run complete.
+    #[tokio::test]
+    async fn a_broken_client_stream_ends_the_bridge_as_a_lost_client() {
+        let (bridge, in_tx, _out_rx) = a_bridged_terminal(&["cat"]);
+
+        in_tx
+            .send(Err(tonic::Status::unavailable("client connection reset")))
+            .await
+            .expect("deliver the broken stream");
+
+        assert_eq!(bridge.await.expect("bridge task"), PtyBridgeEnd::ClientGone);
+    }
+
+    // The shape the broken-stream test cannot reach: a client killed while output
+    // is flowing is noticed on the *send*, not the input stream. The payload here
+    // ignores SIGHUP and never exits, which is what a real one does once it blocks
+    // writing into a terminal nobody drains — so a bridge that waits for its exit
+    // before reporting the client gone never reports at all, and the run stays
+    // charged. Nothing here is time-bounded: the fixed bridge returns without
+    // waiting on the child, and the unfixed one is the hang this pins.
+    #[tokio::test]
+    async fn a_client_lost_while_output_flows_ends_the_bridge_without_waiting_for_the_payload() {
+        let (bridge, _in_tx, out_rx) =
+            a_bridged_terminal(&["/bin/sh", "-c", "trap '' HUP; while :; do echo line; done"]);
+
+        // The client is gone: the next write the payload forces fails, which is
+        // the only notice the bridge gets.
+        drop(out_rx);
+
+        assert_eq!(bridge.await.expect("bridge task"), PtyBridgeEnd::ClientGone);
+    }
+
+    // The control: an ordinary exit is the client's own to report, so the node
+    // must not end the run behind its back.
+    #[tokio::test]
+    async fn a_shell_that_exits_on_its_own_ends_the_bridge_as_a_child_exit() {
+        let (bridge, _in_tx, mut out_rx) = a_bridged_terminal(&["/bin/sh", "-c", "exit 0"]);
+
+        let end = bridge.await.expect("bridge task");
+        // Drained after the bridge returns so the exit status it sends cannot be
+        // mistaken for a client that stopped reading.
+        out_rx.close();
+        assert_eq!(end, PtyBridgeEnd::ChildExited);
     }
 
     #[tokio::test]

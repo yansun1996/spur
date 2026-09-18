@@ -92,6 +92,17 @@ impl AssociationCache {
         snapshot.admin_level.get(user).cloned()
     }
 
+    /// Whether the cluster names any administrator at all. An unloaded cache (accounting off, or
+    /// not yet fetched) names none, and a caller cannot prove membership of an empty set.
+    pub fn names_any_admin(&self) -> bool {
+        let snapshot = self.snapshot.read();
+        snapshot.loaded
+            && snapshot
+                .admin_level
+                .values()
+                .any(|lvl| crate::accounting::admin_level_is_admin(lvl))
+    }
+
     /// Whether `user` is associated with `account`. An unloaded cache reports `CacheUnavailable`
     /// rather than guessing; see `validate_user_account` in `cluster.rs` for how callers must treat that.
     pub fn account_membership(&self, user: &str, account: &str) -> AccountMembership {

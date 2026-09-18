@@ -249,7 +249,7 @@ pub struct RestApiConfig {
 /// All fields are optional — `None` means no hook is configured for that point.
 /// Paths must be fully qualified; no search path is set for security reasons.
 /// Hook lifecycle and failure semantics match Slurm.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HooksConfig {
     /// Script run on compute nodes before job launch (Slurm `Prolog`).
     pub prolog: Option<String>,
@@ -273,6 +273,35 @@ pub struct HooksConfig {
     /// Lua script defining `slurm_job_submit(job_desc, submit_uid)`, run in a
     /// sandbox at submission. Slurm `job_submit/lua` parity. Runs after `job_submit`.
     pub job_submit_lua: Option<String>,
+    /// Seconds to wait for the node `epilog` before recording it failed and
+    /// releasing the job's resources. `0` waits forever, matching Slurm's
+    /// `PrologEpilogTimeout` default.
+    #[serde(default = "default_epilog_timeout_secs")]
+    pub epilog_timeout_secs: u64,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            prolog: None,
+            epilog: None,
+            prolog_slurmctld: None,
+            epilog_slurmctld: None,
+            task_prolog: None,
+            task_epilog: None,
+            srun_prolog: None,
+            srun_epilog: None,
+            job_submit: None,
+            job_submit_lua: None,
+            epilog_timeout_secs: default_epilog_timeout_secs(),
+        }
+    }
+}
+
+/// Sized so an epilog doing real cleanup finishes well inside it, and finite so
+/// a wedged one cannot hold a job's slice for the life of the node.
+fn default_epilog_timeout_secs() -> u64 {
+    600
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3329,6 +3358,38 @@ job_submit_lua = "/etc/spur/job_submit.lua"
         );
         // metrics section omitted — should keep defaults
         assert!(config.metrics.enabled);
+    }
+
+    // A deployed spur.conf predates the field, and a node epilog on such a
+    // cluster must come back bounded rather than inheriting the old forever-wait.
+    #[test]
+    fn a_hooks_section_without_an_epilog_timeout_gets_a_finite_one() {
+        let toml = r#"
+cluster_name = "test"
+
+[hooks]
+epilog = "/etc/spur/epilog.sh"
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.hooks.epilog_timeout_secs, 600);
+        assert_eq!(
+            HooksConfig::default().epilog_timeout_secs,
+            config.hooks.epilog_timeout_secs,
+            "the in-code default and the parsed default must be the same bound"
+        );
+    }
+
+    #[test]
+    fn an_epilog_timeout_of_zero_is_honored_as_the_opt_out() {
+        let toml = r#"
+cluster_name = "test"
+
+[hooks]
+epilog = "/etc/spur/epilog.sh"
+epilog_timeout_secs = 0
+"#;
+        let config = SlurmConfig::load_from_str(toml).unwrap();
+        assert_eq!(config.hooks.epilog_timeout_secs, 0);
     }
 
     #[test]
