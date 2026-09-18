@@ -1093,10 +1093,9 @@ pub fn resolve_supplementary_gids(uid: u32, gid: u32) -> Vec<u32> {
 /// The groups show as `nobody` inside the container but the kernel
 /// still honours them for permission checks on device nodes.
 fn setup_user_namespace(uid: u32, gid: u32) -> anyhow::Result<()> {
-    nix::sched::unshare(
-        CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID,
-    )
-    .context("unshare(CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID)")?;
+    // CLONE_NEWNS is deliberately not unshared here — see fork_into_pid_namespace.
+    nix::sched::unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID)
+        .context("unshare(CLONE_NEWUSER | CLONE_NEWPID)")?;
 
     std::fs::write("/proc/self/uid_map", format!("0 {} 1\n", uid)).context("write uid_map")?;
     std::fs::write("/proc/self/setgroups", "deny").context("write setgroups deny")?;
@@ -1135,11 +1134,17 @@ fn wait_and_mirror_exit_code(child: nix::unistd::Pid, exit_marker: Option<&Path>
     code
 }
 
-/// Fork to enter a new PID namespace. The child (PID 1 inside the
-/// namespace) returns Ok(()); the parent waits for the child and exits.
+/// Fork to enter a new PID namespace. The child (PID 1 inside the namespace)
+/// returns Ok(()); the parent waits for the child and exits. The child also
+/// gets its own mount namespace: shared with the parent, its later pivot_root
+/// would sever the parent's own host access, needed to write `exit_marker`.
 fn fork_into_pid_namespace(exit_marker: Option<&Path>) -> anyhow::Result<()> {
     match unsafe { nix::unistd::fork().context("fork for PID namespace")? } {
-        nix::unistd::ForkResult::Child => Ok(()),
+        nix::unistd::ForkResult::Child => {
+            nix::sched::unshare(CloneFlags::CLONE_NEWNS).context("unshare(CLONE_NEWNS)")?;
+            set_mount_propagation_private()?;
+            Ok(())
+        }
         nix::unistd::ForkResult::Parent { child } => {
             let code = wait_and_mirror_exit_code(child, exit_marker);
             std::process::exit(code);
@@ -1188,14 +1193,13 @@ pub fn container_init(
     }
 
     if is_root {
-        nix::sched::unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
-            .context("unshare(CLONE_NEWNS | CLONE_NEWPID)")?;
+        nix::sched::unshare(CloneFlags::CLONE_NEWPID).context("unshare(CLONE_NEWPID)")?;
     } else {
         setup_user_namespace(config.uid, config.gid)
             .context("rootless container setup failed while setting up user namespace")?;
     }
 
-    set_mount_propagation_private()?;
+    // CLONE_NEWNS happens inside the child, not here — see fork_into_pid_namespace.
     fork_into_pid_namespace(exit_marker)?;
 
     mount_filesystems(rootfs)?;
@@ -2074,6 +2078,91 @@ pub(crate) mod tests {
                 assert_eq!(wait_and_mirror_exit_code(child, None), 9);
             }
         }
+    }
+
+    /// True when this host lets an unprivileged process create user + mount
+    /// namespaces. Some hardened kernels disable this via sysctl; that's a
+    /// host property the test should skip on, not fail against.
+    fn unprivileged_namespaces_supported() -> bool {
+        match unsafe { nix::unistd::fork().unwrap() } {
+            nix::unistd::ForkResult::Child => {
+                let ok = nix::sched::unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)
+                    .is_ok();
+                std::process::exit(if ok { 0 } else { 1 });
+            }
+            nix::unistd::ForkResult::Parent { child } => matches!(
+                nix::sys::wait::waitpid(child, None),
+                Ok(nix::sys::wait::WaitStatus::Exited(_, 0))
+            ),
+        }
+    }
+
+    /// A child sharing its wrapper's mount namespace loses the wrapper's own
+    /// host filesystem access the moment the child pivot_roots (container.rs's
+    /// real launch path, via pivot_into_rootfs) — including the exit marker
+    /// the wrapper must still write after reaping the child.
+    #[test]
+    fn a_pivoting_child_does_not_break_the_wrappers_exit_marker_write() {
+        if !unprivileged_namespaces_supported() {
+            eprintln!(
+                "skipping a_pivoting_child_does_not_break_the_wrappers_exit_marker_write: \
+                 this host disallows unprivileged user namespaces"
+            );
+            return;
+        }
+        with_container_dir(|dir| {
+            let rootfs = dir.join("pivot_target");
+            std::fs::create_dir_all(&rootfs).unwrap();
+            let base = "step_20_0";
+            let marker = step_exit_marker_path(base);
+
+            match unsafe { nix::unistd::fork().unwrap() } {
+                nix::unistd::ForkResult::Child => {
+                    // Mirrors container_init's rootless setup path: a fresh
+                    // user+pid namespace, then fork into the pid-namespace
+                    // wrapper exactly as a real container launch does. Every
+                    // failure exits this forked child directly rather than
+                    // unwinding a panic through it.
+                    if let Err(error) = setup_user_namespace(
+                        nix::unistd::getuid().as_raw(),
+                        nix::unistd::getgid().as_raw(),
+                    ) {
+                        eprintln!("rootless namespace setup failed: {error:#}");
+                        std::process::exit(110);
+                    }
+                    match fork_into_pid_namespace(Some(&marker)) {
+                        Ok(()) => {
+                            // The pivoting child — exactly what container_init's
+                            // continuation does right after this call returns.
+                            if let Err(error) = pivot_into_rootfs(&rootfs, "/") {
+                                eprintln!("pivot into rootfs failed: {error:#}");
+                                std::process::exit(112);
+                            }
+                            std::process::exit(7);
+                        }
+                        Err(error) => {
+                            eprintln!("fork_into_pid_namespace failed: {error:#}");
+                            std::process::exit(111);
+                        }
+                    }
+                }
+                nix::unistd::ForkResult::Parent { child } => {
+                    let status = nix::sys::wait::waitpid(child, None);
+                    assert_eq!(
+                        status,
+                        Ok(nix::sys::wait::WaitStatus::Exited(child, 7)),
+                        "the wrapper's mirrored exit code must be the pivoting child's real one"
+                    );
+                }
+            }
+
+            assert_eq!(
+                read_step_exit_marker(base),
+                Some(7),
+                "the wrapper must still be able to write the exit marker to the host \
+                 filesystem after the child pivot_roots into its own rootfs"
+            );
+        });
     }
 
     #[test]

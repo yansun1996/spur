@@ -282,7 +282,18 @@ async fn launch_stepd(
                 "failed to stop stepd after readiness failure"
             );
         }
-        cleanup_unstarted_stepd(&store, config.job_id, run_attempt, launch_spec.step_id);
+        // An unanswered handshake proves nothing about the process itself; only
+        // a confirmed-dead session may be swept here.
+        if readiness_failure_confirmed_dead(&descriptor) {
+            cleanup_unstarted_stepd(&store, config.job_id, run_attempt, launch_spec.step_id);
+        } else {
+            warn!(
+                job_id = config.job_id,
+                run_attempt,
+                "stepd did not answer readiness in time but is still alive; leaving its \
+                 session for discovery rather than deleting it out from under it"
+            );
+        }
         return Err(executor::LaunchError::Other(
             anyhow::Error::from(error).context("wait for stepd socket"),
         ));
@@ -821,6 +832,16 @@ fn unreported_durable_exit(
             })
         })
         .unwrap_or(false)
+}
+
+/// Whether a runtime that missed its readiness window may have its session
+/// swept. A rejected/unanswered hello proves the handshake didn't land, not
+/// that the process is dead.
+fn readiness_failure_confirmed_dead(descriptor: &crate::stepd::StepdDescriptor) -> bool {
+    matches!(
+        crate::stepd::stepd_liveness(descriptor),
+        Ok(crate::stepd::StepdLiveness::Stale)
+    )
 }
 
 fn cleanup_unstarted_stepd(
@@ -2726,6 +2747,105 @@ async fn step_cancel_requested(
 /// meant the job's own output there.
 fn requested_step_of(req: &spur_proto::proto::StreamJobOutputRequest) -> Option<u32> {
     req.step.or((req.step_id != 0).then_some(req.step_id))
+}
+
+/// Whether a step a live tail is following might still write more output:
+/// unsupervised (`active_steps`), adopted-supervised (`stepds`), or a
+/// restart-orphaned container step the sweep is still waiting on
+/// (`reaping_orphans`, which has neither of the other two).
+fn step_output_still_pending(
+    step_key: (u32, u32),
+    active_steps: &HashMap<(u32, u32), ActiveStep>,
+    stepds: &StepdMap,
+    reaping_orphans: &HashSet<(u32, u32)>,
+) -> bool {
+    active_steps.contains_key(&step_key)
+        || stepds.contains_key(&step_key)
+        || reaping_orphans.contains(&step_key)
+}
+
+#[cfg(test)]
+mod step_output_still_pending_tests {
+    use super::*;
+
+    type Fixtures = (
+        HashMap<(u32, u32), ActiveStep>,
+        StepdMap,
+        HashSet<(u32, u32)>,
+    );
+
+    fn empty() -> Fixtures {
+        (HashMap::new(), StepdMap::new(), HashSet::new())
+    }
+
+    #[test]
+    fn a_step_absent_from_all_three_is_not_pending() {
+        let (active_steps, stepds, reaping_orphans) = empty();
+        assert!(!step_output_still_pending(
+            (1, 0),
+            &active_steps,
+            &stepds,
+            &reaping_orphans
+        ));
+    }
+
+    #[test]
+    fn a_restart_orphaned_container_step_is_pending_though_unsupervised() {
+        // The exact gap this closes: after a restart, an orphaned container
+        // step has no active_steps entry (in-memory, reset on restart) and no
+        // stepds entry (it was never supervised) — only reaping_orphans still
+        // names it, while the sweep waits on its real exit.
+        let (active_steps, stepds, mut reaping_orphans) = empty();
+        reaping_orphans.insert((7, 0));
+        assert!(step_output_still_pending(
+            (7, 0),
+            &active_steps,
+            &stepds,
+            &reaping_orphans
+        ));
+    }
+
+    #[test]
+    fn an_adopted_supervised_step_is_pending_via_stepds() {
+        let (active_steps, mut stepds, reaping_orphans) = empty();
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            7,
+            1,
+            0,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/unused.sock"),
+            std::path::PathBuf::new(),
+        );
+        stepds.insert(stepd_key(&descriptor), descriptor);
+        assert!(step_output_still_pending(
+            (7, 0),
+            &active_steps,
+            &stepds,
+            &reaping_orphans
+        ));
+    }
+
+    #[test]
+    fn a_live_unsupervised_step_is_pending_via_active_steps() {
+        let (mut active_steps, stepds, reaping_orphans) = empty();
+        active_steps.insert(
+            (7, 0),
+            ActiveStep {
+                cancel_requested: false,
+                pid: Some(1234),
+                epoch: 0,
+                stdout_path: String::new(),
+                stderr_path: String::new(),
+            },
+        );
+        assert!(step_output_still_pending(
+            (7, 0),
+            &active_steps,
+            &stepds,
+            &reaping_orphans
+        ));
+    }
 }
 
 /// Which namespaces a launch lands a job in. Shared so a job adopted after an
@@ -8705,6 +8825,7 @@ impl SlurmAgent for AgentService {
         if let Some(requested_step) = requested_step_of(&req) {
             let active_steps = self.active_steps.clone();
             let stepds = self.stepds.clone();
+            let reaping_orphans = self.reaping_orphans.clone();
             let want_stderr = req.stream == "stderr";
             let step_id = requested_step;
             let start_offset = req.start_offset;
@@ -8801,12 +8922,12 @@ impl SlurmAgent for AgentService {
                             }
                         }
                     }
-                    // Adoption restores a supervised step to `stepds`, never to
-                    // `active_steps`, so a tail that reconnects after a restart
-                    // would read an adopted step as finished and drop the rest
-                    // of its output.
-                    let still_running = active_steps.lock().await.contains_key(&step_key)
-                        || stepds.lock().await.contains_key(&step_key);
+                    let still_running = step_output_still_pending(
+                        step_key,
+                        &*active_steps.lock().await,
+                        &*stepds.lock().await,
+                        &*reaping_orphans.lock().await,
+                    );
                     if !still_running {
                         // Final read to drain anything written after the last poll.
                         if file.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
@@ -10761,6 +10882,65 @@ mod tests {
             "an exited pid with its old start-ticks recorded must read as stale"
         );
         assert!(stop_stepd_process(&descriptor).await.is_ok());
+    }
+
+    #[test]
+    fn a_readiness_timeout_against_a_still_live_process_is_not_confirmed_dead() {
+        // The process is genuinely alive: a rejected or unanswered hello proved
+        // nothing except that the handshake itself did not land in time.
+        let child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn a stand-in stepd");
+        let pid = child.id();
+        let start_ticks =
+            crate::stepd::process_start_ticks(pid).expect("read start ticks while alive");
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            1,
+            1,
+            spur_core::step::STEP_BATCH,
+            pid,
+            start_ticks,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        assert!(
+            !readiness_failure_confirmed_dead(&descriptor),
+            "a readiness timeout must not be read as proof of death for a live process"
+        );
+
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_readiness_timeout_against_a_genuinely_dead_process_is_confirmed_dead() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived process");
+        let pid = child.id();
+        let start_ticks =
+            crate::stepd::process_start_ticks(pid).expect("read start ticks before it exits");
+        child
+            .wait()
+            .expect("reap the process so its pid is free to be stale");
+
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            1,
+            1,
+            spur_core::step::STEP_BATCH,
+            pid,
+            start_ticks,
+            std::path::PathBuf::from("/tmp/runtime.sock"),
+            std::path::PathBuf::new(),
+        );
+
+        assert!(
+            readiness_failure_confirmed_dead(&descriptor),
+            "an exited pid with its old start-ticks recorded must be safe to sweep"
+        );
     }
 
     #[test]
