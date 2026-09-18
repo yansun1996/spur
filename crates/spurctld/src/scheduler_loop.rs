@@ -181,6 +181,7 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     // `None` until the first sweep of a term, so a new leader does not inherit
     // the previous one's schedule.
     let mut last_ledger_sweep: Option<Instant> = None;
+    let mut last_held_node_recheck: Option<Instant> = None;
 
     loop {
         // Event-driven wake: sleep until EITHER a job is submitted OR the periodic tick fires.
@@ -215,6 +216,19 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             let pull_cluster = cluster.clone();
             tokio::spawn(async move {
                 pull_all_node_ledgers(&pull_cluster, "routine sweep").await;
+            });
+        }
+
+        // A held node is offered no dispatch and asks for nothing, so draining it
+        // closes every trigger that would notice its claim has since cleared.
+        if !entering_term
+            && last_held_node_recheck
+                .is_none_or(|last| last.elapsed() >= HELD_NODE_RECHECK_INTERVAL)
+        {
+            last_held_node_recheck = Some(Instant::now());
+            let pull_cluster = cluster.clone();
+            tokio::spawn(async move {
+                recheck_nodes_held_for_unresolved_claims(&pull_cluster).await;
             });
         }
 
@@ -2670,7 +2684,43 @@ fn abort_placement(cluster: &Arc<ClusterManager>, job_id: spur_core::job::JobId)
 }
 
 /// How often the controller sweeps the cluster for drift nothing reported.
-const LEDGER_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+pub(crate) const LEDGER_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How often the controller looks again at the nodes it is itself holding. Far
+/// shorter than the sweep: the hold is lost capacity for as long as it stands.
+pub(crate) const HELD_NODE_RECHECK_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// The nodes carrying a hold this controller wrote for claims it could not
+/// resolve. A reason set anywhere else is somebody else's to lift.
+fn nodes_held_for_unresolved_claims(cluster: &ClusterManager) -> Vec<String> {
+    cluster
+        .get_nodes()
+        .into_iter()
+        .filter(|node| {
+            node.state_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(crate::server::UNRESOLVED_CLAIM_REASON))
+        })
+        .map(|node| node.name)
+        .collect()
+}
+
+/// Take a fresh cut of every node held on an unresolved claim, which is the only
+/// thing that retires the hold once the claim behind it is gone.
+pub(crate) async fn recheck_nodes_held_for_unresolved_claims(cluster: &Arc<ClusterManager>) {
+    let mut set = tokio::task::JoinSet::new();
+    for node in nodes_held_for_unresolved_claims(cluster) {
+        // Shared with every other trigger, so a node just pulled for another
+        // reason is not pulled twice.
+        if !cluster.claim_ledger_pull_slot(&node) {
+            continue;
+        }
+        let cluster = cluster.clone();
+        set.spawn(async move { pull_node_ledger(&cluster, &node, "held-node recheck").await });
+    }
+    while set.join_next().await.is_some() {}
+}
 
 /// Pull a fresh cut of one node's ledger and reconcile it. The heartbeat
 /// carries no inventory, so this is how a controller-side event gets one.

@@ -1372,7 +1372,7 @@ fn release_the_owed_epilog(
 
 /// Marks the reason this pass owns, so a later pass can tell its own stale text
 /// from an operator's and clear only the former.
-const UNRESOLVED_CLAIM_REASON: &str = "holding claims the controller has no record of";
+pub(crate) const UNRESOLVED_CLAIM_REASON: &str = "holding claims the controller has no record of";
 
 /// Hold a node whose claims nobody can account for out of service: left
 /// schedulable it is picked every cycle and refuses every launch, indefinitely.
@@ -9723,6 +9723,130 @@ mod tests {
         assert!(
             scheduler_places(&cluster, &pinned).is_empty(),
             "a held node must leave candidacy, or a spared retry budget has no terminator"
+        );
+    }
+
+    // A hold that outlives its claim is lost capacity: the cut that finds the
+    // claim gone is the only thing that gives the node back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_without_the_claim_gives_the_held_node_back() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
+            job_id: 8,
+            spec: Box::new(spur_core::job::JobSpec {
+                nodelist: Some("n1".into()),
+                ..a_one_node_spec()
+            }),
+        });
+        let pinned = cluster.get_job(8).expect("the pinned job");
+        assert_eq!(
+            scheduler_places(&cluster, &pinned),
+            vec!["n1".to_string()],
+            "the pin must reach n1 while the node is healthy, or the release below proves nothing"
+        );
+
+        let held = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![
+                    (7, 1, spur_core::job::LedgerDisposition::Held),
+                    (99, 1, spur_core::job::LedgerDisposition::Unresolved),
+                ],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+        assert_eq!(held.unresolved, vec![99]);
+        await_node_reason(&svc, "n1", &unresolved_reason("99")).await;
+        let drained = cluster.get_node("n1").expect("node");
+        assert!(
+            matches!(drained.state, NodeState::Drain | NodeState::Draining),
+            "the claim must drain the node, got {:?}",
+            drained.state
+        );
+        assert!(
+            scheduler_places(&cluster, &pinned).is_empty(),
+            "a drained node must leave candidacy"
+        );
+
+        let cleared = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(true, vec![(7, 1, spur_core::job::LedgerDisposition::Held)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+        assert!(cleared.unresolved.is_empty());
+        await_node_reason(&svc, "n1", "").await;
+        let back = cluster.get_node("n1").expect("node");
+        assert!(
+            !back.state.is_admin_hold(),
+            "the node must come off the hold, got {:?}",
+            back.state
+        );
+        assert_eq!(
+            scheduler_places(&cluster, &pinned),
+            vec!["n1".to_string()],
+            "clearing the reason without returning the node to candidacy is still lost capacity"
+        );
+    }
+
+    // Draining a node stops its dispatches and silences its asks, closing every
+    // trigger that would take the cut the hold comes off for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_node_is_pulled_again_long_before_the_sweep() {
+        assert!(
+            crate::scheduler_loop::HELD_NODE_RECHECK_INTERVAL
+                < crate::scheduler_loop::LEDGER_SWEEP_INTERVAL,
+            "a recheck no sooner than the sweep leaves a stale hold standing for the sweep's period"
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        register_a_node(&cluster, "n2");
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![
+                    (7, 1, spur_core::job::LedgerDisposition::Held),
+                    (99, 1, spur_core::job::LedgerDisposition::Unresolved),
+                ],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+        await_node_reason(&svc, "n1", &unresolved_reason("99")).await;
+
+        crate::scheduler_loop::recheck_nodes_held_for_unresolved_claims(&cluster).await;
+
+        assert!(
+            !cluster.claim_ledger_pull_slot("n1"),
+            "the held node's slot must be spent, or nothing went and asked it"
+        );
+        assert!(
+            cluster.claim_ledger_pull_slot("n2"),
+            "a node under no hold of ours must be left for its own triggers"
         );
     }
 
