@@ -1037,14 +1037,24 @@ async fn teardown_completed_job(
         job_id,
         completed.run_attempt,
     ));
-    // The slice is NOT freed here. Cleanup finishing is not the controller
-    // having committed the completion, and only that frees it.
-    let _ = allocation;
     // Marked, not removed: the record is the evidence a later reconcile reads,
     // and the sweep collects it once nothing is still owed.
     if let Some(run) = named_run(job_id, completed.run_attempt) {
         if let Err(error) = admissions.mark_run_cleaned(run, epilog) {
             warn!(job_id, %error, "failed to settle the admission record after teardown");
+        } else {
+            // The durable write succeeded, so the record now says `Cleaned`. Free
+            // the in-memory slice: the cores are idle and a restart would skip
+            // re-charging them. The record stays on disk until an ack clears it.
+            let warrant = ReleaseWarrant::teardown_complete(run);
+            let released = allocation.lock().await.release_job(warrant);
+            if released {
+                info!(
+                    job_id,
+                    run_attempt = completed.run_attempt,
+                    "freed slice on teardown"
+                );
+            }
         }
     }
     cleanup_completed_job_mpi(job_id, &completed.mpi, mpi_host).await;
@@ -4181,14 +4191,18 @@ impl AgentService {
                 self.gather_run_evidence(admitted, descriptors, &store, boot_id.as_deref());
             let disposition = crate::admission::classify_run(&evidence);
 
-            // Every disposition holds, but a slice already handed back does not:
-            // re-charging one takes a core from whatever the node gave it to.
-            if run.slice_released {
+            // A slice already handed back, or one whose teardown finished: neither
+            // should re-charge. A `Cleaned` record says the cores are idle.
+            let skip_charge =
+                run.slice_released || run.state == crate::admission::RunState::Cleaned;
+            if skip_charge {
                 tracing::debug!(
                     job_id = run.job_id,
                     run_attempt = run.run_attempt,
                     ?disposition,
-                    "an admitted run's slice was already released; not re-charging it"
+                    slice_released = run.slice_released,
+                    cleaned = run.state == crate::admission::RunState::Cleaned,
+                    "an admitted run's slice is free; not re-charging it"
                 );
             } else {
                 // The recorded slice is exact, so this does not under-count the
@@ -5228,8 +5242,8 @@ pub(crate) enum ReleaseOutcome {
     NotDue,
 }
 
-/// Free a run's slice, now that the controller has committed its completion.
-/// This is the only path that frees one: an exit alone never does.
+/// Free a run's slice after the controller has committed its completion.
+/// Teardown also frees the slice; this path handles the ack-driven release.
 async fn release_acknowledged_allocation(
     allocation: &Arc<Mutex<NodeAllocation>>,
     admissions: &crate::admission::AdmissionStore,
@@ -20279,6 +20293,72 @@ mod tests {
         assert!(
             run.conflict_hold.is_none(),
             "the hold is what kept asking for a reconcile that never resolved"
+        );
+    }
+
+    // Teardown finishing must free the in-memory slice immediately, so cores
+    // become schedulable without waiting for an ack. The record stays on disk.
+    #[tokio::test]
+    async fn teardown_frees_the_slice_immediately() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        let before_charge = svc.allocation.lock().await.free_cpus();
+        charge_a_slice(&svc, 7).await;
+        let while_held = svc.allocation.lock().await.free_cpus();
+        assert!(while_held < before_charge, "the charge took cores");
+
+        tear_down_a_finished_run(&svc, 7, state.path()).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            before_charge,
+            "teardown must free the in-memory slice, so cores are schedulable"
+        );
+        let run = admissions
+            .load_run(key(7, 1))
+            .expect("record survives teardown");
+        assert_eq!(
+            run.state,
+            crate::admission::RunState::Cleaned,
+            "the durable record says Cleaned"
+        );
+        assert!(
+            !run.slice_released,
+            "slice_released stays false until a real ack"
+        );
+    }
+
+    // A restart must not re-charge a run whose teardown finished. The record
+    // says Cleaned, so the cores are physically idle.
+    #[tokio::test]
+    async fn a_restart_skips_cleaned_runs() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+
+        let mut run = crate::admission::RunAdmission::new(
+            42,
+            1,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources {
+                cpu_ids: vec![0, 1],
+                memory_mb: 1_000,
+                gpu_devices: Vec::new(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        run.state = crate::admission::RunState::Cleaned;
+        admissions.admit_run(&run).expect("admit");
+
+        let before = svc.allocation.lock().await.free_cpus();
+        svc.replay_admitted_allocations(&[]).await;
+        let after = svc.allocation.lock().await.free_cpus();
+
+        assert_eq!(
+            after, before,
+            "a Cleaned record must not re-charge on restart"
         );
     }
 
