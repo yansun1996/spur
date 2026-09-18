@@ -73,7 +73,10 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
     // survives it and keeps working on a slice the drop has already released.
     cmd.stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        // Its own group, so abandoning the wait can signal the hook's whole tree
+        // without reaching the supervisor whose group it would otherwise share.
+        .process_group(0);
     let child = spawn_hook_in_work_dir(&mut cmd, &ctx.work_dir, ctx.job_id, &ctx.script_context)
         .with_context(|| {
             format!(
@@ -82,10 +85,14 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
             )
         })?;
 
+    let mut group = HookProcessGroup::of(&child);
     let output = child
         .wait_with_output()
         .await
         .with_context(|| format!("{} script failed to complete", ctx.script_context))?;
+    if let Some(group) = group.as_mut() {
+        group.disarm();
+    }
 
     if !output.stderr.is_empty() {
         let stderr_text = String::from_utf8_lossy(&output.stderr);
@@ -108,6 +115,38 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
     }
 
     Ok(())
+}
+
+/// Kills the hook's process group when the wait for it was abandoned.
+/// `kill_on_drop` reaches the direct child only, so anything the hook spawned —
+/// the shape a real epilog has — would outlive the bound that released the slice.
+struct HookProcessGroup {
+    pgid: nix::unistd::Pid,
+    armed: bool,
+}
+
+impl HookProcessGroup {
+    /// `process_group(0)` makes the hook its own group leader, so its pid names
+    /// the group. A child with no pid has already been reaped by someone else.
+    fn of(child: &tokio::process::Child) -> Option<Self> {
+        child.id().map(|pid| Self {
+            pgid: nix::unistd::Pid::from_raw(pid as i32),
+            armed: true,
+        })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for HookProcessGroup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = nix::sys::signal::killpg(self.pgid, nix::sys::signal::Signal::SIGKILL);
+    }
 }
 
 /// Context for the job-submission hook. Feeds env twins and the audit line;
@@ -676,6 +715,61 @@ mod tests {
             cpus: 8,
             memory_mb: 16384,
         }
+    }
+
+    fn pid_is_alive(pid: nix::unistd::Pid) -> bool {
+        nix::sys::signal::kill(pid, None).is_ok()
+    }
+
+    /// Blocks until the script has published its child's pid, so a dead
+    /// grandchild below can only be the abandoned wait's doing.
+    async fn published_pid(path: &std::path::Path) -> nix::unistd::Pid {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    return nix::unistd::Pid::from_raw(pid);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    // The shape a real epilog has: it spawns the work. Abandoning the wait has to
+    // reach that work, not just the script that started it.
+    #[tokio::test]
+    #[serial(run_hooks)]
+    async fn abandoning_a_hook_kills_what_the_hook_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("spawned.pid");
+        let script = make_script(&format!(
+            "sleep 300 &\necho $! > {}\nwait\n",
+            pidfile.display()
+        ));
+        let ctx = test_ctx();
+        let path = script.to_str().unwrap().to_string();
+
+        let mut hook = Box::pin(run_hook(&path, &ctx));
+        let spawned = tokio::select! {
+            _ = &mut hook => panic!("the hook waits on its child and cannot return here"),
+            pid = published_pid(&pidfile) => pid,
+        };
+        assert!(pid_is_alive(spawned), "the hook's child must be running");
+
+        drop(hook);
+
+        let mut alive = true;
+        for _ in 0..500 {
+            if !pid_is_alive(spawned) {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let _ = nix::sys::signal::kill(spawned, nix::sys::signal::Signal::SIGKILL);
+        assert!(
+            !alive,
+            "a hook's child outlived the abandoned wait and still stands on the slice"
+        );
     }
 
     #[tokio::test]
