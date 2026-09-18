@@ -5625,10 +5625,13 @@ fn job_to_proto(job: &spur_core::job::Job) -> JobInfo {
             nanos: 0,
         }),
         requeue: job.spec.requeue,
+        // Every requeue the job actually took, whatever it was charged for: a
+        // spared one still restarted the job, which is what Slurm reports here.
         restarts: job
             .requeue_count
             .saturating_add(job.preempt_requeue_count)
-            .saturating_add(job.user_requeue_count),
+            .saturating_add(job.user_requeue_count)
+            .saturating_add(job.spared_requeue_count),
         // srun and salloc synthesize a script too, so its presence alone does not
         // mean the batch submission Slurm's flag denotes.
         batch_flag: job.spec.script.is_some() && !job.spec.srun_job && !job.spec.interactive,

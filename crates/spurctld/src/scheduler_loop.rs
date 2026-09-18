@@ -1801,9 +1801,8 @@ enum DispatchConfirmOutcome {
     /// The placement this dispatch charged is still held, so the caller gives
     /// it up.
     Aborted,
-    /// Aborted after the backoff that frees the placement was already proposed.
-    /// Giving it up again proposes a second one and both apply, so a single
-    /// failure spends two of the job's retries — and spares neither.
+    /// Aborted with the backoff already proposed. A second one also applies, so
+    /// one failure would spend two retries.
     AbortedAndSettled,
 }
 
@@ -5213,9 +5212,8 @@ mod tests {
             );
         }
 
-        /// A conflicted node pinned by `--nodelist`: the shape with the fewest
-        /// brakes left on it, since a pinned job is exempt from the node
-        /// dispatch cooldown and this agent's ledger names no claim to drain on.
+        /// A conflicted node pinned by `--nodelist`: no cooldown, and a ledger
+        /// that names no claim to drain on.
         async fn a_job_pinned_to_a_refusing_node(
             cm: &Arc<ClusterManager>,
             name: &str,
@@ -5285,11 +5283,8 @@ mod tests {
             }
         }
 
-        // The terminator behind the exemption. A pinned job against a node no
-        // drain ever takes out of candidacy would retry at the floor forever if
-        // the exemption were unbounded, so the exemption is bounded: the hold
-        // grows with every spared refusal, and past a budget's worth of them the
-        // job is charged again and ends up parked for an operator.
+        // The terminator: with no drain to end it, only the bound stops a pinned
+        // job retrying at the floor forever.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn a_standing_conflict_stops_retrying_even_though_nothing_drains_the_node() {
             let dir = TempDir::new().unwrap();

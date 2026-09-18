@@ -591,11 +591,8 @@ pub(crate) enum RequeueCharge {
     Spared,
 }
 
-/// What a dispatch-failure backoff left the placement the job had reserved in.
-/// Only the backoff's own apply frees it, so a caller that is told
-/// [`StillHeld`](PlacementDisposition::StillHeld) still owns giving it up —
-/// and one told [`Released`](PlacementDisposition::Released) must not, or the
-/// second release charges the job a second retry for one failure.
+/// Whether the backoff's own apply freed the placement. Giving up a released
+/// one again charges the job a second retry for a single failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PlacementDisposition {
     Released,
@@ -2653,10 +2650,8 @@ impl ClusterManager {
                 // failed confirmation and this call — nothing to back off.
                 return Ok(PlacementDisposition::StillHeld);
             }
-            // The exemption is generous, not unlimited: a job that has already
-            // ridden out a whole budget's worth of refusals it did not cause is
-            // facing drift no retry will clear, and pays from here on so that it
-            // still reaches the hold an operator can see.
+            // Bounded, so drift no retry can clear still reaches the hold an
+            // operator sees.
             let spare = charge == RequeueCharge::Spared && job.spared_requeue_count < max_requeue;
             if !spare && job.requeue_count >= max_requeue {
                 drop(jobs);

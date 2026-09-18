@@ -907,10 +907,8 @@ pub struct Job {
     /// toward `max_batch_requeue`.
     #[serde(default)]
     pub user_requeue_count: u32,
-    /// Number of dispatch refusals this job was not charged for, because the
-    /// node refused work it already held. Paces the launch backoff like a real
-    /// requeue does, and bounds the exemption: past `max_batch_requeue` spared
-    /// refusals the job is charged again, so a standing conflict still ends.
+    /// Refusals the job was not charged for. Paces the backoff like a real
+    /// requeue, and past `max_batch_requeue` the exemption stops.
     #[serde(default)]
     pub spared_requeue_count: u32,
 
@@ -2864,5 +2862,18 @@ mod tests {
             },
         );
         assert_eq!(job.eligible_time(), job.submit_time);
+    }
+
+    // A snapshot written before `spared_requeue_count` existed. Frozen on
+    // purpose: never regenerate it, or it stops answering for the old shape.
+    #[test]
+    fn a_pre_upgrade_job_snapshot_loads_with_no_spared_requeues() {
+        let frozen = r#"{"actual_stderr_path":null,"actual_stdout_path":null,"allocated_nodes":[],"allocated_resources":null,"bb_stage_state":"NONE","derived_exit_code":0,"end_time":null,"epilog_gated_nodes":[],"exit_code":null,"exit_signal":0,"het_group":null,"het_job_id":null,"job_id":7,"launch_failure_detail":null,"node_completions":{},"pending_reason":"None","per_node_alloc":{},"preempt_mode":null,"preempt_qos":null,"preempt_requeue_count":0,"preempted_by":null,"priority":1000,"requeue_count":0,"run_attempt":0,"spec":{"account":null,"argv":[],"array_job_id":null,"array_max_concurrent":null,"array_spec":null,"array_task_id":null,"begin_time":null,"burst_buffer":null,"comment":null,"constraint":null,"container_entrypoint":null,"container_env":{},"container_image":null,"container_mount_home":false,"container_mounts":[],"container_name":null,"container_readonly":false,"container_remap_root":false,"container_workdir":null,"cpus_per_task":1,"deadline":null,"dependency":[],"distribution":null,"environment":{},"exclude":null,"exclusive":false,"extra_resources":{},"gid":0,"gpus":null,"gpus_per_node":null,"gpus_per_task":null,"gres":[],"het_group":null,"hold":false,"host_ipc":false,"host_network":false,"interactive":false,"mail_type":[],"mail_user":null,"memory_per_cpu_mb":null,"memory_per_node_mb":null,"mpi":null,"name":"","nodelist":null,"num_nodes":1,"num_tasks":1,"open_mode":null,"partition":null,"priority":null,"privileged":false,"pty":false,"qos":null,"requeue":false,"reservation":null,"script":null,"script_args":[],"shm_size":null,"spread_job":false,"srun_job":false,"stderr_path":null,"stdin_path":null,"stdout_path":null,"submit_line":null,"tasks_per_node":null,"time_limit":null,"time_min":null,"topology":null,"uid":0,"user":"","wckey":null,"work_dir":"/tmp"},"srun_step_dispatch":false,"start_time":null,"state":"PENDING","submit_time":"2026-09-18T08:14:59.171480061Z","suspended_at":null,"suspended_secs":0,"time_limit_signaled_at":null,"user_requeue_count":0}"#;
+        let job: Job = serde_json::from_str(frozen).expect("an old snapshot must still load");
+        assert_eq!(job.job_id, 7);
+        assert_eq!(
+            job.spared_requeue_count, 0,
+            "a job written before the exemption existed was never spared one"
+        );
     }
 }
