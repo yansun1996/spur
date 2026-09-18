@@ -850,6 +850,7 @@ impl ControllerService {
     /// Admin bar for an operation that can end running work, on a cluster that may authenticate
     /// nobody. A verified identity settles it; failing that the client's own word does, which is
     /// an operator-error guard and not a boundary — the same trade `is_k0s_admin` documents.
+    /// A cluster that names no admins at all bars nobody, for the reason `is_k0s_admin` keeps `root`.
     #[allow(clippy::result_large_err)]
     fn require_admin_by_assertion<T>(
         &self,
@@ -857,12 +858,16 @@ impl ControllerService {
         asserted: &str,
         op: &str,
     ) -> Result<(), Status> {
+        let cache = self.cluster.association_cache();
         let allowed = match Self::verified_identity(request) {
             Some(identity) => self.caller_is_admin(Some(identity)),
             // Empty is refused rather than waved through: the field is client-supplied, so
             // treating "unset" as admin would make the check bypassable by omitting it.
             None => {
-                !asserted.is_empty() && is_k0s_admin(self.cluster.association_cache(), asserted)
+                !asserted.is_empty()
+                    // A cluster that names no admins cannot have a caller prove admin-ness, and
+                    // refusing everyone there breaks a working operator workflow.
+                    && (is_k0s_admin(cache, asserted) || !cache.names_any_admin())
             }
         };
         if allowed {
@@ -6541,16 +6546,47 @@ mod tests {
             allowed(None, "root"),
             "refusing here would leave a no-auth cluster unable to reconcile at all"
         );
-        assert!(!allowed(None, "bob"));
+        assert!(
+            allowed(None, "bob"),
+            "a cluster that names no admins cannot ask bob to prove he is one"
+        );
         assert!(
             !allowed(None, ""),
             "an omitted caller must not be admin, or the check is bypassable by omission"
+        );
+
+        // Once the cluster does name admins the bar is real again, so the widening
+        // above cannot be read as "the assertion path never refuses anyone".
+        svc.cluster
+            .association_cache()
+            .insert_admin_level("carol", "Admin");
+        assert!(allowed(None, "carol"));
+        assert!(allowed(None, "root"));
+        assert!(
+            !allowed(None, "bob"),
+            "a named non-admin must be refused once the cluster has admins to name"
         );
 
         assert!(
             svc.require_admin(&req(None), "update node").is_ok(),
             "the ordinary node update must keep accepting an unnamed caller"
         );
+    }
+
+    #[test]
+    fn a_cluster_names_an_admin_only_once_accounting_says_so() {
+        let cache = crate::association_cache::AssociationCache::new();
+        assert!(
+            !cache.names_any_admin(),
+            "accounting off names nobody, so nobody can be asked to prove admin-ness"
+        );
+        cache.insert_admin_level("dave", "Operator");
+        assert!(
+            !cache.names_any_admin(),
+            "Operator is not admin; a cluster with only operators still names no admin"
+        );
+        cache.insert_admin_level("carol", "Admin");
+        assert!(cache.names_any_admin());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

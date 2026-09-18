@@ -82,27 +82,50 @@ class TestOperatorReconcile:
         for job_id in job_ids:
             cluster.scancel(str(job_id))
 
-    # The authz bar must hold on a cluster that authenticates nobody, without
-    # locking its operators out — see the root case in the tests above.
-    def test_a_non_admin_is_refused_on_a_cluster_with_no_authentication(self, cluster):
-        submit_user = cluster.nodes[0].user
-        if submit_user == "root":
-            pytest.skip("need a non-root SSH user to test non-admin rejection")
-        probe = cluster.cli_as_user("root", ["scontrol", "show", "config"])
-        if "sudo" in probe.lower() and (
-            "password" in probe.lower() or "not allowed" in probe.lower()
-        ):
-            pytest.skip(f"sudo -u unavailable in this environment: {probe.strip()}")
-
+    # A cluster that authenticates nobody and names no admins cannot ask anyone
+    # to prove admin-ness; barring everyone there locks its operators out.
+    def test_a_named_caller_may_reconcile_where_the_cluster_names_no_admins(
+        self, cluster
+    ):
         node = cluster.node_names[0]
         before = ledger_pulls(cluster)
-        out = cluster.cli_as_user(
-            submit_user,
-            ["scontrol", "update", f"NodeName={node}", "Reconcile=yes"],
+
+        code, out = reconcile(cluster, node)
+        assert code == 0, (
+            f"a no-auth, no-accounting cluster must not bar its own operator:\n{out}"
         )
-        assert "requires cluster admin" in out.lower(), (
-            f"a non-admin reconcile must be denied even with auth off: {out}"
+        wait_until(
+            lambda: ledger_pulls(cluster) > before,
+            f"node {node} never answered the ledger pull of a permitted reconcile",
         )
+
+    def test_a_non_admin_is_refused_once_accounting_names_an_admin(
+        self, accounting_cluster
+    ):
+        cluster = accounting_cluster
+        if cluster.nodes[0].user == "root":
+            pytest.skip("root is always an admin; need a non-root SSH user")
+
+        cluster.sacctmgr(
+            ["add", "account", "name=recacct", "description=Reconcile"]
+        )
+        cluster.sacctmgr(
+            ["add", "user", "name=e2e-rec-admin", "account=recacct",
+             "adminlevel=Admin"]
+        )
+
+        node = cluster.node_names[0]
+        # The association cache refreshes on a timer, so the refusal is what
+        # proves it has picked the admin up; polling for it is not a race.
+        wait_until(
+            lambda: reconcile(cluster, node)[0] != 0,
+            "a non-admin was never refused even though accounting names an admin",
+            timeout=90,
+        )
+
+        before = ledger_pulls(cluster)
+        code, out = reconcile(cluster, node)
+        assert code != 0 and "requires cluster admin" in out.lower(), out
         assert ledger_pulls(cluster) == before, (
             "a refused reconcile must not reach the node"
         )
