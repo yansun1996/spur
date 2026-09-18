@@ -30,6 +30,10 @@ pub enum ReleaseGround {
     /// The controller dispatched a newer attempt onto this job id, and that
     /// dispatch is the decision which ends the attempt being displaced.
     SupersededByNewerAttempt,
+    /// Teardown finished: the run's processes are gone and local cleanup is
+    /// done. The record still exists (state `Cleaned`) until an ack clears it,
+    /// but the cores are physically idle and may be re-used.
+    TeardownComplete,
 }
 
 /// Licence to hand a run's slice back. Deliberately not `Clone` and built only
@@ -83,6 +87,15 @@ impl ReleaseWarrant {
         }
     }
 
+    /// Teardown finished and the record is durably marked `Cleaned`. Mint this
+    /// only after the fsync succeeds, so a crash re-charges nothing.
+    pub fn teardown_complete(run: RunKey) -> Self {
+        Self {
+            run,
+            ground: ReleaseGround::TeardownComplete,
+        }
+    }
+
     pub fn run(&self) -> RunKey {
         self.run
     }
@@ -100,6 +113,7 @@ impl std::fmt::Display for ReleaseGround {
             Self::NeverSpawned => f.write_str("never spawned"),
             Self::SettledUnrecordedClaim => f.write_str("settled an unrecorded claim"),
             Self::SupersededByNewerAttempt => f.write_str("superseded by a newer attempt"),
+            Self::TeardownComplete => f.write_str("teardown complete"),
         }
     }
 }
