@@ -69,7 +69,11 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
     for (k, v) in env.into_map() {
         cmd.env(k, v);
     }
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    // A caller that bounds this hook drops the future; without this the child
+    // survives it and keeps working on a slice the drop has already released.
+    cmd.stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
     let child = spawn_hook_in_work_dir(&mut cmd, &ctx.work_dir, ctx.job_id, &ctx.script_context)
         .with_context(|| {
             format!(
