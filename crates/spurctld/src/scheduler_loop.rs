@@ -5854,7 +5854,14 @@ mod tests {
                 !started,
                 "a plain batch job must not start if its only node can't be reached"
             );
-            assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            // One failure, one retry. Two backoffs used to apply per failure, which
+            // quietly halved every cluster's `max_batch_requeue`.
+            assert_eq!(
+                job.requeue_count, 1,
+                "a single dispatch failure must spend exactly one retry"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
