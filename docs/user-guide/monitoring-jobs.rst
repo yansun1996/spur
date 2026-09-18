@@ -1085,7 +1085,11 @@ The reconcile a node runs as part of registering gates that node: it reports a
 reason of ``reconciling with the controller`` and accepts no new work until the
 comparison completes. A controller still replaying its own log waits up to ten
 seconds for that before comparing anything, and that pass as a whole is capped
-at a minute, after which the node is let back in regardless.
+at a minute, after which the node is let back in regardless. Only the pass that
+set a gate clears it, so a controller taking over releases any gate it finds
+still standing: a term that did not open those passes cannot finish them, and a
+node left gated by a leader that died would otherwise stay out of the cluster
+until its agent restarted.
 
 ``Reconcile=yes`` is not gated that way. The node stays schedulable throughout,
 and the command blocks until the comparison finishes rather than returning

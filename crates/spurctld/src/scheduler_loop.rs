@@ -99,6 +99,15 @@ pub(crate) fn relinquish_leadership(
     scheduler.clear_outcomes();
 }
 
+/// Take over everything the previous leader may have left half-done. Runs before this
+/// term places anything, so what it rebuilds is what the placement then reads.
+pub(crate) fn assume_leadership(cluster: &Arc<ClusterManager>) {
+    // Totals were maintained across an unknown replay history; rebuild them from
+    // the job records first, since everything after this reasons against them.
+    cluster.recompute_node_allocations();
+    cluster.release_stranded_reconcile_gates();
+}
+
 /// Spawn the time-limit enforcement watchdog and power manager alongside the scheduler loop.
 pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     let enforcer_cluster = cluster.clone();
@@ -190,10 +199,8 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
             continue;
         }
 
-        // A promoted follower's totals were maintained across an unknown replay
-        // history; rebuild from the job records before this term's placements.
         if entering_term {
-            cluster.recompute_node_allocations();
+            assume_leadership(&cluster);
             let pull_cluster = cluster.clone();
             tokio::spawn(async move {
                 pull_all_node_ledgers(&pull_cluster, "leadership gain").await;

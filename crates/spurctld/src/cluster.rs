@@ -6011,6 +6011,23 @@ impl ClusterManager {
         }
     }
 
+    /// Release every reconcile gate left standing. Only the pass that set one clears it, so a
+    /// leader that died mid-reconcile leaves its nodes unschedulable until their agents restart.
+    /// A term that did not open those passes cannot finish them either, so it hands the gates back.
+    pub fn release_stranded_reconcile_gates(&self) {
+        let gated: Vec<String> = self
+            .nodes
+            .read()
+            .values()
+            .filter(|node| node.reconcile_pending)
+            .map(|node| node.name.clone())
+            .collect();
+        for name in gated {
+            warn!(node = %name, "releasing a reconcile gate left over from an earlier term");
+            self.set_reconcile_pending(&name, false);
+        }
+    }
+
     /// The launches this controller currently has on the wire.
     pub(crate) fn dispatch_tracker(&self) -> &Arc<crate::dispatch_tracker::DispatchTracker> {
         &self.dispatch_tracker
@@ -22749,6 +22766,34 @@ mod tests {
         cm.set_reconcile_pending("n1", false);
         wait_for("released", || !cm.get_node("n1").unwrap().reconcile_pending);
         assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn taking_over_releases_a_gate_the_previous_leader_left_standing() {
+        // Only the pass that set a gate clears it, so a leader that died mid-reconcile
+        // takes its nodes out of the cluster until their agents restart.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        cm.set_reconcile_pending("n1", true);
+        wait_for("gated", || cm.get_node("n1").unwrap().reconcile_pending);
+        assert!(!cm.get_node("n1").unwrap().is_schedulable());
+        let n2_before = cm.get_node("n2").unwrap();
+
+        crate::scheduler_loop::assume_leadership(&cm);
+
+        wait_for("released", || !cm.get_node("n1").unwrap().reconcile_pending);
+        assert!(
+            cm.get_node("n1").unwrap().is_schedulable(),
+            "a node held by a term that ended must be scheduled again"
+        );
+        let n2_after = cm.get_node("n2").unwrap();
+        assert_eq!(
+            (n2_after.state, n2_after.reconcile_pending),
+            (n2_before.state, n2_before.reconcile_pending),
+            "a node that was never gated must not be rewritten by the sweep"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
