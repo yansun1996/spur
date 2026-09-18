@@ -2013,18 +2013,32 @@ fn an_exit_is_still_on_disk(
     })
 }
 
+/// Read every run's record off the runtime's worker threads. A scan plus a read
+/// per run is real blocking I/O, and the callers below are on 2-second loops.
+async fn load_admitted_runs(
+    admissions: &crate::admission::AdmissionStore,
+) -> Vec<crate::admission::AdmittedRun> {
+    let store = admissions.clone();
+    match tokio::task::spawn_blocking(move || store.load_all()).await {
+        Ok(Ok(loaded)) => loaded.runs,
+        Ok(Err(error)) => {
+            warn!(%error, "could not read the admission records");
+            Vec::new()
+        }
+        Err(error) => {
+            warn!(%error, "admission record read task failed");
+            Vec::new()
+        }
+    }
+}
+
 /// Runs no session is left to speak for; without this nothing ever asks, and the
 /// record charges the node's cores for good.
 fn runs_nothing_can_speak_for(
     store: &crate::stepd::StepdStore,
-    admissions: &crate::admission::AdmissionStore,
+    runs: Vec<crate::admission::AdmittedRun>,
 ) -> Vec<crate::admission::AdmittedRun> {
-    let Ok(loaded) = admissions.load_all() else {
-        return Vec::new();
-    };
-    loaded
-        .runs
-        .into_iter()
+    runs.into_iter()
         .filter(|admitted| {
             !admitted.run.controller_ack.is_given()
                 && admitted.owes_a_report()
@@ -2043,7 +2057,8 @@ async fn report_runs_nothing_can_speak_for(
     controller_addr: &str,
     reporting_node: &str,
 ) {
-    for admitted in runs_nothing_can_speak_for(store, admissions) {
+    let runs = load_admitted_runs(admissions).await;
+    for admitted in runs_nothing_can_speak_for(store, runs) {
         let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
         let (Some(run), Some(step_id)) = (admitted.run.key(), admitted.lifecycle_step()) else {
             continue;
@@ -4288,14 +4303,23 @@ impl AgentService {
                         )
                     };
                     drop(jobs);
+                    // One scan for all three: each re-reads the record it acts on
+                    // under its own gate, so this only has to enumerate.
+                    let admitted_runs = load_admitted_runs(&admissions).await;
                     // Strictly before the two sweeps below, which read the record
                     // this writes to decide whether a hook still holds the cores.
-                    resolve_supervised_epilogs(&stepd_store, &admissions, &mut epilog_held_since)
-                        .await;
+                    resolve_supervised_epilogs(
+                        &admitted_runs,
+                        &stepd_store,
+                        &admissions,
+                        &mut epilog_held_since,
+                    )
+                    .await;
                     // Record-driven, so a report path that records an
                     // acknowledgement without releasing cannot strand a slice.
-                    settle_cancelled_runs(&lifecycle, &allocation, &admissions).await;
-                    release_due_allocations(&allocation, &admissions).await;
+                    settle_cancelled_runs(&admitted_runs, &lifecycle, &allocation, &admissions)
+                        .await;
+                    release_due_allocations(&admitted_runs, &allocation, &admissions).await;
                     flag_unbacked_allocations(&unbacked, &admissions).await;
                     // Strictly after the releases above: collecting a record
                     // before its slice is freed destroys the instruction to free it.
@@ -4456,14 +4480,12 @@ async fn flag_unbacked_allocations(
 /// Settle runs the controller cancelled, once their teardown has finished. A
 /// completion for a run it has forgotten is never acknowledged, so nothing frees it.
 async fn settle_cancelled_runs(
+    runs: &[crate::admission::AdmittedRun],
     lifecycle: &crate::job_lifecycle::JobLifecycle,
     allocation: &Arc<Mutex<NodeAllocation>>,
     admissions: &crate::admission::AdmissionStore,
 ) {
-    let Ok(loaded) = admissions.load_all() else {
-        return;
-    };
-    for admitted in loaded.runs {
+    for admitted in runs {
         let run = &admitted.run;
         if !run.cancelled_by_controller
             || run.state != crate::admission::RunState::Cleaned
@@ -4494,13 +4516,11 @@ async fn settle_cancelled_runs(
 /// Free every run the records say is due. Record-driven and idempotent, so a
 /// report that acknowledges without releasing cannot strand a slice.
 async fn release_due_allocations(
+    runs: &[crate::admission::AdmittedRun],
     allocation: &Arc<Mutex<NodeAllocation>>,
     admissions: &crate::admission::AdmissionStore,
 ) {
-    let Ok(loaded) = admissions.load_all() else {
-        return;
-    };
-    for admitted in loaded.runs {
+    for admitted in runs {
         let (Some(run), Some(step_id)) = (admitted.run.key(), admitted.lifecycle_step()) else {
             continue;
         };
@@ -4861,15 +4881,13 @@ fn epilog_hold_is_worth_saying<K: std::hash::Hash + Eq>(
 /// Mirror each in-flight epilog's outcome from the supervisor's own ledger into
 /// the record the gate reads. The hook's owner writes it, so a cancel cannot.
 async fn resolve_supervised_epilogs(
+    runs: &[crate::admission::AdmittedRun],
     store: &crate::stepd::StepdStore,
     admissions: &crate::admission::AdmissionStore,
     held_since: &mut HashMap<RunKey, std::time::Instant>,
 ) {
-    let Ok(loaded) = admissions.load_all() else {
-        return;
-    };
     let mut still_held = HashSet::new();
-    for admitted in loaded.runs {
+    for admitted in runs {
         if !admitted.run.cleanup.epilog.is_in_flight() {
             continue;
         }
@@ -4879,7 +4897,7 @@ async fn resolve_supervised_epilogs(
         let (job_id, run_attempt) = (admitted.run.job_id, admitted.run.run_attempt);
         // No owner was ever named, so no ledger can answer for the hook. The
         // hold ends at the restart that proves the owner did not survive.
-        let Some(step_id) = hook_owner_step(&admitted) else {
+        let Some(step_id) = hook_owner_step(admitted) else {
             still_held.insert(run);
             if epilog_hold_is_worth_saying(held_since, run) {
                 warn!(
@@ -4893,7 +4911,7 @@ async fn resolve_supervised_epilogs(
             Ok(Some(failed)) => epilog_outcome(failed),
             // Nothing the ledger can be read as; only proof the owner is gone
             // may settle it, never the wait itself.
-            Ok(None) if recorded_supervisor_liveness(&admitted) == Liveness::Gone => {
+            Ok(None) if recorded_supervisor_liveness(admitted) == Liveness::Gone => {
                 warn!(
                     job_id,
                     run_attempt, "settling an epilog whose supervisor is gone"
@@ -4912,7 +4930,7 @@ async fn resolve_supervised_epilogs(
             }
             // A ledger that cannot be read is never proof the hook ended, but a
             // hold it takes must still end when nothing is left to end it.
-            Err(error) if recorded_supervisor_liveness(&admitted) == Liveness::Gone => {
+            Err(error) if recorded_supervisor_liveness(admitted) == Liveness::Gone => {
                 warn!(job_id, run_attempt, %error,
                     "settling an unreadable epilog whose supervisor is gone");
                 crate::admission::HookState::Unknown
@@ -17424,7 +17442,12 @@ mod tests {
 
         // The controller is unreachable, so the report stays owed.
         collect_settled_admissions(&svc.allocation, &admissions).await;
-        release_due_allocations(&svc.allocation, &admissions).await;
+        release_due_allocations(
+            &load_admitted_runs(&admissions).await,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
         assert!(
             admissions.load_run(key(77, 1)).is_ok(),
             "an owed report must keep its record"
@@ -17454,7 +17477,12 @@ mod tests {
         );
 
         // The record-driven safety net finds nothing left to do, and collects.
-        release_due_allocations(&svc.allocation, &admissions).await;
+        release_due_allocations(
+            &load_admitted_runs(&admissions).await,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
         collect_settled_admissions(&svc.allocation, &admissions).await;
         assert!(
             admissions.load_run(key(77, 1)).is_err(),
@@ -18938,7 +18966,13 @@ mod tests {
         .await
         .expect("cancel");
 
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
             while_held,
@@ -18950,7 +18984,13 @@ mod tests {
         admissions
             .mark_run_cleaned(key(7, 1), crate::admission::EpilogOwed::No)
             .expect("cleaned");
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -20263,7 +20303,13 @@ mod tests {
             .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: true })
             .expect("record the epilog");
 
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
         assert_eq!(
             admissions
                 .load_run(key(53, 1))
@@ -20272,7 +20318,13 @@ mod tests {
                 .epilog,
             crate::admission::HookState::Failed
         );
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -20317,13 +20369,57 @@ mod tests {
             .obligations(55, 1, spur_core::step::STEP_BATCH)
             .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
             .expect("record the epilog");
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
             while_held + 2,
             "the slice comes back on the supervisor's own word"
+        );
+    }
+
+    // The tick scans the records once and hands the same snapshot to every sweep,
+    // so a sweep that trusted the scan would hold a slice a whole tick too long.
+    #[tokio::test]
+    async fn a_cancelled_run_settles_on_an_epilog_that_landed_after_the_scan() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_epilog(state.path()).await;
+        let admissions = svc.admissions();
+        let while_held = a_cancellable_supervised_run(&svc, 57, a_live_supervisor()).await;
+        svc.drop_tracked_job(57, 1).await;
+
+        let scanned = load_admitted_runs(&admissions).await;
+        assert!(
+            scanned
+                .iter()
+                .any(|admitted| admitted.run.job_id == 57
+                    && admitted.run.cleanup.epilog.is_in_flight()),
+            "the scan has to predate the epilog for this to test anything"
+        );
+
+        admissions
+            .record_epilog(key(57, 1), crate::admission::HookState::Succeeded)
+            .expect("record the epilog");
+
+        settle_cancelled_runs(&scanned, &svc.lifecycle, &svc.allocation, &admissions).await;
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "the gate reads the record, not the scan that predates it"
         );
     }
 
@@ -20347,7 +20443,13 @@ mod tests {
         admissions
             .settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart)
             .expect("settle the hooks of a previous agent");
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -20369,7 +20471,13 @@ mod tests {
         admissions
             .settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart)
             .expect("sweep the hooks of a previous agent");
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             admissions
@@ -20448,7 +20556,13 @@ mod tests {
         admissions
             .settle_hooks_whose_owner_is_gone(hook_owner_did_not_survive_restart)
             .expect("sweep the hooks of a previous agent");
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -20608,8 +20722,19 @@ mod tests {
         obligations
             .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
             .expect("record the finished epilog");
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
-        release_due_allocations(&svc.allocation, &admissions).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
+        release_due_allocations(
+            &load_admitted_runs(&admissions).await,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -20721,7 +20846,13 @@ mod tests {
             spur_core::step::STEP_BATCH,
             Some(a_live_supervisor()),
         );
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -20873,8 +21004,20 @@ mod tests {
             .obligations(62, 1, 0)
             .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
             .expect("record the step's epilog");
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -20911,8 +21054,20 @@ mod tests {
         contents.insert_str(0, "{not json\n");
         std::fs::write(&path, contents).expect("corrupt the log");
 
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -20997,8 +21152,20 @@ mod tests {
             .obligations(71, 1, spur_core::step::STEP_EXTERN)
             .append(&crate::stepd::StepdObligation::EpilogCompleted { failed: false })
             .expect("record the epilog's outcome");
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
@@ -21041,8 +21208,20 @@ mod tests {
         );
         assert!(admitted.run.cleanup.epilog.is_in_flight());
 
-        resolve_supervised_epilogs(&store, &admissions, &mut HashMap::new()).await;
-        settle_cancelled_runs(&svc.lifecycle, &svc.allocation, &admissions).await;
+        resolve_supervised_epilogs(
+            &load_admitted_runs(&admissions).await,
+            &store,
+            &admissions,
+            &mut HashMap::new(),
+        )
+        .await;
+        settle_cancelled_runs(
+            &load_admitted_runs(&admissions).await,
+            &svc.lifecycle,
+            &svc.allocation,
+            &admissions,
+        )
+        .await;
 
         assert_eq!(
             svc.allocation.lock().await.free_cpus(),
