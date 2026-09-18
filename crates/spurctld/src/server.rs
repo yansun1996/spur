@@ -1469,7 +1469,7 @@ fn release_the_owed_epilog(
     run_attempt: u32,
 ) -> bool {
     match cluster.node_complete(job_id, node, -1, 0, run_attempt) {
-        Ok(crate::cluster::NodeCompleteResult::EpilogReleased) => true,
+        Ok(crate::cluster::NodeCompleteResult::EpilogReleased { .. }) => true,
         Ok(result) => {
             warn!(node = %node, job_id, ?result, "the report was not applied; this job stays recorded on the node");
             false
@@ -3044,7 +3044,7 @@ impl SlurmController for ControllerService {
     async fn report_job_status(
         &self,
         request: Request<ReportJobStatusRequest>,
-    ) -> Result<Response<()>, Status> {
+    ) -> Result<Response<ReportJobStatusResponse>, Status> {
         if let Err(status) = self.check_leader(&request) {
             let proxy = &self.leader_proxy;
             match proxy.get_leader_client().await {
@@ -3105,9 +3105,15 @@ impl SlurmController for ControllerService {
 
         use crate::cluster::NodeCompleteResult;
 
+        let resp = |raft_index: u64| {
+            Response::new(ReportJobStatusResponse {
+                release_raft_index: raft_index,
+            })
+        };
+
         match completion_result {
-            Some(Ok(NodeCompleteResult::AllDone { .. })) => Ok(Response::new(())),
-            Some(Ok(NodeCompleteResult::Completing)) => {
+            Some(Ok(NodeCompleteResult::AllDone { raft_index, .. })) => Ok(resp(raft_index)),
+            Some(Ok(NodeCompleteResult::Completing { raft_index })) => {
                 if let Some(job) = self.cluster.get_job(req.job_id) {
                     if job
                         .spec
@@ -3138,15 +3144,15 @@ impl SlurmController for ControllerService {
                         }
                     }
                 }
-                Ok(Response::new(()))
+                Ok(resp(raft_index))
             }
-            Some(Ok(NodeCompleteResult::EpilogReleased)) => {
+            Some(Ok(NodeCompleteResult::EpilogReleased { raft_index })) => {
                 info!(
                     job_id = req.job_id,
                     node = %req.reporting_node,
                     "epilog reported for a finished run; the node's slice is free"
                 );
-                Ok(Response::new(()))
+                Ok(resp(raft_index))
             }
             Some(Ok(NodeCompleteResult::AlreadyTerminal)) => {
                 warn!(
@@ -3154,7 +3160,7 @@ impl SlurmController for ControllerService {
                     node = %req.reporting_node,
                     "duplicate completion report for terminal job"
                 );
-                Ok(Response::new(()))
+                Ok(resp(0))
             }
             Some(Ok(NodeCompleteResult::StaleReport)) => {
                 warn!(
@@ -3163,7 +3169,7 @@ impl SlurmController for ControllerService {
                     run_attempt = req.run_attempt,
                     "ignoring completion report from superseded run"
                 );
-                Ok(Response::new(()))
+                Ok(resp(0))
             }
             // Not gated on the id watermark: a controller that lost its state
             // restarts its counter, putting genuinely old ids above it.
@@ -3173,7 +3179,7 @@ impl SlurmController for ControllerService {
                     node = %req.reporting_node,
                     "completion for a job the controller has no record of; accepting it"
                 );
-                Ok(Response::new(()))
+                Ok(resp(0))
             }
             // No retry can put the node back on a job it was taken off, so
             // refusing the report would hold its slice for good.
@@ -3183,7 +3189,7 @@ impl SlurmController for ControllerService {
                     %node,
                     "completion from a node this job is no longer placed on; accepting it"
                 );
-                Ok(Response::new(()))
+                Ok(resp(0))
             }
             Some(Err(e)) => {
                 warn!(
@@ -3194,7 +3200,7 @@ impl SlurmController for ControllerService {
                 );
                 Err(node_complete_to_status(e))
             }
-            None => Ok(Response::new(())),
+            None => Ok(resp(0)),
         }
     }
 
