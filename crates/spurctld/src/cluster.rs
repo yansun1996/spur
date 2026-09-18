@@ -451,6 +451,9 @@ pub struct ClusterManager {
     /// Per-node locks serializing (re-)registration, so unrelated nodes don't block each other
     /// while a same-name racer can't act on a stale label diff (see `register_node`).
     node_registration_locks: parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<()>>>>,
+    /// Nodes a pass on this controller is gating right now. Leader-local: a gate this
+    /// process is not holding is one only the takeover sweep can still hand back.
+    reconciling_nodes: parking_lot::Mutex<HashSet<String>>,
     raft: RwLock<Option<SpurRaft>>,
     /// Latch for `state_machine_ready`, keyed to the term it was taken in: a
     /// leader commits continuously, and a regained one replayed nothing.
@@ -626,6 +629,7 @@ impl ClusterManager {
             k0s_role_counts: K0sRoleCounts::default(),
             k0s_phase_accounting: parking_lot::Mutex::new(()),
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
+            reconciling_nodes: parking_lot::Mutex::new(HashSet::new()),
             raft: RwLock::new(None),
             state_machine_ready_term: AtomicU64::new(0),
             accounting: RwLock::new(None),
@@ -728,11 +732,7 @@ impl ClusterManager {
             let jobs = self.jobs.read();
             taken
                 .into_iter()
-                .filter(|(_, victim)| {
-                    !jobs
-                        .get(victim)
-                        .is_some_and(|j| j.allocated_nodes.iter().any(|name| j.is_held_on(name)))
-                })
+                .filter(|(_, victim)| !jobs.get(victim).is_some_and(Job::holds_a_placement))
                 .map(|(beneficiary, _)| beneficiary)
                 .collect()
         };
@@ -6039,16 +6039,28 @@ impl ClusterManager {
         }
     }
 
+    /// Note that a pass on this controller is holding `node`'s gate, so the takeover sweep
+    /// leaves it be. Cleared by the returned guard however the pass ends.
+    pub(crate) fn hold_reconcile_gate(self: &Arc<Self>, node: String) -> HeldReconcileGate {
+        self.reconciling_nodes.lock().insert(node.clone());
+        HeldReconcileGate {
+            cluster: self.clone(),
+            node,
+        }
+    }
+
     /// Release every reconcile gate left standing. Only the pass that set one clears it, so a
     /// leader that died mid-reconcile leaves its nodes unschedulable until their agents restart.
-    /// A term that did not open those passes cannot finish them either, so it hands the gates back.
+    /// A pass still running here can still clear its own, so those are left alone.
     pub fn release_stranded_reconcile_gates(&self) {
+        let live = self.reconciling_nodes.lock().clone();
         let gated: Vec<String> = self
             .nodes
             .read()
             .values()
             .filter(|node| node.reconcile_pending)
             .map(|node| node.name.clone())
+            .filter(|name| !live.contains(name))
             .collect();
         for name in gated {
             warn!(node = %name, "releasing a reconcile gate left over from an earlier term");
@@ -8798,6 +8810,19 @@ pub(crate) fn node_config_matches(
 pub enum MarkDownPolicy {
     Allowed,
     Suppressed,
+}
+
+/// Marks a node as one this controller is reconciling, so the takeover sweep does not
+/// hand back a gate whose pass is still running. Released on drop, panic included.
+pub(crate) struct HeldReconcileGate {
+    cluster: Arc<ClusterManager>,
+    node: String,
+}
+
+impl Drop for HeldReconcileGate {
+    fn drop(&mut self) {
+        self.cluster.reconciling_nodes.lock().remove(&self.node);
+    }
 }
 
 /// Withholds DOWN marking for `grace` after leadership is first observed: a
@@ -22892,7 +22917,7 @@ mod tests {
             "the reservation is charged before the job transitions"
         );
 
-        cm.recompute_node_allocations();
+        crate::scheduler_loop::assume_leadership(&cm);
 
         assert_eq!(alloc_cpus(&cm, "n1"), 4, "the rebuild must keep the charge");
         assert!(
@@ -22900,8 +22925,8 @@ mod tests {
             "a job already holding a reservation must not be offered for a second one"
         );
 
-        // Nothing is answering for that reservation, so the takeover hands it back
-        // rather than leaving the job Pending on cores it can never be dispatched to.
+        // Nothing is answering for that reservation, so the sweep the tick runs next
+        // hands it back rather than leaving the job Pending on cores nothing is coming for.
         cm.abort_orphaned_placements();
         wait_for("released", || alloc_cpus(&cm, "n1") == 0);
         let job = cm.get_job(job_id).expect("job");
@@ -22977,6 +23002,28 @@ mod tests {
             (n2_before.state, n2_before.reconcile_pending),
             "a node that was never gated must not be rewritten by the sweep"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn taking_over_leaves_a_gate_a_live_pass_is_still_holding() {
+        // A pass on this controller outlives a leadership flap, and the gate is what keeps
+        // the scheduler off a node whose claims it is still cancelling.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.set_reconcile_pending("n1", true);
+        wait_for("gated", || cm.get_node("n1").unwrap().reconcile_pending);
+
+        let held = cm.hold_reconcile_gate("n1".to_string());
+        crate::scheduler_loop::assume_leadership(&cm);
+        assert!(
+            cm.get_node("n1").unwrap().reconcile_pending,
+            "the sweep must not hand back a gate whose pass can still clear it"
+        );
+
+        drop(held);
+        crate::scheduler_loop::assume_leadership(&cm);
+        wait_for("released", || !cm.get_node("n1").unwrap().reconcile_pending);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

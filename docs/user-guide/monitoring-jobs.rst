@@ -998,9 +998,10 @@ The reason is written only where the controller has no other reason to
 overwrite, and the drain only where the node is not already held by someone
 else. A node carrying any other reason — an operator's, or one the controller
 set for something else such as a missed heartbeat — keeps it untouched, and the
-drift is reported in the controller log instead. Both naming and lifting need an
-attested reconcile, which under the default ``open`` node admission no reconcile
-is — see `What a reconcile may act on`_ below.
+drift is reported in the controller log instead. Naming happens whatever the node
+admission mode; *lifting* needs an attested reconcile, which under the default
+``open`` mode no reconcile is, so on such a cluster the hold is an operator's to
+clear — see `What a reconcile may act on`_ below.
 
 The controller already reconciles a node on its own:
 
@@ -1059,10 +1060,11 @@ dialing a node is no more proof of who answered than being called by one is, and
 neither licenses cancelling work or settling a job.
 
 Under ``open``, reconciliation therefore **reports only**. Drift is written to
-the controller log, a claim the controller cannot explain is still named and the
-node still drained for it, and nothing is killed, settled or released. Set
-``[admission] mode = "token"`` so each node proves its identity when it
-registers; that restores the acting half for every trigger. See
+the controller log, and *every* claim the controller has no record of — running
+or finished — is named in the node's reason and drains it, since none of them
+may be answered. Nothing is killed, settled or released, and the hold stays until
+an operator clears it. Set ``[admission] mode = "token"`` so each node proves its
+identity when it registers; that restores the acting half for every trigger. See
 :doc:`/admin-guide/configuration`.
 
 Asking for one by hand requires a cluster admin, because it can end running

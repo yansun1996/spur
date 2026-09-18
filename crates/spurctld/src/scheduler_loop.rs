@@ -105,7 +105,6 @@ pub(crate) fn assume_leadership(cluster: &Arc<ClusterManager>) {
     // Totals were maintained across an unknown replay history; rebuild them from
     // the job records first, since everything after this reasons against them.
     cluster.recompute_node_allocations();
-    cluster.abort_orphaned_placements();
     cluster.release_stranded_reconcile_gates();
 }
 
@@ -227,6 +226,9 @@ pub async fn run(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
         // stage candidates. Real agent-side data movement is a follow-up;
         // drive_bb_stage_in() is the controller-side seam only.
         cluster.drive_bb_stage_in();
+        // A propose that failed leaves the job Pending and charged, and the classification
+        // below will not offer it again while it is; retrying is what unsticks it.
+        cluster.abort_orphaned_placements();
         cluster.purge_expired_reservations();
         cluster.enforce_reservation_end_times();
         cluster.requeue_stranded_preempted_jobs();

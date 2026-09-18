@@ -288,6 +288,10 @@ pub(crate) const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::fr
 /// controller acts on each one, so an unbounded cut is work an agent gets to set.
 const MAX_LEDGER_ENTRIES: usize = 4096;
 
+/// Claims named in a node's reason before it summarises. The reason is a Raft entry and
+/// a terminal line, not a report; the rest are in the controller log either way.
+const NAMED_CLAIMS_IN_REASON: usize = 16;
+
 /// How long a reconcile waits for this controller to replay its own log. Well under
 /// `RECONCILE_BUDGET`, leaving time for the directions that do not depend on it.
 const CONTROLLER_CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -297,11 +301,21 @@ const CONTROLLER_CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_
 struct ReconcileGate {
     cluster: Arc<ClusterManager>,
     node: String,
+    _held: crate::cluster::HeldReconcileGate,
 }
 
 impl ReconcileGate {
-    fn new(cluster: Arc<ClusterManager>, node: String) -> Self {
-        Self { cluster, node }
+    fn new(
+        cluster: Arc<ClusterManager>,
+        node: String,
+        held: Option<crate::cluster::HeldReconcileGate>,
+    ) -> Self {
+        let held = held.unwrap_or_else(|| cluster.hold_reconcile_gate(node.clone()));
+        Self {
+            cluster,
+            node,
+            _held: held,
+        }
     }
 }
 
@@ -854,7 +868,6 @@ impl ControllerService {
     /// Admin bar for an operation that can end running work, on a cluster that may authenticate
     /// nobody. A verified identity settles it; failing that the client's own word does, which is
     /// an operator-error guard and not a boundary — the same trade `is_k0s_admin` documents.
-    /// A cluster that names no admins at all bars nobody, for the reason `is_k0s_admin` keeps `root`.
     #[allow(clippy::result_large_err)]
     fn require_admin_by_assertion<T>(
         &self,
@@ -862,16 +875,14 @@ impl ControllerService {
         asserted: &str,
         op: &str,
     ) -> Result<(), Status> {
-        let cache = self.cluster.association_cache();
         let allowed = match Self::verified_identity(request) {
             Some(identity) => self.caller_is_admin(Some(identity)),
             // Empty is refused rather than waved through: the field is client-supplied, so
             // treating "unset" as admin would make the check bypassable by omitting it.
             None => {
                 !asserted.is_empty()
-                    // A cluster that names no admins cannot have a caller prove admin-ness, and
-                    // refusing everyone there breaks a working operator workflow.
-                    && (is_k0s_admin(cache, asserted) || !cache.names_any_admin())
+                    && (is_k0s_admin(self.cluster.association_cache(), asserted)
+                        || self.names_no_admin())
             }
         };
         if allowed {
@@ -880,6 +891,22 @@ impl ControllerService {
         Err(Status::permission_denied(format!(
             "{op} requires cluster admin"
         )))
+    }
+
+    /// Whether the cluster names no administrator at all, so no caller could prove being one --
+    /// the reason `is_k0s_admin` keeps `root`. A cache that has not answered yet is not that.
+    fn names_no_admin(&self) -> bool {
+        let config = self.cluster.config();
+        // A cluster that configured a signing key can mint admins outside accounting, so the
+        // cache is not the whole roster there and a caller can prove it by presenting one.
+        if config.auth.jwt_key.is_some() || config.auth.jwt_key_file.is_some() {
+            return false;
+        }
+        let cache = self.cluster.association_cache();
+        if cache.is_loaded() {
+            return !cache.names_any_admin();
+        }
+        config.accounting.database_url.is_empty()
     }
 
     /// Whether a caller is exempt from the non-admin restrictions (the priority ceiling): an admin,
@@ -1078,19 +1105,6 @@ async fn answer_unrecorded_claims(
             answered_every_claim = false;
             break;
         }
-        // Reported either way: an operator sees the drift even where the caller
-        // proved too little for the controller to act on it.
-        if !license.teardown_is_licensed(cluster) {
-            warn!(
-                node = %node,
-                job_id = entry.job_id,
-                run_attempt = entry.run_attempt,
-                provenance = license.provenance.as_str(),
-                "an unattested cut cannot license answering a claim; leaving it alone"
-            );
-            answered_every_claim = false;
-            continue;
-        }
         // A name only a newer agent can send says something about this claim that
         // this controller cannot read. Not knowing what it means is not grounds to kill it.
         let Some(disposition) = spur_core::job::LedgerDisposition::from_wire(&entry.disposition)
@@ -1105,6 +1119,19 @@ async fn answer_unrecorded_claims(
             outcome.unresolved.push(entry.job_id);
             continue;
         };
+        // Gates the acting half only. The drift is still an operator's to see, and the
+        // node still holds cores this record counts as free whoever produced the cut.
+        if !license.teardown_is_licensed(cluster) {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                provenance = license.provenance.as_str(),
+                "an unattested cut cannot license answering a claim; naming it instead"
+            );
+            outcome.unresolved.push(entry.job_id);
+            continue;
+        }
         // Teardown is done and Raft has no record of the run, so the completion
         // this claim is waiting on is one only this side can still give it.
         if disposition.may_be_settled() {
@@ -1379,14 +1406,21 @@ fn name_unresolved_claims_on_node(
     claims.dedup();
     let wanted = match claims.as_slice() {
         [] => String::new(),
-        claims => format!(
-            "{UNRESOLVED_CLAIM_REASON}: {}",
-            claims
+        claims => {
+            // The list goes into a Raft entry and an operator's terminal, and a cut may name
+            // thousands; the count carries the rest without either having to hold them.
+            let named: Vec<String> = claims
                 .iter()
+                .take(NAMED_CLAIMS_IN_REASON)
                 .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+                .collect();
+            let rest = claims.len().saturating_sub(named.len());
+            let mut reason = format!("{UNRESOLVED_CLAIM_REASON}: {}", named.join(","));
+            if rest > 0 {
+                reason.push_str(&format!(" and {rest} more"));
+            }
+            reason
+        }
     };
     if wanted.is_empty() {
         release_unresolved_claim_hold(cluster, &current, mine, license);
@@ -1414,15 +1448,16 @@ fn claim_hold_state(node: &Node) -> NodeState {
     }
 }
 
-/// Put a node back in service once its claims are answered. Lifting a hold is an
-/// inference from absence, so it needs the premises a settle needs, and the tag.
+/// Put a node back in service once its claims are answered. Lifting is an inference from
+/// absence, so it needs a complete cut and the tag -- but the same bar naming took, or a
+/// cut that may drain a node could never undrain it and every hold would be permanent.
 fn release_unresolved_claim_hold(
     cluster: &Arc<ClusterManager>,
     current: &Node,
     mine: bool,
     license: &ReconcileLicense<'_>,
 ) {
-    if !mine || !license.absence_is_evidence || !license.teardown_is_licensed(cluster) {
+    if !mine || !license.absence_is_evidence {
         return;
     }
     if let Err(error) = cluster.release_controller_hold(&current.name) {
@@ -2738,6 +2773,11 @@ impl SlurmController for ControllerService {
         // The agent took this cut before it called, so the watch can only cover
         // launches still on the wire now -- the best this direction allows.
         let dispatched = self.cluster.dispatch_tracker().watch(&req.hostname);
+        // Taken before the gate it protects, or a leadership flap in between finds a gate
+        // with no pass holding it and the takeover sweep hands it back mid-reconcile.
+        let held_gate = ledger
+            .is_some()
+            .then(|| self.cluster.hold_reconcile_gate(req.hostname.clone()));
         let known_before = ledger.is_some() && self.cluster.get_node(&req.hostname).is_some();
         if known_before {
             self.cluster.set_reconcile_pending(&req.hostname, true);
@@ -2784,7 +2824,7 @@ impl SlurmController for ControllerService {
             // On its own task: tonic drops a handler future when the client
             // disconnects, and a gate left set removes the node for good.
             tokio::spawn(async move {
-                let _gate = ReconcileGate::new(cluster, node.clone());
+                let _gate = ReconcileGate::new(cluster, node.clone(), held_gate);
                 if tokio::time::timeout(
                     RECONCILE_BUDGET,
                     reconcile_node_ledger(
@@ -6590,8 +6630,8 @@ mod tests {
             "an omitted caller must not be admin, or the check is bypassable by omission"
         );
 
-        // Once the cluster does name admins the bar is real again, so the widening
-        // above cannot be read as "the assertion path never refuses anyone".
+        // A cluster that does name admins holds a named non-admin to it, so the
+        // assertion path is not simply "anyone who sends a name".
         svc.cluster
             .association_cache()
             .insert_admin_level("carol", "Admin");
@@ -6613,7 +6653,7 @@ mod tests {
         let cache = crate::association_cache::AssociationCache::new();
         assert!(
             !cache.names_any_admin(),
-            "accounting off names nobody, so nobody can be asked to prove admin-ness"
+            "a cache that has answered nothing names nobody"
         );
         cache.insert_admin_level("dave", "Operator");
         assert!(
@@ -6622,6 +6662,30 @@ mod tests {
         );
         cache.insert_admin_level("carol", "Admin");
         assert!(cache.names_any_admin());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_accounting_database_that_has_not_answered_yet_widens_nothing() {
+        // The cache reads the same empty either way. Widening on it would hand admin to
+        // any asserted name for as long as a configured database stayed unreachable.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.accounting.database_url = "postgres://unreachable/spur".into();
+        let svc = test_service_with(&dir, config).await;
+        assert!(
+            !svc.cluster.association_cache().is_loaded(),
+            "fixture assumption: nothing has loaded this cache"
+        );
+
+        let mut request = Request::new(());
+        request
+            .extensions_mut()
+            .remove::<spur_core::auth::Identity>();
+        assert!(
+            svc.require_admin_by_assertion(&request, "bob", "reconciling a node")
+                .is_err(),
+            "a cluster with accounting yet to answer has not said that bob is an admin"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7862,8 +7926,6 @@ mod tests {
         assert_eq!(outcome.cancelled, vec![99]);
     }
 
-    // A revoked licence has to stop the pass it opened. Reconfigure swaps the
-    // whole config, so admission can reopen while a reconcile is still killing.
     /// A leader whose admission mode can be rewritten under a running pass, which
     /// takes a config path the fixtures that build a config in memory cannot have.
     async fn cluster_with_switchable_admission(
@@ -7898,6 +7960,8 @@ mod tests {
         cluster.reconfigure().expect("reopen admission");
     }
 
+    // A revoked licence has to stop the pass it opened. Reconfigure swaps the
+    // whole config, so admission can reopen while a reconcile is still killing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn admission_reopened_under_a_pass_licenses_no_more_of_it() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -9445,12 +9509,12 @@ mod tests {
         format!("{}: {claims}", super::UNRESOLVED_CLAIM_REASON)
     }
 
-    // An unlicensed pass answers no claim, so its empty account of the node is
-    // not evidence that the claims went away.
+    // A pass that cannot act on a claim still finds it, and a claim that is still there
+    // is not one the hold naming it may come off for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unlicensed_pass_leaves_an_already_named_claim_named() {
         let dir = tempfile::TempDir::new().unwrap();
-        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        let (svc, cluster) = service_with_a_job_on_a_node_under_open_admission(&dir).await;
         assert!(
             cluster
                 .state_machine_ready(std::time::Duration::from_secs(5))
@@ -9459,8 +9523,6 @@ mod tests {
         set_node_reason(&cluster, "n1", &unresolved_reason("9"));
         await_node_reason(&svc, "n1", &unresolved_reason("9")).await;
 
-        // Open admission cannot place the caller at the node a registration names,
-        // so nothing in this cut licenses acting on -- or clearing -- anything.
         reconcile_node_ledger(
             &cluster,
             "n1",
@@ -9469,14 +9531,84 @@ mod tests {
                 vec![(9, 1, spur_core::job::LedgerDisposition::Unresolved)],
             ),
             &no_launch_in_flight(&cluster, "n1"),
-            CutProvenance::Registered,
+            CutProvenance::Pulled,
         )
         .await;
 
         assert_eq!(
             node_reason(&svc, "n1").await,
             unresolved_reason("9"),
-            "the claim is still held; only a pass that could see it may clear it"
+            "the claim is still held, so the reason naming it stands"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_reason_summarises_rather_than_listing_every_claim() {
+        // The reason is a Raft entry and a terminal line. A cut may name thousands of
+        // claims, and under open admission nothing had to prove it may.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        let many: Vec<(u32, u32, spur_core::job::LedgerDisposition)> = (0..64)
+            .map(|i| (100 + i, 1, spur_core::job::LedgerDisposition::Unresolved))
+            .collect();
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(true, many),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        let reason = node_reason(&svc, "n1").await;
+        assert!(
+            reason.ends_with(" and 48 more"),
+            "the count has to carry what the list does not: {reason}"
+        );
+        assert_eq!(
+            reason.matches(',').count(),
+            super::NAMED_CLAIMS_IN_REASON - 1,
+            "exactly the named claims, and no more, reach the record"
+        );
+    }
+
+    // The half an unattested cut must keep: a node holding cores the record counts as
+    // free is picked every cycle and refuses every launch, whoever produced the cut.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unattested_cut_still_names_a_claim_and_holds_the_node_for_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node_under_open_admission(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(outcome.cancelled, Vec::<u32>::new());
+        assert_eq!(
+            outcome.unresolved,
+            vec![99],
+            "reporting the drift is what the operator has left when nothing may act"
+        );
+        assert_eq!(node_reason(&svc, "n1").await, unresolved_reason("99"));
+        assert!(
+            !cluster.get_node("n1").expect("node").is_schedulable(),
+            "the scheduler must stop picking a node whose cores are spoken for"
         );
     }
 
@@ -9730,10 +9862,10 @@ mod tests {
         );
     }
 
-    // Under open admission any reachable host can assert any hostname, so a cut
-    // arriving with a registration cannot license putting a node back in service.
+    // The hold is a signal, not a teardown, and it takes the same bar in both directions:
+    // a cut that may drain a node and could never undrain it makes every hold permanent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unattested_cut_cannot_lift_the_hold() {
+    async fn an_unattested_cut_lifts_the_hold_an_unattested_cut_could_set() {
         let dir = tempfile::TempDir::new().unwrap();
         let (cluster, conf_path) = cluster_with_switchable_admission(&dir).await;
         register_a_node(&cluster, "n1");
@@ -9742,24 +9874,20 @@ mod tests {
                 .state_machine_ready(std::time::Duration::from_secs(5))
                 .await
         );
-        reconcile_an_unresolvable_claim(&cluster, "n1", Vec::new()).await;
-        let held = node_hold(&cluster, "n1");
-
         reopen_admission(&conf_path, &cluster);
-        reconcile_node_ledger(
-            &cluster,
-            "n1",
-            ledger(true, Vec::new()),
-            &no_launch_in_flight(&cluster, "n1"),
-            CutProvenance::Pulled,
-        )
-        .await;
-
+        reconcile_an_unresolvable_claim(&cluster, "n1", Vec::new()).await;
         assert_eq!(
-            node_hold(&cluster, "n1"),
-            held,
-            "the controller cannot place the caller at the node this cut names"
+            node_hold(&cluster, "n1").1.as_deref(),
+            Some(unresolved_reason("9").as_str()),
+            "an unattested cut names the claim it cannot answer"
         );
+
+        reconcile_a_clean_ledger(&cluster, "n1", Vec::new()).await;
+
+        let back = cluster.get_node("n1").expect("node");
+        assert_eq!(back.state, NodeState::Idle);
+        assert_eq!(back.state_reason, None);
+        assert!(!back.admin_locked, "the node must not stay locked out");
     }
 
     // A node released while it is still running work is not idle, and reporting

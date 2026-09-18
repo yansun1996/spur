@@ -87,6 +87,8 @@ class TestOperatorReconcile:
     def test_a_named_caller_may_reconcile_where_the_cluster_names_no_admins(
         self, cluster
     ):
+        if cluster.nodes[0].user == "root":
+            pytest.skip("root is an admin either way; this needs a plain caller")
         node = cluster.node_names[0]
         before = ledger_pulls(cluster)
 

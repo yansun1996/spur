@@ -1600,11 +1600,17 @@ mod evict_wal_tests {
                 job_id,
                 detail,
                 reason,
+                run_attempt,
                 ..
             } => {
                 assert_eq!(job_id, 9);
                 assert_eq!(detail.as_deref(), Some("PMIx prepare failed"));
                 assert_eq!(reason, PendingReason::JobLaunchFailure);
+                assert_eq!(
+                    run_attempt,
+                    Some(3),
+                    "the apply re-checks this, so it has to survive the log"
+                );
             }
             _ => panic!("wrong variant"),
         }

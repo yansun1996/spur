@@ -1153,9 +1153,9 @@ the node no longer holds is settled as failed. See
   the node no longer holds are settled.
 * ``open`` (the default) — any host able to reach the controller's port may
   assert any hostname, so the controller cannot place the caller at the node the
-  ledger names. Drift is still detected and written to the controller log, naming
-  the node and job each time, and a claim nobody can account for still drains the
-  node, but nothing is cancelled, settled or released.
+  ledger names. Drift is still detected and written to the controller log, and
+  every claim the controller has no record of is named in the node's reason and
+  drains it, but nothing is cancelled, settled or released.
 
 This holds for a ledger the controller *pulled* as well as for one that arrives
 with a registration. Dialing the node is not independent evidence: under ``open``

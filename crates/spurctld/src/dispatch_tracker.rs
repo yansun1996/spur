@@ -50,7 +50,8 @@ impl DispatchTracker {
         }
     }
 
-    /// Every job with a launch on the wire to any node right now.
+    /// Read by the sweep that gives up a reservation nobody is dispatching: a launch still
+    /// on the wire is one whose own path will finish or abort it.
     pub(crate) fn jobs_in_flight(&self) -> HashSet<JobId> {
         self.state
             .lock()
