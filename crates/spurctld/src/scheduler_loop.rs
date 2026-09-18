@@ -1798,12 +1798,15 @@ async fn register_allocation_on_nodes(
     }
 }
 
-/// Release standalone srun allocations on agents after CompleteJob.
+/// Release a standalone srun allocation or a salloc session on agents after
+/// CompleteJob. No fence: nothing is still in flight for it to guard against.
 pub async fn release_srun_allocation_on_agents(
     cluster: &Arc<ClusterManager>,
     job: &spur_core::job::Job,
 ) {
-    send_cancel_to_agents(cluster, job, 0).await;
+    for agent_addr in cancel_agent_addrs(cluster, job.job_id, &job.allocated_nodes) {
+        tokio::spawn(cancel_one_agent(agent_addr, job.job_id, job.run_attempt, 0));
+    }
 }
 
 /// Outcome of [`confirm_dispatch_on_nodes`]: either every assigned node
@@ -3781,6 +3784,7 @@ mod tests {
         /// under a synthetic per-node launch cost rather than estimating it.
         struct MockAgent {
             cancel_calls: Arc<AtomicU32>,
+            fence_calls: Arc<AtomicU32>,
             release_pmix_calls: Arc<AtomicU32>,
             reject_launch_as: Option<spur_proto::proto::LaunchFailureKind>,
             launch_delay: Duration,
@@ -3817,6 +3821,7 @@ mod tests {
                 _request: tonic::Request<spur_proto::proto::FenceRunRequest>,
             ) -> Result<tonic::Response<spur_proto::proto::FenceRunResponse>, tonic::Status>
             {
+                self.fence_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(tonic::Response::new(spur_proto::proto::FenceRunResponse {
                     success: true,
                     error: String::new(),
@@ -4150,6 +4155,7 @@ mod tests {
             let fanout_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
             let agent = MockAgent {
                 cancel_calls: cancel_calls.clone(),
+                fence_calls: Arc::new(AtomicU32::new(0)),
                 release_pmix_calls: release_pmix_calls.clone(),
                 reject_launch_as,
                 launch_delay,
@@ -4180,6 +4186,7 @@ mod tests {
             let ledger_pulls = Arc::new(AtomicU32::new(0));
             let agent = MockAgent {
                 cancel_calls: Arc::new(AtomicU32::new(0)),
+                fence_calls: Arc::new(AtomicU32::new(0)),
                 reject_launch_as,
                 launch_delay: Duration::ZERO,
                 register_delay: Duration::ZERO,
@@ -4220,6 +4227,7 @@ mod tests {
             let ledger_pulls = Arc::new(AtomicU32::new(0));
             let agent = MockAgent {
                 cancel_calls: Arc::new(AtomicU32::new(0)),
+                fence_calls: Arc::new(AtomicU32::new(0)),
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 register_delay: Duration::ZERO,
@@ -4246,6 +4254,7 @@ mod tests {
             let addr = incoming.local_addr().unwrap();
             let agent = MockAgent {
                 cancel_calls: Arc::new(AtomicU32::new(0)),
+                fence_calls: Arc::new(AtomicU32::new(0)),
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 register_delay: Duration::ZERO,
@@ -4274,6 +4283,7 @@ mod tests {
             let cancel_calls = Arc::new(AtomicU32::new(0));
             let agent = MockAgent {
                 cancel_calls: cancel_calls.clone(),
+                fence_calls: Arc::new(AtomicU32::new(0)),
                 reject_launch_as: None,
                 launch_delay: Duration::ZERO,
                 register_delay: Duration::ZERO,
@@ -4292,6 +4302,37 @@ mod tests {
                     .await;
             });
             (addr, cancel_calls)
+        }
+
+        /// Counts both `cancel_job` and `fence_run` calls, so a test can assert
+        /// whether a release armed the stale-launch fence.
+        async fn spawn_mock_agent_counting_fences(
+        ) -> (std::net::SocketAddr, Arc<AtomicU32>, Arc<AtomicU32>) {
+            let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = incoming.local_addr().unwrap();
+            let cancel_calls = Arc::new(AtomicU32::new(0));
+            let fence_calls = Arc::new(AtomicU32::new(0));
+            let agent = MockAgent {
+                cancel_calls: cancel_calls.clone(),
+                fence_calls: fence_calls.clone(),
+                reject_launch_as: None,
+                launch_delay: Duration::ZERO,
+                register_delay: Duration::ZERO,
+                reject_resources: false,
+                release_pmix_calls: Arc::new(AtomicU32::new(0)),
+                fanout_calls: None,
+                reject_start: false,
+                ledger_pulls: Arc::new(AtomicU32::new(0)),
+            };
+            tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(
+                        spur_proto::proto::slurm_agent_server::SlurmAgentServer::new(agent),
+                    )
+                    .serve_with_incoming(incoming)
+                    .await;
+            });
+            (addr, cancel_calls, fence_calls)
         }
 
         /// Reserve a localhost port with nothing listening on it, so a
@@ -6048,6 +6089,35 @@ mod tests {
                 job.srun_step_dispatch,
                 "the pure interactive path must record itself as step-dispatch, \
                  not the batch-script fallback"
+            );
+        }
+
+        // A graceful srun/salloc completion races nothing, so it must not pay
+        // the stale-launch fence a real cancel needs.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn release_srun_allocation_on_agents_does_not_arm_the_stale_launch_fence() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, cancel_calls, fence_calls) = spawn_mock_agent_counting_fences().await;
+            register_node_at(&cm, "n1", addr);
+
+            let mut spec = batch_spec("srun-graceful-finish", 1);
+            spec.srun_job = true;
+            spec.interactive = true;
+            let job_id = submit_and_wait(&cm, spec);
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            assert!(started, "the allocation must start before it can finish");
+
+            let job = cm.get_job(job_id).unwrap();
+            release_srun_allocation_on_agents(&cm, &job).await;
+
+            wait_for("cancel_job reached the agent", || {
+                cancel_calls.load(Ordering::SeqCst) >= 1
+            });
+            assert_eq!(
+                fence_calls.load(Ordering::SeqCst),
+                0,
+                "a graceful completion must not arm the stale-launch fence a real cancel needs"
             );
         }
 
