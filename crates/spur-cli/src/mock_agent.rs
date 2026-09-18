@@ -1,19 +1,20 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! In-process `SlurmAgent` mock for exercising CLI code paths that tail a step's
-//! output straight from a compute node.
+//! In-process `SlurmAgent` mock for exercising CLI code paths that talk to a
+//! compute node directly, tailing a step's output or opening a terminal on it.
 //!
 //! Same shape as [`crate::mock_controller`]: bind an ephemeral localhost port,
 //! serve a hand-written service on it, and hand the caller back the address plus
-//! a shared record of what the server observed. Only `StreamJobOutput` is
-//! implemented; every other RPC reports `unimplemented` so a test that drifts
-//! onto an unmocked call fails loudly instead of silently succeeding.
+//! a shared record of what the server observed. Only `StreamJobOutput` and the
+//! opening handshake of `InteractiveSession` are implemented; every other RPC
+//! reports `unimplemented` so a test that drifts onto an unmocked call fails
+//! loudly instead of silently succeeding.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use spur_proto::proto::{self, slurm_agent_server};
+use spur_proto::proto::{self, interactive_input, slurm_agent_server};
 use tonic::{Request, Response, Status};
 
 /// A scripted reply to one `StreamJobOutput` call: the bytes to send, then
@@ -29,12 +30,19 @@ pub(crate) struct ScriptedStream {
 pub(crate) struct StreamCapture {
     start_offsets: Arc<Mutex<Vec<u64>>>,
     script: Arc<Mutex<Vec<ScriptedStream>>>,
+    session_inits: Arc<Mutex<Vec<proto::InitSession>>>,
 }
 
 impl StreamCapture {
     /// `start_offset` of every `StreamJobOutput` call, in arrival order.
     pub(crate) fn start_offsets(&self) -> Vec<u64> {
         self.start_offsets.lock().expect("capture lock").clone()
+    }
+
+    /// The `InitSession` opening each `InteractiveSession` call, in arrival
+    /// order, as it arrived on the wire.
+    pub(crate) fn session_inits(&self) -> Vec<proto::InitSession> {
+        self.session_inits.lock().expect("capture lock").clone()
     }
 
     /// Queue the replies successive `StreamJobOutput` calls get. A call past the
@@ -120,11 +128,21 @@ mock_agent_impl! {
             Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
         }
 
+        /// Refuses with a status the client does not retry, so a test observes
+        /// exactly one `InitSession` and no terminal I/O loop is entered.
         async fn interactive_session(
             &self,
-            _request: Request<tonic::Streaming<proto::InteractiveInput>>,
+            request: Request<tonic::Streaming<proto::InteractiveInput>>,
         ) -> Result<Response<Self::InteractiveSessionStream>, Status> {
-            Err(Status::unimplemented("interactive_session"))
+            let mut inbound = request.into_inner();
+            let opening = inbound.message().await?;
+            let Some(interactive_input::Msg::Init(init)) =
+                opening.and_then(|message| message.msg)
+            else {
+                return Err(Status::invalid_argument("first message must be InitSession"));
+            };
+            self.capture.session_inits.lock().expect("capture lock").push(init);
+            Err(Status::aborted("mock agent does not serve a session"))
         }
     }
     unimplemented {

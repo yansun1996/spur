@@ -266,6 +266,7 @@ pub async fn main_with_args(args: Vec<String>) -> Result<()> {
             node,
             &user,
             container_spec_from_srun_args(&args),
+            PtyAllocation::JoinedExisting,
         )
         .await?;
         std::process::exit(exit_code);
@@ -1010,6 +1011,7 @@ async fn run_standalone_srun(
             String::new(),
             &owner,
             container_spec_from_srun_args(args),
+            PtyAllocation::OwnedByThisClient,
         )
         .await;
         let _ = client
@@ -1523,6 +1525,24 @@ async fn complete_interactive_step(
     }
 }
 
+/// Whether the terminal driving a PTY step is the reason its allocation exists.
+/// The agent may end an owned allocation whose terminal dies, never a joined one.
+#[derive(Clone, Copy, Debug)]
+enum PtyAllocation {
+    /// This `srun` submitted the job, so a killed client leaves nothing to
+    /// release it but the agent.
+    OwnedByThisClient,
+    /// The allocation was already there and outlives this terminal.
+    JoinedExisting,
+}
+
+impl PtyAllocation {
+    /// The agent's `overlap` flag, which suppresses ending the allocation.
+    fn overlap(self) -> bool {
+        matches!(self, Self::JoinedExisting)
+    }
+}
+
 /// Create an interactive PTY step on a running job and attach to it, reporting
 /// the step's exit code on every exit path once the step exists.
 async fn run_interactive_pty(
@@ -1532,6 +1552,7 @@ async fn run_interactive_pty(
     node: String,
     user: &str,
     container: Option<ContainerSpec>,
+    allocation: PtyAllocation,
 ) -> Result<i32> {
     let winsize = crate::interactive::get_terminal_size();
 
@@ -1559,7 +1580,8 @@ async fn run_interactive_pty(
                         command: command.clone(),
                         num_tasks: 1,
                         cpus_per_task: 1,
-                        // A PTY step always shares the allocation it runs in.
+                        // The controller's step-sharing flag, not the agent's
+                        // teardown one: a PTY step never excludes other steps.
                         overlap: true,
                         pty: true,
                         winsize: Some(winsize),
@@ -1609,7 +1631,7 @@ async fn run_interactive_pty(
                 step_id,
                 command.clone(),
                 winsize,
-                true,
+                allocation.overlap(),
                 user,
                 effective_container.clone(),
             )
@@ -1780,6 +1802,7 @@ async fn run_as_step(
             node,
             &user,
             container_spec_from_srun_args(args),
+            PtyAllocation::JoinedExisting,
         )
         .await;
         // Runs before `?` so a failed session still pairs the prolog. Not
@@ -2875,6 +2898,7 @@ mod tests {
             String::new(),
             "tester",
             None,
+            PtyAllocation::JoinedExisting,
         )
         .await
         .expect_err("mock returns no node address, so the session cannot open");
@@ -2904,6 +2928,7 @@ mod tests {
             String::new(),
             "tester",
             None,
+            PtyAllocation::JoinedExisting,
         )
         .await
         .expect_err("CreateJobStep was rejected");
@@ -2911,6 +2936,123 @@ mod tests {
         assert!(
             capture.complete_step_calls().is_empty(),
             "no step exists, so nothing may be reported complete"
+        );
+    }
+
+    /// A controller whose created step points at a mock agent that refuses to
+    /// serve, so callers reach the real `InitSession` but skip `process::exit`.
+    async fn spawn_pty_harness() -> (String, crate::mock_agent::StreamCapture) {
+        let (ctrl_addr, ctrl_capture) = crate::mock_controller::spawn().await;
+        let (agent_addr, agent_capture) = crate::mock_agent::spawn().await;
+        ctrl_capture.set_create_step_node_addr(agent_addr.to_string());
+        ctrl_capture.set_get_job_info(spur_proto::proto::JobInfo {
+            job_id: crate::mock_controller::MOCK_JOB_ID,
+            user: "tester".to_string(),
+            nodelist: "node1".to_string(),
+            state: JobState::JobRunning as i32,
+            ..Default::default()
+        });
+        (format!("http://{ctrl_addr}"), agent_capture)
+    }
+
+    fn overlap_seen_by_agent(capture: &crate::mock_agent::StreamCapture) -> bool {
+        let inits = capture.session_inits();
+        assert_eq!(inits.len(), 1, "expected exactly one interactive session");
+        inits[0].overlap
+    }
+
+    fn srun_args_from(cli: &[&str]) -> (SrunArgs, ArgMatches) {
+        let matches = SrunArgs::command()
+            .try_get_matches_from(cli)
+            .expect("parse failed");
+        let mut args = SrunArgs::from_arg_matches(&matches).expect("parse failed");
+        resolve_srun_env(&matches, &mut args).expect("resolve failed");
+        (args, matches)
+    }
+
+    /// A standalone `srun --pty` submits the job it attaches to, so a killed
+    /// terminal strands the nodes unless the agent is told to end the run.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn standalone_pty_does_not_overlap_the_allocation_it_submitted() {
+        let _env = EnvGuard::new();
+        let (controller, agent) = spawn_pty_harness().await;
+        let (args, _matches) =
+            srun_args_from(&["srun", "--pty", "--controller", &controller, "bash"]);
+
+        run_standalone_srun(
+            &args,
+            &HooksConfig::default(),
+            "/tmp",
+            spur_core::mpi::MPI_NONE,
+            "srun --pty bash",
+        )
+        .await
+        .expect_err("the mock agent refuses to serve the session");
+
+        assert!(
+            !overlap_seen_by_agent(&agent),
+            "the client that submitted the job must not overlap it"
+        );
+    }
+
+    /// `srun --pty` inside an existing allocation only borrows it: ending the
+    /// step's terminal must leave the enclosing allocation running.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn pty_step_overlaps_the_allocation_it_runs_inside() {
+        let _env = EnvGuard::new();
+        let (controller, agent) = spawn_pty_harness().await;
+        let (args, matches) =
+            srun_args_from(&["srun", "--pty", "--controller", &controller, "bash"]);
+
+        run_as_step(
+            &args,
+            &matches,
+            crate::mock_controller::MOCK_JOB_ID,
+            &HooksConfig::default(),
+            "/tmp",
+            spur_core::mpi::MPI_NONE,
+        )
+        .await
+        .expect_err("the mock agent refuses to serve the session");
+
+        assert!(
+            overlap_seen_by_agent(&agent),
+            "a step must not end the allocation that hosts it"
+        );
+    }
+
+    /// `srun --jobid N --overlap --pty` attaches to a job that already exists,
+    /// so losing this terminal must not take that job down with it.
+    #[tokio::test]
+    #[serial(env_injection)]
+    async fn attaching_to_a_running_job_overlaps_its_allocation() {
+        let _env = EnvGuard::new();
+        let (controller, agent) = spawn_pty_harness().await;
+
+        let job_id = crate::mock_controller::MOCK_JOB_ID.to_string();
+        main_with_args(
+            [
+                "srun",
+                "--jobid",
+                &job_id,
+                "--overlap",
+                "--pty",
+                "--controller",
+                &controller,
+                "bash",
+            ]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect(),
+        )
+        .await
+        .expect_err("the mock agent refuses to serve the session");
+
+        assert!(
+            overlap_seen_by_agent(&agent),
+            "an attaching terminal must not end the job it joined"
         );
     }
 
