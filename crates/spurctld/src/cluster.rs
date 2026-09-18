@@ -481,6 +481,9 @@ pub struct ClusterManager {
     /// Per-node locks serializing (re-)registration, so unrelated nodes don't block each other
     /// while a same-name racer can't act on a stale label diff (see `register_node`).
     node_registration_locks: parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<()>>>>,
+    /// Nodes a pass on this controller is gating right now. Leader-local: a gate this
+    /// process is not holding is one only the takeover sweep can still hand back.
+    reconciling_nodes: parking_lot::Mutex<HashSet<String>>,
     raft: RwLock<Option<SpurRaft>>,
     /// Latch for `state_machine_ready`, keyed to the term it was taken in: a
     /// leader commits continuously, and a regained one replayed nothing.
@@ -607,6 +610,28 @@ pub struct RequeueOutcome {
     pub skipped: Vec<String>,
 }
 
+/// Whether a dispatch backoff spends one of the job's `max_batch_requeue`
+/// retries. A node refusing work it already holds is a controller-vs-node
+/// drift the job neither caused nor can influence, so that refusal is
+/// [`Spared`](RequeueCharge::Spared): it still waits out the backoff, but the
+/// budget is reserved for failures the job is actually implicated in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequeueCharge {
+    Charged,
+    Spared,
+}
+
+/// What a dispatch-failure backoff left the placement the job had reserved in.
+/// Only the backoff's own apply frees it, so a caller that is told
+/// [`StillHeld`](PlacementDisposition::StillHeld) still owns giving it up —
+/// and one told [`Released`](PlacementDisposition::Released) must not, or the
+/// second release charges the job a second retry for one failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlacementDisposition {
+    Released,
+    StillHeld,
+}
+
 /// A latch is only good for the term it was taken in: a controller that lost
 /// and regained leadership replayed nothing in between. Term 0 means never.
 fn readiness_latch_holds(latched_term: u64, current_term: u64) -> bool {
@@ -656,6 +681,7 @@ impl ClusterManager {
             k0s_role_counts: K0sRoleCounts::default(),
             k0s_phase_accounting: parking_lot::Mutex::new(()),
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
+            reconciling_nodes: parking_lot::Mutex::new(HashSet::new()),
             raft: RwLock::new(None),
             state_machine_ready_term: AtomicU64::new(0),
             accounting: RwLock::new(None),
@@ -758,11 +784,7 @@ impl ClusterManager {
             let jobs = self.jobs.read();
             taken
                 .into_iter()
-                .filter(|(_, victim)| {
-                    !jobs
-                        .get(victim)
-                        .is_some_and(|j| j.allocated_nodes.iter().any(|name| j.is_held_on(name)))
-                })
+                .filter(|(_, victim)| !jobs.get(victim).is_some_and(Job::holds_a_placement))
                 .map(|(beneficiary, _)| beneficiary)
                 .collect()
         };
@@ -1865,7 +1887,11 @@ impl ClusterManager {
             return Ok(());
         };
         let begin_time = self.launch_backoff_until(&job);
-        self.propose(WalOperation::JobDispatchBackoff { job_id, begin_time })?;
+        self.propose(WalOperation::JobDispatchBackoff {
+            job_id,
+            begin_time,
+            spare_requeue_budget: false,
+        })?;
         Ok(())
     }
 
@@ -2685,30 +2711,46 @@ impl ClusterManager {
     /// Pending. `requeue_after_launch_failure` can't be reused: its `requeue_count`
     /// bookkeeping is gated on a real transition out of Running, so without this a
     /// flaky node's job would be reassigned to it every tick, forever unbounded.
+    ///
+    /// `charge` decides whether the hold also spends a slot of the job's
+    /// `max_batch_requeue` budget; see [`RequeueCharge`]. Returns whether the
+    /// backoff it proposed is what frees the job's placement.
     pub(crate) fn backoff_pending_job_after_dispatch_failure(
         &self,
         job_id: JobId,
-    ) -> anyhow::Result<()> {
-        let begin_time = {
+        charge: RequeueCharge,
+    ) -> anyhow::Result<PlacementDisposition> {
+        let max_requeue = self.config().controller.max_batch_requeue;
+        let (begin_time, spare_requeue_budget) = {
             let jobs = self.jobs.read();
             let Some(job) = jobs.get(&job_id) else {
-                return Ok(());
+                return Ok(PlacementDisposition::StillHeld);
             };
             if job.state != JobState::Pending {
                 // Moved on already (e.g. cancelled concurrently) between the
                 // failed confirmation and this call — nothing to back off.
-                return Ok(());
+                return Ok(PlacementDisposition::StillHeld);
             }
-            if job.requeue_count >= self.config().controller.max_batch_requeue {
+            // The exemption is generous, not unlimited: a job that has already
+            // ridden out a whole budget's worth of refusals it did not cause is
+            // facing drift no retry will clear, and pays from here on so that it
+            // still reaches the hold an operator can see.
+            let spare = charge == RequeueCharge::Spared && job.spared_requeue_count < max_requeue;
+            if !spare && job.requeue_count >= max_requeue {
                 drop(jobs);
-                return self.hold_job_at_max_requeue(job_id);
+                self.hold_job_at_max_requeue(job_id)?;
+                return Ok(PlacementDisposition::StillHeld);
             }
-            self.launch_backoff_until(job)
+            (self.launch_backoff_until(job), spare)
         };
 
-        self.propose(WalOperation::JobDispatchBackoff { job_id, begin_time })?;
+        self.propose(WalOperation::JobDispatchBackoff {
+            job_id,
+            begin_time,
+            spare_requeue_budget,
+        })?;
         info!(job_id, hold_until = %begin_time, "job's batch dispatch failed before it started; backing off");
-        Ok(())
+        Ok(PlacementDisposition::Released)
     }
 
     /// Instant until which a job requeued after a launch failure is held. A user
@@ -2717,10 +2759,12 @@ impl ClusterManager {
     /// one verbatim instant rather than reading its own clock.
     fn launch_backoff_until(&self, job: &Job) -> DateTime<Utc> {
         let config = self.config();
+        // Both counts, so a refusal the job is not charged for still paces the
+        // retry: an exempt failure that never grew the hold would spin at `base`.
         let hold_secs = launch_backoff_secs(
             config.scheduler.interval_secs,
             config.controller.max_launch_backoff_secs,
-            job.requeue_count,
+            job.requeue_count.saturating_add(job.spared_requeue_count),
         );
         let hold = Utc::now() + chrono::Duration::seconds(hold_secs as i64);
         job.spec.begin_time.map_or(hold, |user| user.max(hold))
@@ -2774,6 +2818,7 @@ impl ClusterManager {
             job_id,
             detail,
             reason,
+            run_attempt,
             at: None,
         })?;
         let evicted = !resp.jobs_finalized.is_empty();
@@ -3965,6 +4010,9 @@ impl ClusterManager {
         let mut candidates: Vec<PendingJobCandidate> = jobs
             .values()
             .filter(|job| job.state == JobState::Pending)
+            // A reservation is charged while the job is still Pending, so scheduling one
+            // again charges its nodes a second time for the same run.
+            .filter(|job| !job.holds_a_placement())
             .filter(|job| !job.pending_reason.is_scheduling_hold())
             .filter_map(|job| {
                 let before_begin_time = job.spec.begin_time.is_some_and(|begin| now < begin);
@@ -6127,6 +6175,61 @@ impl ClusterManager {
         }
     }
 
+    /// Give up every reservation this controller cannot finish dispatching. `reserve_placement`
+    /// charges a slice before the launch and the dispatcher gives it back if the launch fails,
+    /// so a leader that died in between left the charge with nobody to answer for it.
+    pub fn abort_orphaned_placements(&self) {
+        // Read after the job records, never before: a reservation taken between the two
+        // reads would then be absent from one and present in the other, and taken back.
+        let jobs = self.jobs.read();
+        let in_flight = self.dispatch_tracker.jobs_in_flight();
+        let orphaned: Vec<JobId> = jobs
+            .values()
+            .filter(|job| job.state == JobState::Pending && job.holds_a_placement())
+            .map(|job| job.job_id)
+            .filter(|job_id| !in_flight.contains(job_id))
+            .collect();
+        drop(jobs);
+        for job_id in orphaned {
+            warn!(
+                job_id,
+                "giving up a reservation no dispatch is answering for"
+            );
+            if let Err(error) = self.abort_placement(job_id) {
+                warn!(job_id, %error, "could not give up the reservation; it stays charged");
+            }
+        }
+    }
+
+    /// Note that a pass on this controller is holding `node`'s gate, so the takeover sweep
+    /// leaves it be. Cleared by the returned guard however the pass ends.
+    pub(crate) fn hold_reconcile_gate(self: &Arc<Self>, node: String) -> HeldReconcileGate {
+        self.reconciling_nodes.lock().insert(node.clone());
+        HeldReconcileGate {
+            cluster: self.clone(),
+            node,
+        }
+    }
+
+    /// Release every reconcile gate left standing. Only the pass that set one clears it, so a
+    /// leader that died mid-reconcile leaves its nodes unschedulable until their agents restart.
+    /// A pass still running here can still clear its own, so those are left alone.
+    pub fn release_stranded_reconcile_gates(&self) {
+        let live = self.reconciling_nodes.lock().clone();
+        let gated: Vec<String> = self
+            .nodes
+            .read()
+            .values()
+            .filter(|node| node.reconcile_pending)
+            .map(|node| node.name.clone())
+            .filter(|name| !live.contains(name))
+            .collect();
+        for name in gated {
+            warn!(node = %name, "releasing a reconcile gate left over from an earlier term");
+            self.set_reconcile_pending(&name, false);
+        }
+    }
+
     /// The launches this controller currently has on the wire.
     pub(crate) fn dispatch_tracker(&self) -> &Arc<crate::dispatch_tracker::DispatchTracker> {
         &self.dispatch_tracker
@@ -6197,6 +6300,13 @@ impl ClusterManager {
     /// `max_batch_requeue`.
     fn reset_job_for_requeue(job: &mut Job) {
         job.requeue_count += 1;
+        Self::clear_run_state_for_requeue(job);
+    }
+
+    /// Requeue after a refusal the job did not cause: paces the next retry like
+    /// a charged one, and bounds how many refusals the exemption covers.
+    fn reset_job_for_spared_requeue(job: &mut Job) {
+        job.spared_requeue_count += 1;
         Self::clear_run_state_for_requeue(job);
     }
 
@@ -6394,7 +6504,11 @@ impl ClusterManager {
                     }
                 }
             }
-            WalOperation::JobDispatchBackoff { job_id, begin_time } => {
+            WalOperation::JobDispatchBackoff {
+                job_id,
+                begin_time,
+                spare_requeue_budget,
+            } => {
                 // NoOp if the job left Pending since the leader proposed this
                 // (e.g. a concurrent cancel).
                 let Some(job) = jobs.get_mut(job_id) else {
@@ -6409,7 +6523,11 @@ impl ClusterManager {
                 let allocated_resources = job.allocated_resources.clone();
                 let per_node_map = job.per_node_alloc.clone();
                 let already = Self::slices_no_longer_held(job);
-                Self::reset_job_for_requeue(job);
+                if *spare_requeue_budget {
+                    Self::reset_job_for_spared_requeue(job);
+                } else {
+                    Self::reset_job_for_requeue(job);
+                }
                 job.spec.begin_time = Some(*begin_time);
                 job.set_pending_reason(PendingReason::JobLaunchFailure);
                 Self::deallocate_job_slices(
@@ -6709,8 +6827,16 @@ impl ClusterManager {
                 job_id,
                 detail,
                 reason,
+                run_attempt,
                 ..
             } => {
+                // Re-checked here, not just where this was proposed: a requeue can
+                // commit in between and land this eviction on the run that replaced it.
+                if let Some(job) = jobs.get(job_id) {
+                    if run_attempt.is_some_and(|attempt| attempt < job.run_attempt) {
+                        return ClientResponse::default();
+                    }
+                }
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.launch_failure_detail = detail.clone();
                 }
@@ -7121,6 +7247,9 @@ impl ClusterManager {
                     }
                     if *reset_requeue_count {
                         job.requeue_count = 0;
+                        // Cleared with it: an operator releasing the job would
+                        // otherwise hand back a budget the exemption cannot use.
+                        job.spared_requeue_count = 0;
                     }
                     if *clear_reservation {
                         job.spec.reservation = None;
@@ -8867,6 +8996,19 @@ pub(crate) fn node_config_matches(
 pub enum MarkDownPolicy {
     Allowed,
     Suppressed,
+}
+
+/// Marks a node as one this controller is reconciling, so the takeover sweep does not
+/// hand back a gate whose pass is still running. Released on drop, panic included.
+pub(crate) struct HeldReconcileGate {
+    cluster: Arc<ClusterManager>,
+    node: String,
+}
+
+impl Drop for HeldReconcileGate {
+    fn drop(&mut self) {
+        self.cluster.reconciling_nodes.lock().remove(&self.node);
+    }
 }
 
 /// Withholds DOWN marking for `grace` after leadership is first observed: a
@@ -22991,6 +23133,203 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_evict_that_lost_to_a_requeue_does_not_end_the_run_that_replaced_it() {
+        // The eviction is proposed against the run the caller was holding, and a
+        // requeue can commit before it applies. Its sibling JobNodeComplete re-checks
+        // the attempt on apply for the same reason.
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", false);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
+            job_id: 1,
+            hold: false,
+            begin_time: None,
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(6, 1000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 1000)),
+            srun_step_dispatch: false,
+            run_attempt: 2,
+            at: Some(chrono::Utc::now()),
+        });
+        assert_eq!(cm.get_job(1).expect("job").run_attempt, 2);
+
+        cm.apply_operation(&WalOperation::JobEvict {
+            at: None,
+            job_id: 1,
+            detail: Some("the first run's dispatch gave up".into()),
+            reason: PendingReason::JobLaunchFailure,
+            run_attempt: Some(1),
+        });
+
+        let job = cm.get_job(1).expect("job");
+        assert_eq!(
+            job.state,
+            JobState::Running,
+            "an eviction naming the run that ended must not end the one that replaced it"
+        );
+        assert_eq!(alloc_cpus(&cm, "n1"), 6, "nor free the new run's slice");
+
+        // Naming the run it is actually on still works, so the guard is not a mute button.
+        cm.apply_operation(&WalOperation::JobEvict {
+            at: None,
+            job_id: 1,
+            detail: None,
+            reason: PendingReason::JobLaunchFailure,
+            run_attempt: Some(2),
+        });
+        assert_ne!(cm.get_job(1).expect("job").state, JobState::Running);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_a_leader_left_behind_is_not_scheduled_a_second_time() {
+        // The failover ordering, in the order a new leader runs it: rebuild the totals
+        // from the job records, then classify. A reservation charges its slice while the
+        // job is still Pending, so a classification that ignores it charges the node twice.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let job_id = submit_and_wait(&cm, basic_spec("orphan"));
+        let untouched = submit_and_wait(&cm, basic_spec("waiting"));
+        let slice = scalar_alloc(4, 1000);
+        cm.reserve_placement(
+            job_id,
+            vec!["n1".into()],
+            slice.clone(),
+            per_node_for(&["n1"], slice),
+            false,
+        )
+        .expect("reserve the placement");
+        wait_for("charged", || alloc_cpus(&cm, "n1") == 4);
+        assert_eq!(
+            cm.get_job(job_id).expect("job").state,
+            JobState::Pending,
+            "the reservation is charged before the job transitions"
+        );
+
+        crate::scheduler_loop::assume_leadership(&cm);
+
+        assert_eq!(alloc_cpus(&cm, "n1"), 4, "the rebuild must keep the charge");
+        assert!(
+            !cm.pending_jobs().iter().any(|job| job.job_id == job_id),
+            "a job already holding a reservation must not be offered for a second one"
+        );
+
+        // Nothing is answering for that reservation, so the sweep the tick runs next
+        // hands it back rather than leaving the job Pending on cores nothing is coming for.
+        cm.abort_orphaned_placements();
+        wait_for("released", || alloc_cpus(&cm, "n1") == 0);
+        let job = cm.get_job(job_id).expect("job");
+        assert_eq!(job.state, JobState::Pending);
+        assert!(
+            !job.holds_a_placement(),
+            "the job must be free to be placed again, on whatever is free then"
+        );
+        // Same terms as the dispatcher's own abort: a short launch backoff, after
+        // which the job is picked again by the classification that just skipped it.
+        assert!(job.spec.begin_time.is_some());
+
+        let waiting = cm.get_job(untouched).expect("job");
+        assert_eq!(
+            (waiting.spec.begin_time, waiting.requeue_count),
+            (None, 0),
+            "a job that never reserved anything must not be charged a failed launch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_still_being_dispatched_is_left_alone() {
+        // The abort runs on a controller that may have lost and regained leadership
+        // with its own launch still on the wire; taking that one back races the launch.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let job_id = submit_and_wait(&cm, basic_spec("inflight"));
+        let slice = scalar_alloc(4, 1000);
+        cm.reserve_placement(
+            job_id,
+            vec!["n1".into()],
+            slice.clone(),
+            per_node_for(&["n1"], slice),
+            false,
+        )
+        .expect("reserve the placement");
+        wait_for("charged", || alloc_cpus(&cm, "n1") == 4);
+
+        let _on_the_wire = cm.dispatch_tracker().begin("n1", job_id);
+        cm.abort_orphaned_placements();
+
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            4,
+            "a launch still on the wire must keep its slice"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn taking_over_releases_a_gate_the_previous_leader_left_standing() {
+        // Only the pass that set a gate clears it, so a leader that died mid-reconcile
+        // takes its nodes out of the cluster until their agents restart.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        cm.set_reconcile_pending("n1", true);
+        wait_for("gated", || cm.get_node("n1").unwrap().reconcile_pending);
+        assert!(!cm.get_node("n1").unwrap().is_schedulable());
+        let n2_before = cm.get_node("n2").unwrap();
+
+        crate::scheduler_loop::assume_leadership(&cm);
+
+        wait_for("released", || !cm.get_node("n1").unwrap().reconcile_pending);
+        assert!(
+            cm.get_node("n1").unwrap().is_schedulable(),
+            "a node held by a term that ended must be scheduled again"
+        );
+        let n2_after = cm.get_node("n2").unwrap();
+        assert_eq!(
+            (n2_after.state, n2_after.reconcile_pending),
+            (n2_before.state, n2_before.reconcile_pending),
+            "a node that was never gated must not be rewritten by the sweep"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn taking_over_leaves_a_gate_a_live_pass_is_still_holding() {
+        // A pass on this controller outlives a leadership flap, and the gate is what keeps
+        // the scheduler off a node whose claims it is still cancelling.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        cm.set_reconcile_pending("n1", true);
+        wait_for("gated", || cm.get_node("n1").unwrap().reconcile_pending);
+
+        let held = cm.hold_reconcile_gate("n1".to_string());
+        crate::scheduler_loop::assume_leadership(&cm);
+        assert!(
+            cm.get_node("n1").unwrap().reconcile_pending,
+            "the sweep must not hand back a gate whose pass can still clear it"
+        );
+
+        drop(held);
+        crate::scheduler_loop::assume_leadership(&cm);
+        wait_for("released", || !cm.get_node("n1").unwrap().reconcile_pending);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_reconcile_gate_carries_nothing_but_the_gate() {
         // Anything else it carried would come from a read a registration
         // committing before the entry applies has already made stale.
@@ -24456,7 +24795,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
 
-        assert!(cm.backoff_pending_job_after_dispatch_failure(999).is_ok());
+        assert!(cm
+            .backoff_pending_job_after_dispatch_failure(999, RequeueCharge::Charged)
+            .is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -24467,7 +24808,9 @@ mod tests {
         cm.cancel_job(id, "testuser").unwrap();
         settle(&cm, id, JobState::Cancelled);
 
-        assert!(cm.backoff_pending_job_after_dispatch_failure(id).is_ok());
+        assert!(cm
+            .backoff_pending_job_after_dispatch_failure(id, RequeueCharge::Charged)
+            .is_ok());
         assert_eq!(cm.get_job(id).unwrap().state, JobState::Cancelled);
     }
 
@@ -24477,7 +24820,8 @@ mod tests {
         let cm = test_cluster(&dir).await;
         let id = submit_and_wait(&cm, basic_spec("backoff-applies"));
 
-        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id, RequeueCharge::Charged)
+            .unwrap();
         wait_for("backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
         });
@@ -24496,7 +24840,8 @@ mod tests {
         cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
             .unwrap();
 
-        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id, RequeueCharge::Charged)
+            .unwrap();
         wait_for("backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
         });
@@ -24521,14 +24866,16 @@ mod tests {
 
         cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n1: timeout".into())
             .unwrap();
-        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id, RequeueCharge::Charged)
+            .unwrap();
         wait_for("first backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 1)
         });
 
         cm.set_job_launch_failure_detail(id, "PMIx prepare failed: n2: timeout".into())
             .unwrap();
-        cm.backoff_pending_job_after_dispatch_failure(id).unwrap();
+        cm.backoff_pending_job_after_dispatch_failure(id, RequeueCharge::Charged)
+            .unwrap();
         wait_for("second backoff applied", || {
             cm.get_job(id).is_some_and(|j| j.requeue_count == 2)
         });
@@ -24560,6 +24907,7 @@ mod tests {
         cm.apply_operation(&WalOperation::JobDispatchBackoff {
             job_id: 999,
             begin_time: Utc::now(),
+            spare_requeue_budget: false,
         });
         assert!(cm.get_job(999).is_none());
     }
@@ -24576,6 +24924,7 @@ mod tests {
         cm.apply_operation(&WalOperation::JobDispatchBackoff {
             job_id: id,
             begin_time: Utc::now(),
+            spare_requeue_budget: false,
         });
 
         let job = cm.get_job(id).unwrap();

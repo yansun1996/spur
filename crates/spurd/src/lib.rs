@@ -14,6 +14,7 @@ pub mod cluster;
 pub mod container;
 pub mod controller_auth;
 pub(crate) mod device_cgroup;
+pub(crate) mod epilog;
 pub mod executor;
 pub mod job_entry;
 pub(crate) mod job_lifecycle;

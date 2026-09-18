@@ -979,9 +979,10 @@ still running other work reports ``drng`` until that work finishes, then
 ``drain``.
 
 Both the drain and the reason are lifted by the first reconcile that finds no
-claim left, and lifting them takes the same evidence as settling a job: a
-complete ledger from the node's current agent. A node that cannot enumerate its
-own records stays drained. Where the node had also gone ``down`` in the
+claim left. Lifting them takes a complete ledger from the node's current agent,
+and takes it whatever the node admission mode, since the drain is a signal rather
+than an act on anyone's work. A node that cannot enumerate its own records
+stays drained. Where the node had also gone ``down`` in the
 meantime, the reconcile releases the hold but leaves the state alone — the
 heartbeat decides when that node is fit again, not the reconcile. Resuming the
 node by hand does not help while the claim is still there: the next reconcile
@@ -998,11 +999,8 @@ The reason is written only where the controller has no other reason to
 overwrite, and the drain only where the node is not already held by someone
 else. A node carrying any other reason — an operator's, or one the controller
 set for something else such as a missed heartbeat — keeps it untouched, and the
-drift is reported in the controller log instead. Both naming and lifting need an
-attested reconcile: under the default ``open`` node admission a ledger that
-arrives with a registration cannot license either, so on those clusters both are
-done by a reconcile the controller initiated. See
-:doc:`/admin-guide/configuration` for how ``admission.mode`` decides that.
+drift is reported in the controller log instead. Naming and lifting both happen
+whatever the node admission mode — see `What a reconcile may act on`_ below.
 
 The controller already reconciles a node on its own:
 
@@ -1049,16 +1047,38 @@ reason names the node it was lost from:
 
    Reason=NodeDown (node node01 no longer holds this job)
 
-Whether a reconcile may cancel and settle, or only report what it found, depends
-on ``[admission] mode`` for the registration case; see
-:doc:`/admin-guide/configuration`. Every other trigger above acts in either mode.
+What a reconcile may act on
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A reconcile cancels and settles on any cluster, whatever ``[admission] mode`` is
+set to, for every trigger in the list above bar one. All of those are pulls: the
+controller went out and asked the node. A stock cluster therefore repairs itself,
+and the paragraphs above describe what it does there.
+
+The exception is the ledger a registering agent sends unasked. Under
+``[admission] mode = "token"`` that cut is acted on as it arrives. Under the
+default ``open`` it is read and reported but not acted on, because the caller
+chose both the moment and the hostname and proved neither; the repair waits for
+the next pull, which the registration schedules anyway. A claim the controller
+cannot explain is named in the node's reason and drains it in both cases.
+
+``open`` admission means the controller cannot tell a node from a host claiming
+to be one. That is a property of the mode, not of this feature, and
+reconciliation is not the way in: the per-node completion report already acts on
+a node name the caller asserts with no credential, and reporting completion for
+each of a job's nodes ends that job and frees its resources everywhere. Set
+``[admission] mode = "token"`` to make node identity provable, and restrict the
+control-plane port either way. See :doc:`/admin-guide/configuration`.
 
 Asking for one by hand requires a cluster admin, because it can end running
 work. Where authentication is configured the verified identity decides it. Where
 it is not, the admin check falls back to the username the client sends, which is
 an operator-error guard and not a security boundary — on such a cluster anyone
-who can reach the controller can claim any name. An omitted username is refused
-rather than trusted:
+who can reach the controller can claim any name. A cluster that names no
+administrators at all — no accounting, or accounting with no user at
+``AdminLevel=Admin``, and no ``[auth] jwt_key`` to mint one with — bars nobody,
+since there is no membership a caller could be asked to prove. An omitted
+username is refused rather than trusted:
 
 .. code-block:: bash
 
@@ -1071,7 +1091,11 @@ The reconcile a node runs as part of registering gates that node: it reports a
 reason of ``reconciling with the controller`` and accepts no new work until the
 comparison completes. A controller still replaying its own log waits up to ten
 seconds for that before comparing anything, and that pass as a whole is capped
-at a minute, after which the node is let back in regardless.
+at a minute, after which the node is let back in regardless. Only the pass that
+set a gate clears it, so a controller taking over releases any gate it finds
+still standing: a term that did not open those passes cannot finish them, and a
+node left gated by a leader that died would otherwise stay out of the cluster
+until its agent restarted.
 
 ``Reconcile=yes`` is not gated that way. The node stays schedulable throughout,
 and the command blocks until the comparison finishes rather than returning

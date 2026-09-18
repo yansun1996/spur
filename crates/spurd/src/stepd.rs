@@ -361,6 +361,46 @@ fn recv_custody(sock: std::os::fd::RawFd) -> nix::Result<(Vec<u8>, Vec<std::os::
     Ok((buf[..read].to_vec(), fds))
 }
 
+async fn connect_custody(
+    session_dir: &std::path::Path,
+) -> io::Result<std::os::unix::net::UnixStream> {
+    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+/// Ask, then wait for the answer on a blocking thread. Passing a descriptor
+/// needs `recvmsg`, which has no async form a runtime worker could yield on.
+async fn custody_exchange(
+    stream: std::os::unix::net::UnixStream,
+    opcode: u8,
+    session_id: u32,
+) -> io::Result<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
+    tokio::task::spawn_blocking(move || {
+        use std::os::fd::AsRawFd;
+        let raw = stream.as_raw_fd();
+        send_custody(raw, &custody_payload(opcode, session_id), &[])
+            .map_err(|error| io::Error::other(format!("request: {error}")))?;
+        recv_custody(raw).map_err(|error| io::Error::other(format!("reply: {error}")))
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
+/// Blocking receive that hands the stream back, so the reply can go out on it.
+fn recv_custody_owned(
+    stream: std::os::unix::net::UnixStream,
+) -> nix::Result<(
+    std::os::unix::net::UnixStream,
+    Vec<u8>,
+    Vec<std::os::fd::OwnedFd>,
+)> {
+    use std::os::fd::AsRawFd;
+    let (payload, fds) = recv_custody(stream.as_raw_fd())?;
+    Ok((stream, payload, fds))
+}
+
 /// Ask the supervisor to hold a dup of one shell's pty master, so that terminal
 /// does not hang up when the agent that created it goes away. Keyed per shell:
 /// one job can have several terminals open at once.
@@ -387,14 +427,9 @@ pub async fn deposit_pty_master(
 pub async fn reclaim_orphaned_pty(
     session_dir: &std::path::Path,
 ) -> io::Result<Option<(u32, std::os::fd::OwnedFd)>> {
-    use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    let raw = stream.as_raw_fd();
-    send_custody(raw, &custody_payload(CUSTODY_RECLAIM_ANY, 0), &[])
-        .map_err(|error| io::Error::other(format!("request orphaned pty: {error}")))?;
-    let (payload, fds) = recv_custody(raw)
+    let stream = connect_custody(session_dir).await?;
+    let (payload, fds) = custody_exchange(stream, CUSTODY_RECLAIM_ANY, 0)
+        .await
         .map_err(|error| io::Error::other(format!("reclaim orphaned pty: {error}")))?;
     match parse_custody_payload(&payload) {
         Some((CUSTODY_FOUND, session_id)) => Ok(fds.into_iter().next().map(|fd| (session_id, fd))),
@@ -422,14 +457,9 @@ pub async fn reclaim_pty_master(
     session_dir: &std::path::Path,
     session_id: u32,
 ) -> io::Result<Option<std::os::fd::OwnedFd>> {
-    use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    let raw = stream.as_raw_fd();
-    send_custody(raw, &custody_payload(CUSTODY_RECLAIM, session_id), &[])
-        .map_err(|error| io::Error::other(format!("request pty master: {error}")))?;
-    let (payload, fds) = recv_custody(raw)
+    let stream = connect_custody(session_dir).await?;
+    let (payload, fds) = custody_exchange(stream, CUSTODY_RECLAIM, session_id)
+        .await
         .map_err(|error| io::Error::other(format!("reclaim pty master: {error}")))?;
     match parse_custody_payload(&payload) {
         Some((CUSTODY_FOUND, _)) => Ok(fds.into_iter().next()),
@@ -1498,10 +1528,13 @@ async fn serve_pty_custody(listener: UnixListener, held: PtyCustody) {
             if stream.set_nonblocking(false).is_err() {
                 return;
             }
-            let raw = stream.as_raw_fd();
-            let Ok((payload, fds)) = recv_custody(raw) else {
+            // Off the runtime: a peer that connects and never speaks would
+            // otherwise hold a worker thread against every other task.
+            let received = tokio::task::spawn_blocking(move || recv_custody_owned(stream)).await;
+            let Ok(Ok((stream, payload, fds))) = received else {
                 return;
             };
+            let raw = stream.as_raw_fd();
             let Some((opcode, session_id)) = parse_custody_payload(&payload) else {
                 tracing::warn!("malformed pty custody request");
                 return;
@@ -2269,13 +2302,16 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // that owns the job's lifetime runs them — a numbered step would re-run them.
     let owns_job_lifetime = !spur_core::step::is_user_step(step_id);
     let epilog_failed = match hooks.epilog.as_deref().filter(|_| owns_job_lifetime) {
-        Some(epilog) => match spur_core::hooks::run_hook(epilog, &hook_context).await {
-            Err(error) => {
-                tracing::error!(job_id, %error, "runtime epilog hook failed");
-                true
+        Some(epilog) => {
+            match crate::epilog::run_bounded(epilog, &hook_context, hooks.epilog_timeout_secs).await
+            {
+                Err(fault) => {
+                    tracing::error!(job_id, %fault, "runtime epilog hook did not succeed");
+                    true
+                }
+                Ok(()) => false,
             }
-            Ok(_) => false,
-        },
+        }
         None => false,
     };
     if let Some(spank) = spank.as_ref().filter(|_| owns_job_lifetime) {
@@ -3141,9 +3177,9 @@ mod pty_custody_tests {
         tokio::spawn(super::serve_pty_custody(listener, held))
     }
 
-    // Multi-thread: a reclaim blocks in recvmsg, so the server it waits on needs
-    // a worker of its own. In production that server is a separate process.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // Single-threaded on purpose: with one worker, a reclaim that blocked it
+    // could never be answered, so this pins the exchange off the runtime.
+    #[tokio::test]
     async fn a_master_the_supervisor_launched_is_handed_back_still_usable() {
         use std::io::{Read, Write};
 
@@ -3173,7 +3209,7 @@ mod pty_custody_tests {
         server.abort();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn a_reclaim_for_a_terminal_nobody_launched_is_absent_not_a_hang() {
         let dir = tempfile::tempdir().expect("temp dir");
         let held: super::PtyCustody =
@@ -3188,7 +3224,7 @@ mod pty_custody_tests {
         server.abort();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn a_terminal_for_a_launch_with_no_process_is_not_left_held() {
         let held: super::PtyCustody =
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));

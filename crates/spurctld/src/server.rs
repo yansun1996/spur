@@ -288,7 +288,15 @@ pub(crate) fn resolve_startup_jwt_key(
 
 /// How long a node may stay gated for one reconcile. A node held past this is
 /// worse than one reconciled imperfectly: it is silently out of the cluster.
-const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Claims one pass will read from a single cut. Far above any real node, and the
+/// controller acts on each one, so an unbounded cut is work an agent gets to set.
+const MAX_LEDGER_ENTRIES: usize = 4096;
+
+/// Claims named in a node's reason before it summarises. The reason is a Raft entry and
+/// a terminal line, not a report; the rest are in the controller log either way.
+const NAMED_CLAIMS_IN_REASON: usize = 16;
 
 /// How long a reconcile waits for this controller to replay its own log. Well under
 /// `RECONCILE_BUDGET`, leaving time for the directions that do not depend on it.
@@ -299,11 +307,21 @@ const CONTROLLER_CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_
 struct ReconcileGate {
     cluster: Arc<ClusterManager>,
     node: String,
+    _held: crate::cluster::HeldReconcileGate,
 }
 
 impl ReconcileGate {
-    fn new(cluster: Arc<ClusterManager>, node: String) -> Self {
-        Self { cluster, node }
+    fn new(
+        cluster: Arc<ClusterManager>,
+        node: String,
+        held: Option<crate::cluster::HeldReconcileGate>,
+    ) -> Self {
+        let held = held.unwrap_or_else(|| cluster.hold_reconcile_gate(node.clone()));
+        Self {
+            cluster,
+            node,
+            _held: held,
+        }
     }
 }
 
@@ -973,7 +991,9 @@ impl ControllerService {
             // Empty is refused rather than waved through: the field is client-supplied, so
             // treating "unset" as admin would make the check bypassable by omitting it.
             None => {
-                !asserted.is_empty() && is_k0s_admin(self.cluster.association_cache(), asserted)
+                !asserted.is_empty()
+                    && (is_k0s_admin(self.cluster.association_cache(), asserted)
+                        || self.names_no_admin())
             }
         };
         if allowed {
@@ -982,6 +1002,22 @@ impl ControllerService {
         Err(Status::permission_denied(format!(
             "{op} requires cluster admin"
         )))
+    }
+
+    /// Whether the cluster names no administrator at all, so no caller could prove being one --
+    /// the reason `is_k0s_admin` keeps `root`. A cache that has not answered yet is not that.
+    fn names_no_admin(&self) -> bool {
+        let config = self.cluster.config();
+        // A cluster that configured a signing key can mint admins outside accounting, so the
+        // cache is not the whole roster there and a caller can prove it by presenting one.
+        if config.auth.jwt_key.is_some() || config.auth.jwt_key_file.is_some() {
+            return false;
+        }
+        let cache = self.cluster.association_cache();
+        if cache.is_loaded() {
+            return !cache.names_any_admin();
+        }
+        config.accounting.database_url.is_empty()
     }
 
     /// Whether a caller is exempt from the non-admin restrictions (the priority ceiling): an admin,
@@ -1009,12 +1045,21 @@ pub(crate) struct ReconcileOutcome {
     pub unresolved: Vec<u32>,
 }
 
-/// How the controller came by a cut. Under open admission neither one attests
-/// the node: a caller that can register may repoint the address a pull dials.
+/// How the controller came by a cut. A pull is the controller's own choice of moment
+/// and node; a registration is the caller's, which is the weaker of the two.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CutProvenance {
     Pulled,
     Registered,
+}
+
+impl CutProvenance {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pulled => "pulled",
+            Self::Registered => "registered",
+        }
+    }
 }
 
 /// Diff an agent's asserted ledger against Raft and resolve the differences.
@@ -1071,9 +1116,11 @@ impl ReconcileLicense<'_> {
     /// rather than fixed at the open: a mode revoked mid-pass licenses no more.
     fn teardown_is_licensed(&self, cluster: &ClusterManager) -> bool {
         match self.provenance {
+            // The controller chose to dial this node. Open admission cannot tell it from an
+            // impostor, but neither can the RPCs an impostor already has; see the admin guide.
             CutProvenance::Pulled => true,
-            // Open admission lets any reachable host assert any hostname, so the
-            // cut names a node the controller has no way to place the caller at.
+            // A cut pushed at registration is a weaker position: the caller picked the moment
+            // and the hostname, and under open admission proved neither.
             CutProvenance::Registered => matches!(
                 cluster.config().admission.mode,
                 spur_core::config::AdmissionMode::Token
@@ -1112,8 +1159,18 @@ async fn open_reconcile_license<'a>(
         return None;
     }
     let mut held = std::collections::HashMap::new();
-    let mut every_entry_named_a_run = true;
-    for entry in &ledger.entries {
+    // A cut read only in part is not a complete account of what the node holds, so
+    // the cap costs the absence half rather than letting one agent set the work.
+    let mut every_entry_named_a_run = ledger.entries.len() <= MAX_LEDGER_ENTRIES;
+    if !every_entry_named_a_run {
+        warn!(
+            node = %node,
+            entries = ledger.entries.len(),
+            cap = MAX_LEDGER_ENTRIES,
+            "agent reported more claims than one pass reads; answering the first of them"
+        );
+    }
+    for entry in ledger.entries.iter().take(MAX_LEDGER_ENTRIES) {
         match spur_core::job::RunKey::new(entry.job_id, entry.run_attempt) {
             Some(run) => {
                 held.insert(run, entry);
@@ -1164,22 +1221,36 @@ async fn answer_unrecorded_claims(
             answered_every_claim = false;
             break;
         }
-        // Reported either way: an operator sees the drift even where the caller
-        // proved too little for the controller to act on it.
+        // A name only a newer agent can send says something about this claim that
+        // this controller cannot read. Not knowing what it means is not grounds to kill it.
+        let Some(disposition) = spur_core::job::LedgerDisposition::from_wire(&entry.disposition)
+        else {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                disposition = %entry.disposition,
+                "agent named a disposition this controller cannot read; leaving the claim alone"
+            );
+            outcome.unresolved.push(entry.job_id);
+            continue;
+        };
+        // Gates the acting half only. The drift is still an operator's to see, and the
+        // node still holds cores this record counts as free whoever produced the cut.
         if !license.teardown_is_licensed(cluster) {
             warn!(
                 node = %node,
                 job_id = entry.job_id,
                 run_attempt = entry.run_attempt,
-                "unattested registration cannot license answering a claim; leaving it alone"
+                provenance = license.provenance.as_str(),
+                "an unattested cut cannot license answering a claim; naming it instead"
             );
-            answered_every_claim = false;
+            outcome.unresolved.push(entry.job_id);
             continue;
         }
-        let disposition = spur_core::job::LedgerDisposition::from_wire(&entry.disposition);
         // Teardown is done and Raft has no record of the run, so the completion
         // this claim is waiting on is one only this side can still give it.
-        if disposition.is_some_and(spur_core::job::LedgerDisposition::may_be_settled) {
+        if disposition.may_be_settled() {
             // Said of the answer, never of the intent: an agent that declines --
             // because a hook is still on the cores -- leaves the claim standing.
             if crate::scheduler_loop::settle_run_on_node(cluster, node, *run, &mut link).await {
@@ -1203,7 +1274,7 @@ async fn answer_unrecorded_claims(
         }
         // "Cannot tell" is never "dead". Nothing here licenses ending the claim
         // and nothing proves it is over, so it is named rather than acted on.
-        if disposition.is_some_and(spur_core::job::LedgerDisposition::already_accounted_for) {
+        if disposition.already_accounted_for() {
             warn!(
                 node = %node,
                 job_id = entry.job_id,
@@ -1291,7 +1362,8 @@ async fn reconcile_node_ledger_after(
             warn!(
                 node = %node,
                 job_id,
-                "unattested registration cannot license settling a job; leaving its record alone"
+                provenance = license.provenance.as_str(),
+                "an unattested cut cannot license settling a job; leaving its record alone"
             );
             continue;
         }
@@ -1302,7 +1374,7 @@ async fn reconcile_node_ledger_after(
 
     // Direction C: both agree the run exists but the slices differ. Correcting
     // means rewriting the record the controller derives its totals from.
-    for entry in &ledger.entries {
+    for entry in ledger.entries.iter().take(MAX_LEDGER_ENTRIES) {
         if entry.conflict_hold {
             warn!(
                 node = %node,
@@ -1450,14 +1522,21 @@ fn name_unresolved_claims_on_node(
     claims.dedup();
     let wanted = match claims.as_slice() {
         [] => String::new(),
-        claims => format!(
-            "{UNRESOLVED_CLAIM_REASON}: {}",
-            claims
+        claims => {
+            // The list goes into a Raft entry and an operator's terminal, and a cut may name
+            // thousands; the count carries the rest without either having to hold them.
+            let named: Vec<String> = claims
                 .iter()
+                .take(NAMED_CLAIMS_IN_REASON)
                 .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
+                .collect();
+            let rest = claims.len().saturating_sub(named.len());
+            let mut reason = format!("{UNRESOLVED_CLAIM_REASON}: {}", named.join(","));
+            if rest > 0 {
+                reason.push_str(&format!(" and {rest} more"));
+            }
+            reason
+        }
     };
     if wanted.is_empty() {
         release_unresolved_claim_hold(cluster, &current, mine, license);
@@ -1485,15 +1564,16 @@ fn claim_hold_state(node: &Node) -> NodeState {
     }
 }
 
-/// Put a node back in service once its claims are answered. Lifting a hold is an
-/// inference from absence, so it needs the premises a settle needs, and the tag.
+/// Put a node back in service once its claims are answered. Lifting is an inference from
+/// absence, so it needs a complete cut and the tag -- but the same bar naming took, or a
+/// cut that may drain a node could never undrain it and every hold would be permanent.
 fn release_unresolved_claim_hold(
     cluster: &Arc<ClusterManager>,
     current: &Node,
     mine: bool,
     license: &ReconcileLicense<'_>,
 ) {
-    if !mine || !license.absence_is_evidence || !license.teardown_is_licensed(cluster) {
+    if !mine || !license.absence_is_evidence {
         return;
     }
     if let Err(error) = cluster.release_controller_hold(&current.name) {
@@ -2877,6 +2957,11 @@ impl SlurmController for ControllerService {
         // The agent took this cut before it called, so the watch can only cover
         // launches still on the wire now -- the best this direction allows.
         let dispatched = self.cluster.dispatch_tracker().watch(&req.hostname);
+        // Taken before the gate it protects, or a leadership flap in between finds a gate
+        // with no pass holding it and the takeover sweep hands it back mid-reconcile.
+        let held_gate = ledger
+            .is_some()
+            .then(|| self.cluster.hold_reconcile_gate(req.hostname.clone()));
         let known_before = ledger.is_some() && self.cluster.get_node(&req.hostname).is_some();
         if known_before {
             self.cluster.set_reconcile_pending(&req.hostname, true);
@@ -2898,7 +2983,14 @@ impl SlurmController for ControllerService {
                 caller_privileged,
                 req.runs_job_epilog,
             )
-            .map_err(register_node_rpc_status)?;
+            // A rejected registration runs no reconcile, so a gate set for one above would
+            // be held by nothing and take the node out until the next leadership change.
+            .map_err(|error| {
+                if known_before {
+                    self.cluster.set_reconcile_pending(&req.hostname, false);
+                }
+                register_node_rpc_status(error)
+            })?;
 
         // A first registration builds the node record from scratch, which is
         // also the earliest moment the gate has anything to be recorded on.
@@ -2923,7 +3015,7 @@ impl SlurmController for ControllerService {
             // On its own task: tonic drops a handler future when the client
             // disconnects, and a gate left set removes the node for good.
             tokio::spawn(async move {
-                let _gate = ReconcileGate::new(cluster, node.clone());
+                let _gate = ReconcileGate::new(cluster, node.clone(), held_gate);
                 if tokio::time::timeout(
                     RECONCILE_BUDGET,
                     reconcile_node_ledger(
@@ -6627,15 +6719,70 @@ mod tests {
             allowed(None, "root"),
             "refusing here would leave a no-auth cluster unable to reconcile at all"
         );
-        assert!(!allowed(None, "bob"));
+        assert!(
+            allowed(None, "bob"),
+            "a cluster that names no admins cannot ask bob to prove he is one"
+        );
         assert!(
             !allowed(None, ""),
             "an omitted caller must not be admin, or the check is bypassable by omission"
         );
 
+        // A cluster that does name admins holds a named non-admin to it, so the
+        // assertion path is not simply "anyone who sends a name".
+        svc.cluster
+            .association_cache()
+            .insert_admin_level("carol", "Admin");
+        assert!(allowed(None, "carol"));
+        assert!(allowed(None, "root"));
+        assert!(
+            !allowed(None, "bob"),
+            "a named non-admin must be refused once the cluster has admins to name"
+        );
+
         assert!(
             svc.require_admin(&req(None), "update node").is_ok(),
             "the ordinary node update must keep accepting an unnamed caller"
+        );
+    }
+
+    #[test]
+    fn a_cluster_names_an_admin_only_once_accounting_says_so() {
+        let cache = crate::association_cache::AssociationCache::new();
+        assert!(
+            !cache.names_any_admin(),
+            "a cache that has answered nothing names nobody"
+        );
+        cache.insert_admin_level("dave", "Operator");
+        assert!(
+            !cache.names_any_admin(),
+            "Operator is not admin; a cluster with only operators still names no admin"
+        );
+        cache.insert_admin_level("carol", "Admin");
+        assert!(cache.names_any_admin());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_accounting_database_that_has_not_answered_yet_widens_nothing() {
+        // The cache reads the same empty either way. Widening on it would hand admin to
+        // any asserted name for as long as a configured database stayed unreachable.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut config = step_test_config();
+        config.accounting.database_url = "postgres://unreachable/spur".into();
+        let svc = test_service_with(&dir, config).await;
+        assert!(
+            !svc.cluster.association_cache().is_loaded(),
+            "fixture assumption: nothing has loaded this cache"
+        );
+
+        let mut request = Request::new(());
+        request
+            .extensions_mut()
+            .remove::<spur_core::auth::Identity>();
+        assert!(
+            svc.require_admin_by_assertion(&request, "bob", "reconciling a node")
+                .is_err(),
+            "a cluster with accounting yet to answer has not said that bob is an admin"
         );
     }
 
@@ -7451,7 +7598,7 @@ mod tests {
         .unwrap()
     }
 
-    /// A node holding one running job, as Raft records it.
+    /// A node holding one running job, as Raft records it, on the default config.
     async fn service_with_a_job_on_a_node(
         dir: &tempfile::TempDir,
     ) -> (ControllerService, Arc<ClusterManager>) {
@@ -7749,6 +7896,132 @@ mod tests {
         );
     }
 
+    // The whole feature on a stock cluster. A reconcile that only reports there fixes
+    // nothing an operator was not already going to have to fix by hand.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pull_cancels_and_settles_on_the_default_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert_eq!(
+            svc.cluster.config().admission.mode,
+            spur_core::config::AdmissionMode::Open,
+            "fixture assumption: default admission mode is Open"
+        );
+
+        let cancelling = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+        assert_eq!(
+            cancelling.cancelled,
+            vec![99],
+            "direction A has to act here, or the claim is nobody's to end"
+        );
+
+        let settling = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, Vec::new()),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+        assert_eq!(
+            settling.settled,
+            vec![7],
+            "direction B has to act here too, or the slice never comes back"
+        );
+        assert!(!holds_job(&cluster.jobs_allocated_on_node("n1"), 7));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_longer_than_one_pass_reads_is_capped_and_stops_proving_absence() {
+        // Every entry costs the controller an act, so an agent that names an unbounded
+        // number of claims would be setting how long one pass runs.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        let flood: Vec<(u32, u32)> = (0..(super::MAX_LEDGER_ENTRIES as u32 + 16))
+            .map(|i| (1_000_000 + i, 1))
+            .collect();
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, flood),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled.len(),
+            super::MAX_LEDGER_ENTRIES,
+            "the pass must answer the cap and no more"
+        );
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
+            "a cut read only in part is no evidence the node let go of what it omits"
+        );
+        assert_eq!(outcome.settled, Vec::<u32>::new());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disposition_this_controller_cannot_read_is_named_rather_than_killed() {
+        // A rolling upgrade runs newer agents under an older controller. A word this
+        // controller has no meaning for says something about the claim; killing it
+        // because the word is unfamiliar is the one answer the word cannot license.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        let mut cut = ledger(true, vec![(7, 1), (99, 1)]);
+        for entry in &mut cut.entries {
+            entry.disposition = "quiesced_by_a_newer_agent".into();
+        }
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            cut,
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            Vec::<u32>::new(),
+            "a name this controller cannot read is not licence to end the claim"
+        );
+        assert_eq!(
+            outcome.unresolved,
+            vec![99],
+            "the drift still has to surface"
+        );
+    }
+
+    // The other half of the same upgrade: an agent that predates the field sends
+    // nothing, and the controller assumed a plain held claim before the field existed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_agent_that_names_no_disposition_still_has_its_claim_answered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(outcome.cancelled, vec![99]);
+        assert_eq!(outcome.unresolved, Vec::<u32>::new());
+    }
+
     // Degrade, do not deadlock: proving the join token restores the destructive
     // half, so the gate costs an attested deployment nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7770,15 +8043,13 @@ mod tests {
         assert_eq!(outcome.cancelled, vec![99]);
     }
 
-    // A revoked licence has to stop the pass it opened. Reconfigure swaps the
-    // whole config, so admission can reopen while a reconcile is still killing.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn admission_reopened_under_a_pass_licenses_no_more_of_it() {
-        let dir = tempfile::TempDir::new().unwrap();
+    /// A leader whose admission mode can be rewritten under a running pass, which
+    /// takes a config path the fixtures that build a config in memory cannot have.
+    async fn cluster_with_switchable_admission(
+        dir: &tempfile::TempDir,
+    ) -> (Arc<ClusterManager>, std::path::PathBuf) {
         let conf_path = dir.path().join("spur.conf");
-        let conf = |mode| format!("cluster_name = \"test\"\n[admission]\nmode = \"{mode}\"\n");
-        std::fs::write(&conf_path, conf("token")).unwrap();
-
+        std::fs::write(&conf_path, admission_conf("token")).unwrap();
         let config = spur_core::config::SlurmConfig::load_from_file(&conf_path).unwrap();
         let cluster = Arc::new(
             ClusterManager::new_with_config_path(config, dir.path(), Some(conf_path.clone()))
@@ -7794,6 +8065,24 @@ mod tests {
             .await
             .unwrap();
         cluster.set_raft(handle.raft);
+        (cluster, conf_path)
+    }
+
+    fn admission_conf(mode: &str) -> String {
+        format!("cluster_name = \"test\"\n[admission]\nmode = \"{mode}\"\n")
+    }
+
+    fn reopen_admission(conf_path: &std::path::Path, cluster: &Arc<ClusterManager>) {
+        std::fs::write(conf_path, admission_conf("open")).unwrap();
+        cluster.reconfigure().expect("reopen admission");
+    }
+
+    // A revoked licence has to stop the pass it opened. Reconfigure swaps the
+    // whole config, so admission can reopen while a reconcile is still killing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admission_reopened_under_a_pass_licenses_no_more_of_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (cluster, conf_path) = cluster_with_switchable_admission(&dir).await;
 
         let (agent, release, mut fences) = spawn_gated_probe_agent_watching_fences().await;
         seed_a_job_on_a_node(&cluster);
@@ -7829,8 +8118,7 @@ mod tests {
 
         // The pass is provably mid-flight: one kill is held on the agent.
         let first = fences.recv().await.expect("a fence reaches the agent");
-        std::fs::write(&conf_path, conf("open")).unwrap();
-        cluster.reconfigure().expect("reopen admission");
+        reopen_admission(&conf_path, &cluster);
         release.notify_one();
         release.notify_one();
         let outcome = reconcile.await.expect("reconcile");
@@ -8377,11 +8665,13 @@ mod tests {
     async fn register_lifetime(svc: &ControllerService, session: &str) {
         let mut cut = ledger(false, Vec::new());
         cut.agent_session_id = session.into();
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
         svc.register_agent(Request::new(RegisterAgentRequest {
             hostname: "n1".into(),
             address: "127.0.0.1".into(),
             port: a_port_nothing_listens_on().into(),
             ledger: Some(cut),
+            join_token,
             ..Default::default()
         }))
         .await
@@ -8595,6 +8885,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_registration_leaves_no_gate_behind() {
+        // A gate the registration set and the rejection abandoned is held by nothing:
+        // no pass will clear it, and the node is out of the cluster until a new term.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-a").await;
+        wait_until_node_ungated(&cluster, "n1").await;
+
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
+        let mut rejected = Request::new(RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            port: a_port_nothing_listens_on().into(),
+            labels: [("pool".to_string(), "stolen".to_string())].into(),
+            ledger: Some(ledger(false, Vec::new())),
+            join_token,
+            ..Default::default()
+        });
+        rejected.extensions_mut().insert(viewer("mallory", false));
+        svc.register_agent(rejected)
+            .await
+            .expect_err("a non-admin caller must not be able to relabel an existing node");
+
+        wait_until_node_ungated(&cluster, "n1").await;
+    }
+
+    async fn wait_until_node_ungated(cluster: &Arc<ClusterManager>, node: &str) {
+        for _ in 0..200 {
+            if cluster.get_node(node).is_some_and(|n| !n.reconcile_pending) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("node {node} stayed gated with nothing holding the gate");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_rejected_registration_disowns_no_lifetime() {
         // A registration that never took effect runs no reconcile of its own, so
         // letting it supersede the live lifetime would discard cuts and replace none.
@@ -8604,12 +8931,14 @@ mod tests {
 
         let mut cut = ledger(false, Vec::new());
         cut.agent_session_id = "session-b".into();
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
         let mut rejected = Request::new(RegisterAgentRequest {
             hostname: "n1".into(),
             address: "127.0.0.1".into(),
             port: a_port_nothing_listens_on().into(),
             labels: [("pool".to_string(), "stolen".to_string())].into(),
             ledger: Some(cut),
+            join_token,
             ..Default::default()
         });
         rejected.extensions_mut().insert(viewer("mallory", false));
@@ -9333,8 +9662,8 @@ mod tests {
         format!("{}: {claims}", super::UNRESOLVED_CLAIM_REASON)
     }
 
-    // An unlicensed pass answers no claim, so its empty account of the node is
-    // not evidence that the claims went away.
+    // A pass that cannot act on a claim still finds it, and a claim that is still there
+    // is not one the hold naming it may come off for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unlicensed_pass_leaves_an_already_named_claim_named() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -9347,8 +9676,6 @@ mod tests {
         set_node_reason(&cluster, "n1", &unresolved_reason("9"));
         await_node_reason(&svc, "n1", &unresolved_reason("9")).await;
 
-        // Open admission cannot place the caller at the node a registration names,
-        // so nothing in this cut licenses acting on -- or clearing -- anything.
         reconcile_node_ledger(
             &cluster,
             "n1",
@@ -9357,14 +9684,158 @@ mod tests {
                 vec![(9, 1, spur_core::job::LedgerDisposition::Unresolved)],
             ),
             &no_launch_in_flight(&cluster, "n1"),
-            CutProvenance::Registered,
+            CutProvenance::Pulled,
         )
         .await;
 
         assert_eq!(
             node_reason(&svc, "n1").await,
             unresolved_reason("9"),
-            "the claim is still held; only a pass that could see it may clear it"
+            "the claim is still held, so the reason naming it stands"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_reason_summarises_rather_than_listing_every_claim() {
+        // The reason is a Raft entry and a terminal line. A cut may name thousands of
+        // claims, and under open admission nothing had to prove it may.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+        let many: Vec<(u32, u32, spur_core::job::LedgerDisposition)> = (0..64)
+            .map(|i| (100 + i, 1, spur_core::job::LedgerDisposition::Unresolved))
+            .collect();
+
+        reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(true, many),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        let reason = node_reason(&svc, "n1").await;
+        assert!(
+            reason.ends_with(" and 48 more"),
+            "the count has to carry what the list does not: {reason}"
+        );
+        assert_eq!(
+            reason.matches(',').count(),
+            super::NAMED_CLAIMS_IN_REASON - 1,
+            "exactly the named claims, and no more, reach the record"
+        );
+    }
+
+    // The half an unattested cut must keep: a node holding cores the record counts as
+    // free is picked every cycle and refuses every launch, whoever produced the cut.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unattested_cut_still_names_a_claim_and_holds_the_node_for_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+
+        assert_eq!(outcome.cancelled, Vec::<u32>::new());
+        assert_eq!(
+            outcome.unresolved,
+            vec![99],
+            "reporting the drift is what the operator has left when nothing may act"
+        );
+        assert_eq!(node_reason(&svc, "n1").await, unresolved_reason("99"));
+        assert!(
+            !cluster.get_node("n1").expect("node").is_schedulable(),
+            "the scheduler must stop picking a node whose cores are spoken for"
+        );
+    }
+
+    /// Ask the real scheduler where a job would go, so a candidacy assertion
+    /// pins the filter placement actually runs rather than one beside it.
+    fn scheduler_places(cluster: &Arc<ClusterManager>, job: &spur_core::job::Job) -> Vec<String> {
+        use spur_sched::traits::Scheduler as _;
+        let nodes = cluster.get_nodes();
+        let partitions = cluster.get_partitions();
+        let reservations = cluster.get_reservations();
+        let cluster_state = spur_sched::traits::ClusterState {
+            busy_until: &std::collections::HashMap::new(),
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &reservations,
+            topology: None,
+        };
+        spur_sched::backfill::BackfillScheduler::new(10)
+            .schedule(std::slice::from_ref(job), &cluster_state)
+            .into_iter()
+            .filter(|a| a.job_id == job.job_id)
+            .flat_map(|a| a.nodes)
+            .collect()
+    }
+
+    // The terminator behind the dispatch-refusal requeue exemption: a job whose
+    // budget is never charged retries forever unless naming the claim takes the
+    // node out of candidacy. `-w n1` is the worst case -- it also waives the
+    // dispatch cooldown, so the hold is the only thing left standing between
+    // this job and the same conflicted node every tick.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn naming_an_unresolved_claim_takes_the_node_out_of_the_scheduler_s_candidate_set() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
+            job_id: 8,
+            spec: Box::new(spur_core::job::JobSpec {
+                nodelist: Some("n1".into()),
+                ..a_one_node_spec()
+            }),
+        });
+        let pinned = cluster.get_job(8).expect("the pinned job");
+        assert_eq!(
+            scheduler_places(&cluster, &pinned),
+            vec!["n1".to_string()],
+            "the pin must actually reach n1 while the node is healthy, or the check below proves nothing"
+        );
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Registered,
+        )
+        .await;
+        assert_eq!(outcome.unresolved, vec![99]);
+
+        let held = cluster.get_node("n1").expect("node");
+        assert!(
+            held.state.is_admin_hold(),
+            "the claim must put the node on a hold, got {:?}",
+            held.state
+        );
+        assert!(
+            scheduler_places(&cluster, &pinned).is_empty(),
+            "a held node must leave candidacy, or a spared retry budget has no terminator"
         );
     }
 
@@ -9618,10 +10089,10 @@ mod tests {
         );
     }
 
-    // Under open admission any reachable host can assert any hostname, so a cut
-    // arriving with a registration cannot license putting a node back in service.
+    // The hold is a signal, not a teardown, and it takes the same bar in both directions:
+    // a cut that may drain a node and could never undrain it makes every hold permanent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unattested_cut_cannot_lift_the_hold() {
+    async fn an_unattested_cut_lifts_the_hold_an_unattested_cut_could_set() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         let cluster = svc.cluster.clone();
@@ -9631,27 +10102,34 @@ mod tests {
                 .state_machine_ready(std::time::Duration::from_secs(5))
                 .await
         );
-        assert_eq!(
-            cluster.config().admission.mode,
-            spur_core::config::AdmissionMode::Open
-        );
-        reconcile_an_unresolvable_claim(&cluster, "n1", Vec::new()).await;
-        let held = node_hold(&cluster, "n1");
 
-        reconcile_node_ledger(
-            &cluster,
-            "n1",
-            ledger(true, Vec::new()),
-            &no_launch_in_flight(&cluster, "n1"),
-            CutProvenance::Registered,
-        )
-        .await;
+        let unattested = |entries| {
+            let cluster = cluster.clone();
+            async move {
+                reconcile_node_ledger(
+                    &cluster,
+                    "n1",
+                    ledger_disposed(true, entries),
+                    &no_launch_in_flight(&cluster, "n1"),
+                    CutProvenance::Registered,
+                )
+                .await
+            }
+        };
 
+        unattested(vec![(9, 1, spur_core::job::LedgerDisposition::Unresolved)]).await;
         assert_eq!(
-            node_hold(&cluster, "n1"),
-            held,
-            "the controller cannot place the caller at the node this cut names"
+            node_hold(&cluster, "n1").1.as_deref(),
+            Some(unresolved_reason("9").as_str()),
+            "an unattested cut names the claim it cannot answer"
         );
+
+        unattested(Vec::new()).await;
+
+        let back = cluster.get_node("n1").expect("node");
+        assert_eq!(back.state, NodeState::Idle);
+        assert_eq!(back.state_reason, None);
+        assert!(!back.admin_locked, "the node must not stay locked out");
     }
 
     // A node released while it is still running work is not idle, and reporting
