@@ -2341,8 +2341,9 @@ async fn launch_container_job(
             // RLIMIT_MEMLOCK: raise while still root, before container_init drops privileges.
             apply_memlock(cfg.memlock);
 
-            // Run container init: namespaces, mounts, pivot_root, priv drop
-            let hook_env = match crate::container::container_init(config, &rootfs) {
+            // A batch job's container is recovered via allocation adoption,
+            // not a per-step exit marker, so there is none to write here.
+            let hook_env = match crate::container::container_init(config, &rootfs, None) {
                 Ok(env) => env,
                 Err(e) => {
                     let msg = format!("E:{:#}", e);
