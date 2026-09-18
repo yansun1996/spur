@@ -576,6 +576,89 @@ fn supervisor_owns_teardown(descriptors: &[crate::stepd::StepdDescriptor]) -> bo
         .any(|descriptor| descriptor.step_id != spur_core::step::STEP_EXTERN)
 }
 
+/// Why a terminal bridge stopped. The client is the only thing that reports an
+/// srun step's completion, so one that vanished leaves nobody to end the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtyBridgeEnd {
+    ChildExited,
+    ClientGone,
+}
+
+/// Ask every supervisor of this run to shut down, escalating to SIGKILL for any
+/// that outlives the grace period. Returns whether one owns the job's teardown.
+async fn shutdown_run_supervisors(
+    stepds: &Arc<Mutex<StepdMap>>,
+    job_id: u32,
+    run_attempt: u32,
+) -> bool {
+    let runtimes = stepds_for_attempt(&*stepds.lock().await, job_id, run_attempt);
+    let supervised = supervisor_owns_teardown(&runtimes);
+    for descriptor in runtimes {
+        match crate::stepd::shutdown_allocation(&descriptor, uuid::Uuid::new_v4().to_string()).await
+        {
+            Ok(()) => {
+                let stepds = stepds.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    let still_current = stepds
+                        .lock()
+                        .await
+                        .get(&stepd_key(&descriptor))
+                        .is_some_and(|current| stepd_is_current(current, &descriptor));
+                    if !still_current {
+                        return;
+                    }
+                    info!(
+                        job_id,
+                        run_attempt = descriptor.run_attempt,
+                        "runtime grace period expired, sending SIGKILL"
+                    );
+                    if let Err(error) = crate::stepd::signal_allocation(
+                        &descriptor,
+                        uuid::Uuid::new_v4().to_string(),
+                        nix::sys::signal::Signal::SIGKILL as i32,
+                    )
+                    .await
+                    {
+                        warn!(job_id, run_attempt = descriptor.run_attempt, %error,
+                            "failed to SIGKILL stepd after grace period");
+                    }
+                });
+            }
+            Err(error) => {
+                warn!(job_id, step_id = descriptor.step_id, %error,
+                    "runtime termination request failed");
+            }
+        }
+    }
+    supervised
+}
+
+/// End an srun allocation whose terminal client vanished. The allocation exists
+/// only to host that client, and nothing else will ever report it complete: the
+/// supervisor's own completion is what hands the slice back to the controller.
+async fn end_abandoned_srun_allocation(
+    running: &RunningJobs,
+    stepds: &Arc<Mutex<StepdMap>>,
+    job_id: u32,
+    run_attempt: u32,
+) -> bool {
+    // A job with a payload of its own outlives any terminal attached to it, so
+    // only an allocation-only run — and only the attempt that was served — ends.
+    let hosted_the_terminal = running.lock().await.get(&job_id).is_some_and(|tracked| {
+        tracked.job.is_allocation_only() && tracked.run_attempt == run_attempt
+    });
+    if !hosted_the_terminal {
+        return false;
+    }
+    info!(
+        job_id,
+        run_attempt, "terminal client is gone; ending the srun allocation it held"
+    );
+    shutdown_run_supervisors(stepds, job_id, run_attempt).await;
+    true
+}
+
 async fn fence_displaced_stepd(
     stepds: &Arc<Mutex<StepdMap>>,
     job_id: u32,
@@ -8711,8 +8794,9 @@ impl SlurmAgent for AgentService {
                         .await
                         .unwrap_or(128)
                 };
-                Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx)
-                    .await;
+                let _ =
+                    Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx)
+                        .await;
             });
 
             return Ok(Response::new(ReceiverStream::new(rx)));
@@ -8775,8 +8859,20 @@ impl SlurmAgent for AgentService {
                 })?,
         };
 
+        // Read before the bridge detaches: after it ends the tracking may already
+        // be gone, and a stale attempt must not tear down a re-dispatched run.
+        let run_attempt = self
+            .running
+            .lock()
+            .await
+            .get(&init.job_id)
+            .map(|tracked| tracked.run_attempt)
+            .unwrap_or_default();
+
         self.live_ptys.lock().await.insert(init.job_id);
         let live_ptys = self.live_ptys.clone();
+        let running = self.running.clone();
+        let stepds = self.stepds.clone();
         let job_id = init.job_id;
         let child_pid = terminal.pid;
         let bridge = Self::run_pty_bridge(
@@ -8788,7 +8884,7 @@ impl SlurmAgent for AgentService {
             tx,
         );
         tokio::spawn(async move {
-            bridge.await;
+            let end = bridge.await;
             live_ptys.lock().await.remove(&job_id);
             if let Some(dir) = legacy_custody_dir
                 .as_deref()
@@ -8797,6 +8893,9 @@ impl SlurmAgent for AgentService {
                 if let Err(error) = crate::stepd::release_pty_master(dir, child_pid as u32).await {
                     warn!(job_id, child_pid, %error, "failed to release a closed terminal");
                 }
+            }
+            if end == PtyBridgeEnd::ClientGone {
+                end_abandoned_srun_allocation(&running, &stepds, job_id, run_attempt).await;
             }
         });
 
@@ -9501,47 +9600,7 @@ impl AgentService {
             );
             return;
         }
-        let runtimes = stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt);
-        let supervised = supervisor_owns_teardown(&runtimes);
-        for descriptor in runtimes {
-            match crate::stepd::shutdown_allocation(&descriptor, uuid::Uuid::new_v4().to_string())
-                .await
-            {
-                Ok(()) => {
-                    let stepds = self.stepds.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-                        let still_current = stepds
-                            .lock()
-                            .await
-                            .get(&stepd_key(&descriptor))
-                            .is_some_and(|current| stepd_is_current(current, &descriptor));
-                        if !still_current {
-                            return;
-                        }
-                        info!(
-                            job_id,
-                            run_attempt = descriptor.run_attempt,
-                            "runtime grace period expired, sending SIGKILL"
-                        );
-                        if let Err(error) = crate::stepd::signal_allocation(
-                            &descriptor,
-                            uuid::Uuid::new_v4().to_string(),
-                            nix::sys::signal::Signal::SIGKILL as i32,
-                        )
-                        .await
-                        {
-                            warn!(job_id, run_attempt = descriptor.run_attempt, %error,
-                                "failed to SIGKILL stepd after grace period");
-                        }
-                    });
-                }
-                Err(error) => {
-                    warn!(job_id, step_id = descriptor.step_id, %error,
-                        "runtime termination request failed");
-                }
-            }
-        }
+        let supervised = shutdown_run_supervisors(&self.stepds, job_id, run_attempt).await;
         // A step without a supervisor of its own still runs under the agent, so
         // a supervised sibling must not spare it.
         self.cancel_active_steps_for_job(job_id, nix::sys::signal::Signal::SIGTERM as i32)
@@ -9719,7 +9778,8 @@ impl AgentService {
         interactive: bool,
         mut inbound: S,
         tx: tokio::sync::mpsc::Sender<Result<InteractiveOutput, Status>>,
-    ) where
+    ) -> PtyBridgeEnd
+    where
         S: tokio_stream::Stream<Item = Result<InteractiveInput, Status>> + Unpin + Send,
         F: std::future::Future<Output = i32> + Send,
     {
@@ -9739,7 +9799,7 @@ impl AgentService {
                 let _ = tx
                     .send(Err(Status::internal(format!("AsyncFd setup: {e}"))))
                     .await;
-                return;
+                return PtyBridgeEnd::ChildExited;
             }
         };
 
@@ -9749,6 +9809,7 @@ impl AgentService {
         // a non-interactive stdin-EOF doesn't spin the select.
         let mut input_open = true;
         let mut exit_code: i32 = 128;
+        let mut end = PtyBridgeEnd::ChildExited;
 
         loop {
             tokio::select! {
@@ -9765,6 +9826,7 @@ impl AgentService {
                                         )),
                                     };
                                     if tx.send(Ok(msg)).await.is_err() {
+                                        end = PtyBridgeEnd::ClientGone;
                                         break;
                                     }
                                 }
@@ -9811,6 +9873,7 @@ impl AgentService {
                             let _ = crate::pty::signal_foreground(
                                 master_raw, child_pid, libc::SIGHUP,
                             );
+                            end = PtyBridgeEnd::ClientGone;
                             break;
                         }
                         None => {
@@ -9819,6 +9882,7 @@ impl AgentService {
                                 let _ = crate::pty::signal_foreground(
                                     master_raw, child_pid, libc::SIGHUP,
                                 );
+                                end = PtyBridgeEnd::ClientGone;
                                 break;
                             }
                             // Non-interactive stdin-EOF: the client still wants the
@@ -9841,11 +9905,16 @@ impl AgentService {
             exit_code = (&mut wait_exit).await;
         }
 
-        let _ = tx
+        if tx
             .send(Ok(InteractiveOutput {
                 msg: Some(interactive_output::Msg::ExitStatus(exit_code)),
             }))
-            .await;
+            .await
+            .is_err()
+        {
+            end = PtyBridgeEnd::ClientGone;
+        }
+        end
     }
 
     /// Non-blocking read from a PTY master via an AsyncFd ready guard.
@@ -20030,6 +20099,128 @@ mod tests {
         );
     }
 
+    /// A supervisor that answers control requests, publishing each one *before*
+    /// it acknowledges: a caller that has its answer has already been recorded,
+    /// so a test can read the record without waiting on anything.
+    fn a_listening_supervisor(
+        listener: tokio::net::UnixListener,
+        descriptor: crate::stepd::StepdDescriptor,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<crate::stepd::StepdRequest>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let served = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) =
+                    crate::stepd::accept_hello(&listener, &descriptor, &descriptor.capability)
+                        .await
+                else {
+                    return;
+                };
+                let (reader, mut writer) = stream.into_split();
+                let mut line = String::new();
+                if BufReader::new(reader).read_line(&mut line).await.is_err() {
+                    return;
+                }
+                let request = serde_json::from_str(&line).expect("decode runtime request");
+                if tx.send(request).is_err() {
+                    return;
+                }
+                let _ = writer
+                    .write_all(
+                        format!(
+                            "{}\n",
+                            serde_json::to_string(&crate::stepd::StepdResponse::Acknowledged)
+                                .expect("encode acknowledgement")
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        (served, rx)
+    }
+
+    fn a_terminal_allocation_supervisor(
+        dir: &std::path::Path,
+        job_id: u32,
+        run_attempt: u32,
+    ) -> (tokio::net::UnixListener, crate::stepd::StepdDescriptor) {
+        let socket_path = dir.join(format!("runtime-{job_id}.sock"));
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind runtime socket");
+        let mut descriptor = crate::stepd::StepdDescriptor::new(
+            job_id,
+            run_attempt,
+            spur_core::step::STEP_EXTERN,
+            0,
+            0,
+            socket_path,
+            std::path::PathBuf::new(),
+        );
+        descriptor.capability = format!("abandoned-terminal-{job_id}");
+        (listener, descriptor)
+    }
+
+    // An `srun --pty` client that is killed never reports its step, so the node is
+    // the only thing that can end the run. Without this the allocation's supervisor
+    // idles forever and the controller keeps charging its cores.
+    #[tokio::test]
+    async fn an_abandoned_terminal_ends_the_srun_allocation_it_held() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let dir = tempfile::tempdir().expect("runtime socket directory");
+        let (listener, descriptor) = a_terminal_allocation_supervisor(dir.path(), 910, 4);
+        let (supervisor, mut served) = a_listening_supervisor(listener, descriptor.clone());
+
+        let stepds: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
+        stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let running: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        running.lock().await.insert(910, an_allocation_only_job(4));
+
+        assert!(
+            end_abandoned_srun_allocation(&running, &stepds, 910, 4).await,
+            "an allocation held only for a vanished terminal must be ended"
+        );
+        assert!(matches!(
+            served.try_recv(),
+            Ok(crate::stepd::StepdRequest::Shutdown)
+        ));
+        supervisor.abort();
+    }
+
+    // The other half: `sattach` to a batch job ends the terminal, not the job.
+    #[tokio::test]
+    async fn an_abandoned_terminal_leaves_a_job_with_its_own_payload_running() {
+        let _unbounded = crate::stepd::UnboundedRequests::new();
+        let dir = tempfile::tempdir().expect("runtime socket directory");
+        let (listener, descriptor) = a_terminal_allocation_supervisor(dir.path(), 911, 4);
+        let (supervisor, mut served) = a_listening_supervisor(listener, descriptor.clone());
+
+        let stepds: Arc<Mutex<StepdMap>> = Arc::new(Mutex::new(HashMap::new()));
+        stepds
+            .lock()
+            .await
+            .insert(stepd_key(&descriptor), descriptor.clone());
+        let running: RunningJobs = Arc::new(Mutex::new(HashMap::new()));
+        let mut batch = TrackedJob::dummy(0);
+        batch.run_attempt = 4;
+        running.lock().await.insert(911, batch);
+
+        assert!(
+            !end_abandoned_srun_allocation(&running, &stepds, 911, 4).await,
+            "a batch job outlives any terminal attached to it"
+        );
+        assert!(
+            served.try_recv().is_err(),
+            "no supervisor of a batch job may be asked to shut down"
+        );
+        supervisor.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn graceful_cancel_stepd_escalates_to_sigkill() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -22055,6 +22246,86 @@ mod tests {
                 assert_eq!(waitpid_exit_code(child), 128 + libc::SIGKILL);
             }
         }
+    }
+
+    /// A bridge over a PTY running `argv`, with handles on both ends of the
+    /// client's streams so a test can take either of them away.
+    #[allow(clippy::type_complexity)]
+    fn a_bridged_terminal(
+        argv: &[&str],
+    ) -> (
+        tokio::task::JoinHandle<PtyBridgeEnd>,
+        tokio::sync::mpsc::Sender<Result<spur_proto::proto::InteractiveInput, tonic::Status>>,
+        tokio::sync::mpsc::Receiver<Result<spur_proto::proto::InteractiveOutput, tonic::Status>>,
+    ) {
+        let (master, slave) = crate::pty::openpty_with_winsize(None).expect("openpty");
+        nix::fcntl::fcntl(
+            &master,
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("O_NONBLOCK");
+        let raw = crate::executor::JobIoRaw::Pty {
+            master: std::os::fd::AsRawFd::as_raw_fd(&master),
+            slave: std::os::fd::AsRawFd::as_raw_fd(&slave),
+        };
+        let mut cmd = tokio::process::Command::new(argv[0]);
+        cmd.args(&argv[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        unsafe {
+            cmd.pre_exec(move || raw.wire());
+        }
+        let mut child = cmd.spawn().expect("spawn terminal payload");
+        let child_pid = child.id().expect("child pid") as i32;
+        drop(slave);
+
+        let (in_tx, in_rx) = tokio::sync::mpsc::channel(64);
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel(64);
+        let wait_exit = async move {
+            child
+                .wait()
+                .await
+                .ok()
+                .and_then(|status| status.code())
+                .unwrap_or(128)
+        };
+        let bridge = tokio::spawn(AgentService::run_pty_bridge(
+            master,
+            wait_exit,
+            child_pid,
+            true,
+            tokio_stream::wrappers::ReceiverStream::new(in_rx),
+            out_tx,
+        ));
+        (bridge, in_tx, out_rx)
+    }
+
+    // A `kill -9` on the client breaks the stream mid-session. The bridge has to
+    // say so: it is the only signal that nobody will report this run complete.
+    #[tokio::test]
+    async fn a_broken_client_stream_ends_the_bridge_as_a_lost_client() {
+        let (bridge, in_tx, _out_rx) = a_bridged_terminal(&["cat"]);
+
+        in_tx
+            .send(Err(tonic::Status::unavailable("client connection reset")))
+            .await
+            .expect("deliver the broken stream");
+
+        assert_eq!(bridge.await.expect("bridge task"), PtyBridgeEnd::ClientGone);
+    }
+
+    // The control: an ordinary exit is the client's own to report, so the node
+    // must not end the run behind its back.
+    #[tokio::test]
+    async fn a_shell_that_exits_on_its_own_ends_the_bridge_as_a_child_exit() {
+        let (bridge, _in_tx, mut out_rx) = a_bridged_terminal(&["/bin/sh", "-c", "exit 0"]);
+
+        let end = bridge.await.expect("bridge task");
+        // Drained after the bridge returns so the exit status it sends cannot be
+        // mistaken for a client that stopped reading.
+        out_rx.close();
+        assert_eq!(end, PtyBridgeEnd::ChildExited);
     }
 
     #[tokio::test]
