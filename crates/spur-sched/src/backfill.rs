@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{Duration, Utc};
 use tracing::{debug, info};
@@ -506,7 +506,7 @@ impl Scheduler for BackfillScheduler {
             // Earliest start per node, folding resource and reservation
             // conflicts into one search. Exclusive jobs time against the
             // node's full capacity, not their own modest share.
-            let mut searched_out = false;
+            let mut exhausted_at: HashSet<usize> = HashSet::new();
             let mut node_starts: Vec<(usize, chrono::DateTime<Utc>)> = Vec::new();
             for &ni in &suitable {
                 let res_check = ReservationCheck {
@@ -516,7 +516,9 @@ impl Scheduler for BackfillScheduler {
                 };
                 let start =
                     self.earliest_valid_start(ni, res_check, timing_request(ni), duration, now);
-                searched_out |= start.exhausted;
+                if start.exhausted {
+                    exhausted_at.insert(ni);
+                }
                 debug!(
                     job_id = job.job_id,
                     node = %cluster.nodes[ni].name,
@@ -636,6 +638,12 @@ impl Scheduler for BackfillScheduler {
 
             let assigned_nodes: Vec<(usize, chrono::DateTime<Utc>)> =
                 node_starts.into_iter().take(needed_nodes).collect();
+
+            // Derived from the assigned set only: a candidate the job is not placed
+            // on has no say in whether its start can be projected.
+            let mut searched_out = assigned_nodes
+                .iter()
+                .any(|(ni, _)| exhausted_at.contains(ni));
 
             // Converge on a start every assigned node is simultaneously free
             // at — an independently-computed per-node start can be stale
@@ -2104,6 +2112,51 @@ mod tests {
             outcome.planned_start.is_none(),
             "and the log must not carry the date the view withheld"
         );
+    }
+
+    // A candidate the job is not placed on has no say in its projection: the node
+    // it did land on knows when it frees, and that is what the user is owed.
+    #[test]
+    fn an_exhausted_candidate_the_job_skipped_does_not_withhold_its_start() {
+        let mut sched = BackfillScheduler::new(100);
+        let mut nodes = make_nodes(2);
+        for node in &mut nodes {
+            node.alloc_resources = ResourceAllocations::with_scalar(64, 256_000);
+        }
+        let partitions = vec![Partition {
+            name: "default".into(),
+            ..Default::default()
+        }];
+        let now = Utc::now();
+        let slot = now + Duration::minutes(90);
+        let mut busy_until = std::collections::HashMap::new();
+        busy_until.insert("node001".to_string(), slot);
+        busy_until.insert(
+            "node002".to_string(),
+            now + crate::timeline::PROJECTION_HORIZON + Duration::days(30),
+        );
+        let cluster = ClusterState {
+            busy_until: &busy_until,
+            nodes: &nodes,
+            partitions: &partitions,
+            reservations: &[],
+            topology: None,
+        };
+
+        assert!(sched.schedule(&[make_job(1, 1, 64)], &cluster).is_empty());
+        let (held_on, start) = sched
+            .planned_job_starts()
+            .get(&1)
+            .cloned()
+            .expect("the node the job was placed on has a real slot to project");
+        assert_eq!(held_on, vec!["node001".to_string()]);
+        assert!(
+            (start - slot).num_seconds().abs() <= 1,
+            "expected node001's own free time, got {start}"
+        );
+        let outcome = sched.last_outcome.get(&1).expect("outcome recorded");
+        assert_eq!(outcome.kind, UnplacedKind::FutureSlotReserved);
+        assert_eq!(outcome.planned_start, Some(start));
     }
 
     #[test]

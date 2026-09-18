@@ -106,6 +106,16 @@ Examples:
    ``--jobid`` requires ``--overlap``; ``--jobid`` alone is an error.
    ``--input``/``-i`` is ignored in step mode.
 
+.. note::
+
+   A ``--pty`` terminal ends when its client goes away — a closed laptop, a
+   dropped ssh session, or a ``kill`` of ``srun`` itself. For a standalone
+   ``srun --pty``, which allocates a job of its own, that ends the job and
+   returns its resources: nothing else is left to report the work finished. A
+   step inside an ``salloc`` allocation ends only that step — the allocation and
+   its shell stay. To keep work running across a lost connection, submit it with
+   ``sbatch``.
+
 Interactive Allocation — ``salloc``
 ------------------------------------
 

@@ -233,8 +233,9 @@ Follow this order for any cluster upgrade:
 1. **Rebuild all binaries together** from the same source tree — they share a Raft
    WAL schema and must stay version-matched.
 2. **Upgrade controllers before agents.** Both playbooks do this automatically, one
-   controller at a time to preserve quorum. One release reverses this step; see
-   :ref:`node-reconciliation-upgrade`.
+   controller at a time to preserve quorum. The node-reconciliation release keeps
+   this order; see :ref:`node-reconciliation-upgrade` for what each half does while
+   the other is still on the old build.
 3. **Drain agents before swapping binaries.** The rolling playbook drains automatically; a
    running job blocks the swap unless you force it.
 4. **Never wipe state during an upgrade.** Keep the default ``spur_wipe_state=false``.
@@ -432,6 +433,11 @@ sends no ledger with its registration, so the controller builds no comparison an
 gates nothing; a controller that pulls one from such an agent gets "not
 implemented" back and leaves the node alone. Reconciliation therefore starts
 working node by node as each agent is replaced, in either order.
+
+**A ledger sent unasked with a registration waits for a pull under the default**
+``[admission] mode = "open"``\ **.** Every other trigger acts in either mode, so
+a stock cluster repairs itself; that one case is reported and repaired on the
+next pull instead. See :doc:`/admin-guide/configuration`.
 
 **A pre-upgrade controller can clear a node's unresolved-claim reason while the
 claim is still held.** It counts only the claims an agent released, so an agent's

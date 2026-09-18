@@ -111,11 +111,12 @@ impl LedgerDisposition {
         }
     }
 
-    /// `None` for anything this controller cannot name, which it must then treat
-    /// as an ordinary claim rather than as licence to leave it alone.
+    /// `None` for a name this controller does not know, which only a newer agent can
+    /// send; the caller must treat that as "cannot act", never as an ordinary claim.
+    /// An agent that predates the field sends nothing, which is the plain held claim.
     pub fn from_wire(disposition: &str) -> Option<Self> {
         match disposition {
-            "held" => Some(Self::Held),
+            "" | "held" => Some(Self::Held),
             "over_but_charged" => Some(Self::OverButCharged),
             "unresolved" => Some(Self::Unresolved),
             _ => None,
@@ -906,6 +907,12 @@ pub struct Job {
     /// toward `max_batch_requeue`.
     #[serde(default)]
     pub user_requeue_count: u32,
+    /// Number of dispatch refusals this job was not charged for, because the
+    /// node refused work it already held. Paces the launch backoff like a real
+    /// requeue does, and bounds the exemption: past `max_batch_requeue` spared
+    /// refusals the job is charged again, so a standing conflict still ends.
+    #[serde(default)]
+    pub spared_requeue_count: u32,
 
     /// Monotonic run epoch, bumped on each dispatch (first dispatch = 1). Lets
     /// the controller drop a completion report from a superseded run.
@@ -1011,6 +1018,15 @@ impl Job {
         self.epilog_gated_nodes.contains(node)
     }
 
+    /// Whether a placement is already charged for this job. `reserve_placement` commits the
+    /// charge while the job is still `Pending` and the transition follows the dispatch, so a
+    /// `Pending` job that answers yes is one a second placement would charge its nodes twice for.
+    pub fn holds_a_placement(&self) -> bool {
+        self.allocated_nodes
+            .iter()
+            .any(|node| self.is_held_on(node))
+    }
+
     /// Whether this node's agent has confirmed the launch, so its ledger can be
     /// expected to name the job. A Pending reservation is charged, not confirmed.
     pub fn is_confirmed_on(&self, node: &str) -> bool {
@@ -1053,6 +1069,7 @@ impl Job {
             requeue_count: 0,
             preempt_requeue_count: 0,
             user_requeue_count: 0,
+            spared_requeue_count: 0,
             run_attempt: 0,
             het_job_id: None,
             het_group: None,

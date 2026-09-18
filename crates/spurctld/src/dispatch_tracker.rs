@@ -50,6 +50,17 @@ impl DispatchTracker {
         }
     }
 
+    /// Read by the sweep that gives up a reservation nobody is dispatching: a launch still
+    /// on the wire is one whose own path will finish or abort it.
+    pub(crate) fn jobs_in_flight(&self) -> HashSet<JobId> {
+        self.state
+            .lock()
+            .in_flight
+            .values()
+            .flat_map(|jobs| jobs.keys().copied())
+            .collect()
+    }
+
     /// Start observing launches to `node`. Open this before asking the agent for
     /// a cut; the cut cannot be trusted about anything the watch goes on to see.
     pub(crate) fn watch(self: &Arc<Self>, node: &str) -> DispatchWatch {

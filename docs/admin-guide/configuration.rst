@@ -234,8 +234,13 @@ and Raft high-availability topology.
      - integer
      - ``5``
      - Live
-     - Maximum automatic requeues (excluding preemption) before a job is held with
-       ``JobHoldMaxRequeue``. Must be ``>= 1``; ``0`` is a validation error.
+     - Maximum automatic requeues before a job is held with
+       ``JobHoldMaxRequeue``. Preemption is excluded, as is a node refusing a
+       dispatch because it already holds the job's resources — drift the job
+       neither caused nor can influence. Those refusals are exempt up to this
+       many, and are charged normally after that, so a conflict nothing resolves
+       still parks the job. Each refusal lengthens the launch backoff either
+       way. Must be ``>= 1``; ``0`` is a validation error.
    * - ``max_launch_backoff_secs``
      - integer
      - ``300``
@@ -1128,7 +1133,7 @@ node's account of what it is holding may be acted on destructively.
      - ``"open"``
      - Node admission mode. ``open`` lets any node register; ``token`` requires a
        registering ``spurd`` to present a valid admission token. Also decides
-       whether a ledger arriving with a registration may license the controller
+       whether a ledger arriving *with a registration* may license the controller
        to cancel work — see below.
 
 See :doc:`accounting` for managing admission tokens with ``spur token``.
@@ -1146,35 +1151,33 @@ them; or it is left alone and named in the node's reason for an operator. A job
 the node no longer holds is settled as failed. See
 :doc:`/user-guide/monitoring-jobs` for what a reconcile does and when one runs.
 
-``mode`` decides whether a ledger that arrives *with a registration* may license
-those two destructive halves:
+Reconciliation acts in **either** mode when the controller went out and pulled the
+ledger itself — which is every trigger except one, so a stock cluster repairs
+itself. What ``mode`` decides is the remaining case, a ledger a caller *pushes*
+at the controller as part of registering:
 
 * ``token`` — the registering agent presented a valid admission token, so the
-  controller acts on what it sent: unrecorded claims are answered, and jobs the
-  node no longer holds are settled.
-* ``open`` (the default) — any host able to reach the controller's port may
-  assert any hostname, so the controller cannot place the caller at the node the
-  ledger names. Drift is still detected and written to the controller log, naming
-  the node and job each time, but nothing is cancelled or settled on the strength
-  of that registration.
-
-A ledger the controller *pulled* is licensed in either mode, because the
-controller chose to dial the node rather than being called by it. So an ``open``
-cluster still repairs itself — it just waits for the next pull instead of
-repairing at the moment a node registers.
+  controller acts on the cut it arrived with: unrecorded claims are answered, and
+  jobs the node no longer holds are settled, at the moment the node registers.
+* ``open`` (the default) — the caller picked both the moment and the hostname and
+  proved neither, so that cut is read but not acted on. The drift it shows is
+  written to the controller log, and a claim the controller has no record of is
+  still named in the node's reason and drains it. The repair itself waits for the
+  next pull, which a registration schedules anyway.
 
 .. note::
 
-   Treat this as a misconfiguration guard, not a security boundary. Other
-   agent-facing RPCs — the per-node completion report among them — already act on
-   a node name the caller asserts, with no credential required, so ``open``
-   admission was never a trust boundary and ``token`` does not turn it into one.
-   Keep the control-plane port reachable only from hosts you trust either way.
+   ``mode`` is a misconfiguration guard, not a security boundary, and the
+   reconciler is not where that boundary would go. Other agent-facing RPCs — the
+   per-node completion report among them — already act on a node name the caller
+   asserts with no credential required, and reporting completion for each of a
+   job's nodes ends that job and frees its resources everywhere. Nothing in
+   reconciliation is reachable that is not already reachable there.
 
-   What ``token`` buys is that the controller acts on a registering node's word
-   immediately. What the default costs is the wait for a pulled ledger: until one
-   comes around, drift is visible in the controller log but unrepaired, and the
-   resources it describes stay booked.
+   What ``token`` buys is that a node's identity is provable, so the controller
+   can tell a node from a host claiming to be one. That is worth having on any
+   cluster whose control-plane port is not already restricted to hosts you trust
+   — which is the control that actually bounds this, in either mode.
 
 ``[devices]``
 -------------
@@ -1695,6 +1698,69 @@ submitting host on each invocation.
      - ``job_submit.lua``
      - controller, at submit
      - Live
+
+.. note::
+
+   Every hook runs in a process group of its own, so a signal sent to the
+   process that started it does not reach it. For the client-side hooks this is
+   visible: ``Ctrl-C`` on ``srun`` no longer interrupts ``srun_prolog`` or
+   ``srun_epilog``, which run to completion or until ``srun`` itself exits. A
+   hook that can hang should carry its own bound — for example:
+
+   .. code-block:: bash
+
+      #!/bin/bash
+      timeout 30 /usr/local/bin/drain-scratch || exit 0
+
+The ``[hooks]`` section also carries one non-path setting:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 10 14 14 36
+
+   * - Field
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``epilog_timeout_secs``
+     - integer
+     - ``600``
+     - Agent restart
+     - Seconds to wait for ``epilog`` on a compute node before giving up on it.
+       ``0`` waits forever, matching Slurm's ``PrologEpilogTimeout`` default.
+
+.. note::
+
+   A job's CPU, memory, and GPU allocation stays charged to it until ``epilog``
+   returns, because the node withholds its completion report until then. An
+   ``epilog`` that never returns therefore holds that allocation — and the job
+   record behind it — for as long as the node keeps heartbeating; only marking
+   the node ``DOWN`` frees it.
+
+   On expiry Spur stops waiting, records the hook as failed so the allocation is
+   released, and drains the node. Elapsed time is not evidence that a hook is
+   wedged rather than slow, so the drain is deliberate: nothing new should land
+   on the node until an operator has confirmed what the hook did or did not
+   clean up.
+
+   On expiry Spur also sends ``SIGKILL`` to the hook's process group — the hook
+   and everything it spawned. The hook runs in a group of its own, so the signal
+   reaches nothing else on the node. Without it the abandoned hook would carry
+   on working against an allocation that has already been handed to the next
+   job, which is the overlap the drain exists to prevent. Treat a timed-out node
+   as having had a partial epilog: whatever the hook had not finished by the
+   deadline was stopped part-way.
+
+   The timeout is named in the node's own log
+   (``epilog script did not return within Ns``). The drain reason recorded on the
+   controller is ``epilog script timed out after Ns`` for jobs run without a
+   supervisor, and the generic ``epilog script failed`` for supervised jobs,
+   which is the default — check the node log to tell the two apart.
+
+   Raise this on clusters whose epilog does genuinely long cleanup (wiping a
+   large scratch filesystem, resetting devices), or set ``0`` to restore the
+   unbounded wait.
 
 .. note::
 
