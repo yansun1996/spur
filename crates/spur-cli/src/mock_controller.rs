@@ -9,9 +9,9 @@
 //! caller back the address plus a shared record of what the server observed.
 //! Only a handful of RPCs are implemented (`SubmitJob`, `GetJob`,
 //! `JobKeepalive`, `CreateJobStep`, `CompleteJobStep`, `RunStep`, `GetNode`,
-//! `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`); every other RPC
-//! reports `unimplemented` so an unexpected call fails loudly instead of
-//! silently returning a default.
+//! `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`, `CompleteJob`,
+//! `CancelJob`); every other RPC reports `unimplemented` so an unexpected
+//! call fails loudly instead of silently returning a default.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -57,7 +57,10 @@ pub(crate) struct StepCapture {
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
     /// Defaults to `MOCK_JOB_ID`; override with `set_submit_job_id`.
     submit_job_id: Arc<AtomicU32>,
-    cancel_job_calls: Arc<AtomicU32>,
+    complete_job_calls: Arc<Mutex<Vec<(u32, i32)>>>,
+    /// When set, `complete_job` returns this error instead of succeeding.
+    complete_job_error: Arc<Mutex<Option<tonic::Code>>>,
+    cancel_job_calls: Arc<Mutex<Vec<(u32, i32)>>>,
 }
 
 impl Default for StepCapture {
@@ -81,6 +84,8 @@ impl Default for StepCapture {
             deregister_node_calls: Arc::default(),
             update_node_fail_names: Arc::default(),
             submit_job_id: Arc::new(AtomicU32::new(MOCK_JOB_ID)),
+            complete_job_calls: Arc::default(),
+            complete_job_error: Arc::default(),
             cancel_job_calls: Arc::default(),
         }
     }
@@ -180,9 +185,16 @@ impl StepCapture {
         *self.get_job_sequence.lock().unwrap() = seq;
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn cancel_job_calls(&self) -> u32 {
-        self.cancel_job_calls.load(Ordering::SeqCst)
+    pub(crate) fn complete_job_calls(&self) -> Vec<(u32, i32)> {
+        self.complete_job_calls.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_complete_job_error(&self, code: tonic::Code) {
+        *self.complete_job_error.lock().unwrap() = Some(code);
+    }
+
+    pub(crate) fn cancel_job_calls(&self) -> Vec<(u32, i32)> {
+        self.cancel_job_calls.lock().unwrap().clone()
     }
 }
 
@@ -292,14 +304,6 @@ mock_controller_impl! {
             }))
         }
 
-        async fn cancel_job(
-            &self,
-            _request: tonic::Request<proto::CancelJobRequest>,
-        ) -> Result<tonic::Response<()>, tonic::Status> {
-            self.capture.cancel_job_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(tonic::Response::new(()))
-        }
-
         async fn run_step(
             &self,
             request: tonic::Request<proto::RunStepRequest>,
@@ -382,10 +386,38 @@ mock_controller_impl! {
                 .push((request.name, request.force));
             Ok(tonic::Response::new(proto::DeregisterNodeResponse::default()))
         }
+
+        async fn complete_job(
+            &self,
+            request: tonic::Request<proto::CompleteJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            let request = request.into_inner();
+            self.capture
+                .complete_job_calls
+                .lock()
+                .unwrap()
+                .push((request.job_id, request.exit_code));
+            if let Some(code) = *self.capture.complete_job_error.lock().unwrap() {
+                return Err(tonic::Status::new(code, "mock complete_job failure"));
+            }
+            Ok(tonic::Response::new(()))
+        }
+
+        async fn cancel_job(
+            &self,
+            request: tonic::Request<proto::CancelJobRequest>,
+        ) -> Result<tonic::Response<()>, tonic::Status> {
+            let request = request.into_inner();
+            self.capture
+                .cancel_job_calls
+                .lock()
+                .unwrap()
+                .push((request.job_id, request.signal));
+            Ok(tonic::Response::new(()))
+        }
     }
     unimplemented {
         get_jobs(proto::GetJobsRequest) -> proto::GetJobsResponse;
-        complete_job(proto::CompleteJobRequest) -> ();
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();

@@ -2386,10 +2386,24 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
     }
 }
 
+/// Below this, a single missed keepalive (one lost UDP-ish ping, one slow
+/// tick) would read as client death; two full intervals is the same floor
+/// `inactive_limit_secs` itself is validated against in `config.rs`.
+const SRUN_JOB_KEEPALIVE_FLOOR_SECS: i64 = 2 * spur_core::config::KEEPALIVE_INTERVAL_SECS as i64;
+
+/// A missing entry (nothing seen yet this stint) is never past the floor —
+/// mirrors `interactive_reap_candidates` seeding a first sighting to `now`.
+fn srun_job_past_keepalive_floor(now: DateTime<Utc>, last_seen: Option<DateTime<Utc>>) -> bool {
+    last_seen.is_some_and(|last_seen| {
+        now - last_seen > chrono::Duration::seconds(SRUN_JOB_KEEPALIVE_FLOOR_SECS)
+    })
+}
+
 /// Reap interactive allocations (salloc/srun) whose client stopped sending
-/// keepalives, mirroring Slurm's `InactiveLimit`. Idle allocations get a
-/// SIGTERM -> grace -> SIGKILL sequence (like `enforce_time_limits`) and are
-/// finalized via the TIMEOUT path. Disabled when `inactive_limit_secs == 0`.
+/// keepalives, mirroring Slurm's `InactiveLimit`: SIGTERM -> grace -> SIGKILL.
+/// Salloc only reaps opt-in (`inactive_limit_secs`) and finalizes via TIMEOUT;
+/// a standalone srun always reaps on its own fixed floor and is never
+/// finalized here — its task's own stepd reports the real exit instead.
 async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     use spur_core::job::{JobId, JobState};
 
@@ -2435,8 +2449,22 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
 
         // Prunes the keepalive map every tick; returns candidates only when
         // the limit is enabled.
-        let stale = cluster.interactive_reap_candidates(&ids, now, limit_secs);
-        let stale_set: HashSet<JobId> = stale.iter().copied().collect();
+        let mut stale_set: HashSet<JobId> = cluster
+            .interactive_reap_candidates(&ids, now, limit_secs)
+            .into_iter()
+            .collect();
+        // A standalone srun reaps on its own fixed floor, independent of
+        // whether the admin enabled InactiveLimit at all. The call above
+        // already seeded and pruned this job's entry for every id in `ids`.
+        for job in running.iter().filter(|j| j.spec.srun_job) {
+            if stale_set.contains(&job.job_id) {
+                continue;
+            }
+            if srun_job_past_keepalive_floor(now, cluster.keepalive_last_seen(job.job_id)) {
+                stale_set.insert(job.job_id);
+            }
+        }
+        let stale: Vec<JobId> = stale_set.iter().copied().collect();
         // Drop grace timers for jobs that recovered (pinged again) or are gone,
         // so a client that comes back during the grace aborts the kill.
         signaled.retain(|id, _| stale_set.contains(id));
@@ -2480,9 +2508,15 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
                         "InactiveLimit grace expired — force-killing allocation"
                     );
 
-                    if let Err(e) = cluster.complete_job(job_id, -1, JobState::Timeout) {
-                        warn!(job_id, error = %e, "failed to reap inactive allocation");
-                        continue;
+                    // A task-dispatch srun reports its own real exit once
+                    // killed; finalizing it here would race that report. A
+                    // `--pty` session reports no user step, so it still needs
+                    // this synthetic finalization exactly as before.
+                    if job.spec.pty || !job.spec.srun_job {
+                        if let Err(e) = cluster.complete_job(job_id, -1, JobState::Timeout) {
+                            warn!(job_id, error = %e, "failed to reap inactive allocation");
+                            continue;
+                        }
                     }
 
                     // SIGKILL on the run's current nodes, not the stale snapshot.
@@ -3220,6 +3254,36 @@ mod tests {
         ];
         let unique: std::collections::HashSet<&str> = categories.iter().copied().collect();
         assert_eq!(unique.len(), categories.len(), "got: {categories:?}");
+    }
+
+    #[test]
+    fn srun_job_past_keepalive_floor_ignores_a_first_sighting() {
+        let now = Utc::now();
+        assert!(
+            !srun_job_past_keepalive_floor(now, None),
+            "nothing seen yet this stint must not read as abandoned"
+        );
+    }
+
+    #[test]
+    fn srun_job_past_keepalive_floor_tolerates_one_missed_ping() {
+        let now = Utc::now();
+        let one_interval_ago =
+            now - chrono::Duration::seconds(spur_core::config::KEEPALIVE_INTERVAL_SECS as i64 + 5);
+        assert!(
+            !srun_job_past_keepalive_floor(now, Some(one_interval_ago)),
+            "a single lost ping must not end the allocation"
+        );
+    }
+
+    #[test]
+    fn srun_job_past_keepalive_floor_fires_past_two_missed_pings() {
+        let now = Utc::now();
+        let long_silent = now - chrono::Duration::seconds(SRUN_JOB_KEEPALIVE_FLOOR_SECS + 1);
+        assert!(
+            srun_job_past_keepalive_floor(now, Some(long_silent)),
+            "two missed pings in a row is the client actually gone"
+        );
     }
 
     #[test]

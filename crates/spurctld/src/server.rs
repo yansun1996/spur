@@ -2175,10 +2175,16 @@ impl SlurmController for ControllerService {
             )
             .map_err(|e| match e {
                 crate::cluster::SrunCompleteError::NotFound(_) => Status::not_found(e.to_string()),
+                // Distinct from the other preconditions: the job's own task
+                // step can end it before the client calls CompleteJob, and
+                // that "already done" case must read differently from a
+                // genuine precondition failure.
+                crate::cluster::SrunCompleteError::AlreadyTerminal { .. } => {
+                    Status::already_exists(e.to_string())
+                }
                 crate::cluster::SrunCompleteError::NotSrunJob(_)
                 | crate::cluster::SrunCompleteError::NotStepDispatch(_)
-                | crate::cluster::SrunCompleteError::NotRunning { .. }
-                | crate::cluster::SrunCompleteError::AlreadyTerminal { .. } => {
+                | crate::cluster::SrunCompleteError::NotRunning { .. } => {
                     Status::failed_precondition(e.to_string())
                 }
                 crate::cluster::SrunCompleteError::NotOwner { .. } => {
@@ -3057,8 +3063,20 @@ impl SlurmController for ControllerService {
         // Non-empty `reporting_node` means a per-node completion report. The final
         // job outcome is still derived from aggregated exit codes in
         // `Job::derived_completion`.
-        let completion_result = if !req.reporting_node.is_empty() && reports_whole_job(req.step_id)
-        {
+        //
+        // A user step's own report normally speaks only for itself; a
+        // standalone srun's one-shot step is the exception (`is_standalone_srun_shape`).
+        let has_report = !req.reporting_node.is_empty();
+        let is_owning_srun_step = has_report
+            && req.step_id.is_some_and(spur_core::step::is_user_step)
+            && self
+                .cluster
+                .job_shape_for_step_completion(req.job_id)
+                .is_some_and(|(srun_job, srun_step_dispatch, state)| {
+                    is_standalone_srun_shape(srun_job, srun_step_dispatch) && state.is_active()
+                });
+        let ends_job = reports_whole_job(req.step_id) || is_owning_srun_step;
+        let completion_result = if has_report && ends_job {
             validate_completion_report_state_for_rpc(state, req.exit_code)?;
             Some(self.cluster.node_complete(
                 req.job_id,
@@ -3103,7 +3121,24 @@ impl SlurmController for ControllerService {
         };
 
         match completion_result {
-            Some(Ok(NodeCompleteResult::AllDone { raft_index, .. })) => Ok(resp(raft_index)),
+            Some(Ok(NodeCompleteResult::AllDone { raft_index, .. })) => {
+                // node_complete only ends the job; this is what tells the
+                // node to shut down STEP_EXTERN, same as CompleteJob does.
+                // Only a standalone srun's own step needs it, so the (rare)
+                // job fetch happens here rather than on every report above.
+                if is_owning_srun_step {
+                    if let Some(job) = self.cluster.get_job(req.job_id) {
+                        let cluster = self.cluster.clone();
+                        tokio::spawn(async move {
+                            crate::scheduler_loop::release_srun_allocation_on_agents(
+                                &cluster, &job,
+                            )
+                            .await;
+                        });
+                    }
+                }
+                Ok(resp(raft_index))
+            }
             Some(Ok(NodeCompleteResult::Completing { raft_index })) => {
                 if let Some(job) = self.cluster.get_job(req.job_id) {
                     if job
@@ -6325,6 +6360,14 @@ fn reports_whole_job(step_id: Option<spur_core::step::StepId>) -> bool {
     step_id.is_none_or(|id| !spur_core::step::is_user_step(id))
 }
 
+/// A standalone srun's allocation-only shape (never salloc, which doesn't set
+/// `spec.srun_job`). `report_job_status` uses this to let a user step's own
+/// completion end the job — no client is guaranteed to still be around to
+/// report it via CompleteJob, the way a salloc session's own life does.
+fn is_standalone_srun_shape(srun_job: bool, srun_step_dispatch: bool) -> bool {
+    srun_job && srun_step_dispatch
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_completion_report_state_for_rpc(
     state: spur_core::job::JobState,
@@ -7690,6 +7733,108 @@ mod tests {
             per_node_alloc: [("n1".to_string(), slice)].into_iter().collect(),
             srun_step_dispatch: false,
             run_attempt,
+            at: Some(chrono::Utc::now()),
+        });
+    }
+
+    /// The shape `run_standalone_srun`'s own submission produces:
+    /// `spec.srun_job` and `srun_step_dispatch` both set.
+    fn seed_a_standalone_srun_job_on_a_node(cluster: &Arc<ClusterManager>) {
+        register_a_node(cluster, "n1");
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
+            job_id: 7,
+            spec: Box::new(spur_core::job::JobSpec {
+                srun_job: true,
+                ..a_one_node_spec()
+            }),
+        });
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobStateChange {
+            job_id: 7,
+            old_state: spur_core::job::JobState::Pending,
+            new_state: spur_core::job::JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        let slice = spur_core::resource::ResourceAllocations::with_scalar(2, 1000);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobStart {
+            job_id: 7,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: [("n1".to_string(), slice)].into_iter().collect(),
+            srun_step_dispatch: true,
+            run_attempt: 1,
+            at: Some(chrono::Utc::now()),
+        });
+    }
+
+    /// The same shape spanning two nodes, so a report from the first must not
+    /// finalize the job before the second has reported too.
+    fn seed_a_two_node_standalone_srun_job(cluster: &Arc<ClusterManager>) {
+        register_a_node(cluster, "n1");
+        register_a_node(cluster, "n2");
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
+            job_id: 7,
+            spec: Box::new(spur_core::job::JobSpec {
+                srun_job: true,
+                num_nodes: 2,
+                ..a_one_node_spec()
+            }),
+        });
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobStateChange {
+            job_id: 7,
+            old_state: spur_core::job::JobState::Pending,
+            new_state: spur_core::job::JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        let slice = spur_core::resource::ResourceAllocations::with_scalar(2, 1000);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobStart {
+            job_id: 7,
+            nodes: vec!["n1".into(), "n2".into()],
+            resources: slice.clone(),
+            per_node_alloc: [("n1".to_string(), slice.clone()), ("n2".to_string(), slice)]
+                .into_iter()
+                .collect(),
+            srun_step_dispatch: true,
+            run_attempt: 1,
+            at: Some(chrono::Utc::now()),
+        });
+    }
+
+    /// A salloc session: `spec.interactive` set, `spec.srun_job` is not.
+    fn seed_an_interactive_salloc_job_on_a_node(cluster: &Arc<ClusterManager>) {
+        register_a_node(cluster, "n1");
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobSubmit {
+            at: None,
+            job_id: 7,
+            spec: Box::new(spur_core::job::JobSpec {
+                interactive: true,
+                ..a_one_node_spec()
+            }),
+        });
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobStateChange {
+            job_id: 7,
+            old_state: spur_core::job::JobState::Pending,
+            new_state: spur_core::job::JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        let slice = spur_core::resource::ResourceAllocations::with_scalar(2, 1000);
+        cluster.apply_operation(&spur_core::wal::WalOperation::JobStart {
+            job_id: 7,
+            nodes: vec!["n1".into()],
+            resources: slice.clone(),
+            per_node_alloc: [("n1".to_string(), slice)].into_iter().collect(),
+            srun_step_dispatch: true,
+            run_attempt: 1,
             at: Some(chrono::Utc::now()),
         });
     }
@@ -10571,6 +10716,179 @@ mod tests {
             "refusing this report holds n1's slice for good: {:?}",
             reported.err()
         );
+    }
+
+    /// A standalone srun's task step is the whole reason its allocation
+    /// exists, so its completion push must end the job with the real exit
+    /// code rather than leave it Running until TimeLimit fabricates one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_standalone_paths_own_task_step_completion_ends_its_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        seed_a_standalone_srun_job_on_a_node(&svc.cluster);
+
+        let reported = svc
+            .report_job_status(Request::new(ReportJobStatusRequest {
+                job_id: 7,
+                state: spur_core::job::JobState::Completed.to_proto_i32(),
+                exit_code: 0,
+                reporting_node: "n1".into(),
+                run_attempt: 1,
+                step_id: Some(1), // a user step, not STEP_BATCH/STEP_EXTERN
+                ..Default::default()
+            }))
+            .await
+            .expect("report accepted");
+
+        assert!(
+            reported.into_inner().release_raft_index > 0,
+            "the task step's own completion must commit and acknowledge"
+        );
+        let job = svc.cluster.get_job(7).expect("job 7");
+        assert_eq!(job.state, spur_core::job::JobState::Completed);
+        assert_eq!(job.exit_code, Some(0));
+    }
+
+    /// Same as above, but failed: the job must settle with the real exit
+    /// code, never the synthetic `-1` a TimeLimit-driven reap would produce.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_standalone_paths_failed_task_step_ends_its_job_with_the_real_exit_code() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        seed_a_standalone_srun_job_on_a_node(&svc.cluster);
+
+        svc.report_job_status(Request::new(ReportJobStatusRequest {
+            job_id: 7,
+            state: spur_core::job::JobState::Failed.to_proto_i32(),
+            exit_code: 137,
+            signal: 9,
+            reporting_node: "n1".into(),
+            run_attempt: 1,
+            step_id: Some(1),
+            ..Default::default()
+        }))
+        .await
+        .expect("report accepted");
+
+        let job = svc.cluster.get_job(7).expect("job 7");
+        assert_eq!(job.state, spur_core::job::JobState::Failed);
+        assert_eq!(job.exit_code, Some(137));
+    }
+
+    /// A two-node standalone srun must wait for both nodes' task-step reports
+    /// before ending: the first already moves the job to Completing, and
+    /// that must not stop the second's report from reaching `node_complete`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_multi_node_standalone_srun_waits_for_every_node_before_ending() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        seed_a_two_node_standalone_srun_job(&svc.cluster);
+
+        svc.report_job_status(Request::new(ReportJobStatusRequest {
+            job_id: 7,
+            state: spur_core::job::JobState::Completed.to_proto_i32(),
+            exit_code: 0,
+            reporting_node: "n1".into(),
+            run_attempt: 1,
+            step_id: Some(1),
+            ..Default::default()
+        }))
+        .await
+        .expect("report accepted");
+
+        let job = svc.cluster.get_job(7).expect("job 7");
+        assert_eq!(
+            job.state,
+            spur_core::job::JobState::Completing,
+            "one of two nodes reported; the job must not finalize yet"
+        );
+
+        let reported = svc
+            .report_job_status(Request::new(ReportJobStatusRequest {
+                job_id: 7,
+                state: spur_core::job::JobState::Completed.to_proto_i32(),
+                exit_code: 0,
+                reporting_node: "n2".into(),
+                run_attempt: 1,
+                step_id: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .expect("report accepted");
+
+        assert!(
+            reported.into_inner().release_raft_index > 0,
+            "the second node's report must be the one that commits and acknowledges"
+        );
+        let job = svc.cluster.get_job(7).expect("job 7");
+        assert_eq!(job.state, spur_core::job::JobState::Completed);
+        assert_eq!(job.exit_code, Some(0));
+    }
+
+    /// Regression guard: a salloc session's own step completing must never
+    /// end the shell — only `spec.srun_job` reaches this path, not `interactive`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_salloc_sessions_step_completion_does_not_end_its_job() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        seed_an_interactive_salloc_job_on_a_node(&svc.cluster);
+
+        let reported = svc
+            .report_job_status(Request::new(ReportJobStatusRequest {
+                job_id: 7,
+                state: spur_core::job::JobState::Completed.to_proto_i32(),
+                exit_code: 0,
+                reporting_node: "n1".into(),
+                run_attempt: 1,
+                step_id: Some(1),
+                ..Default::default()
+            }))
+            .await
+            .expect("a user step's report is always accepted, even as a no-op");
+
+        assert_eq!(
+            reported.into_inner().release_raft_index,
+            0,
+            "a salloc step's own completion must not commit anything"
+        );
+        let job = svc.cluster.get_job(7).expect("job 7");
+        assert_eq!(
+            job.state,
+            spur_core::job::JobState::Running,
+            "the salloc session must outlive a step run inside it"
+        );
+    }
+
+    /// The client's own `CompleteJob` can race the job's own task step
+    /// ending it first; that race must read as `AlreadyExists`; a client
+    /// that mistook it for a real failure would fire a pointless cancel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn complete_job_reports_already_exists_when_the_task_step_beat_it_there() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service(&dir).await;
+        seed_a_standalone_srun_job_on_a_node(&svc.cluster);
+
+        svc.report_job_status(Request::new(ReportJobStatusRequest {
+            job_id: 7,
+            state: spur_core::job::JobState::Completed.to_proto_i32(),
+            exit_code: 0,
+            reporting_node: "n1".into(),
+            run_attempt: 1,
+            step_id: Some(1),
+            ..Default::default()
+        }))
+        .await
+        .expect("report accepted");
+
+        let err = svc
+            .complete_job(Request::new(CompleteJobRequest {
+                job_id: 7,
+                exit_code: 0,
+                user: "testuser".into(),
+            }))
+            .await
+            .expect_err("the job already ended");
+        assert_eq!(err.code(), Code::AlreadyExists);
     }
 
     /// A service with a configured node-identity signing key, for stepd
