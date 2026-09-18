@@ -3235,6 +3235,87 @@ async fn wait_for_reparented_exit(pid: i32) -> i32 {
     0
 }
 
+// No start-time check: a reused pid can stall recovery, same known limit as
+// `wait_for_reparented_exit`'s other, older caller.
+fn orphan_pid_is_alive(pid: i32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// One leaked step rootfs directory: recover what it can, then reclaim the
+/// disk. Returns a handle when still running, so a test can await it.
+async fn sweep_one_orphaned_container_step(
+    job_id: u32,
+    step_id: u32,
+    base: String,
+    completions: crate::step_completion::StepCompletions,
+    reaping: Arc<Mutex<HashSet<(u32, u32)>>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some((pid, run_attempt)) = crate::container::read_step_launch_marker(&base) else {
+        // No marker: an older crash predates markers, or (e.g. `srun --pty`)
+        // this session type never writes one — either way, nothing to recover.
+        reap_orphaned_step_rootfs(&base);
+        return None;
+    };
+    if orphan_pid_is_alive(pid) {
+        // Recovery can take as long as the workload does, so this must not
+        // block startup; `reaping` fences a requeue against the same path.
+        reaping.lock().await.insert((job_id, step_id));
+        return Some(tokio::spawn(async move {
+            wait_for_reparented_exit(pid).await;
+            complete_recovered_step(job_id, run_attempt, step_id, &base, &completions).await;
+            reap_orphaned_step_rootfs(&base);
+            reaping.lock().await.remove(&(job_id, step_id));
+        }));
+    }
+    complete_recovered_step(job_id, run_attempt, step_id, &base, &completions).await;
+    reap_orphaned_step_rootfs(&base);
+    None
+}
+
+/// Reports the real exit code if the marker made that possible; otherwise
+/// reports nothing rather than fabricate one — `await_step`'s not_found stays.
+async fn complete_recovered_step(
+    job_id: u32,
+    run_attempt: u32,
+    step_id: u32,
+    base: &str,
+    completions: &crate::step_completion::StepCompletions,
+) {
+    let Some(exit_code) = crate::container::read_step_exit_marker(base) else {
+        warn!(
+            job_id,
+            run_attempt,
+            step_id,
+            "an orphaned step's real outcome could not be recovered after a restart"
+        );
+        return;
+    };
+    info!(
+        job_id,
+        run_attempt,
+        step_id,
+        exit_code,
+        "recovered an orphaned step's real outcome after a restart"
+    );
+    completions
+        .complete(
+            job_id,
+            run_attempt,
+            step_id,
+            crate::step_completion::StepOutcome {
+                exit_code,
+                signal: 0,
+            },
+        )
+        .await;
+}
+
+fn reap_orphaned_step_rootfs(base: &str) {
+    let mode = crate::container::infer_rootfs_mode(base);
+    crate::container::remove_step_markers(base);
+    crate::container::cleanup_rootfs(base, &mode);
+}
+
 /// A step that builds its own container keeps the agent in its exec path, so it
 /// cannot be handed to a supervisor. Entering a parent job's namespaces can.
 fn step_can_be_supervised(container_image: &str) -> bool {
@@ -3571,6 +3652,8 @@ fn reject_nul_bytes(cmd: &StepChildCommand) -> Result<(), Status> {
 /// (namespace unshare, mounts, device injection, pivot_root, priv drop), signals
 /// readiness on `ready_w`, then execs `cmd`. Never returns. The whole namespace
 /// setup is shared by the buffered and PTY containerized-step paths.
+// A fork/exec helper — each input is a distinct piece of the child's context.
+#[allow(clippy::too_many_arguments)]
 fn container_child_exec(
     container_cfg: &crate::container::ContainerConfig,
     rootfs: &std::path::Path,
@@ -3579,6 +3662,7 @@ fn container_child_exec(
     cgroup_join: &Option<executor::CgroupJoin>,
     env_base: HashMap<String, String>,
     cmd: StepChildCommand,
+    exit_marker: Option<std::path::PathBuf>,
 ) -> ! {
     use std::os::fd::AsRawFd;
     let ready_w_fd = ready_w.as_raw_fd();
@@ -3592,16 +3676,17 @@ fn container_child_exec(
     crate::container::close_inherited_fds(ready_w_fd);
     executor::apply_memlock(memlock);
 
-    let hook_env = match crate::container::container_init(container_cfg, rootfs) {
-        Ok(env) => env,
-        Err(e) => {
-            let msg = format!("E:{e:#}");
-            unsafe {
-                libc::write(ready_w_fd, msg.as_ptr() as *const _, msg.len());
+    let hook_env =
+        match crate::container::container_init(container_cfg, rootfs, exit_marker.as_deref()) {
+            Ok(env) => env,
+            Err(e) => {
+                let msg = format!("E:{e:#}");
+                unsafe {
+                    libc::write(ready_w_fd, msg.as_ptr() as *const _, msg.len());
+                }
+                std::process::exit(1);
             }
-            std::process::exit(1);
-        }
-    };
+        };
 
     unsafe { libc::write(ready_w_fd, b"OK".as_ptr() as *const _, 2) };
     drop(ready_w);
@@ -3738,6 +3823,7 @@ async fn run_containerized_step(
     step_files: crate::executor::StepOutputFiles,
     active_steps: &Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     step_key: (u32, u32),
+    run_attempt: u32,
     memlock: spur_core::config::MemlockLimit,
     cgroup: Option<&std::path::Path>,
     cgroup_required: bool,
@@ -3776,6 +3862,11 @@ async fn run_containerized_step(
     // joins itself below while still root, and `required` is verified parent-side.
     let cgroup_join = executor::CgroupJoin::for_cgroup(cgroup);
 
+    // Named so a restarted agent can find this step's rootfs sibling markers by
+    // (job_id, step_id) alone — see `container::orphaned_step_rootfs_dirs`.
+    let rootfs_base = crate::container::step_rootfs_base(step_key.0, step_key.1);
+    let exit_marker = crate::container::step_exit_marker_path(&rootfs_base);
+
     match unsafe { nix::unistd::fork().map_err(|e| Status::internal(format!("fork failed: {e}")))? }
     {
         nix::unistd::ForkResult::Child => {
@@ -3796,6 +3887,7 @@ async fn run_containerized_step(
                 &cgroup_join,
                 env_base,
                 child_cmd,
+                Some(exit_marker),
             );
         }
         nix::unistd::ForkResult::Parent { child: child_pid } => {
@@ -3805,6 +3897,23 @@ async fn run_containerized_step(
             drop(step_files);
 
             container_parent_ready(child_pid, ready_r, cgroup_required, cgroup)?;
+
+            // Hard precondition, not best-effort: the sweep trusts a missing
+            // marker to mean a step never got this far.
+            if let Err(error) = crate::container::write_step_launch_marker(
+                &rootfs_base,
+                child_pid.as_raw(),
+                run_attempt,
+            ) {
+                crate::executor::kill_process_tree(
+                    child_pid.as_raw(),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = nix::sys::wait::waitpid(child_pid, None);
+                return Err(Status::internal(format!(
+                    "failed to record the step's restart-recovery marker: {error}"
+                )));
+            }
 
             // Register PID for cancellation.
             let raw_pid = child_pid.as_raw() as u32;
@@ -3869,6 +3978,9 @@ pub struct AgentService {
     active_steps: Arc<Mutex<HashMap<(u32, u32), ActiveStep>>>,
     /// Where a supervised step's launching RPC parks for its exit status.
     step_completions: crate::step_completion::StepCompletions,
+    /// `(job_id, step_id)` a restart-recovery task still owns the rootfs of; a
+    /// redispatch of the same key must wait rather than reuse the directory.
+    reaping_orphans: Arc<Mutex<HashSet<(u32, u32)>>>,
     /// Jobs this agent is currently bridging a terminal for. A job absent here
     /// with a terminal in custody has been orphaned by a restart.
     live_ptys: Arc<Mutex<std::collections::HashSet<u32>>>,
@@ -4051,6 +4163,7 @@ impl AgentService {
             k0s: Arc::new(crate::cluster::K0sAgent::from_config(cluster)),
             active_steps: Arc::new(Mutex::new(HashMap::new())),
             step_completions: crate::step_completion::StepCompletions::new(),
+            reaping_orphans: Arc::new(Mutex::new(HashSet::new())),
             live_ptys: Arc::new(Mutex::new(std::collections::HashSet::new())),
             lifecycle: crate::job_lifecycle::JobLifecycle::default(),
             stepds: Arc::new(Mutex::new(HashMap::new())),
@@ -4155,6 +4268,26 @@ impl AgentService {
                 );
             }
         }
+    }
+
+    /// Recovers/reaps leaked per-step container rootfs dirs; returns each
+    /// still-running step's handle so a test can await it.
+    pub async fn sweep_orphaned_container_steps(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut still_running = Vec::new();
+        for (job_id, step_id, base) in crate::container::orphaned_step_rootfs_dirs() {
+            if let Some(handle) = sweep_one_orphaned_container_step(
+                job_id,
+                step_id,
+                base,
+                self.step_completions.clone(),
+                self.reaping_orphans.clone(),
+            )
+            .await
+            {
+                still_running.push(handle);
+            }
+        }
+        still_running
     }
 
     /// Rebuild the claim index from the admission records, which are exact and
@@ -6157,14 +6290,11 @@ impl Drop for StepScriptCleanup {
 /// the `run_command` future is dropped mid-flight (srun Ctrl-C, client
 /// disconnect, controller RPC timeout) between `setup_rootfs` and the normal
 /// cleanup — otherwise every such attempt leaks an extracted/mounted rootfs.
-/// Removes a step's container rootfs on drop, so a rootfs is torn down even when
-/// the `run_command` future is dropped mid-flight (srun Ctrl-C, client
-/// disconnect, controller RPC timeout) between `setup_rootfs` and the normal
-/// cleanup — otherwise every such attempt leaks an extracted/mounted rootfs.
 ///
 /// `pid` is the container child's pid (set once known). On drop, any live child
 /// is killed before the rootfs is removed so `cleanup_rootfs` never races an
-/// `rm -rf`/umount against a process still pivoted into the directory.
+/// `rm -rf`/umount against a process still pivoted into the directory. Does
+/// not run if the *agent itself* dies — `sweep_orphaned_container_steps` covers that.
 struct StepRootfsGuard {
     base: String,
     mode: crate::container::RootfsMode,
@@ -6183,6 +6313,8 @@ impl Drop for StepRootfsGuard {
             );
             let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None);
         }
+        // The agent is alive to see this through; a restart's markers are moot.
+        crate::container::remove_step_markers(&self.base);
         crate::container::cleanup_rootfs(&self.base, &self.mode);
     }
 }
@@ -8907,6 +9039,16 @@ impl SlurmAgent for AgentService {
         } else if req.container.as_ref().is_some_and(|c| !c.image.is_empty()) {
             // Case 2: standalone srun --container-image with no running parent
             // container — set up a fresh rootfs for this step.
+            //
+            // Refuse a requeue that lands here before a restart-recovered
+            // orphan of a prior attempt finishes tearing down the same path.
+            if self.reaping_orphans.lock().await.contains(&step_key) {
+                // failed_precondition, not unavailable: the latter reads as
+                // "lost the agent" and misroutes into the reawait_step path.
+                return Err(Status::failed_precondition(
+                    "a previous run's container for this step is still being reclaimed; retry",
+                ));
+            }
             let c = req
                 .container
                 .as_ref()
@@ -9060,6 +9202,7 @@ impl SlurmAgent for AgentService {
                 step_files,
                 &self.active_steps,
                 step_key,
+                job_attempt,
                 memlock,
                 job_entry.cgroup_path.as_deref(),
                 self.cgroup.required,
@@ -11237,6 +11380,8 @@ impl AgentService {
                     &cgroup_join,
                     env_base,
                     child_cmd,
+                    // Interactive sessions have no restart-recovery path yet.
+                    None,
                 );
             }
             nix::unistd::ForkResult::Parent { child: child_pid } => {
@@ -15965,6 +16110,234 @@ mod tests {
         assert_eq!(response.into_inner().exit_code, 5);
     }
 
+    // --- Restart recovery for a standalone `srun --container-image` step
+    //     (Case 2 of `run_command`, which has no supervisor to adopt) ---
+
+    /// Shared with container.rs: two locks on the same env var wouldn't serialize.
+    use crate::container::tests::env_lock_async as container_dir_lock;
+
+    #[tokio::test]
+    async fn sweep_reaps_a_step_dir_with_no_launch_marker() {
+        let _guard = container_dir_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SPUR_CONTAINER_DIR", tmp.path());
+        std::fs::create_dir_all(tmp.path().join("step_7_0")).unwrap();
+
+        let completions = crate::step_completion::StepCompletions::new();
+        let handle = sweep_one_orphaned_container_step(
+            7,
+            0,
+            "step_7_0".to_string(),
+            completions.clone(),
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+        .await;
+
+        assert!(
+            handle.is_none(),
+            "no launch marker means nothing to wait on"
+        );
+        assert!(
+            !tmp.path().join("step_7_0").exists(),
+            "an unrecoverable leftover must still be reaped"
+        );
+        assert_eq!(completions.settled(7, 0, 0).await, None);
+        std::env::remove_var("SPUR_CONTAINER_DIR");
+    }
+
+    #[tokio::test]
+    async fn sweep_recovers_an_already_finished_orphans_real_exit_code() {
+        let _guard = container_dir_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SPUR_CONTAINER_DIR", tmp.path());
+        std::fs::create_dir_all(tmp.path().join("step_8_1")).unwrap();
+
+        // A pid this test knows is not alive: reap a short-lived real child so
+        // there is no ambiguity about a still-alive process reusing it.
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id() as i32;
+        dead.wait().unwrap();
+
+        crate::container::write_step_launch_marker("step_8_1", dead_pid, 3).unwrap();
+        std::fs::write(crate::container::step_exit_marker_path("step_8_1"), "5").unwrap();
+
+        let completions = crate::step_completion::StepCompletions::new();
+        let handle = sweep_one_orphaned_container_step(
+            8,
+            1,
+            "step_8_1".to_string(),
+            completions.clone(),
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+        .await;
+
+        assert!(
+            handle.is_none(),
+            "an already-dead pid must not spawn a waiter"
+        );
+        assert_eq!(
+            completions.settled(8, 3, 1).await,
+            Some(crate::step_completion::StepOutcome {
+                exit_code: 5,
+                signal: 0
+            }),
+            "the real recorded exit code must reach step_completions, not a fabricated one"
+        );
+        assert!(
+            !tmp.path().join("step_8_1").exists(),
+            "the rootfs must be reaped"
+        );
+        std::env::remove_var("SPUR_CONTAINER_DIR");
+    }
+
+    #[tokio::test]
+    async fn sweep_leaves_an_unrecoverable_orphan_unsettled_but_still_reaps_it() {
+        let _guard = container_dir_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SPUR_CONTAINER_DIR", tmp.path());
+        std::fs::create_dir_all(tmp.path().join("step_8_2")).unwrap();
+
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id() as i32;
+        dead.wait().unwrap();
+
+        // Launch marker present (the step was in flight), but no exit marker —
+        // it was killed, or died, before it could write one.
+        crate::container::write_step_launch_marker("step_8_2", dead_pid, 1).unwrap();
+
+        let completions = crate::step_completion::StepCompletions::new();
+        sweep_one_orphaned_container_step(
+            8,
+            2,
+            "step_8_2".to_string(),
+            completions.clone(),
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+        .await;
+
+        assert_eq!(
+            completions.settled(8, 1, 2).await,
+            None,
+            "an unrecoverable outcome must not be reported as any specific exit code"
+        );
+        assert!(
+            !tmp.path().join("step_8_2").exists(),
+            "the rootfs must still be reaped even when the outcome is unknown"
+        );
+        std::env::remove_var("SPUR_CONTAINER_DIR");
+    }
+
+    /// End to end: an orphan is still running when its agent is gone; a fresh
+    /// `AgentService` (a restart) recovers its real exit via `await_step`.
+    #[tokio::test]
+    async fn sweep_recovers_a_still_running_orphan_end_to_end_through_await_step() {
+        let _guard = container_dir_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SPUR_CONTAINER_DIR", tmp.path());
+        std::fs::create_dir_all(tmp.path().join("step_9_4")).unwrap();
+
+        let exit_marker = crate::container::step_exit_marker_path("step_9_4");
+        // Stand-in wrapper: mirrors wait_and_mirror_exit_code by writing its own
+        // exit code to the marker just before exiting, with nobody left to waitpid it.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "sleep 0.3; echo -n 7 > {}; exit 7",
+                exit_marker.display()
+            ))
+            .spawn()
+            .expect("spawn stand-in orphan");
+        let pid = child.id() as i32;
+        crate::container::write_step_launch_marker("step_9_4", pid, 6).unwrap();
+        // Reap it the way init eventually reaps a real orphan; the sweep only
+        // watches for the /proc entry to disappear, not for this wait itself.
+        tokio::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || child.wait()).await;
+        });
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        // Stands in for main.rs's recover_stepds, which runs before the sweep
+        // and is what populates `running` for this job in production.
+        svc.insert_test_job(9, TrackedJob::dummy(std::process::id()))
+            .await;
+
+        let recoveries = svc.sweep_orphaned_container_steps().await;
+        assert_eq!(
+            recoveries.len(),
+            1,
+            "the still-running orphan must be watched in the background"
+        );
+        for recovery in recoveries {
+            recovery.await.expect("the recovery task must not panic");
+        }
+
+        // Recovery already ran to completion above, so no poll loop is needed.
+        let response = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 9,
+                step_id: 4,
+                user: "testuser".into(),
+                run_attempt: 0,
+            }))
+            .await
+            .expect("the orphan's real exit code must have been recovered");
+
+        assert_eq!(
+            response.into_inner().exit_code,
+            7,
+            "the job's real exit code must survive the restart, not come back as a fabricated failure"
+        );
+        assert!(
+            !tmp.path().join("step_9_4").exists(),
+            "the recovered step's rootfs must be reaped once its outcome is known"
+        );
+        std::env::remove_var("SPUR_CONTAINER_DIR");
+    }
+
+    /// If the job's own allocation was never restored into `running` (the
+    /// `recover_stepds` step main.rs runs before this sweep), the honest
+    /// answer is fail-closed not_found — never the recovered exit code.
+    #[tokio::test]
+    async fn a_recovered_step_answers_not_found_without_its_jobs_allocation_restored() {
+        let _guard = container_dir_lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SPUR_CONTAINER_DIR", tmp.path());
+        std::fs::create_dir_all(tmp.path().join("step_11_0")).unwrap();
+
+        let mut dead = std::process::Command::new("true").spawn().unwrap();
+        let dead_pid = dead.id() as i32;
+        dead.wait().unwrap();
+        crate::container::write_step_launch_marker("step_11_0", dead_pid, 1).unwrap();
+        std::fs::write(crate::container::step_exit_marker_path("step_11_0"), "0").unwrap();
+
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        // No insert_test_job: `running` stays empty, as it would if this job's
+        // own allocation was never restored.
+        svc.sweep_orphaned_container_steps().await;
+
+        let err = svc
+            .await_step(Request::new(AwaitStepRequest {
+                job_id: 11,
+                step_id: 0,
+                user: "testuser".into(),
+                run_attempt: 0,
+            }))
+            .await
+            .expect_err("an untracked job must not leak its recovered outcome");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        std::env::remove_var("SPUR_CONTAINER_DIR");
+    }
+
     /// A batch session as its supervisor published it, recording where the
     /// job's output landed so an agent that restarts can still find it.
     fn published_batch_descriptor(
@@ -17425,6 +17798,37 @@ mod tests {
         assert!(
             err.message().contains("not found"),
             "expected an image-resolution failure, got: {}",
+            err.message()
+        );
+    }
+
+    /// Never reaches image resolution — proven by the message, since a bogus
+    /// image also surfaces as FailedPrecondition but with a different one.
+    #[tokio::test]
+    async fn run_command_refuses_a_container_step_while_its_old_attempt_is_still_being_reaped() {
+        let (svc, job_id) = run_command_test_setup().await;
+        let step_id = 4;
+        svc.reaping_orphans.lock().await.insert((job_id, step_id));
+
+        let req = Request::new(RunCommandRequest {
+            command: vec!["true".into()],
+            job_id,
+            step_id,
+            container: Some(spur_proto::proto::ContainerSpec {
+                image: "/nonexistent/bogus-step-image.sqsh".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let err = svc
+            .run_command(req)
+            .await
+            .expect_err("a step still being reaped must not start a fresh one");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("still being reclaimed"),
+            "got: {}",
             err.message()
         );
     }

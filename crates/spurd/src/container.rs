@@ -14,6 +14,7 @@
 //! - NVIDIA: bind-mount /dev/nvidia* + libnvidia-container or driver libs
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -271,6 +272,21 @@ pub fn step_rootfs_base(job_id: u32, step_id: u32) -> String {
     format!("step_{job_id}_{step_id}")
 }
 
+/// Matches the disposable `job_<id>`/`step_<job>_<step>` names the restart
+/// sweep reaps as orphans — reserved so a named container can't collide.
+fn looks_like_a_managed_rootfs_name(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("job_") {
+        return rest.parse::<u32>().is_ok();
+    }
+    match name
+        .strip_prefix("step_")
+        .and_then(|rest| rest.split_once('_'))
+    {
+        Some((job, step)) => job.parse::<u32>().is_ok() && step.parse::<u32>().is_ok(),
+        None => false,
+    }
+}
+
 pub fn setup_rootfs(
     image_path: &Path,
     base: &str,
@@ -278,7 +294,11 @@ pub fn setup_rootfs(
 ) -> anyhow::Result<(PathBuf, RootfsMode)> {
     let cdir = container_dir();
     let base_dir = if let Some(name) = name {
-        cdir.join(sanitize_name(name))
+        let sanitized = sanitize_name(name);
+        if looks_like_a_managed_rootfs_name(&sanitized) {
+            bail!("container name '{name}' is reserved for internal use");
+        }
+        cdir.join(sanitized)
     } else {
         cdir.join(base)
     };
@@ -468,6 +488,81 @@ pub fn cleanup_rootfs(base: &str, mode: &RootfsMode) {
     } else {
         debug!(path = %base_dir.display(), "container rootfs cleaned up");
     }
+}
+
+/// Guesses `RootfsMode` for a caller with no runtime record of which
+/// `setup_rootfs` picked; an overlay always creates all four subdirectories.
+pub fn infer_rootfs_mode(base: &str) -> RootfsMode {
+    let base_dir = container_dir().join(base);
+    let is_overlay = ["lower", "upper", "work", "merged"]
+        .iter()
+        .all(|name| base_dir.join(name).is_dir());
+    if is_overlay {
+        RootfsMode::Overlay
+    } else {
+        RootfsMode::Extracted
+    }
+}
+
+/// Sibling files to a step's rootfs (never inside it, so pivot_root can't hide
+/// them): `.launch` is the pid to watch, `.exit` its real recovered outcome.
+fn step_marker_path(base: &str, suffix: &str) -> PathBuf {
+    container_dir().join(format!("{base}.{suffix}"))
+}
+
+/// Computed before the fork so the path can be handed to the child to write.
+pub fn step_exit_marker_path(base: &str) -> PathBuf {
+    step_marker_path(base, "exit")
+}
+
+/// A launch precondition, not best-effort — the sweep trusts a missing
+/// marker to mean a step never got this far.
+pub fn write_step_launch_marker(base: &str, pid: i32, run_attempt: u32) -> std::io::Result<()> {
+    let file = std::fs::File::create(step_marker_path(base, "launch"))?;
+    (&file).write_all(format!("{pid}\n{run_attempt}\n").as_bytes())?;
+    file.sync_all()
+}
+
+pub fn read_step_launch_marker(base: &str) -> Option<(i32, u32)> {
+    let content = std::fs::read_to_string(step_marker_path(base, "launch")).ok()?;
+    let mut lines = content.lines();
+    let pid = lines.next()?.trim().parse().ok()?;
+    let run_attempt = lines.next()?.trim().parse().ok()?;
+    Some((pid, run_attempt))
+}
+
+pub fn read_step_exit_marker(base: &str) -> Option<i32> {
+    std::fs::read_to_string(step_exit_marker_path(base))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+pub fn remove_step_markers(base: &str) {
+    let _ = std::fs::remove_file(step_marker_path(base, "launch"));
+    let _ = std::fs::remove_file(step_exit_marker_path(base));
+}
+
+/// Unnamed per-step rootfs dirs left on disk (named containers never match
+/// `step_<job>_<n>`) for a restart-time sweep to reconcile.
+pub fn orphaned_step_rootfs_dirs() -> Vec<(u32, u32, String)> {
+    let dir = container_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rest = name.strip_prefix("step_")?;
+            let (job_part, step_part) = rest.split_once('_')?;
+            let job_id: u32 = job_part.parse().ok()?;
+            let step_id: u32 = step_part.parse().ok()?;
+            Some((job_id, step_id, name))
+        })
+        .collect()
 }
 
 /// Creates a file or directory at the mount-point destination to match the
@@ -1051,16 +1146,30 @@ fn set_mount_propagation_private() -> anyhow::Result<()> {
     .context("set mount propagation to private")
 }
 
+/// Waits for the pid-namespace child, mirrors its exit code, and best-effort
+/// records it to `exit_marker` in case the real parent dies before `waitpid` can.
+fn wait_and_mirror_exit_code(child: nix::unistd::Pid, exit_marker: Option<&Path>) -> i32 {
+    let code = match nix::sys::wait::waitpid(child, None) {
+        Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
+        _ => 1,
+    };
+    if let Some(path) = exit_marker {
+        let write = std::fs::File::create(path)
+            .and_then(|mut f| f.write_all(code.to_string().as_bytes()).and(f.sync_all()));
+        if let Err(e) = write {
+            warn!(path = %path.display(), error = %e, "failed to record a step's exit marker");
+        }
+    }
+    code
+}
+
 /// Fork to enter a new PID namespace. The child (PID 1 inside the
 /// namespace) returns Ok(()); the parent waits for the child and exits.
-fn fork_into_pid_namespace() -> anyhow::Result<()> {
+fn fork_into_pid_namespace(exit_marker: Option<&Path>) -> anyhow::Result<()> {
     match unsafe { nix::unistd::fork().context("fork for PID namespace")? } {
         nix::unistd::ForkResult::Child => Ok(()),
         nix::unistd::ForkResult::Parent { child } => {
-            let code = match nix::sys::wait::waitpid(child, None) {
-                Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
-                _ => 1,
-            };
+            let code = wait_and_mirror_exit_code(child, exit_marker);
             std::process::exit(code);
         }
     }
@@ -1093,6 +1202,7 @@ pub fn close_inherited_fds(preserve_fd: RawFd) {
 pub fn container_init(
     config: &ContainerConfig,
     rootfs: &Path,
+    exit_marker: Option<&Path>,
 ) -> anyhow::Result<HashMap<String, String>> {
     let is_root = nix::unistd::geteuid().is_root();
 
@@ -1114,7 +1224,7 @@ pub fn container_init(
     }
 
     set_mount_propagation_private()?;
-    fork_into_pid_namespace()?;
+    fork_into_pid_namespace(exit_marker)?;
 
     mount_filesystems(rootfs)?;
 
@@ -1195,16 +1305,21 @@ fn sanitize_name(name: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
 
-    /// Serialize tests that mutate `SPUR_IMAGE_DIR` (or any process-global
-    /// env var). Cargo runs tests in parallel within a binary, so without
-    /// a lock these races produce intermittent CI failures.
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    /// The one lock every env-mutating test in the crate shares — `tokio`'s,
+    /// so an async caller can hold it across `.await`.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// For a plain test; panics if called from inside a tokio runtime.
+    pub(crate) fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.blocking_lock()
+    }
+
+    /// For a `#[tokio::test]` that needs to hold the lock across an `.await`.
+    pub(crate) async fn env_lock_async() -> tokio::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().await
     }
 
     // --- Mount parsing ---
@@ -1902,5 +2017,146 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- Restart-recovery markers for a standalone `srun --container-image` step ---
+
+    fn with_container_dir<T>(f: impl FnOnce(&std::path::Path) -> T) -> T {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SPUR_CONTAINER_DIR", tmp.path());
+        let result = f(tmp.path());
+        std::env::remove_var("SPUR_CONTAINER_DIR");
+        result
+    }
+
+    #[test]
+    fn a_named_container_cannot_collide_with_a_step_rootfs_name() {
+        with_container_dir(|dir| {
+            let image = dir.join("fake.sqsh");
+            std::fs::write(&image, b"not a real image").unwrap();
+            let err = setup_rootfs(&image, "unused", Some("step_1_2"))
+                .expect_err("a reserved-shaped name must be rejected");
+            assert!(err.to_string().contains("reserved"));
+        });
+    }
+
+    #[test]
+    fn a_named_container_cannot_collide_with_a_batch_job_rootfs_name() {
+        with_container_dir(|dir| {
+            let image = dir.join("fake.sqsh");
+            std::fs::write(&image, b"not a real image").unwrap();
+            let err = setup_rootfs(&image, "unused", Some("job_5"))
+                .expect_err("a reserved-shaped name must be rejected");
+            assert!(err.to_string().contains("reserved"));
+        });
+    }
+
+    #[test]
+    fn an_ordinary_container_name_is_unaffected() {
+        assert!(!looks_like_a_managed_rootfs_name("my-container"));
+        assert!(!looks_like_a_managed_rootfs_name("step_abc_def"));
+        assert!(looks_like_a_managed_rootfs_name("step_1_2"));
+        assert!(looks_like_a_managed_rootfs_name("job_5"));
+    }
+
+    #[test]
+    fn a_launch_marker_round_trips_pid_and_run_attempt() {
+        with_container_dir(|_| {
+            write_step_launch_marker("step_5_2", 4242, 3).unwrap();
+            assert_eq!(read_step_launch_marker("step_5_2"), Some((4242, 3)));
+        });
+    }
+
+    #[test]
+    fn a_missing_launch_marker_reads_as_none() {
+        with_container_dir(|_| {
+            assert_eq!(read_step_launch_marker("step_5_2"), None);
+        });
+    }
+
+    #[test]
+    fn an_exit_marker_written_by_the_wait_helper_is_readable_by_base() {
+        with_container_dir(|_| {
+            let path = step_exit_marker_path("step_9_1");
+            match unsafe { nix::unistd::fork().unwrap() } {
+                nix::unistd::ForkResult::Child => std::process::exit(5),
+                nix::unistd::ForkResult::Parent { child } => {
+                    let code = wait_and_mirror_exit_code(child, Some(&path));
+                    assert_eq!(code, 5);
+                }
+            }
+            assert_eq!(
+                read_step_exit_marker("step_9_1"),
+                Some(5),
+                "the exit marker written by the wait helper must be readable back by base name"
+            );
+        });
+    }
+
+    #[test]
+    fn wait_and_mirror_exit_code_without_a_marker_still_returns_the_real_code() {
+        match unsafe { nix::unistd::fork().unwrap() } {
+            nix::unistd::ForkResult::Child => std::process::exit(9),
+            nix::unistd::ForkResult::Parent { child } => {
+                assert_eq!(wait_and_mirror_exit_code(child, None), 9);
+            }
+        }
+    }
+
+    #[test]
+    fn remove_step_markers_clears_both_files() {
+        with_container_dir(|_| {
+            write_step_launch_marker("step_1_0", 1, 1).unwrap();
+            std::fs::write(step_exit_marker_path("step_1_0"), "0").unwrap();
+
+            remove_step_markers("step_1_0");
+
+            assert_eq!(read_step_launch_marker("step_1_0"), None);
+            assert_eq!(read_step_exit_marker("step_1_0"), None);
+        });
+    }
+
+    #[test]
+    fn orphaned_step_rootfs_dirs_finds_unnamed_step_dirs_only() {
+        with_container_dir(|dir| {
+            std::fs::create_dir_all(dir.join("step_5_2")).unwrap();
+            std::fs::create_dir_all(dir.join("step_10_0")).unwrap();
+            // A batch job's own container: different naming, must not match.
+            std::fs::create_dir_all(dir.join("job_5")).unwrap();
+            // A named (persistent) container: never swept away.
+            std::fs::create_dir_all(dir.join("my-named-container")).unwrap();
+            // A file, not a directory, must not be treated as a rootfs.
+            std::fs::write(dir.join("step_1_1"), b"not a directory").unwrap();
+
+            let mut found = orphaned_step_rootfs_dirs();
+            found.sort();
+
+            assert_eq!(
+                found,
+                vec![
+                    (5, 2, "step_5_2".to_string()),
+                    (10, 0, "step_10_0".to_string()),
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn infer_rootfs_mode_recognizes_an_overlay_layout() {
+        with_container_dir(|dir| {
+            for name in ["lower", "upper", "work", "merged"] {
+                std::fs::create_dir_all(dir.join("step_2_0").join(name)).unwrap();
+            }
+            assert_eq!(infer_rootfs_mode("step_2_0"), RootfsMode::Overlay);
+        });
+    }
+
+    #[test]
+    fn infer_rootfs_mode_defaults_to_extracted() {
+        with_container_dir(|dir| {
+            std::fs::create_dir_all(dir.join("step_2_0").join("usr")).unwrap();
+            assert_eq!(infer_rootfs_mode("step_2_0"), RootfsMode::Extracted);
+        });
     }
 }
