@@ -73,10 +73,11 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
     // survives it and keeps working on a slice the drop has already released.
     cmd.stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        // Its own group, so abandoning the wait can signal the hook's whole tree
-        // without reaching the supervisor whose group it would otherwise share.
-        .process_group(0);
+        .kill_on_drop(true);
+    // Its own group, so abandoning the wait can signal the hook's whole tree
+    // without reaching the supervisor whose group it would otherwise share.
+    #[cfg(unix)]
+    cmd.process_group(0);
     let child = spawn_hook_in_work_dir(&mut cmd, &ctx.work_dir, ctx.job_id, &ctx.script_context)
         .with_context(|| {
             format!(
@@ -86,13 +87,14 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
         })?;
 
     let mut group = HookProcessGroup::of(&child);
-    let output = child
-        .wait_with_output()
-        .await
-        .with_context(|| format!("{} script failed to complete", ctx.script_context))?;
+    let waited = child.wait_with_output().await;
+    // Disarmed before the error is raised: failing to read the hook is not the
+    // same as abandoning it, and a tree that may have finished is not ours to kill.
     if let Some(group) = group.as_mut() {
         group.disarm();
     }
+    let output =
+        waited.with_context(|| format!("{} script failed to complete", ctx.script_context))?;
 
     if !output.stderr.is_empty() {
         let stderr_text = String::from_utf8_lossy(&output.stderr);
@@ -121,7 +123,7 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
 /// `kill_on_drop` reaches the direct child only, so anything the hook spawned —
 /// the shape a real epilog has — would outlive the bound that released the slice.
 struct HookProcessGroup {
-    pgid: nix::unistd::Pid,
+    pgid: i32,
     armed: bool,
 }
 
@@ -130,7 +132,7 @@ impl HookProcessGroup {
     /// the group. A child with no pid has already been reaped by someone else.
     fn of(child: &tokio::process::Child) -> Option<Self> {
         child.id().map(|pid| Self {
-            pgid: nix::unistd::Pid::from_raw(pid as i32),
+            pgid: pid as i32,
             armed: true,
         })
     }
@@ -145,9 +147,20 @@ impl Drop for HookProcessGroup {
         if !self.armed {
             return;
         }
-        let _ = nix::sys::signal::killpg(self.pgid, nix::sys::signal::Signal::SIGKILL);
+        kill_process_group(self.pgid);
     }
 }
+
+#[cfg(unix)]
+fn kill_process_group(pgid: i32) {
+    let _ = nix::sys::signal::killpg(
+        nix::unistd::Pid::from_raw(pgid),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: i32) {}
 
 /// Context for the job-submission hook. Feeds env twins and the audit line;
 /// `spec_json` is the fully-resolved spec sent to the script on stdin.

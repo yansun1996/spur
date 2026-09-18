@@ -234,8 +234,13 @@ and Raft high-availability topology.
      - integer
      - ``5``
      - Live
-     - Maximum automatic requeues (excluding preemption) before a job is held with
-       ``JobHoldMaxRequeue``. Must be ``>= 1``; ``0`` is a validation error.
+     - Maximum automatic requeues before a job is held with
+       ``JobHoldMaxRequeue``. Preemption is excluded, as is a node refusing a
+       dispatch because it already holds the job's resources — drift the job
+       neither caused nor can influence. Those refusals are exempt up to this
+       many, and are charged normally after that, so a conflict nothing resolves
+       still parks the job. Each refusal lengthens the launch backoff either
+       way. Must be ``>= 1``; ``0`` is a validation error.
    * - ``max_launch_backoff_secs``
      - integer
      - ``300``
@@ -1694,6 +1699,19 @@ submitting host on each invocation.
      - controller, at submit
      - Live
 
+.. note::
+
+   Every hook runs in a process group of its own, so a signal sent to the
+   process that started it does not reach it. For the client-side hooks this is
+   visible: ``Ctrl-C`` on ``srun`` no longer interrupts ``srun_prolog`` or
+   ``srun_epilog``, which run to completion or until ``srun`` itself exits. A
+   hook that can hang should carry its own bound — for example:
+
+   .. code-block:: bash
+
+      #!/bin/bash
+      timeout 30 /usr/local/bin/drain-scratch || exit 0
+
 The ``[hooks]`` section also carries one non-path setting:
 
 .. list-table::
@@ -1726,10 +1744,13 @@ The ``[hooks]`` section also carries one non-path setting:
    on the node until an operator has confirmed what the hook did or did not
    clean up.
 
-   Spur does not signal the hook, but it does stop reading its ``stderr``, so a
-   hook that writes to ``stderr`` after the timeout will itself die on
-   ``SIGPIPE``, partway through. Treat a timed-out node as having had no epilog
-   at all.
+   On expiry Spur also sends ``SIGKILL`` to the hook's process group — the hook
+   and everything it spawned. The hook runs in a group of its own, so the signal
+   reaches nothing else on the node. Without it the abandoned hook would carry
+   on working against an allocation that has already been handed to the next
+   job, which is the overlap the drain exists to prevent. Treat a timed-out node
+   as having had a partial epilog: whatever the hook had not finished by the
+   deadline was stopped part-way.
 
    The timeout is named in the node's own log
    (``epilog script did not return within Ns``). The drain reason recorded on the
