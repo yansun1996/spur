@@ -105,6 +105,7 @@ pub(crate) fn assume_leadership(cluster: &Arc<ClusterManager>) {
     // Totals were maintained across an unknown replay history; rebuild them from
     // the job records first, since everything after this reasons against them.
     cluster.recompute_node_allocations();
+    cluster.abort_orphaned_placements();
     cluster.release_stranded_reconcile_gates();
 }
 

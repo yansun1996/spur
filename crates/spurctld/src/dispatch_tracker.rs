@@ -50,6 +50,16 @@ impl DispatchTracker {
         }
     }
 
+    /// Every job with a launch on the wire to any node right now.
+    pub(crate) fn jobs_in_flight(&self) -> HashSet<JobId> {
+        self.state
+            .lock()
+            .in_flight
+            .values()
+            .flat_map(|jobs| jobs.keys().copied())
+            .collect()
+    }
+
     /// Start observing launches to `node`. Open this before asking the agent for
     /// a cut; the cut cannot be trusted about anything the watch goes on to see.
     pub(crate) fn watch(self: &Arc<Self>, node: &str) -> DispatchWatch {

@@ -3849,6 +3849,9 @@ impl ClusterManager {
         let mut candidates: Vec<PendingJobCandidate> = jobs
             .values()
             .filter(|job| job.state == JobState::Pending)
+            // A reservation is charged while the job is still Pending, so scheduling one
+            // again charges its nodes a second time for the same run.
+            .filter(|job| !job.holds_a_placement())
             .filter(|job| !job.pending_reason.is_scheduling_hold())
             .filter_map(|job| {
                 let before_begin_time = job.spec.begin_time.is_some_and(|begin| now < begin);
@@ -6008,6 +6011,30 @@ impl ClusterManager {
             runs_job_epilog: None,
         }) {
             warn!(node = %name, %error, "could not record the reconcile gate");
+        }
+    }
+
+    /// Give up every reservation this controller cannot finish dispatching. `reserve_placement`
+    /// charges a slice before the launch and the dispatcher gives it back if the launch fails,
+    /// so a leader that died in between left the charge with nobody to answer for it.
+    pub fn abort_orphaned_placements(&self) {
+        let in_flight = self.dispatch_tracker.jobs_in_flight();
+        let orphaned: Vec<JobId> = self
+            .jobs
+            .read()
+            .values()
+            .filter(|job| job.state == JobState::Pending && job.holds_a_placement())
+            .map(|job| job.job_id)
+            .filter(|job_id| !in_flight.contains(job_id))
+            .collect();
+        for job_id in orphaned {
+            warn!(
+                job_id,
+                "giving up a reservation no dispatch is answering for"
+            );
+            if let Err(error) = self.abort_placement(job_id) {
+                warn!(job_id, %error, "could not give up the reservation; it stays charged");
+            }
         }
     }
 
@@ -22766,6 +22793,91 @@ mod tests {
         cm.set_reconcile_pending("n1", false);
         wait_for("released", || !cm.get_node("n1").unwrap().reconcile_pending);
         assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_a_leader_left_behind_is_not_scheduled_a_second_time() {
+        // The failover ordering, in the order a new leader runs it: rebuild the totals
+        // from the job records, then classify. A reservation charges its slice while the
+        // job is still Pending, so a classification that ignores it charges the node twice.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let job_id = submit_and_wait(&cm, basic_spec("orphan"));
+        let untouched = submit_and_wait(&cm, basic_spec("waiting"));
+        let slice = scalar_alloc(4, 1000);
+        cm.reserve_placement(
+            job_id,
+            vec!["n1".into()],
+            slice.clone(),
+            per_node_for(&["n1"], slice),
+            false,
+        )
+        .expect("reserve the placement");
+        wait_for("charged", || alloc_cpus(&cm, "n1") == 4);
+        assert_eq!(
+            cm.get_job(job_id).expect("job").state,
+            JobState::Pending,
+            "the reservation is charged before the job transitions"
+        );
+
+        cm.recompute_node_allocations();
+
+        assert_eq!(alloc_cpus(&cm, "n1"), 4, "the rebuild must keep the charge");
+        assert!(
+            !cm.pending_jobs().iter().any(|job| job.job_id == job_id),
+            "a job already holding a reservation must not be offered for a second one"
+        );
+
+        // Nothing is answering for that reservation, so the takeover hands it back
+        // rather than leaving the job Pending on cores it can never be dispatched to.
+        cm.abort_orphaned_placements();
+        wait_for("released", || alloc_cpus(&cm, "n1") == 0);
+        let job = cm.get_job(job_id).expect("job");
+        assert_eq!(job.state, JobState::Pending);
+        assert!(
+            !job.holds_a_placement(),
+            "the job must be free to be placed again, on whatever is free then"
+        );
+        // Same terms as the dispatcher's own abort: a short launch backoff, after
+        // which the job is picked again by the classification that just skipped it.
+        assert!(job.spec.begin_time.is_some());
+
+        let waiting = cm.get_job(untouched).expect("job");
+        assert_eq!(
+            (waiting.spec.begin_time, waiting.requeue_count),
+            (None, 0),
+            "a job that never reserved anything must not be charged a failed launch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reservation_still_being_dispatched_is_left_alone() {
+        // The abort runs on a controller that may have lost and regained leadership
+        // with its own launch still on the wire; taking that one back races the launch.
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        let job_id = submit_and_wait(&cm, basic_spec("inflight"));
+        let slice = scalar_alloc(4, 1000);
+        cm.reserve_placement(
+            job_id,
+            vec!["n1".into()],
+            slice.clone(),
+            per_node_for(&["n1"], slice),
+            false,
+        )
+        .expect("reserve the placement");
+        wait_for("charged", || alloc_cpus(&cm, "n1") == 4);
+
+        let _on_the_wire = cm.dispatch_tracker().begin("n1", job_id);
+        cm.abort_orphaned_placements();
+
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            4,
+            "a launch still on the wire must keep its slice"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

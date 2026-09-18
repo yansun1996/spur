@@ -1011,6 +1011,15 @@ impl Job {
         self.epilog_gated_nodes.contains(node)
     }
 
+    /// Whether a placement is already charged for this job. `reserve_placement` commits the
+    /// charge while the job is still `Pending` and the transition follows the dispatch, so a
+    /// `Pending` job that answers yes is one a second placement would charge its nodes twice for.
+    pub fn holds_a_placement(&self) -> bool {
+        self.allocated_nodes
+            .iter()
+            .any(|node| self.is_held_on(node))
+    }
+
     /// Whether this node's agent has confirmed the launch, so its ledger can be
     /// expected to name the job. A Pending reservation is charged, not confirmed.
     pub fn is_confirmed_on(&self, node: &str) -> bool {
