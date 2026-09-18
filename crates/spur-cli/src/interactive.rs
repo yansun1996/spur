@@ -13,6 +13,23 @@ use std::io::IsTerminal;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{signal, SignalKind};
 
+/// Whether the terminal driving a PTY step is the reason its allocation exists.
+/// The agent may end an owned allocation whose terminal dies, never a joined one.
+#[derive(Clone, Copy, Debug)]
+pub enum PtyAllocation {
+    /// This client submitted the job; a killed client leaves nothing to release it.
+    OwnedByThisClient,
+    /// The allocation was already there and outlives this terminal.
+    JoinedExisting,
+}
+
+impl PtyAllocation {
+    /// The agent's `overlap` flag, which suppresses ending the allocation.
+    pub fn overlap(self) -> bool {
+        matches!(self, Self::JoinedExisting)
+    }
+}
+
 /// Keeps an interactive allocation attended by pinging the controller on a
 /// fixed interval, and stops the pings when dropped. Aborting on `Drop` means
 /// an early `?` return on the caller's path can't leak the task.
@@ -237,7 +254,7 @@ pub async fn open_interactive_session(
     step_id: u32,
     argv: Vec<String>,
     winsize: spur_proto::proto::WindowSize,
-    overlap: bool,
+    allocation: PtyAllocation,
     user: &str,
     container: Option<spur_proto::proto::ContainerSpec>,
     execution_credential: String,
@@ -250,7 +267,7 @@ pub async fn open_interactive_session(
         msg: Some(interactive_input::Msg::Init(InitSession {
             job_id,
             step_id,
-            overlap,
+            overlap: allocation.overlap(),
             pty: true,
             winsize: Some(winsize),
             argv,
@@ -375,7 +392,7 @@ pub async fn run_interactive_session(
     step_id: u32,
     argv: Vec<String>,
     winsize: spur_proto::proto::WindowSize,
-    overlap: bool,
+    allocation: PtyAllocation,
     user: &str,
 ) -> Result<i32> {
     let handle = open_interactive_session(
@@ -384,7 +401,7 @@ pub async fn run_interactive_session(
         step_id,
         argv,
         winsize,
-        overlap,
+        allocation,
         user,
         None,
         String::new(),

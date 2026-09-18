@@ -165,8 +165,16 @@ async fn interactive_attach(
     user: &str,
 ) -> Result<i32> {
     let winsize = crate::interactive::get_terminal_size();
-    crate::interactive::run_interactive_session(agent, job_id, 0, Vec::new(), winsize, true, user)
-        .await
+    crate::interactive::run_interactive_session(
+        agent,
+        job_id,
+        0,
+        Vec::new(),
+        winsize,
+        crate::interactive::PtyAllocation::JoinedExisting,
+        user,
+    )
+    .await
 }
 
 fn state_name(state: i32) -> &'static str {

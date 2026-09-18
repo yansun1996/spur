@@ -1509,23 +1509,7 @@ async fn complete_interactive_step(
     }
 }
 
-/// Whether the terminal driving a PTY step is the reason its allocation exists.
-/// The agent may end an owned allocation whose terminal dies, never a joined one.
-#[derive(Clone, Copy, Debug)]
-enum PtyAllocation {
-    /// This `srun` submitted the job, so a killed client leaves nothing to
-    /// release it but the agent.
-    OwnedByThisClient,
-    /// The allocation was already there and outlives this terminal.
-    JoinedExisting,
-}
-
-impl PtyAllocation {
-    /// The agent's `overlap` flag, which suppresses ending the allocation.
-    fn overlap(self) -> bool {
-        matches!(self, Self::JoinedExisting)
-    }
-}
+use crate::interactive::PtyAllocation;
 
 /// Create an interactive PTY step on a running job and attach to it, reporting
 /// the step's exit code on every exit path once the step exists.
@@ -1619,7 +1603,7 @@ async fn run_interactive_pty(
                 step_id,
                 command.clone(),
                 winsize,
-                allocation.overlap(),
+                allocation,
                 user,
                 effective_container.clone(),
                 step_cred,
