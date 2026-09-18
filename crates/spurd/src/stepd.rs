@@ -2109,13 +2109,16 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // that owns the job's lifetime runs them — a numbered step would re-run them.
     let owns_job_lifetime = !spur_core::step::is_user_step(step_id);
     let epilog_failed = match hooks.epilog.as_deref().filter(|_| owns_job_lifetime) {
-        Some(epilog) => match spur_core::hooks::run_hook(epilog, &hook_context).await {
-            Err(error) => {
-                tracing::error!(job_id, %error, "runtime epilog hook failed");
-                true
+        Some(epilog) => {
+            match crate::epilog::run_bounded(epilog, &hook_context, hooks.epilog_timeout_secs).await
+            {
+                Err(fault) => {
+                    tracing::error!(job_id, %fault, "runtime epilog hook did not succeed");
+                    true
+                }
+                Ok(()) => false,
             }
-            Ok(_) => false,
-        },
+        }
         None => false,
     };
     if let Some(spank) = spank.as_ref().filter(|_| owns_job_lifetime) {

@@ -13,6 +13,7 @@ pub mod auth_middleware;
 pub mod cluster;
 pub mod container;
 pub(crate) mod device_cgroup;
+pub(crate) mod epilog;
 pub mod executor;
 pub mod job_entry;
 pub(crate) mod job_lifecycle;

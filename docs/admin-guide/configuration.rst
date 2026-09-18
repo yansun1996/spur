@@ -1694,6 +1694,53 @@ submitting host on each invocation.
      - controller, at submit
      - Live
 
+The ``[hooks]`` section also carries one non-path setting:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 26 10 14 14 36
+
+   * - Field
+     - Type
+     - Default
+     - Reload
+     - Description
+   * - ``epilog_timeout_secs``
+     - integer
+     - ``600``
+     - Agent restart
+     - Seconds to wait for ``epilog`` on a compute node before giving up on it.
+       ``0`` waits forever, matching Slurm's ``PrologEpilogTimeout`` default.
+
+.. note::
+
+   A job's CPU, memory, and GPU allocation stays charged to it until ``epilog``
+   returns, because the node withholds its completion report until then. An
+   ``epilog`` that never returns therefore holds that allocation — and the job
+   record behind it — for as long as the node keeps heartbeating; only marking
+   the node ``DOWN`` frees it.
+
+   On expiry Spur stops waiting, records the hook as failed so the allocation is
+   released, and drains the node. Elapsed time is not evidence that a hook is
+   wedged rather than slow, so the drain is deliberate: nothing new should land
+   on the node until an operator has confirmed what the hook did or did not
+   clean up.
+
+   Spur does not signal the hook, but it does stop reading its ``stderr``, so a
+   hook that writes to ``stderr`` after the timeout will itself die on
+   ``SIGPIPE``, partway through. Treat a timed-out node as having had no epilog
+   at all.
+
+   The timeout is named in the node's own log
+   (``epilog script did not return within Ns``). The drain reason recorded on the
+   controller is ``epilog script timed out after Ns`` for jobs run without a
+   supervisor, and the generic ``epilog script failed`` for supervised jobs,
+   which is the default — check the node log to tell the two apart.
+
+   Raise this on clusters whose epilog does genuinely long cleanup (wiping a
+   large scratch filesystem, resetting devices), or set ``0`` to restore the
+   unbounded wait.
+
 .. note::
 
    ``reconfigure`` validates ``job_submit`` and ``job_submit_lua`` before swapping

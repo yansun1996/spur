@@ -4327,24 +4327,16 @@ impl AgentService {
                             cpus: c.cpus,
                             memory_mb: c.memory_mb,
                         };
-                        // Marked before the hook: an agent that dies inside one
-                        // leaves a `Running` that reloads as unknowable.
-                        let hooked = named_run(c.job_id, c.run_attempt);
-                        if let Some(run) = hooked {
-                            let _ =
-                                admissions.record_epilog(run, crate::admission::HookState::Running);
-                        }
-                        let outcome = spur_core::hooks::run_hook(epilog_script, &ctx).await;
-                        if let Some(run) = hooked {
-                            let _ = admissions.record_epilog(run, epilog_outcome(outcome.is_err()));
-                        }
-                        if let Err(e) = outcome {
-                            error!(
-                                job_id = c.job_id,
-                                error = %e,
-                                "epilog hook failed — requesting node drain"
-                            );
-                            drain_jobs.insert(c.job_id, "epilog script failed".into());
+                        let drain = crate::epilog::run_job_epilog(
+                            &admissions,
+                            epilog_script,
+                            &ctx,
+                            named_run(c.job_id, c.run_attempt),
+                            hooks.epilog_timeout_secs,
+                        )
+                        .await;
+                        if let Some(reason) = drain {
+                            drain_jobs.insert(c.job_id, reason);
                         }
                     }
                 }
