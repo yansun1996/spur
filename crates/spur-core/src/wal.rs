@@ -215,6 +215,10 @@ pub enum WalOperation {
         /// the launch backoff, so a run that did launch must not claim one.
         #[serde(default = "evicted_after_launch_failure")]
         reason: PendingReason,
+        /// Which run this evicts. Re-checked on apply, as `JobNodeComplete` does: a
+        /// requeue can commit between propose and apply. `None` predates the field.
+        #[serde(default)]
+        run_attempt: Option<u32>,
         #[serde(default)]
         at: Option<chrono::DateTime<chrono::Utc>>,
     },
@@ -1587,6 +1591,7 @@ mod evict_wal_tests {
             job_id: 9,
             detail: Some("PMIx prepare failed".into()),
             reason: PendingReason::JobLaunchFailure,
+            run_attempt: Some(3),
         };
         let json = serde_json::to_string(&op).unwrap();
         let back: WalOperation = serde_json::from_str(&json).unwrap();
@@ -1626,10 +1631,20 @@ mod evict_wal_tests {
         const FROZEN: &str = r#"{"JobEvict":{"job_id":7,"detail":"boom"}}"#;
         let op: WalOperation =
             serde_json::from_str(FROZEN).expect("a pre-reason entry must still deserialize");
-        let WalOperation::JobEvict { reason, detail, .. } = op else {
+        let WalOperation::JobEvict {
+            reason,
+            detail,
+            run_attempt,
+            ..
+        } = op
+        else {
             panic!("wrong variant");
         };
         assert_eq!(detail.as_deref(), Some("boom"));
+        assert_eq!(
+            run_attempt, None,
+            "an entry that names no run must not be read as naming run 0"
+        );
         assert_eq!(
             reason,
             PendingReason::JobLaunchFailure,
@@ -1644,6 +1659,7 @@ mod evict_wal_tests {
             job_id: 4,
             detail: Some("node n1 no longer holds this job".into()),
             reason: PendingReason::NodeDown,
+            run_attempt: None,
         };
         let back: WalOperation =
             serde_json::from_str(&serde_json::to_string(&op).expect("serialize")).expect("parse");

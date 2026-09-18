@@ -2696,6 +2696,7 @@ impl ClusterManager {
             job_id,
             detail,
             reason,
+            run_attempt,
             at: None,
         })?;
         let evicted = !resp.jobs_finalized.is_empty();
@@ -6637,8 +6638,16 @@ impl ClusterManager {
                 job_id,
                 detail,
                 reason,
+                run_attempt,
                 ..
             } => {
+                // Re-checked here, not just where this was proposed: a requeue can
+                // commit in between and land this eviction on the run that replaced it.
+                if let Some(job) = jobs.get(job_id) {
+                    if run_attempt.is_some_and(|attempt| attempt < job.run_attempt) {
+                        return ClientResponse::default();
+                    }
+                }
                 if let Some(job) = jobs.get_mut(job_id) {
                     job.launch_failure_detail = detail.clone();
                 }
@@ -22793,6 +22802,68 @@ mod tests {
         cm.set_reconcile_pending("n1", false);
         wait_for("released", || !cm.get_node("n1").unwrap().reconcile_pending);
         assert!(cm.get_node("n1").unwrap().is_schedulable());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_evict_that_lost_to_a_requeue_does_not_end_the_run_that_replaced_it() {
+        // The eviction is proposed against the run the caller was holding, and a
+        // requeue can commit before it applies. Its sibling JobNodeComplete re-checks
+        // the attempt on apply for the same reason.
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", false);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
+            job_id: 1,
+            hold: false,
+            begin_time: None,
+        });
+        cm.apply_operation(&WalOperation::JobStateChange {
+            job_id: 1,
+            old_state: JobState::Pending,
+            new_state: JobState::Running,
+            pending_reason: None,
+            pending_priority: None,
+            begin_time: None,
+            pending_reason_desc: None,
+        });
+        cm.apply_operation(&WalOperation::JobStart {
+            job_id: 1,
+            nodes: vec!["n1".into()],
+            resources: scalar_alloc(6, 1000),
+            per_node_alloc: per_node_for(&["n1"], scalar_alloc(6, 1000)),
+            srun_step_dispatch: false,
+            run_attempt: 2,
+            at: Some(chrono::Utc::now()),
+        });
+        assert_eq!(cm.get_job(1).expect("job").run_attempt, 2);
+
+        cm.apply_operation(&WalOperation::JobEvict {
+            at: None,
+            job_id: 1,
+            detail: Some("the first run's dispatch gave up".into()),
+            reason: PendingReason::JobLaunchFailure,
+            run_attempt: Some(1),
+        });
+
+        let job = cm.get_job(1).expect("job");
+        assert_eq!(
+            job.state,
+            JobState::Running,
+            "an eviction naming the run that ended must not end the one that replaced it"
+        );
+        assert_eq!(alloc_cpus(&cm, "n1"), 6, "nor free the new run's slice");
+
+        // Naming the run it is actually on still works, so the guard is not a mute button.
+        cm.apply_operation(&WalOperation::JobEvict {
+            at: None,
+            job_id: 1,
+            detail: None,
+            reason: PendingReason::JobLaunchFailure,
+            run_attempt: Some(2),
+        });
+        assert_ne!(cm.get_job(1).expect("job").state, JobState::Running);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
