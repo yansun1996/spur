@@ -3649,11 +3649,9 @@ impl SlurmController for ControllerService {
         })?;
         let node_addr = node_comm_socket(&node, &target_node)?;
 
-        let existing_steps = self.cluster.get_steps(job_id);
-        let step_id = existing_steps
-            .iter()
-            .filter(|s| s.step_id < 0xFFFF_FFF0)
-            .count() as u32;
+        // Not derived from `get_steps` here: two concurrent calls for the same
+        // job would both read the same pre-commit step count and collide.
+        let step_id = self.cluster.allocate_step_id(job_id);
 
         let step = spur_core::step::JobStep {
             job_id,
@@ -13164,6 +13162,53 @@ mod tests {
             .expect("the owner must be allowed to attach");
 
         assert_eq!(resp.into_inner().node_addr, "127.0.0.1:6818");
+    }
+
+    // Two steps for the same job dispatched close together must never be
+    // handed the same id. Drives the real RPC path from genuinely concurrent
+    // tasks: the bug was a TOCTOU between a step count read and its own commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn create_job_step_never_hands_out_the_same_id_to_concurrent_callers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = std::sync::Arc::new(test_service(&dir).await);
+        let job_id = running_job_owned_by(&svc, "ubuntu").await;
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let svc = svc.clone();
+            tasks.push(tokio::spawn(async move {
+                svc.create_job_step(Request::new(CreateJobStepRequest {
+                    job_id,
+                    command: vec!["bash".into()],
+                    num_tasks: 1,
+                    cpus_per_task: 1,
+                    overlap: true,
+                    pty: true,
+                    winsize: None,
+                    node: String::new(),
+                    user: "ubuntu".into(),
+                    ..Default::default()
+                }))
+                .await
+                .expect("owner must be allowed to create a step")
+                .into_inner()
+                .step_id
+            }));
+        }
+
+        let mut step_ids = Vec::new();
+        for task in tasks {
+            step_ids.push(task.await.expect("step-creation task must not panic"));
+        }
+
+        let mut unique = step_ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            step_ids.len(),
+            "concurrent create_job_step calls for the same job handed out duplicate step ids: {step_ids:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

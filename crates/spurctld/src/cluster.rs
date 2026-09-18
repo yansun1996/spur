@@ -467,6 +467,10 @@ pub struct ClusterManager {
     next_job_id: AtomicU32,
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
+    /// Next numbered step id per job, reserved synchronously so two racing
+    /// `create_job_step` calls for one job can't compute the same id from an
+    /// uncommitted `steps` snapshot. See `allocate_step_id`.
+    next_step_id: RwLock<HashMap<JobId, u32>>,
     /// Configured cluster-wide license totals (immutable; from config). Current
     /// availability is derived as total minus the licenses held by active jobs
     /// (see `available_licenses`), so it cannot drift or diverge from config.
@@ -677,6 +681,7 @@ impl ClusterManager {
             config_seeded_partitions: RwLock::new(config_seeded_partitions),
             reservations: RwLock::new(Vec::new()),
             steps: RwLock::new(HashMap::new()),
+            next_step_id: RwLock::new(HashMap::new()),
             next_job_id: AtomicU32::new(first_job_id),
             license_pool: RwLock::new(license_pool),
             burst_buffer_total_gb: RwLock::new(burst_buffer_total_gb),
@@ -3952,6 +3957,26 @@ impl ClusterManager {
         Ok(())
     }
 
+    /// Reserve the next numbered step id for a job, read-and-bump under one
+    /// lock so two racing calls can't derive the same id from an uncommitted
+    /// `steps` snapshot. Never cleared once seeded, or a step-create proposal
+    /// still in flight when the job finalizes could be reissued.
+    pub fn allocate_step_id(&self, job_id: JobId) -> u32 {
+        let mut next = self.next_step_id.write();
+        let counter = next.entry(job_id).or_insert_with(|| {
+            self.steps
+                .read()
+                .keys()
+                .filter(|(jid, step_id)| *jid == job_id && spur_core::step::is_user_step(*step_id))
+                .map(|(_, step_id)| step_id + 1)
+                .max()
+                .unwrap_or(0)
+        });
+        let id = *counter;
+        *counter += 1;
+        id
+    }
+
     /// Record an srun step's completion via Raft so the step exit code and the
     /// job's running-max DerivedExitCode are durable and replay-consistent.
     #[allow(clippy::result_large_err)]
@@ -6006,6 +6031,10 @@ impl ClusterManager {
             }
         }
         drop(steps);
+        // `next_step_id[job_id]` is deliberately left in place: a step-create
+        // proposal this finalization races can still be in flight, and clearing
+        // the seed here would let it re-derive from `steps` before that
+        // proposal lands, reissuing its id. See `allocate_step_id`.
         // Licenses are not returned here: usage is derived from running jobs, so a
         // job leaving the running set frees its licenses automatically.
     }
@@ -12541,6 +12570,64 @@ mod tests {
         assert_eq!(job.state, JobState::Failed);
         assert_eq!(job.exit_code, Some(2));
         assert_eq!(job.derived_exit_code, 7);
+    }
+
+    fn user_step(job_id: JobId, step_id: u32) -> JobStep {
+        JobStep {
+            job_id,
+            step_id,
+            name: "s".into(),
+            state: StepState::Running,
+            num_tasks: 1,
+            cpus_per_task: 1,
+            resources: spur_core::resource::ResourceAllocations::default(),
+            nodes: vec!["n1".into()],
+            distribution: spur_core::step::TaskDistribution::Block,
+            start_time: Some(Utc::now()),
+            end_time: None,
+            exit_code: None,
+        }
+    }
+
+    // A step whose create proposal failed after allocate_step_id reserved its
+    // id leaves a gap in `steps`; a count-based reseed would recompute the
+    // same id as an existing, later step and collide with it.
+    #[test]
+    fn allocate_step_id_skips_a_gap_left_by_a_burned_id() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("gap")),
+        });
+        for step_id in [0, 1, 2, 4] {
+            cm.apply_operation(&WalOperation::JobStepCreate {
+                step: Box::new(user_step(1, step_id)),
+            });
+        }
+
+        assert_eq!(cm.allocate_step_id(1), 5);
+    }
+
+    // The step an id was reserved for can still be an in-flight Raft proposal
+    // when the job's own completion finalizes it; clearing the counter there
+    // would let the next call re-derive it from `steps` (still missing the
+    // in-flight step) and reissue the same id.
+    #[test]
+    fn a_reserved_id_survives_the_jobs_own_finalization() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        cm.apply_operation(&WalOperation::JobSubmit {
+            at: None,
+            job_id: 1,
+            spec: Box::new(basic_spec("finalize-race")),
+        });
+
+        let reserved = cm.allocate_step_id(1);
+        cm.complete_job_steps(&1, 0, Utc::now());
+
+        assert_eq!(cm.allocate_step_id(1), reserved + 1);
     }
 
     /// A PTY client reports client-side, so its report can land after a sweep
