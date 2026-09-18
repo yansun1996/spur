@@ -282,7 +282,11 @@ pub(crate) fn resolve_startup_jwt_key(
 
 /// How long a node may stay gated for one reconcile. A node held past this is
 /// worse than one reconciled imperfectly: it is silently out of the cluster.
-const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const RECONCILE_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Claims one pass will read from a single cut. Far above any real node, and the
+/// controller acts on each one, so an unbounded cut is work an agent gets to set.
+const MAX_LEDGER_ENTRIES: usize = 4096;
 
 /// How long a reconcile waits for this controller to replay its own log. Well under
 /// `RECONCILE_BUDGET`, leaving time for the directions that do not depend on it.
@@ -1012,8 +1016,18 @@ async fn open_reconcile_license<'a>(
         return None;
     }
     let mut held = std::collections::HashMap::new();
-    let mut every_entry_named_a_run = true;
-    for entry in &ledger.entries {
+    // A cut read only in part is not a complete account of what the node holds, so
+    // the cap costs the absence half rather than letting one agent set the work.
+    let mut every_entry_named_a_run = ledger.entries.len() <= MAX_LEDGER_ENTRIES;
+    if !every_entry_named_a_run {
+        warn!(
+            node = %node,
+            entries = ledger.entries.len(),
+            cap = MAX_LEDGER_ENTRIES,
+            "agent reported more claims than one pass reads; answering the first of them"
+        );
+    }
+    for entry in ledger.entries.iter().take(MAX_LEDGER_ENTRIES) {
         match spur_core::job::RunKey::new(entry.job_id, entry.run_attempt) {
             Some(run) => {
                 held.insert(run, entry);
@@ -1077,10 +1091,23 @@ async fn answer_unrecorded_claims(
             answered_every_claim = false;
             continue;
         }
-        let disposition = spur_core::job::LedgerDisposition::from_wire(&entry.disposition);
+        // A name only a newer agent can send says something about this claim that
+        // this controller cannot read. Not knowing what it means is not grounds to kill it.
+        let Some(disposition) = spur_core::job::LedgerDisposition::from_wire(&entry.disposition)
+        else {
+            warn!(
+                node = %node,
+                job_id = entry.job_id,
+                run_attempt = entry.run_attempt,
+                disposition = %entry.disposition,
+                "agent named a disposition this controller cannot read; leaving the claim alone"
+            );
+            outcome.unresolved.push(entry.job_id);
+            continue;
+        };
         // Teardown is done and Raft has no record of the run, so the completion
         // this claim is waiting on is one only this side can still give it.
-        if disposition.is_some_and(spur_core::job::LedgerDisposition::may_be_settled) {
+        if disposition.may_be_settled() {
             // Said of the answer, never of the intent: an agent that declines --
             // because a hook is still on the cores -- leaves the claim standing.
             if crate::scheduler_loop::settle_run_on_node(cluster, node, *run, &mut link).await {
@@ -1104,7 +1131,7 @@ async fn answer_unrecorded_claims(
         }
         // "Cannot tell" is never "dead". Nothing here licenses ending the claim
         // and nothing proves it is over, so it is named rather than acted on.
-        if disposition.is_some_and(spur_core::job::LedgerDisposition::already_accounted_for) {
+        if disposition.already_accounted_for() {
             warn!(
                 node = %node,
                 job_id = entry.job_id,
@@ -1204,7 +1231,7 @@ async fn reconcile_node_ledger_after(
 
     // Direction C: both agree the run exists but the slices differ. Correcting
     // means rewriting the record the controller derives its totals from.
-    for entry in &ledger.entries {
+    for entry in ledger.entries.iter().take(MAX_LEDGER_ENTRIES) {
         if entry.conflict_hold {
             warn!(
                 node = %node,
@@ -7728,6 +7755,90 @@ mod tests {
             holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
             "the job must still be recorded on the node"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cut_longer_than_one_pass_reads_is_capped_and_stops_proving_absence() {
+        // Every entry costs the controller an act, so an agent that names an unbounded
+        // number of claims would be setting how long one pass runs.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        let flood: Vec<(u32, u32)> = (0..(super::MAX_LEDGER_ENTRIES as u32 + 16))
+            .map(|i| (1_000_000 + i, 1))
+            .collect();
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, flood),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled.len(),
+            super::MAX_LEDGER_ENTRIES,
+            "the pass must answer the cap and no more"
+        );
+        assert!(
+            holds_job(&cluster.jobs_allocated_on_node("n1"), 7),
+            "a cut read only in part is no evidence the node let go of what it omits"
+        );
+        assert_eq!(outcome.settled, Vec::<u32>::new());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disposition_this_controller_cannot_read_is_named_rather_than_killed() {
+        // A rolling upgrade runs newer agents under an older controller. A word this
+        // controller has no meaning for says something about the claim; killing it
+        // because the word is unfamiliar is the one answer the word cannot license.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        let mut cut = ledger(true, vec![(7, 1), (99, 1)]);
+        for entry in &mut cut.entries {
+            entry.disposition = "quiesced_by_a_newer_agent".into();
+        }
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            cut,
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            Vec::<u32>::new(),
+            "a name this controller cannot read is not licence to end the claim"
+        );
+        assert_eq!(
+            outcome.unresolved,
+            vec![99],
+            "the drift still has to surface"
+        );
+    }
+
+    // The other half of the same upgrade: an agent that predates the field sends
+    // nothing, and the controller assumed a plain held claim before the field existed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_agent_that_names_no_disposition_still_has_its_claim_answered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger(true, vec![(7, 1), (99, 1)]),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(outcome.cancelled, vec![99]);
+        assert_eq!(outcome.unresolved, Vec::<u32>::new());
     }
 
     // Degrade, do not deadlock: proving the join token restores the destructive

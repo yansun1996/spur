@@ -111,11 +111,12 @@ impl LedgerDisposition {
         }
     }
 
-    /// `None` for anything this controller cannot name, which it must then treat
-    /// as an ordinary claim rather than as licence to leave it alone.
+    /// `None` for a name this controller does not know, which only a newer agent can
+    /// send; the caller must treat that as "cannot act", never as an ordinary claim.
+    /// An agent that predates the field sends nothing, which is the plain held claim.
     pub fn from_wire(disposition: &str) -> Option<Self> {
         match disposition {
-            "held" => Some(Self::Held),
+            "" | "held" => Some(Self::Held),
             "over_but_charged" => Some(Self::OverButCharged),
             "unresolved" => Some(Self::Unresolved),
             _ => None,
