@@ -7,10 +7,11 @@
 //! Follows the same shape as the `MockAgent` harness in `spurctld`: bind an
 //! ephemeral localhost port, serve a hand-written service on it, and hand the
 //! caller back the address plus a shared record of what the server observed.
-//! Only a handful of RPCs are implemented (`CreateJobStep`, `RunStep`,
-//! `GetNode`, `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`); every
-//! other RPC reports `unimplemented` so an unexpected call fails loudly instead
-//! of silently returning a default.
+//! Only a handful of RPCs are implemented (`SubmitJob`, `GetJob`,
+//! `JobKeepalive`, `CreateJobStep`, `CompleteJobStep`, `RunStep`, `GetNode`,
+//! `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`); every other RPC
+//! reports `unimplemented` so an unexpected call fails loudly instead of
+//! silently returning a default.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -28,18 +29,22 @@ pub(crate) const MOCK_STEP_ID: u32 = 4242;
 /// Exit code the mock reports from `RunStep`.
 pub(crate) const MOCK_EXIT_CODE: i32 = 7;
 
+/// Job id the mock hands back from `SubmitJob`.
+pub(crate) const MOCK_JOB_ID: u32 = 909;
+
 /// What the mock controller actually received, shared with the test body.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct StepCapture {
     get_job_calls: Arc<AtomicU32>,
-    /// When set, `get_job` returns `JobInfo { user: ... }` or the configured error.
-    get_job_response: Arc<Mutex<Option<Result<String, tonic::Code>>>>,
+    /// When set, `get_job` returns this job or the configured error.
+    get_job_response: Arc<Mutex<Option<Result<proto::JobInfo, tonic::Code>>>>,
     /// Sequence of `JobInfo` for successive `get_job` calls; last entry repeats.
     get_job_sequence: Arc<Mutex<Vec<proto::JobInfo>>>,
     create_step_num_tasks: Arc<AtomicU32>,
     create_step_num_nodes: Arc<AtomicU32>,
     create_step_nodelist: Arc<Mutex<String>>,
     create_step_error: Arc<Mutex<Option<tonic::Code>>>,
+    create_step_node_addr: Arc<Mutex<String>>,
     complete_step_calls: Arc<Mutex<Vec<(u32, i32)>>>,
     run_step_step_id: Arc<AtomicU32>,
     run_step_calls: Arc<AtomicU32>,
@@ -50,8 +55,35 @@ pub(crate) struct StepCapture {
     deregister_node_calls: Arc<Mutex<Vec<(String, bool)>>>,
     /// Node names that `update_node` should reject with `NotFound`.
     update_node_fail_names: Arc<Mutex<HashSet<String>>>,
+    /// Defaults to `MOCK_JOB_ID`; override with `set_submit_job_id`.
     submit_job_id: Arc<AtomicU32>,
     cancel_job_calls: Arc<AtomicU32>,
+}
+
+impl Default for StepCapture {
+    fn default() -> Self {
+        Self {
+            get_job_calls: Arc::default(),
+            get_job_response: Arc::default(),
+            get_job_sequence: Arc::default(),
+            create_step_num_tasks: Arc::default(),
+            create_step_num_nodes: Arc::default(),
+            create_step_nodelist: Arc::default(),
+            create_step_error: Arc::default(),
+            create_step_node_addr: Arc::default(),
+            complete_step_calls: Arc::default(),
+            run_step_step_id: Arc::default(),
+            run_step_calls: Arc::default(),
+            get_node_names: Arc::default(),
+            get_node_requests: Arc::default(),
+            update_node_names: Arc::default(),
+            drain_node_names: Arc::default(),
+            deregister_node_calls: Arc::default(),
+            update_node_fail_names: Arc::default(),
+            submit_job_id: Arc::new(AtomicU32::new(MOCK_JOB_ID)),
+            cancel_job_calls: Arc::default(),
+        }
+    }
 }
 
 impl StepCapture {
@@ -60,7 +92,16 @@ impl StepCapture {
     }
 
     pub(crate) fn set_get_job_user(&self, user: impl Into<String>) {
-        *self.get_job_response.lock().unwrap() = Some(Ok(user.into()));
+        self.set_get_job_info(proto::JobInfo {
+            user: user.into(),
+            ..Default::default()
+        });
+    }
+
+    /// Whole `JobInfo` for tests that need more than the owner, such as one
+    /// waiting for the job to reach `Running` on a named node.
+    pub(crate) fn set_get_job_info(&self, job: proto::JobInfo) {
+        *self.get_job_response.lock().unwrap() = Some(Ok(job));
     }
 
     pub(crate) fn set_get_job_error(&self, code: tonic::Code) {
@@ -83,6 +124,12 @@ impl StepCapture {
     /// Make `create_job_step` fail, so tests can drive the pre-step failure path.
     pub(crate) fn set_create_step_error(&self, code: tonic::Code) {
         *self.create_step_error.lock().unwrap() = Some(code);
+    }
+
+    /// Point the created step at an agent, so the caller goes on to open a
+    /// session there. Left empty the caller stops at "no node address".
+    pub(crate) fn set_create_step_node_addr(&self, addr: impl Into<String>) {
+        *self.create_step_node_addr.lock().unwrap() = addr.into();
     }
 
     /// `(step_id, exit_code)` pairs from `CompleteJobStep`, in call order.
@@ -186,10 +233,19 @@ mock_controller_impl! {
             }
             Ok(tonic::Response::new(proto::CreateJobStepResponse {
                 step_id: MOCK_STEP_ID,
-                node_addr: String::new(),
+                node_addr: self.capture.create_step_node_addr.lock().unwrap().clone(),
                 container: None,
                 execution_credential: String::new(),
             }))
+        }
+
+        /// A live controller answers these, so a blocking client under test does
+        /// not print its "allocation may be reaped" warning.
+        async fn job_keepalive(
+            &self,
+            _request: tonic::Request<proto::JobKeepaliveRequest>,
+        ) -> Result<tonic::Response<proto::JobKeepaliveResponse>, tonic::Status> {
+            Ok(tonic::Response::new(proto::JobKeepaliveResponse::default()))
         }
 
         async fn complete_job_step(
@@ -220,10 +276,7 @@ mock_controller_impl! {
             }
 
             match self.capture.get_job_response.lock().unwrap().clone() {
-                Some(Ok(user)) => Ok(tonic::Response::new(proto::JobInfo {
-                    user,
-                    ..Default::default()
-                })),
+                Some(Ok(job)) => Ok(tonic::Response::new(job)),
                 Some(Err(code)) => Err(tonic::Status::new(code, "mock get_job failure")),
                 None => Err(tonic::Status::unimplemented("get_job")),
             }
@@ -333,7 +386,6 @@ mock_controller_impl! {
     unimplemented {
         get_jobs(proto::GetJobsRequest) -> proto::GetJobsResponse;
         complete_job(proto::CompleteJobRequest) -> ();
-        job_keepalive(proto::JobKeepaliveRequest) -> proto::JobKeepaliveResponse;
         suspend_job(proto::SuspendJobRequest) -> ();
         resume_job(proto::ResumeJobRequest) -> ();
         update_job(proto::UpdateJobRequest) -> ();
