@@ -6019,15 +6019,17 @@ impl ClusterManager {
     /// charges a slice before the launch and the dispatcher gives it back if the launch fails,
     /// so a leader that died in between left the charge with nobody to answer for it.
     pub fn abort_orphaned_placements(&self) {
+        // Read after the job records, never before: a reservation taken between the two
+        // reads would then be absent from one and present in the other, and taken back.
+        let jobs = self.jobs.read();
         let in_flight = self.dispatch_tracker.jobs_in_flight();
-        let orphaned: Vec<JobId> = self
-            .jobs
-            .read()
+        let orphaned: Vec<JobId> = jobs
             .values()
             .filter(|job| job.state == JobState::Pending && job.holds_a_placement())
             .map(|job| job.job_id)
             .filter(|job_id| !in_flight.contains(job_id))
             .collect();
+        drop(jobs);
         for job_id in orphaned {
             warn!(
                 job_id,

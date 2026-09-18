@@ -979,9 +979,10 @@ still running other work reports ``drng`` until that work finishes, then
 ``drain``.
 
 Both the drain and the reason are lifted by the first reconcile that finds no
-claim left, and lifting them takes the same evidence as settling a job: a
-complete ledger from the node's current agent. A node that cannot enumerate its
-own records stays drained. Where the node had also gone ``down`` in the
+claim left. Lifting them takes a complete ledger from the node's current agent,
+and takes it in either node admission mode, since the drain is a signal rather
+than an act on anyone's work. A node that cannot enumerate its own records
+stays drained. Where the node had also gone ``down`` in the
 meantime, the reconcile releases the hold but leaves the state alone — the
 heartbeat decides when that node is fit again, not the reconcile. Resuming the
 node by hand does not help while the claim is still there: the next reconcile
@@ -998,10 +999,9 @@ The reason is written only where the controller has no other reason to
 overwrite, and the drain only where the node is not already held by someone
 else. A node carrying any other reason — an operator's, or one the controller
 set for something else such as a missed heartbeat — keeps it untouched, and the
-drift is reported in the controller log instead. Naming happens whatever the node
-admission mode; *lifting* needs an attested reconcile, which under the default
-``open`` mode no reconcile is, so on such a cluster the hold is an operator's to
-clear — see `What a reconcile may act on`_ below.
+drift is reported in the controller log instead. Naming and lifting both happen
+whatever the node admission mode; what that mode decides is whether the claim
+itself may be answered — see `What a reconcile may act on`_ below.
 
 The controller already reconciles a node on its own:
 
@@ -1062,8 +1062,9 @@ neither licenses cancelling work or settling a job.
 Under ``open``, reconciliation therefore **reports only**. Drift is written to
 the controller log, and *every* claim the controller has no record of — running
 or finished — is named in the node's reason and drains it, since none of them
-may be answered. Nothing is killed, settled or released, and the hold stays until
-an operator clears it. Set ``[admission] mode = "token"`` so each node proves its
+may be answered. Nothing is killed, settled or released. The hold is not
+permanent: it lifts on the first complete cut from that node's current agent
+that no longer names the claim. Set ``[admission] mode = "token"`` so each node proves its
 identity when it registers; that restores the acting half for every trigger. See
 :doc:`/admin-guide/configuration`.
 
@@ -1073,8 +1074,9 @@ it is not, the admin check falls back to the username the client sends, which is
 an operator-error guard and not a security boundary — on such a cluster anyone
 who can reach the controller can claim any name. A cluster that names no
 administrators at all — no accounting, or accounting with no user at
-``AdminLevel=Admin`` — bars nobody, since there is no membership a caller could
-be asked to prove. An omitted username is refused rather than trusted:
+``AdminLevel=Admin``, and no ``[auth] jwt_key`` to mint one with — bars nobody,
+since there is no membership a caller could be asked to prove. An omitted
+username is refused rather than trusted:
 
 .. code-block:: bash
 

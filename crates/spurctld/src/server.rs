@@ -2799,7 +2799,14 @@ impl SlurmController for ControllerService {
                 caller_privileged,
                 req.runs_job_epilog,
             )
-            .map_err(register_node_rpc_status)?;
+            // A rejected registration runs no reconcile, so a gate set for one above would
+            // be held by nothing and take the node out until the next leadership change.
+            .map_err(|error| {
+                if known_before {
+                    self.cluster.set_reconcile_pending(&req.hostname, false);
+                }
+                register_node_rpc_status(error)
+            })?;
 
         // A first registration builds the node record from scratch, which is
         // also the earliest moment the gate has anything to be recorded on.
@@ -8766,6 +8773,43 @@ mod tests {
             cluster.agent_sessions().vouches_for("n1", "session-b"),
             "a name that rejoins must not be judged against the cluster it left"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_registration_leaves_no_gate_behind() {
+        // A gate the registration set and the rejection abandoned is held by nothing:
+        // no pass will clear it, and the node is out of the cluster until a new term.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        register_lifetime(&svc, "session-a").await;
+        wait_until_node_ungated(&cluster, "n1").await;
+
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
+        let mut rejected = Request::new(RegisterAgentRequest {
+            hostname: "n1".into(),
+            address: "127.0.0.1".into(),
+            port: a_port_nothing_listens_on().into(),
+            labels: [("pool".to_string(), "stolen".to_string())].into(),
+            ledger: Some(ledger(false, Vec::new())),
+            join_token,
+            ..Default::default()
+        });
+        rejected.extensions_mut().insert(viewer("mallory", false));
+        svc.register_agent(rejected)
+            .await
+            .expect_err("a non-admin caller must not be able to relabel an existing node");
+
+        wait_until_node_ungated(&cluster, "n1").await;
+    }
+
+    async fn wait_until_node_ungated(cluster: &Arc<ClusterManager>, node: &str) {
+        for _ in 0..200 {
+            if cluster.get_node(node).is_some_and(|n| !n.reconcile_pending) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("node {node} stayed gated with nothing holding the gate");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
