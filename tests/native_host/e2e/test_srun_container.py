@@ -863,3 +863,107 @@ class TestSrunPtyContainerStep:
                 )
         finally:
             cluster.scancel(job_id)
+
+
+# ---------------------------------------------------------------------------
+# Agent restart mid-step (N7/N14): a standalone container step is
+# deliberately unsupervised, running as a direct child of spurd's own exec
+# path rather than a spurstepd-parented tree. An agent restart must recover
+# its real exit code and full stdout, not fabricate FAILED/1 and drop the
+# output.
+# ---------------------------------------------------------------------------
+
+
+class TestContainerStepAgentRestart:
+    def test_a_restarted_agent_recovers_the_steps_real_outcome(
+        self, step_container_cluster
+    ):
+        cluster = step_container_cluster
+        img = cluster.step_container_image
+        node = cluster.node_names[0]
+        out_path = f"{cluster.remote_dir}/n7-restart.out"
+        name = "n7-container-restart"
+        launch = (
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
+            f"PATH={shlex.quote(cluster.bin_dir)}:$PATH "
+            f"nohup {shlex.quote(cluster.bin_dir + '/srun')} -J {name} "
+            f"-w {shlex.quote(node)} -t 2:00 "
+            f"--container-image={shlex.quote(img)} "
+            "bash -c 'echo N7-START; sleep 20; echo N7-END; exit 0' "
+            f"> {shlex.quote(out_path)} 2>&1 & echo backgrounded"
+        )
+        cluster.nodes[0].exec(launch)
+
+        job_id = None
+        deadline = time.time() + 30
+        while time.time() < deadline and job_id is None:
+            ids = cluster.running_job_ids_by_name(name)
+            if ids:
+                job_id = ids[0]
+            else:
+                time.sleep(1)
+        assert job_id is not None, (
+            f"containerized srun step never reached running:\n{cluster.squeue_all()}"
+        )
+
+        # Restart mid-flight, not before the step has actually started doing
+        # anything: wait for its own start marker first.
+        deadline = time.time() + 20
+        started = False
+        while time.time() < deadline:
+            content = cluster.nodes[0].exec_allow_fail(f"cat '{out_path}' 2>/dev/null || true")
+            if "N7-START" in content:
+                started = True
+                break
+            time.sleep(1)
+        assert started, (
+            "the step never printed its start marker before the restart "
+            "window closed"
+        )
+
+        # A graceful stop (SIGTERM, what cluster.restart_agent() sends) lets
+        # spurd's own in-flight RPC-handler future unwind normally, which
+        # drops its StepRootfsGuard and cleans up the very marker files this
+        # recovery path depends on -- that is a normal, controlled shutdown,
+        # not the crash N7/N14 characterize. The live repro is specific about
+        # this: killed by exact PID (SIGKILL), never pkill/SIGTERM, precisely
+        # because only a hard kill leaves no chance for Drop-based cleanup to
+        # run and skips straight to the next start's restart-time sweep.
+        spurd_pid = cluster.nodes[0].exec(
+            f"pgrep -f '{cluster.bin_dir}/spurd'"
+        ).strip()
+        assert spurd_pid, "could not find spurd's pid to kill"
+        cluster.nodes[0].exec_allow_fail(f"kill -9 {spurd_pid}")
+        time.sleep(1)
+        cluster.nodes[0].exec(cluster._spurd_start_cmd(0))
+        cluster.wait_agent_serving(0)
+
+        state = wait_job(cluster, job_id, timeout=120)
+        assert state == "CD", (
+            f"job {job_id} did not complete cleanly after the agent restart "
+            f"-- a fabricated FAILED/exit-1 is exactly N7's bug:\n"
+            f"{cluster.debug_job(job_id)}"
+        )
+
+        show = cluster.scontrol("show", "job", str(job_id))
+        assert "ExitCode=0:0" in show, (
+            f"job {job_id}'s real exit code (0) was not recovered across "
+            f"the restart:\n{show}"
+        )
+
+        content = cluster.nodes[0].exec_allow_fail(f"cat '{out_path}' 2>/dev/null || true")
+        assert "N7-START" in content and "N7-END" in content, (
+            f"the step's full stdout was not recovered after the restart "
+            f"(N7's other symptom -- silently lost output):\n{content}"
+        )
+
+        # N8's rootfs leak, checked as a bonus: the staged rootfs for this
+        # step must not linger once the job is done.
+        leftover = cluster.nodes[0].exec_allow_fail(
+            f"find / -xdev -maxdepth 6 -type d -name 'step_{job_id}_*' "
+            f"2>/dev/null || true"
+        ).strip()
+        assert not leftover, (
+            f"the step's staged container rootfs leaked after the restart: "
+            f"{leftover}"
+        )
