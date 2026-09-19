@@ -250,3 +250,105 @@ class TestTerminalOverreach:
             f"client's death -- a follow-up srun in the same allocation "
             f"should still succeed:\n{content}"
         )
+
+
+def _wait_no_process_pty(cluster, pattern: str, timeout: int = 20) -> bool:
+    pat = f"[{pattern[0]}]{pattern[1:]}" if pattern else pattern
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        out = cluster.nodes[0].exec_allow_fail(f"pgrep -f '{pat}' || echo NONE")
+        if "NONE" in out or not out.strip():
+            return True
+        time.sleep(1)
+    return False
+
+
+def _supervisor_pids_pty(cluster, node_index: int = 0) -> set[str]:
+    node = cluster.nodes[node_index]
+    out = node.exec_allow_fail("ps -eww -o pid=,args= 2>/dev/null || true")
+    pids = set()
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or not fields[1].endswith("spurstepd"):
+            continue
+        if fields[2] == cluster.state_dir:
+            pids.add(fields[0])
+    return pids
+
+
+class TestPtyAgentRestartFailsSafe:
+    """A `srun --pty` job does not survive an agent restart (its connection
+    to spurd is the pty bridge itself, so killing spurd drops it in the same
+    instant) -- but the failure must be safe: no leaked process, no leaked
+    CPU/GPU hold, and any resulting node drain must self-clear on its own,
+    with no operator action (C8)."""
+
+    def test_no_leak_and_the_node_self_heals(self, cluster):
+        node = cluster.node_names[0]
+        name = "c8-pty-restart"
+        launch = (
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
+            f"PATH={shlex.quote(cluster.bin_dir)}:$PATH "
+            f"nohup {shlex.quote(cluster.bin_dir + '/srun')} -J {name} "
+            f"-w {shlex.quote(node)} --pty bash -c 'sleep 60' "
+            f">/dev/null 2>&1 & echo backgrounded"
+        )
+        cluster.nodes[0].exec(launch)
+
+        job_id = None
+        deadline = time.time() + 30
+        while time.time() < deadline and job_id is None:
+            ids = cluster.running_job_ids_by_name(name)
+            if ids:
+                job_id = ids[0]
+            else:
+                time.sleep(1)
+        assert job_id is not None, (
+            f"pty job never reached running:\n{cluster.squeue_all()}"
+        )
+        time.sleep(2)
+
+        spurd_pid = cluster.nodes[0].exec(
+            f"pgrep -f '{cluster.bin_dir}/spurd'"
+        ).strip()
+        assert spurd_pid, "could not find spurd's pid to kill"
+        cluster.nodes[0].exec_allow_fail(f"kill -9 {spurd_pid}")
+        time.sleep(1)
+        cluster.nodes[0].exec(cluster._spurd_start_cmd(0))
+        cluster.wait_agent_serving(0)
+
+        # Does not survive: the job ends terminal rather than being adopted.
+        state = wait_job(cluster, job_id, timeout=60)
+        assert state in ("CA", "F", "GONE"), (
+            f"job {job_id} unexpectedly stayed non-terminal after the "
+            f"restart:\n{cluster.debug_job(job_id)}"
+        )
+
+        # But fails safe: no leaked task process, no leaked spurstepd.
+        no_task_leak = _wait_no_process_pty(cluster, "sleep 60", timeout=30)
+        assert no_task_leak, (
+            "the pty job's remote task leaked past the agent restart:\n"
+            + cluster.nodes[0].exec_allow_fail("pgrep -af '[s]leep 60' || echo NONE")
+        )
+        deadline = time.time() + 30
+        remaining = _supervisor_pids_pty(cluster)
+        while remaining and time.time() < deadline:
+            time.sleep(2)
+            remaining = _supervisor_pids_pty(cluster)
+        assert remaining == set(), (
+            f"the pty job's spurstepd leaked past the agent restart: {remaining}"
+        )
+
+        # And self-heals: any transient drain from the stale-claim reconcile
+        # must clear on its own within a reasonable window, no admin action.
+        deadline = time.time() + 90
+        states = {}
+        while time.time() < deadline:
+            states = cluster.sinfo_nodes()
+            if states.get(node, "").lower() in ("idle", "mix", "alloc"):
+                break
+            time.sleep(3)
+        assert states.get(node, "").lower() in ("idle", "mix", "alloc"), (
+            f"node {node} did not self-heal back to a schedulable state "
+            f"within 90s: {states}\n{cluster.sinfo()}"
+        )
