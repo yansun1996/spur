@@ -5169,6 +5169,8 @@ impl AgentService {
     }
 
     /// Spawn a background task to monitor running jobs and report completions.
+    /// Must start after `recover_stepds`/`replay_admitted_allocations`: this loop's sweep
+    /// trusts `running` as the live set, so a session adopted later would misread as unbacked.
     pub fn start_monitor(&self, controller_addr: String) {
         let running = self.running.clone();
         let allocation = self.allocation.clone();
@@ -5308,8 +5310,9 @@ pub(crate) struct DrainRequest {
 /// sized above a typical image pull and fork.
 const LAUNCHING_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Flag claims the agent has no tracked job for. It does **not** free them:
+/// Flag claims the agent has no tracked job for. It does **not** free them itself:
 /// forgetting a job is not evidence its work finished, and no timeout makes it so.
+/// Freeing one is the controller's call, made once it can find no record of it either.
 async fn flag_unbacked_allocations(
     unbacked: &[(u32, u32)],
     admissions: &crate::admission::AdmissionStore,
@@ -20948,6 +20951,45 @@ mod tests {
             run.conflict_hold.is_none(),
             "the hold is what kept asking for a reconcile that never resolved"
         );
+    }
+
+    // The same CancelJob RPC the controller sends for an ordinary unrecorded claim also
+    // has to settle a conflict-held one, since nothing is tracked for either -- exercised
+    // here in-process, with no gRPC and no permissive auth required.
+    #[tokio::test]
+    async fn a_cancel_of_an_untracked_conflict_held_claim_clears_it() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+        admit_a_launch(&svc, 7);
+        let while_held = charge_a_slice(&svc, 7).await;
+        admissions
+            .take_conflict_hold(key(7, 1), "held with no tracked job on this agent")
+            .expect("hold");
+        assert!(
+            svc.running.lock().await.get(&7).is_none(),
+            "nothing may be tracked here"
+        );
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id: 7,
+            run_attempt: 1,
+            signal: 9,
+        }))
+        .await
+        .expect("cancel");
+
+        assert_eq!(
+            svc.allocation.lock().await.free_cpus(),
+            while_held + 2,
+            "nothing was tracked, so the cancel itself must free the slice"
+        );
+        let run = admissions.load_run(key(7, 1)).expect("record");
+        assert!(
+            run.conflict_hold.is_none(),
+            "a cancelled claim must not keep asking to be reconciled"
+        );
+        assert!(run.slice_released);
     }
 
     // Teardown finishing must free the in-memory slice immediately, so cores

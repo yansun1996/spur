@@ -966,11 +966,15 @@ about it:
   holds those CPUs, GPUs and memory indefinitely, including across a restart.
   The node keeps a veto it alone can exercise: while a cleanup hook is still
   running under the job, it declines and the next reconcile asks again;
-- neither — the node cannot account for the claim and the controller has no
-  record of it, so nothing may end it and nothing proves it is over. The claim
-  is left alone, but the node is drained and named in its reason as ``holding
-  claims the controller has no record of``, followed by the job ids. Only an
-  operator can clear the underlying condition.
+- neither, but the node's own restart-time check already found nothing behind
+  the claim (no tracked process, no supervisor) — cancelled the same as a
+  still-running claim, since that is exactly what a reconcile would otherwise
+  be trying to establish;
+- neither, and the node has no such evidence either way — nothing may end it
+  and nothing proves it is over. The claim is left alone, but the node is
+  drained and named in its reason as ``holding claims the controller has no
+  record of``, followed by the job ids. Only an operator can clear the
+  underlying condition.
 
 The drain is what keeps the cluster from grinding against the node: the held
 cores are ones the controller counts as free, so left in service the node is
@@ -985,8 +989,10 @@ than an act on anyone's work. A node that cannot enumerate its own records
 stays drained. Where the node had also gone ``down`` in the
 meantime, the reconcile releases the hold but leaves the state alone — the
 heartbeat decides when that node is fit again, not the reconcile. Resuming the
-node by hand does not help while the claim is still there: the next reconcile
-drains it again.
+node by hand does not help while a genuinely unresolvable claim is still
+there: the next reconcile drains it again. A claim the node already flagged
+as unbacked needs no manual resume at all — the reconcile that cancels it
+clears the reason in the same pass.
 
 Both the drained nodes and the job ids show up in the usual places:
 
