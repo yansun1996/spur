@@ -3,6 +3,8 @@
 
 """A numbered step gets its own supervisor, and a job reclaims what it made."""
 
+import os
+import re
 import shlex
 import time
 
@@ -375,3 +377,92 @@ class TestSupervisedJobReclaim:
             time.sleep(2)
             remaining = _job_cgroups(cluster, job_ids[0])
         assert remaining == [], f"the allocation left cgroups behind: {remaining}"
+
+
+class TestConcurrentStepLaunchRace:
+    """Two `srun --exclusive` steps launched close together inside one
+    `sbatch` script must never collide on the same numbered step id: the
+    collision made the agent fence one step as a stale supervisor of the
+    other, ending the job on the fast step's completion instead of waiting
+    for the slow one (N13). Reproduced live at ~33% (2/6 trials); this test
+    repeats the exact repro shape enough times to trust a negative result,
+    not a single deterministic pass.
+
+    N13_TRIALS lets a slower/CI run trade confidence for time; the default is
+    fewer than the 15-20 trials the live investigation used, since each trial
+    costs ~30s here (dominated by the slow step) and this suite pays that
+    cost per `pytest` invocation, not once per fix loop.
+    """
+
+    def test_concurrent_exclusive_steps_never_end_the_job_early(self, cluster):
+        trials = int(os.environ.get("N13_TRIALS", "8"))
+        node = cluster.node_names[0]
+        script = cluster.write_file(
+            "n13-race.sh",
+            "#!/bin/bash\n"
+            "srun --exclusive -n1 -c1 bash -c 'sleep 6; echo STEP1-DONE' &\n"
+            "srun --exclusive -n1 -c1 bash -c 'sleep 30; echo STEP2-DONE' &\n"
+            "wait\n"
+            "echo JOB-DONE\n",
+            all_nodes=True,
+        )
+
+        failures = []
+        for trial in range(trials):
+            out_path = f"{cluster.remote_dir}/n13-{trial}.out"
+            job_id = parse_job_id(
+                cluster.sbatch(
+                    ["-J", f"n13-race-{trial}", "-w", node, "-c", "4",
+                     "-o", out_path, script]
+                )
+            )
+            assert job_id is not None, f"trial {trial}: sbatch returned no job id"
+            assert wait_job(cluster, job_id, timeout=90) == "CD", (
+                f"trial {trial}: job {job_id} did not complete cleanly:\n"
+                f"{cluster.debug_job(job_id)}"
+            )
+
+            show = cluster.scontrol("show", "job", str(job_id))
+            content = cluster.read_output_on_any_node(out_path)
+            problems = []
+
+            # The tell from the original bug: the job ending on the fast
+            # step's completion, well under the slow step's 30s.
+            match = re.search(r"RunTime=(\d+):(\d+):(\d+)", show)
+            if match:
+                run_secs = int(match.group(1)) * 3600 + int(match.group(2)) * 60 + int(match.group(3))
+                if run_secs < 20:
+                    problems.append(f"RunTime={match.group(0)} (job ended before the slow step could)")
+            else:
+                problems.append(f"no RunTime found in scontrol output:\n{show}")
+
+            for marker in ("STEP1-DONE", "STEP2-DONE", "JOB-DONE"):
+                count = content.count(marker)
+                if count != 1:
+                    problems.append(f"{marker} appeared {count} times, expected 1")
+
+            if problems:
+                failures.append(
+                    f"trial {trial} (job {job_id}): " + "; ".join(problems) +
+                    f"\noutput:\n{content}\nscontrol:\n{show}"
+                )
+
+        # Fencing/rejection log lines are the other direct evidence of the
+        # collision, checked once across the whole run rather than per trial
+        # since the log is shared and cheap to scan in one pass.
+        fencing = cluster.nodes[0].exec_allow_fail(
+            f"grep -c 'fenced a run against in-flight launches' "
+            f"{cluster.log_dir}/spurd.log || true"
+        ).strip()
+        rejected = cluster.nodes[0].exec_allow_fail(
+            f"grep -c 'runtime hello rejected' {cluster.log_dir}/spurd.log || true"
+        ).strip()
+        if fencing not in ("", "0"):
+            failures.append(f"{fencing} 'fenced a run against in-flight launches' log lines")
+        if rejected not in ("", "0"):
+            failures.append(f"{rejected} 'runtime hello rejected' log lines")
+
+        assert not failures, (
+            f"{len(failures)}/{trials} trials showed the step-id collision:\n\n"
+            + "\n\n".join(failures)
+        )
