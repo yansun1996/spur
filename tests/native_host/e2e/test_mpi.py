@@ -5,6 +5,8 @@
 
 import os
 import re
+import shlex
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
@@ -181,6 +183,72 @@ class TestMpiSingleNode:
                 ranks.add(int(match.group(1)))
                 assert int(match.group(2)) == 4
         assert ranks == {0, 1, 2, 3}, f"expected ranks 0-3, got {ranks}:\n{content}"
+
+
+@pytest.mark.mpi
+class TestMpiAgentRestart:
+    """An agent restart after PMIx wireup completes (during the ranks' own
+    work, not during MPI_Init itself) must be adopted cleanly, the same way
+    any other supervised step is (F6)."""
+
+    def test_restart_after_wireup_is_adopted_and_completes(self, mpi_cluster):
+        cluster = mpi_cluster
+        node = cluster.node_names[0]
+        hello_mpi_hold = cluster.compile_mpi_fixture("hello_mpi_hold.c")
+        name = "f6-mpi-restart"
+        out_path = f"{cluster.remote_dir}/f6-mpi.out"
+        hold_secs = 25
+        launch = (
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
+            f"PATH={shlex.quote(cluster.bin_dir)}:$PATH "
+            f"nohup {shlex.quote(cluster.bin_dir + '/srun')} -J {name} "
+            f"-w {shlex.quote(node)} --mpi=pmix -n2 -t 2:00 "
+            f"{shlex.quote(hello_mpi_hold)} {hold_secs} "
+            f"> {shlex.quote(out_path)} 2>&1 & echo backgrounded"
+        )
+        cluster.nodes[0].exec(launch)
+
+        job_id = None
+        deadline = time.time() + 30
+        while time.time() < deadline and job_id is None:
+            ids = cluster.running_job_ids_by_name(name)
+            if ids:
+                job_id = ids[0]
+            else:
+                time.sleep(1)
+        assert job_id is not None, (
+            f"MPI job never reached running:\n{cluster.squeue_all()}"
+        )
+
+        # Wait for both ranks to clear the barrier -- past MPI_Init/wireup,
+        # not during it.
+        deadline = time.time() + 30
+        content = ""
+        while time.time() < deadline:
+            content = cluster.nodes[0].exec_allow_fail(f"cat '{out_path}' 2>/dev/null || true")
+            if content.count("WIRED-UP") >= 2:
+                break
+            time.sleep(1)
+        assert content.count("WIRED-UP") >= 2, (
+            f"both ranks never cleared the post-wireup barrier:\n{content}"
+        )
+
+        spurd_pid = cluster.nodes[0].exec(
+            f"pgrep -f '{cluster.bin_dir}/spurd'"
+        ).strip()
+        assert spurd_pid, "could not find spurd's pid to kill"
+        cluster.nodes[0].exec_allow_fail(f"kill -9 {spurd_pid}")
+        time.sleep(1)
+        cluster.nodes[0].exec(cluster._spurd_start_cmd(0))
+        cluster.wait_agent_serving(0)
+
+        state = wait_job(cluster, job_id, timeout=90)
+        assert state == "CD", (
+            f"MPI job {job_id} did not complete cleanly after the agent "
+            f"restart:\n{cluster.debug_job(job_id)}"
+        )
+        content = cluster.nodes[0].exec_allow_fail(f"cat '{out_path}' 2>/dev/null || true")
+        assert_mpi_ranks(content, {0, 1}, 2)
 
 
 @pytest.mark.mpi
