@@ -7,6 +7,11 @@ The command must run through an interactive PTY session rather than the
 buffered RunStep path, and the step it creates must reach a terminal state.
 """
 
+import shlex
+import time
+
+from cluster import job_state, parse_job_id, wait_job, wait_job_state
+
 
 class TestSrunPtyStep:
     def test_pty_step_runs_on_a_tty(self, cluster):
@@ -139,3 +144,109 @@ class TestSrunPtyStepMultiNode:
         assert code == 0, out
         hosts = {ln.split("=", 1)[1].strip() for ln in out.splitlines() if ln.startswith("NODE=")}
         assert hosts == {target}, out
+
+
+class TestTerminalOverreach:
+    """A batch job's own process tree must not depend on whoever happens to
+    be attached to it, and an outer `salloc` allocation must not depend on an
+    inner `--pty` client staying alive (C12/C13)."""
+
+    def test_batch_job_survives_losing_its_attached_terminal(self, cluster):
+        node = cluster.node_names[0]
+        out_path = f"{cluster.remote_dir}/c12-batch.out"
+        script = cluster.write_file(
+            "c12-batch.sh",
+            "#!/bin/bash\nfor i in $(seq 1 30); do echo tick-$i; sleep 1; done\n"
+            "echo C12-DONE\n",
+            all_nodes=True,
+        )
+        job_id = parse_job_id(
+            cluster.sbatch(["-J", "c12-batch", "-w", node, "-o", out_path, script])
+        )
+        assert job_id is not None
+        wait_job_state(cluster, job_id, "R")
+
+        # The attach's own remote command, not the local client's death, is
+        # what the agent's bridge waits on before it even considers ending
+        # anything -- so this must outlive the local kill below by enough
+        # margin to actually exercise that check once the bridge ends.
+        attach_secs = 8
+        launch = (
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
+            f"PATH={shlex.quote(cluster.bin_dir)}:$PATH "
+            f"nohup {shlex.quote(cluster.bin_dir + '/srun')} --jobid {job_id} "
+            f"--overlap --pty bash -c 'sleep {attach_secs}' "
+            f">/dev/null 2>&1 & echo PID:$!"
+        )
+        res = cluster.nodes[0].exec(launch)
+        attach_pid = next(
+            (tok.split(":", 1)[1].strip() for tok in res.split() if tok.startswith("PID:")),
+            None,
+        )
+        assert attach_pid, f"could not capture the attach client's pid:\n{res}"
+        time.sleep(2)
+        cluster.nodes[0].exec_allow_fail(f"kill -9 {attach_pid}")
+
+        # Past the attach's own remote sleep, with margin for the bridge to
+        # notice and the agent's own end-of-attach check to run.
+        time.sleep(attach_secs + 5)
+        assert job_state(cluster.squeue_all(), job_id) == "R", (
+            f"batch job {job_id} was disturbed by its attached terminal "
+            f"ending:\n{cluster.debug_job(job_id)}"
+        )
+
+        assert wait_job(cluster, job_id, timeout=60) == "CD", (
+            f"batch job {job_id} did not complete cleanly after its attached "
+            f"terminal was killed:\n{cluster.debug_job(job_id)}"
+        )
+        content = cluster.read_output_on_any_node(out_path)
+        assert "C12-DONE" in content, (
+            f"the batch job's own script did not run to completion -- losing "
+            f"an attached terminal must not affect it:\n{content}"
+        )
+
+    def test_salloc_survives_an_inner_pty_clients_death(self, cluster):
+        node = cluster.node_names[0]
+        marker = f"{cluster.remote_dir}/c13-marker"
+        # The inner pty's own remote command (not the local client dying) is
+        # what the agent's bridge waits on before it even looks at ending
+        # anything, so the outer shell must wait past it -- with margin --
+        # before proving the allocation is still usable, or the check below
+        # would pass on timing alone without ever exercising that path.
+        inner_secs = 8
+        shell_body = (
+            f"nohup {cluster.bin_dir}/srun --pty bash -c 'sleep {inner_secs}' "
+            f">/dev/null 2>&1 & echo $! > {marker}.innerpid\n"
+            "sleep 2\n"
+            "kill -9 $(cat " + marker + ".innerpid)\n"
+            f"sleep {inner_secs + 5}\n"
+            f"{cluster.bin_dir}/srun hostname > {marker}.afterkill 2>&1\n"
+            f"echo rc=$? >> {marker}.afterkill\n"
+        )
+        script_path = cluster.write_file(
+            "c13-salloc.sh", f"#!/bin/bash\nset -uo pipefail\n{shell_body}\n"
+        )
+        launch = (
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
+            f"PATH={shlex.quote(cluster.bin_dir)}:$PATH "
+            f"SHELL={shlex.quote(script_path)} "
+            f"nohup {shlex.quote(cluster.bin_dir + '/spur')} salloc "
+            f"-N 1 -w {shlex.quote(node)} -t 2:00 "
+            f">/dev/null 2>&1 & echo backgrounded"
+        )
+        cluster.nodes[0].exec(launch)
+
+        content = ""
+        deadline = time.time() + inner_secs + 40
+        while time.time() < deadline:
+            content = cluster.nodes[0].exec_allow_fail(
+                f"cat {marker}.afterkill 2>/dev/null || true"
+            )
+            if "rc=" in content:
+                break
+            time.sleep(1)
+        assert "rc=0" in content, (
+            f"the outer salloc allocation did not survive the inner pty "
+            f"client's death -- a follow-up srun in the same allocation "
+            f"should still succeed:\n{content}"
+        )
