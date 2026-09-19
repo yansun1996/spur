@@ -6,7 +6,7 @@ is normally the only thing that ends it. If the client dies before its task
 does, a fixed keepalive floor must reap the job with the task's own real
 signal/exit code -- not leave it RUNNING until a (possibly very long or
 absent) TimeLimit fabricates a `-1:0` result and leaks the session-supervisor
-`spurstepd` forever (N10)."""
+`spurstepd` forever."""
 
 import shlex
 import time
@@ -32,7 +32,7 @@ def _supervisor_pids(cluster, node_index: int = 0) -> set[str]:
 class TestRawSrunClientDeath:
     def test_a_killed_clients_job_ends_within_the_keepalive_floor(self, cluster):
         node = cluster.node_names[0]
-        name = "n10-client-death"
+        name = "raw-srun-client-death"
         # Long enough that the task itself would never finish before the
         # fixed keepalive-floor reaper acts -- the floor plus grace plus one
         # reaper tick is on the order of ~100s (see scheduler_loop.rs).
@@ -60,58 +60,66 @@ class TestRawSrunClientDeath:
                 time.sleep(1)
         assert job_id is not None, f"raw srun job never reached running:\n{cluster.squeue_all()}"
 
-        before = _supervisor_pids(cluster)
-        assert before, "a running raw srun job must have a supervisor"
-
-        # A few seconds in, mirroring N10's own repro ("kill -9'd ~10s into
-        # the run") -- close on the heels of detecting Running externally,
-        # the client's own internal wait-for-running loop may not yet have
-        # gotten far enough to spawn its keepalive pinger.
-        time.sleep(10)
-
-        # Kill only the local client, exactly as N10's repro does -- the
-        # remote task (sleep 600) and its supervisor are untouched by this.
-        cluster.nodes[0].exec_allow_fail(f"kill -9 {srun_pid}")
-
-        # Floor (2x the 30s keepalive interval) + grace (30s) + a 10s reaper
-        # tick, with headroom: ~100-110s observed live. A TimeLimit-driven
-        # recovery would take far longer (or never happen at all, since this
-        # job has no explicit -t), so a generous timeout still discriminates.
         try:
-            state = wait_job(cluster, job_id, timeout=180)
-        except TimeoutError:
-            print("CTLD LOG (filtered):", cluster.nodes[0].exec_allow_fail(
-                f"grep -iE 'keepalive|inactive|reap|cancel|srun_job|stale' "
-                f"{cluster.log_dir}/spurctld.log || true"
-            ))
-            print("SPURD LOG (filtered):", cluster.nodes[0].exec_allow_fail(
-                f"grep -iE 'keepalive|inactive|reap|cancel|srun_job|stale' "
-                f"{cluster.log_dir}/spurd.log || true"
-            ))
-            raise
-        assert state in ("F", "CA", "GONE"), (
-            f"job {job_id} did not reach a terminal state within the "
-            f"keepalive-floor+grace window:\n{cluster.debug_job(job_id)}"
-        )
+            before = _supervisor_pids(cluster)
+            assert before, "a running raw srun job must have a supervisor"
 
-        show = cluster.scontrol("show", "job", str(job_id))
-        assert "ExitCode=-1:0" not in show, (
-            f"job {job_id} recovered via a fabricated TimeLimit exit code, "
-            f"not the keepalive-floor reaper:\n{show}"
-        )
-        assert "RaisedSignal" in show or "ExitCode=0:9" in show or "ExitCode=0:15" in show, (
-            f"job {job_id} did not carry the task's own real termination "
-            f"signal:\n{show}"
-        )
+            # A few seconds in: close on the heels of detecting Running
+            # externally, the client's own internal wait-for-running loop
+            # may not yet have gotten far enough to spawn its keepalive
+            # pinger, and a client that never pings never goes stale.
+            time.sleep(10)
 
-        # No orphaned session-supervisor spurstepd (N10's other symptom: a
-        # permanent process leak surviving even a later TimeLimit recovery).
-        deadline = time.time() + 30
-        remaining = _supervisor_pids(cluster)
-        while remaining and time.time() < deadline:
-            time.sleep(2)
+            # Kill only the local client -- the remote task (sleep 600) and
+            # its supervisor are untouched by this.
+            cluster.nodes[0].exec_allow_fail(f"kill -9 {srun_pid}")
+
+            # Floor (2x the 30s keepalive interval) + grace (30s) + a 10s
+            # reaper tick, with headroom: ~100-110s observed live. A
+            # TimeLimit-driven recovery would take far longer (or never
+            # happen, since this job has no explicit -t), so a generous
+            # timeout still discriminates.
+            try:
+                state = wait_job(cluster, job_id, timeout=180)
+            except TimeoutError:
+                print("CTLD LOG (filtered):", cluster.nodes[0].exec_allow_fail(
+                    f"grep -iE 'keepalive|inactive|reap|cancel|srun_job|stale' "
+                    f"{cluster.log_dir}/spurctld.log || true"
+                ))
+                print("SPURD LOG (filtered):", cluster.nodes[0].exec_allow_fail(
+                    f"grep -iE 'keepalive|inactive|reap|cancel|srun_job|stale' "
+                    f"{cluster.log_dir}/spurd.log || true"
+                ))
+                raise
+            assert state in ("F", "CA", "GONE"), (
+                f"job {job_id} did not reach a terminal state within the "
+                f"keepalive-floor+grace window:\n{cluster.debug_job(job_id)}"
+            )
+
+            show = cluster.scontrol("show", "job", str(job_id))
+            assert "ExitCode=-1:0" not in show, (
+                f"job {job_id} recovered via a fabricated TimeLimit exit "
+                f"code, not the keepalive-floor reaper:\n{show}"
+            )
+            assert (
+                "RaisedSignal" in show
+                or "ExitCode=0:9" in show
+                or "ExitCode=0:15" in show
+            ), (
+                f"job {job_id} did not carry the task's own real "
+                f"termination signal:\n{show}"
+            )
+
+            # No orphaned session-supervisor spurstepd -- a permanent
+            # process leak surviving even a later TimeLimit recovery.
+            deadline = time.time() + 30
             remaining = _supervisor_pids(cluster)
-        assert remaining == set(), (
-            f"the reaped job's session-supervisor spurstepd was never "
-            f"reaped: {remaining}"
-        )
+            while remaining and time.time() < deadline:
+                time.sleep(2)
+                remaining = _supervisor_pids(cluster)
+            assert remaining == set(), (
+                f"the reaped job's session-supervisor spurstepd was never "
+                f"reaped: {remaining}"
+            )
+        finally:
+            cluster.scancel(str(job_id))

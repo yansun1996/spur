@@ -149,65 +149,69 @@ class TestSrunPtyStepMultiNode:
 class TestTerminalOverreach:
     """A batch job's own process tree must not depend on whoever happens to
     be attached to it, and an outer `salloc` allocation must not depend on an
-    inner `--pty` client staying alive (C12/C13)."""
+    inner `--pty` client staying alive."""
 
     def test_batch_job_survives_losing_its_attached_terminal(self, cluster):
         node = cluster.node_names[0]
-        out_path = f"{cluster.remote_dir}/c12-batch.out"
+        out_path = f"{cluster.remote_dir}/attached-batch.out"
         script = cluster.write_file(
-            "c12-batch.sh",
+            "attached-batch.sh",
             "#!/bin/bash\nfor i in $(seq 1 30); do echo tick-$i; sleep 1; done\n"
-            "echo C12-DONE\n",
+            "echo BATCH-DONE\n",
             all_nodes=True,
         )
         job_id = parse_job_id(
-            cluster.sbatch(["-J", "c12-batch", "-w", node, "-o", out_path, script])
+            cluster.sbatch(["-J", "attached-batch", "-w", node, "-o", out_path, script])
         )
         assert job_id is not None
         wait_job_state(cluster, job_id, "R")
 
-        # The attach's own remote command, not the local client's death, is
-        # what the agent's bridge waits on before it even considers ending
-        # anything -- so this must outlive the local kill below by enough
-        # margin to actually exercise that check once the bridge ends.
-        attach_secs = 8
-        launch = (
-            f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
-            f"PATH={shlex.quote(cluster.bin_dir)}:$PATH "
-            f"nohup {shlex.quote(cluster.bin_dir + '/srun')} --jobid {job_id} "
-            f"--overlap --pty bash -c 'sleep {attach_secs}' "
-            f">/dev/null 2>&1 & echo PID:$!"
-        )
-        res = cluster.nodes[0].exec(launch)
-        attach_pid = next(
-            (tok.split(":", 1)[1].strip() for tok in res.split() if tok.startswith("PID:")),
-            None,
-        )
-        assert attach_pid, f"could not capture the attach client's pid:\n{res}"
-        time.sleep(2)
-        cluster.nodes[0].exec_allow_fail(f"kill -9 {attach_pid}")
+        try:
+            # The attach's own remote command, not the local client's death,
+            # is what the agent's bridge waits on before it even considers
+            # ending anything -- so this must outlive the local kill below
+            # by enough margin to actually exercise that check once the
+            # bridge ends.
+            attach_secs = 8
+            launch = (
+                f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
+                f"PATH={shlex.quote(cluster.bin_dir)}:$PATH "
+                f"nohup {shlex.quote(cluster.bin_dir + '/srun')} --jobid {job_id} "
+                f"--overlap --pty bash -c 'sleep {attach_secs}' "
+                f">/dev/null 2>&1 & echo PID:$!"
+            )
+            res = cluster.nodes[0].exec(launch)
+            attach_pid = next(
+                (tok.split(":", 1)[1].strip() for tok in res.split() if tok.startswith("PID:")),
+                None,
+            )
+            assert attach_pid, f"could not capture the attach client's pid:\n{res}"
+            time.sleep(2)
+            cluster.nodes[0].exec_allow_fail(f"kill -9 {attach_pid}")
 
-        # Past the attach's own remote sleep, with margin for the bridge to
-        # notice and the agent's own end-of-attach check to run.
-        time.sleep(attach_secs + 5)
-        assert job_state(cluster.squeue_all(), job_id) == "R", (
-            f"batch job {job_id} was disturbed by its attached terminal "
-            f"ending:\n{cluster.debug_job(job_id)}"
-        )
+            # Past the attach's own remote sleep, with margin for the bridge
+            # to notice and the agent's own end-of-attach check to run.
+            time.sleep(attach_secs + 5)
+            assert job_state(cluster.squeue_all(), job_id) == "R", (
+                f"batch job {job_id} was disturbed by its attached terminal "
+                f"ending:\n{cluster.debug_job(job_id)}"
+            )
 
-        assert wait_job(cluster, job_id, timeout=60) == "CD", (
-            f"batch job {job_id} did not complete cleanly after its attached "
-            f"terminal was killed:\n{cluster.debug_job(job_id)}"
-        )
-        content = cluster.read_output_on_any_node(out_path)
-        assert "C12-DONE" in content, (
-            f"the batch job's own script did not run to completion -- losing "
-            f"an attached terminal must not affect it:\n{content}"
-        )
+            assert wait_job(cluster, job_id, timeout=60) == "CD", (
+                f"batch job {job_id} did not complete cleanly after its "
+                f"attached terminal was killed:\n{cluster.debug_job(job_id)}"
+            )
+            content = cluster.read_output_on_any_node(out_path)
+            assert "BATCH-DONE" in content, (
+                f"the batch job's own script did not run to completion -- "
+                f"losing an attached terminal must not affect it:\n{content}"
+            )
+        finally:
+            cluster.scancel(str(job_id))
 
     def test_salloc_survives_an_inner_pty_clients_death(self, cluster):
         node = cluster.node_names[0]
-        marker = f"{cluster.remote_dir}/c13-marker"
+        marker = f"{cluster.remote_dir}/salloc-inner-pty-marker"
         # The inner pty's own remote command (not the local client dying) is
         # what the agent's bridge waits on before it even looks at ending
         # anything, so the outer shell must wait past it -- with margin --
@@ -218,13 +222,13 @@ class TestTerminalOverreach:
             f"nohup {cluster.bin_dir}/srun --pty bash -c 'sleep {inner_secs}' "
             f">/dev/null 2>&1 & echo $! > {marker}.innerpid\n"
             "sleep 2\n"
-            "kill -9 $(cat " + marker + ".innerpid)\n"
+            f"kill -9 $(cat {marker}.innerpid)\n"
             f"sleep {inner_secs + 5}\n"
             f"{cluster.bin_dir}/srun hostname > {marker}.afterkill 2>&1\n"
             f"echo rc=$? >> {marker}.afterkill\n"
         )
         script_path = cluster.write_file(
-            "c13-salloc.sh", f"#!/bin/bash\nset -uo pipefail\n{shell_body}\n"
+            "salloc-inner-pty.sh", f"#!/bin/bash\nset -uo pipefail\n{shell_body}\n"
         )
         launch = (
             f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
@@ -252,8 +256,15 @@ class TestTerminalOverreach:
         )
 
 
+def _bracket(pattern: str) -> str:
+    """Wrap the first char in a regex class so pgrep -f does not match the
+    shell that is running pgrep itself (its own cmdline contains the literal
+    pattern)."""
+    return f"[{pattern[0]}]{pattern[1:]}" if pattern else pattern
+
+
 def _wait_no_process_pty(cluster, pattern: str, timeout: int = 20) -> bool:
-    pat = f"[{pattern[0]}]{pattern[1:]}" if pattern else pattern
+    pat = _bracket(pattern)
     deadline = time.time() + timeout
     while time.time() < deadline:
         out = cluster.nodes[0].exec_allow_fail(f"pgrep -f '{pat}' || echo NONE")
@@ -280,12 +291,12 @@ class TestPtyAgentRestartFailsSafe:
     """A `srun --pty` job does not survive an agent restart (its connection
     to spurd is the pty bridge itself, so killing spurd drops it in the same
     instant) -- but the failure must be safe: no leaked process, no leaked
-    CPU/GPU hold, and any resulting node drain must self-clear on its own,
-    with no operator action (C8)."""
+    CPU/GPU hold, and any resulting node drain must self-clear with no
+    operator action."""
 
     def test_no_leak_and_the_node_self_heals(self, cluster):
         node = cluster.node_names[0]
-        name = "c8-pty-restart"
+        name = "pty-agent-restart"
         launch = (
             f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
             f"PATH={shlex.quote(cluster.bin_dir)}:$PATH "
@@ -306,49 +317,56 @@ class TestPtyAgentRestartFailsSafe:
         assert job_id is not None, (
             f"pty job never reached running:\n{cluster.squeue_all()}"
         )
-        time.sleep(2)
 
-        spurd_pid = cluster.nodes[0].exec(
-            f"pgrep -f '{cluster.bin_dir}/spurd'"
-        ).strip()
-        assert spurd_pid, "could not find spurd's pid to kill"
-        cluster.nodes[0].exec_allow_fail(f"kill -9 {spurd_pid}")
-        time.sleep(1)
-        cluster.nodes[0].exec(cluster._spurd_start_cmd(0))
-        cluster.wait_agent_serving(0)
-
-        # Does not survive: the job ends terminal rather than being adopted.
-        state = wait_job(cluster, job_id, timeout=60)
-        assert state in ("CA", "F", "GONE"), (
-            f"job {job_id} unexpectedly stayed non-terminal after the "
-            f"restart:\n{cluster.debug_job(job_id)}"
-        )
-
-        # But fails safe: no leaked task process, no leaked spurstepd.
-        no_task_leak = _wait_no_process_pty(cluster, "sleep 60", timeout=30)
-        assert no_task_leak, (
-            "the pty job's remote task leaked past the agent restart:\n"
-            + cluster.nodes[0].exec_allow_fail("pgrep -af '[s]leep 60' || echo NONE")
-        )
-        deadline = time.time() + 30
-        remaining = _supervisor_pids_pty(cluster)
-        while remaining and time.time() < deadline:
+        try:
             time.sleep(2)
-            remaining = _supervisor_pids_pty(cluster)
-        assert remaining == set(), (
-            f"the pty job's spurstepd leaked past the agent restart: {remaining}"
-        )
 
-        # And self-heals: any transient drain from the stale-claim reconcile
-        # must clear on its own within a reasonable window, no admin action.
-        deadline = time.time() + 90
-        states = {}
-        while time.time() < deadline:
-            states = cluster.sinfo_nodes()
-            if states.get(node, "").lower() in ("idle", "mix", "alloc"):
-                break
-            time.sleep(3)
-        assert states.get(node, "").lower() in ("idle", "mix", "alloc"), (
-            f"node {node} did not self-heal back to a schedulable state "
-            f"within 90s: {states}\n{cluster.sinfo()}"
-        )
+            # `pgrep -f` on a bracket-escaped pattern so it never matches the
+            # shell invoking pgrep itself (its own cmdline literally contains
+            # the unescaped pattern).
+            spurd_pid = cluster.nodes[0].exec(
+                f"pgrep -f {shlex.quote(_bracket(cluster.bin_dir + '/spurd'))}"
+            ).strip()
+            assert spurd_pid, "could not find spurd's pid to kill"
+            cluster.nodes[0].exec_allow_fail(f"kill -9 {spurd_pid}")
+            time.sleep(1)
+            cluster.nodes[0].exec(cluster._spurd_start_cmd(0))
+            cluster.wait_agent_serving(0)
+
+            # Does not survive: the job ends terminal, not adopted.
+            state = wait_job(cluster, job_id, timeout=60)
+            assert state in ("CA", "F", "GONE"), (
+                f"job {job_id} unexpectedly stayed non-terminal after the "
+                f"restart:\n{cluster.debug_job(job_id)}"
+            )
+
+            # But fails safe: no leaked task process, no leaked spurstepd.
+            no_task_leak = _wait_no_process_pty(cluster, "sleep 60", timeout=30)
+            assert no_task_leak, (
+                "the pty job's remote task leaked past the agent restart:\n"
+                + cluster.nodes[0].exec_allow_fail("pgrep -af '[s]leep 60' || echo NONE")
+            )
+            deadline = time.time() + 30
+            remaining = _supervisor_pids_pty(cluster)
+            while remaining and time.time() < deadline:
+                time.sleep(2)
+                remaining = _supervisor_pids_pty(cluster)
+            assert remaining == set(), (
+                f"the pty job's spurstepd leaked past the agent restart: {remaining}"
+            )
+
+            # And self-heals: any transient drain from the stale-claim
+            # reconcile must clear on its own, no admin action.
+            deadline = time.time() + 90
+            states = {}
+            while time.time() < deadline:
+                states = cluster.sinfo_nodes()
+                if states.get(node, "").lower() in ("idle", "mix", "alloc"):
+                    break
+                time.sleep(3)
+            assert states.get(node, "").lower() in ("idle", "mix", "alloc"), (
+                f"node {node} did not self-heal back to a schedulable state "
+                f"within 90s: {states}\n{cluster.sinfo()}"
+            )
+        finally:
+            cluster.scancel(str(job_id))

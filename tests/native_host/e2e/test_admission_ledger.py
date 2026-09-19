@@ -311,9 +311,9 @@ class TestEpilogHold:
 
 
 class TestRawInteractiveRecordSweep:
-    """Only sbatch jobs used to get their admission record deleted on natural
-    completion; a raw srun or a salloc left the directory on disk forever,
-    only flipping ``state`` to ``"cleaned"`` (N11)."""
+    """A raw srun or a salloc job's admission record must be deleted on
+    natural completion, not just flipped to state="cleaned" with the
+    directory left behind."""
 
     def test_a_completed_raw_srun_jobs_record_is_deleted(self, cluster):
         node = cluster.node_names[0]
@@ -343,8 +343,8 @@ class TestRawInteractiveRecordSweep:
             f"{cluster.debug_job(job_id)}"
         )
 
-        # A directory left behind with just state flipped is exactly N11's
-        # symptom, not a race: give it a generous window before failing.
+        # A directory left behind with just the state flipped is the failure
+        # this guards, not a race: give it a generous window before failing.
         wait_until(
             lambda: read_run_record(cluster, job_id) is None,
             f"raw srun job {job_id} completed but its admission record "
@@ -375,19 +375,15 @@ class TestRawInteractiveRecordSweep:
 class TestReleaseIndexOnPtyWithEpilog:
     """A clean interactive-session exit with a configured epilog must record a
     real, nonzero Raft commit index for the release — not a hardcoded/local
-    stand-in a restart could not tell apart from a genuine commit (N1).
+    stand-in a restart could not tell apart from a genuine commit.
 
     Uses `salloc`, not a bare standalone `srun --pty`: a bare pty step's own
     task exit does not name a step that "answers for" the run (its lifecycle
     owner is a separate extern step), so its release always goes through the
     controller-cancel settle path, which records `release_raft_index: 0` by
-    design regardless of epilog (`settle_acknowledged_run` always calls
-    `record_settled_claim`, which sets `Some(0)` unconditionally — see
-    `crates/spurd/src/admission.rs`). `salloc`'s own clean-exit report (after
-    901914fc) goes through the acknowledged-completion path instead
-    (`record_acknowledged_completion`), which is the one N1 actually fixed and
-    the one that can carry a genuine index. This is a materially different
-    code path from the cancel-settle one, so it is what this test exercises.
+    design regardless of epilog. `salloc`'s own clean-exit report goes through
+    the acknowledged-completion path instead, which can carry a genuine
+    index — a materially different code path, and the one this test exercises.
     """
 
     def test_a_clean_salloc_exit_records_a_real_release_index(self, unstarted_cluster):
@@ -401,16 +397,16 @@ class TestReleaseIndexOnPtyWithEpilog:
 
         node = cluster.node_names[0]
         code, out = cluster.salloc_run(
-            "echo N1-SALLOC-MARK\n",
+            "echo SALLOC-EPILOG-MARK\n",
             salloc_args=["-N", "1", "-w", node, "-t", "5:00"],
         )
         assert code == 0, f"salloc failed (exit {code}):\n{out}"
-        assert "N1-SALLOC-MARK" in out, out
+        assert "SALLOC-EPILOG-MARK" in out, out
         match = re.search(r"Granted job allocation (\d+)", out)
         assert match, f"could not find salloc's job id in its output:\n{out}"
         job_id = int(match.group(1))
 
-        # Poll tightly: N11 sweeps a settled srun/salloc record off disk within
+        # Poll tightly: the sweep can remove a settled srun/salloc record off disk within
         # a few seconds, so the "released, not yet swept" window is short.
         # Keep the last record seen before it disappears (or None, if it was
         # never observed at all) rather than re-reading after the fact.
@@ -434,5 +430,5 @@ class TestReleaseIndexOnPtyWithEpilog:
         assert index not in (None, 0), (
             f"job {job_id}'s release was acknowledged with no real Raft "
             f"index (got {index!r}) — a hardcoded/local stand-in is what "
-            f"N1 was: {last_seen}"
+            f"a hardcoded value was: {last_seen}"
         )

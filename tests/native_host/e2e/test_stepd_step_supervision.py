@@ -380,25 +380,19 @@ class TestSupervisedJobReclaim:
 
 
 class TestConcurrentStepLaunchRace:
-    """Two `srun --exclusive` steps launched close together inside one
-    `sbatch` script must never collide on the same numbered step id: the
-    collision made the agent fence one step as a stale supervisor of the
-    other, ending the job on the fast step's completion instead of waiting
-    for the slow one (N13). Reproduced live at ~33% (2/6 trials); this test
-    repeats the exact repro shape enough times to trust a negative result,
-    not a single deterministic pass.
-
-    N13_TRIALS lets a slower/CI run trade confidence for time; the default is
-    fewer than the 15-20 trials the live investigation used, since each trial
-    costs ~30s here (dominated by the slow step) and this suite pays that
-    cost per `pytest` invocation, not once per fix loop.
-    """
+    """Two `srun --exclusive` steps launched close together in one `sbatch`
+    script must never collide on the same numbered step id and end the job
+    on the fast step's completion instead of waiting for the slow one.
+    Reproduced live intermittently, so this repeats the repro shape many
+    times rather than trusting a single deterministic pass. STEP_RACE_TRIALS
+    trades confidence for time on a slower/CI run; each trial costs ~30s
+    here (dominated by the slow step)."""
 
     def test_concurrent_exclusive_steps_never_end_the_job_early(self, cluster):
-        trials = int(os.environ.get("N13_TRIALS", "8"))
+        trials = int(os.environ.get("STEP_RACE_TRIALS", "12"))
         node = cluster.node_names[0]
         script = cluster.write_file(
-            "n13-race.sh",
+            "step-race.sh",
             "#!/bin/bash\n"
             "srun --exclusive -n1 -c1 bash -c 'sleep 6; echo STEP1-DONE' &\n"
             "srun --exclusive -n1 -c1 bash -c 'sleep 30; echo STEP2-DONE' &\n"
@@ -409,18 +403,29 @@ class TestConcurrentStepLaunchRace:
 
         failures = []
         for trial in range(trials):
-            out_path = f"{cluster.remote_dir}/n13-{trial}.out"
+            out_path = f"{cluster.remote_dir}/step-race-{trial}.out"
             job_id = parse_job_id(
                 cluster.sbatch(
-                    ["-J", f"n13-race-{trial}", "-w", node, "-c", "4",
+                    ["-J", f"step-race-{trial}", "-w", node, "-c", "4",
                      "-o", out_path, script]
                 )
             )
             assert job_id is not None, f"trial {trial}: sbatch returned no job id"
-            assert wait_job(cluster, job_id, timeout=90) == "CD", (
-                f"trial {trial}: job {job_id} did not complete cleanly:\n"
-                f"{cluster.debug_job(job_id)}"
-            )
+
+            try:
+                state = wait_job(cluster, job_id, timeout=90)
+            except TimeoutError as error:
+                # A hang is itself the failure mode under test -- record it
+                # and move on, rather than losing every remaining trial.
+                failures.append(f"trial {trial} (job {job_id}): {error}")
+                cluster.scancel(str(job_id))
+                continue
+            if state != "CD":
+                failures.append(
+                    f"trial {trial} (job {job_id}): ended {state}, not CD:\n"
+                    f"{cluster.debug_job(job_id)}"
+                )
+                continue
 
             show = cluster.scontrol("show", "job", str(job_id))
             content = cluster.read_output_on_any_node(out_path)
