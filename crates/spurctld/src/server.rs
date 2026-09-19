@@ -1161,9 +1161,10 @@ async fn answer_unrecorded_claims(
             outcome.unresolved.push(entry.job_id);
             continue;
         }
-        // "Cannot tell" is never "dead". Nothing here licenses ending the claim
-        // and nothing proves it is over, so it is named rather than acted on.
-        if disposition.already_accounted_for() {
+        // "Cannot tell" is never "dead" -- unless the agent's own replay already
+        // ruled out a live process for it (conflict_hold); that claim is as
+        // killable as an ordinary unrecorded one, so it takes the same path.
+        if disposition.already_accounted_for() && !entry.conflict_hold {
             warn!(
                 node = %node,
                 job_id = entry.job_id,
@@ -1178,6 +1179,7 @@ async fn answer_unrecorded_claims(
             node = %node,
             job_id = entry.job_id,
             run_attempt = entry.run_attempt,
+            conflict_hold = entry.conflict_hold,
             "agent holds a claim the controller has no record of; cancelling it"
         );
         crate::scheduler_loop::cancel_job_on_nodes(
@@ -8027,6 +8029,111 @@ mod tests {
             vec![99],
             "the drift still has to surface"
         );
+    }
+
+    /// As [`ledger_disposed`], but an `Unresolved` entry also carries the
+    /// `conflict_hold` flag `flag_unbacked_allocations` pairs it with on the wire.
+    fn ledger_conflict_held(
+        complete: bool,
+        entries: Vec<(u32, u32, spur_core::job::LedgerDisposition)>,
+    ) -> spur_proto::proto::NodeLedger {
+        let mut cut = ledger_disposed(complete, entries);
+        for entry in &mut cut.entries {
+            entry.conflict_hold = entry.disposition == "unresolved";
+        }
+        cut
+    }
+
+    // A claim the agent itself flagged as unbacked (no tracked job behind it)
+    // must be cancelled like any other unrecorded claim, not named forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unbacked_conflict_held_claim_is_cancelled_not_named() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_conflict_held(
+                true,
+                vec![
+                    (7, 1, spur_core::job::LedgerDisposition::Held),
+                    (99, 1, spur_core::job::LedgerDisposition::Unresolved),
+                ],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.cancelled,
+            vec![99],
+            "the agent's own replay already ruled out a live process behind this claim"
+        );
+        assert_eq!(outcome.unresolved, Vec::<u32>::new());
+    }
+
+    // The conflict_hold-less sibling of the case above must still be left alone:
+    // an `Unresolved` disposition with no agent-side flag is a different, unproven claim.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unresolved_claim_without_conflict_hold_still_stays_named() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+
+        let outcome = reconcile_node_ledger(
+            &cluster,
+            "n1",
+            ledger_disposed(
+                true,
+                vec![
+                    (7, 1, spur_core::job::LedgerDisposition::Held),
+                    (99, 1, spur_core::job::LedgerDisposition::Unresolved),
+                ],
+            ),
+            &no_launch_in_flight(&cluster, "n1"),
+            CutProvenance::Pulled,
+        )
+        .await;
+
+        assert_eq!(outcome.cancelled, Vec::<u32>::new());
+        assert_eq!(outcome.unresolved, vec![99]);
+    }
+
+    // A node must never drain over a conflict-held claim, and it must stay
+    // clear across every later recheck -- not resolve once and relapse.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_conflict_held_claim_never_drains_the_node_and_stays_clear() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (svc, cluster) = service_with_a_job_on_a_node(&dir).await;
+        assert!(
+            cluster
+                .state_machine_ready(std::time::Duration::from_secs(5))
+                .await
+        );
+
+        for pass in 0..3 {
+            let outcome = reconcile_node_ledger(
+                &cluster,
+                "n1",
+                ledger_conflict_held(
+                    true,
+                    vec![
+                        (7, 1, spur_core::job::LedgerDisposition::Held),
+                        (99, 1, spur_core::job::LedgerDisposition::Unresolved),
+                    ],
+                ),
+                &no_launch_in_flight(&cluster, "n1"),
+                CutProvenance::Pulled,
+            )
+            .await;
+            assert_eq!(outcome.unresolved, Vec::<u32>::new(), "pass {pass}");
+            assert!(
+                cluster.get_node("n1").expect("node").is_schedulable(),
+                "pass {pass}: a resolved claim must never hold the node out of service"
+            );
+            assert_eq!(node_reason(&svc, "n1").await, "", "pass {pass}");
+        }
     }
 
     // The other half of the same upgrade: an agent that predates the field sends
