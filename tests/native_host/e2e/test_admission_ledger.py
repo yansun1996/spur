@@ -5,6 +5,9 @@
 gives it back."""
 
 import json
+import re
+import shlex
+import time
 
 from cluster import parse_job_id, job_state, wait_job, wait_job_state, wait_until
 
@@ -304,4 +307,132 @@ class TestEpilogHold:
         wait_until(
             lambda: cluster.node_cpu_alloc(node) == 0,
             f"node {node} never got its CPUs back once the epilog ended",
+        )
+
+
+class TestRawInteractiveRecordSweep:
+    """Only sbatch jobs used to get their admission record deleted on natural
+    completion; a raw srun or a salloc left the directory on disk forever,
+    only flipping ``state`` to ``"cleaned"`` (N11)."""
+
+    def test_a_completed_raw_srun_jobs_record_is_deleted(self, cluster):
+        node = cluster.node_names[0]
+        name = "adm-srun-sweep"
+        launch = (
+            f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
+            f"PATH={shlex.quote(cluster.bin_dir)}:$PATH "
+            f"nohup {shlex.quote(cluster.bin_dir + '/srun')} -J {name} "
+            f"-w {shlex.quote(node)} sleep 5 "
+            f">/dev/null 2>&1 & echo backgrounded"
+        )
+        cluster.nodes[0].exec(launch)
+
+        job_id = None
+        deadline = time.time() + 30
+        while time.time() < deadline and job_id is None:
+            ids = cluster.running_job_ids_by_name(name)
+            if ids:
+                job_id = ids[0]
+            else:
+                time.sleep(1)
+        assert job_id is not None, f"raw srun job never reached running:\n{cluster.squeue_all()}"
+
+        wait_run_record(cluster, job_id)
+        assert wait_job(cluster, job_id, timeout=60) in ("CD", "GONE"), (
+            f"raw srun job {job_id} did not complete naturally:\n"
+            f"{cluster.debug_job(job_id)}"
+        )
+
+        # A directory left behind with just state flipped is exactly N11's
+        # symptom, not a race: give it a generous window before failing.
+        wait_until(
+            lambda: read_run_record(cluster, job_id) is None,
+            f"raw srun job {job_id} completed but its admission record "
+            f"was never deleted (only sbatch jobs used to sweep it): "
+            f"{read_run_record(cluster, job_id)}",
+            timeout=60,
+        )
+
+    def test_a_completed_sallocs_record_is_deleted(self, cluster):
+        node = cluster.node_names[0]
+        code, out = cluster.salloc_run(
+            "sleep 5\n", salloc_args=["-N", "1", "-w", node, "-t", "0:05"]
+        )
+        assert code == 0, f"salloc failed (exit {code}):\n{out}"
+        match = re.search(r"Granted job allocation (\d+)", out)
+        assert match, f"could not find salloc's job id in its output:\n{out}"
+        job_id = int(match.group(1))
+
+        wait_until(
+            lambda: read_run_record(cluster, job_id) is None,
+            f"salloc job {job_id} completed but its admission record was "
+            f"never deleted (only sbatch jobs used to sweep it): "
+            f"{read_run_record(cluster, job_id)}",
+            timeout=60,
+        )
+
+
+class TestReleaseIndexOnPtyWithEpilog:
+    """A clean interactive-session exit with a configured epilog must record a
+    real, nonzero Raft commit index for the release — not a hardcoded/local
+    stand-in a restart could not tell apart from a genuine commit (N1).
+
+    Uses `salloc`, not a bare standalone `srun --pty`: a bare pty step's own
+    task exit does not name a step that "answers for" the run (its lifecycle
+    owner is a separate extern step), so its release always goes through the
+    controller-cancel settle path, which records `release_raft_index: 0` by
+    design regardless of epilog (`settle_acknowledged_run` always calls
+    `record_settled_claim`, which sets `Some(0)` unconditionally — see
+    `crates/spurd/src/admission.rs`). `salloc`'s own clean-exit report (after
+    901914fc) goes through the acknowledged-completion path instead
+    (`record_acknowledged_completion`), which is the one N1 actually fixed and
+    the one that can carry a genuine index. This is a materially different
+    code path from the cancel-settle one, so it is what this test exercises.
+    """
+
+    def test_a_clean_salloc_exit_records_a_real_release_index(self, unstarted_cluster):
+        cluster = unstarted_cluster
+        hook = cluster.write_file(
+            "hooks/epilog.sh",
+            "#!/bin/bash\nsleep 3\n",
+            all_nodes=True,
+        )
+        cluster.start(config_overrides={"hooks": {"epilog": hook}})
+
+        node = cluster.node_names[0]
+        code, out = cluster.salloc_run(
+            "echo N1-SALLOC-MARK\n",
+            salloc_args=["-N", "1", "-w", node, "-t", "5:00"],
+        )
+        assert code == 0, f"salloc failed (exit {code}):\n{out}"
+        assert "N1-SALLOC-MARK" in out, out
+        match = re.search(r"Granted job allocation (\d+)", out)
+        assert match, f"could not find salloc's job id in its output:\n{out}"
+        job_id = int(match.group(1))
+
+        # Poll tightly: N11 sweeps a settled srun/salloc record off disk within
+        # a few seconds, so the "released, not yet swept" window is short.
+        # Keep the last record seen before it disappears (or None, if it was
+        # never observed at all) rather than re-reading after the fact.
+        last_seen = None
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            record = read_run_record(cluster, job_id)
+            if record is None:
+                break
+            last_seen = record
+            time.sleep(0.2)
+
+        assert last_seen is not None, (
+            f"job {job_id}'s admission record was swept before it was ever "
+            f"observed with its slice released — nothing to check the "
+            f"release index on"
+        )
+        assert last_seen["slice_released"] is True, last_seen
+        assert last_seen["cleanup"]["epilog"] == "succeeded", last_seen
+        index = last_seen["controller_ack"]["release_raft_index"]
+        assert index not in (None, 0), (
+            f"job {job_id}'s release was acknowledged with no real Raft "
+            f"index (got {index!r}) — a hardcoded/local stand-in is what "
+            f"N1 was: {last_seen}"
         )
