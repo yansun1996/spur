@@ -5792,24 +5792,34 @@ impl SlurmAgent for AgentService {
         // signal path can reap it out from under us, so a same-job_id
         // redispatch racing in afterward has something other than job_id
         // alone to be told apart from.
-        let doomed_attempt = match req.run_attempt {
-            0 => match self
+        //
+        // Each lookup is its own statement, not nested inside the next one's
+        // match scrutinee: a match scrutinee's temporaries (here, a mutex
+        // guard) live until the whole match returns, so nesting these would
+        // hold `running` and `stepds` locked simultaneously while acquiring
+        // `allocation` — inverted against release_stepd_tracking's fixed
+        // stepds-then-running-then-allocation order, and a real deadlock.
+        let doomed_attempt = if req.run_attempt != 0 {
+            Some(req.run_attempt)
+        } else {
+            let from_running = self
                 .running
                 .lock()
                 .await
                 .get(&job_id)
-                .map(|t| t.run_attempt)
-            {
-                Some(attempt) => Some(attempt),
-                None => match stepds_for_job(&*self.stepds.lock().await, job_id)
+                .map(|t| t.run_attempt);
+            if from_running.is_some() {
+                from_running
+            } else {
+                let from_stepds = stepds_for_job(&*self.stepds.lock().await, job_id)
                     .first()
-                    .map(|descriptor| descriptor.run_attempt)
-                {
-                    Some(attempt) => Some(attempt),
-                    None => self.allocation.lock().await.owner_attempt(job_id),
-                },
-            },
-            named => Some(named),
+                    .map(|descriptor| descriptor.run_attempt);
+                if from_stepds.is_some() {
+                    from_stepds
+                } else {
+                    self.allocation.lock().await.owner_attempt(job_id)
+                }
+            }
         };
 
         if req.signal > 0 {
