@@ -5396,23 +5396,31 @@ impl SlurmAgent for AgentService {
         // signal path can reap it out from under us, so a same-job_id
         // redispatch racing in afterward has something other than job_id
         // alone to be told apart from.
+        // Each lookup is its own statement so its lock guard drops before the
+        // next is taken. Nesting these as match/if scrutinees instead would hold
+        // `running` (then `stepds`) locked across the whole chain, inverted
+        // against release_stepd_tracking's stepds -> running -> allocation order.
         let doomed_attempt = match req.run_attempt {
-            0 => match self
-                .running
-                .lock()
-                .await
-                .get(&job_id)
-                .map(|t| t.run_attempt)
-            {
-                Some(attempt) => Some(attempt),
-                None => match stepds_for_job(&*self.stepds.lock().await, job_id)
-                    .first()
-                    .map(|descriptor| descriptor.run_attempt)
-                {
-                    Some(attempt) => Some(attempt),
-                    None => self.allocation.lock().await.owner_attempt(job_id),
-                },
-            },
+            0 => {
+                let running_attempt = self
+                    .running
+                    .lock()
+                    .await
+                    .get(&job_id)
+                    .map(|t| t.run_attempt);
+                if running_attempt.is_some() {
+                    running_attempt
+                } else {
+                    let stepd_attempt = stepds_for_job(&*self.stepds.lock().await, job_id)
+                        .first()
+                        .map(|descriptor| descriptor.run_attempt);
+                    if stepd_attempt.is_some() {
+                        stepd_attempt
+                    } else {
+                        self.allocation.lock().await.owner_attempt(job_id)
+                    }
+                }
+            }
             named => Some(named),
         };
 
