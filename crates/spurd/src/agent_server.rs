@@ -3513,6 +3513,7 @@ struct TerminalIdentity {
 
 /// The step id stays the client's user step, which is what puts the shell in a
 /// cgroup leaf under the job rather than on the job node itself.
+#[allow(clippy::too_many_arguments)]
 fn terminal_launch_config(
     entry: &crate::job_entry::JobEntry,
     identity: TerminalIdentity,
@@ -3521,6 +3522,7 @@ fn terminal_launch_config(
     job: TerminalJobFacts,
     memlock: spur_core::config::MemlockLimit,
     cgroup: CgroupConfig,
+    container: Option<executor::ContainerLaunchConfig>,
 ) -> Result<executor::JobLaunchConfig, Status> {
     let TerminalIdentity {
         job_id,
@@ -3555,7 +3557,7 @@ fn terminal_launch_config(
         cpu_ids: Vec::new(),
         uid: entry.uid,
         gid: entry.gid,
-        container: None,
+        container,
         prolog_script: None,
         // This legacy pty path's teardown runs no TaskEpilog, so keep both
         // task hooks off rather than run an unpaired prolog.
@@ -3719,40 +3721,21 @@ async fn run_tokio_step_to_spool(
     }
 }
 
-/// What a containerized child execs after `container_init`. Both the buffered
-/// step (a script file inside the rootfs) and the interactive PTY step (an
-/// interactive shell or inline command) route through the same fork core.
-enum StepChildCommand {
-    /// Run `[entrypoint &&] <shell> <script_path>` — the buffered step path.
-    Script {
-        script_path: String,
-        entrypoint: Option<String>,
-    },
-    /// Exec an interactive shell in place. `None` cmdline = the image's default
-    /// shell; `Some(cmdline)` runs `<shell> -c "exec <cmdline>"` so the workload
-    /// replaces the shell (keeping the PTY session leader as the real process,
-    /// which job control and Ctrl-C depend on).
-    Shell {
-        cmdline: Option<String>,
-        entrypoint: Option<String>,
-    },
+/// What a containerized child execs after `container_init`: the buffered step's
+/// script file inside the rootfs.
+struct StepChildCommand {
+    script_path: String,
+    entrypoint: Option<String>,
 }
 
 /// Reject NUL bytes in strings that reach `execve`: a NUL would silently degrade
 /// the child's exec (e.g. to `bash -c ""`, which exits 0), reporting a step that
 /// never ran as success. Checked before the fork so the error propagates cleanly.
 fn reject_nul_bytes(cmd: &StepChildCommand) -> Result<(), Status> {
-    let strings: [Option<&str>; 2] = match cmd {
-        StepChildCommand::Script {
-            script_path,
-            entrypoint,
-        } => [Some(script_path.as_str()), entrypoint.as_deref()],
-        StepChildCommand::Shell {
-            cmdline,
-            entrypoint,
-        } => [cmdline.as_deref(), entrypoint.as_deref()],
-    };
-    for s in strings.into_iter().flatten() {
+    for s in [Some(cmd.script_path.as_str()), cmd.entrypoint.as_deref()]
+        .into_iter()
+        .flatten()
+    {
         if s.as_bytes().contains(&0) {
             return Err(Status::invalid_argument(
                 "container entrypoint or step command contains a NUL byte",
@@ -3826,39 +3809,13 @@ fn container_child_exec(
     let cstr = |s: &str| std::ffi::CString::new(s).unwrap_or_default();
 
     // NUL bytes were rejected before the fork, so CString::new cannot fail here.
-    let argv: Vec<std::ffi::CString> = match cmd {
-        StepChildCommand::Script {
-            script_path,
-            entrypoint,
-        } => match entrypoint {
-            Some(ep) => vec![
-                c_shell.clone(),
-                cstr("-c"),
-                cstr(&format!("{ep} && {shell} {script_path}")),
-            ],
-            None => vec![c_shell.clone(), cstr(&script_path)],
-        },
-        StepChildCommand::Shell {
-            cmdline,
-            entrypoint,
-        } => match (cmdline, entrypoint) {
-            (None, None) => vec![c_shell.clone()],
-            (Some(cmd), None) => vec![c_shell.clone(), cstr("-c"), cstr(&format!("exec {cmd}"))],
-            (None, Some(ep)) => {
-                vec![
-                    c_shell.clone(),
-                    cstr("-c"),
-                    cstr(&format!("{ep} && exec {shell}")),
-                ]
-            }
-            (Some(cmd), Some(ep)) => {
-                vec![
-                    c_shell.clone(),
-                    cstr("-c"),
-                    cstr(&format!("{ep} && exec {cmd}")),
-                ]
-            }
-        },
+    let argv: Vec<std::ffi::CString> = match cmd.entrypoint {
+        Some(ep) => vec![
+            c_shell.clone(),
+            cstr("-c"),
+            cstr(&format!("{ep} && {shell} {}", cmd.script_path)),
+        ],
+        None => vec![c_shell.clone(), cstr(&cmd.script_path)],
     };
     let c_env: Vec<std::ffi::CString> = final_env
         .iter()
@@ -3912,17 +3869,6 @@ fn container_parent_ready(
     Ok(())
 }
 
-/// Reap a directly-forked child and map its wait status to a shell-style exit
-/// code (128 + signal when killed). Used by the PTY bridge to await a container
-/// step that was forked raw (no `tokio::process::Child` to `wait()` on).
-fn waitpid_exit_code(pid: nix::unistd::Pid) -> i32 {
-    match nix::sys::wait::waitpid(pid, None) {
-        Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => code,
-        Ok(nix::sys::wait::WaitStatus::Signaled(_, sig, _)) => 128 + sig as i32,
-        _ => 128,
-    }
-}
-
 /// Launch a step command inside a fresh container rootfs, wiring the step's
 /// stdout/stderr to the per-step spool files (so `stream_job_output` can tail
 /// them live), matching the non-container step path. Used for standalone
@@ -3967,7 +3913,7 @@ async fn run_containerized_step(
     // from the rootfs before the fork. Keeps a containerized step consistent with
     // a containerized batch job (e.g. tools on the image's PATH resolve).
     let env_base = spur_net::oci::container_base_env(&rootfs, env);
-    let child_cmd = StepChildCommand::Script {
+    let child_cmd = StepChildCommand {
         script_path,
         entrypoint: container_cfg.entrypoint.clone(),
     };
@@ -4892,8 +4838,15 @@ impl AgentService {
         {
             return self.resume_terminal(&descriptor).await;
         }
-        self.launch_supervised_terminal(entry, init.job_id, init.step_id, argv, winsize)
-            .await
+        self.launch_supervised_terminal(
+            entry,
+            init.job_id,
+            init.step_id,
+            argv,
+            winsize,
+            init.container.as_ref(),
+        )
+        .await
     }
 
     /// Take over a terminal whose supervisor is still running. Refused rather
@@ -4944,6 +4897,7 @@ impl AgentService {
         step_id: u32,
         argv: &[String],
         winsize: Option<crate::pty::WindowSize>,
+        container: Option<&ContainerSpec>,
     ) -> Result<SupervisedTerminal, Status> {
         let tracked = {
             let jobs = self.running.lock().await;
@@ -4961,6 +4915,56 @@ impl AgentService {
         };
         let run_attempt = tracked.run_attempt;
 
+        // A terminal step with its own image builds a fresh container the same
+        // way a run_command step does. A step joining a parent's already-running
+        // container never reaches here with one: interactive_session ignores
+        // (and warns about) an image in that case before calling this.
+        let joins_parent_namespaces = entry.has_namespaces() && entry.pid > 0;
+        let mut step_container_rootfs_mode: Option<crate::container::RootfsMode> = None;
+        let step_container = match container.filter(|c| !c.image.is_empty()) {
+            Some(c) if !joins_parent_namespaces => {
+                let mut environment = terminal_environment(entry, job_id);
+                let (gpu_env, container_device_plan) = if tracked.gpu_devices.is_empty() {
+                    (HashMap::new(), None)
+                } else {
+                    let (host_plan, container_plan) = self
+                        .device_registry
+                        .lock()
+                        .await
+                        .build_job_injection_plans(
+                            "gpu",
+                            &tracked.gpu_devices,
+                            entry.uid,
+                            entry.gid,
+                        )
+                        .map_err(|e| {
+                            Status::failed_precondition(format!("GPU injection plan failed: {e}"))
+                        })?;
+                    (host_plan.env, Some(container_plan))
+                };
+                environment.extend(gpu_env);
+                let (cfg, rootfs, rootfs_mode) = self
+                    .build_step_container(
+                        job_id,
+                        step_id,
+                        c,
+                        &entry.work_dir,
+                        &environment,
+                        entry.uid,
+                        entry.gid,
+                        &tracked.gpu_devices,
+                        container_device_plan,
+                    )
+                    .await?;
+                step_container_rootfs_mode = Some(rootfs_mode);
+                Some(executor::ContainerLaunchConfig {
+                    config: cfg,
+                    rootfs,
+                })
+            }
+            _ => None,
+        };
+
         let config = terminal_launch_config(
             entry,
             TerminalIdentity {
@@ -4973,6 +4977,7 @@ impl AgentService {
             tracked,
             self.limits.memlock,
             self.cgroup.clone(),
+            step_container,
         )?;
 
         fence_displaced_stepd(&self.stepds, job_id, step_id, run_attempt)
@@ -4999,7 +5004,7 @@ impl AgentService {
             StepdLaunchOptions {
                 step_id,
                 allocation_only: false,
-                container_rootfs_mode: None,
+                container_rootfs_mode: step_container_rootfs_mode,
                 hooks: (*self.hooks).clone(),
                 plugstack_path: self.plugstack_path.clone(),
                 pmix: None,
@@ -5057,6 +5062,119 @@ impl AgentService {
                 ))
             }
         }
+    }
+
+    /// Resolves a step's own `--container-image` into a rootfs. Shared by
+    /// `run_command` and the interactive terminal path — both build a *fresh*
+    /// container the same way; a step or terminal that joins a parent's
+    /// already-running container never calls this.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_step_container(
+        &self,
+        job_id: u32,
+        step_id: u32,
+        container: &ContainerSpec,
+        work_dir: &str,
+        env: &HashMap<String, String>,
+        uid: u32,
+        gid: u32,
+        gpu_devices: &[u32],
+        container_device_plan: Option<spur_devices::inject::ContainerInjectionPlan>,
+    ) -> Result<
+        (
+            crate::container::ContainerConfig,
+            std::path::PathBuf,
+            crate::container::RootfsMode,
+        ),
+        Status,
+    > {
+        // Refuse a requeue that lands here before a restart-recovered orphan of
+        // a prior attempt finishes tearing down the same path.
+        if self
+            .reaping_orphans
+            .lock()
+            .await
+            .contains(&(job_id, step_id))
+        {
+            return Err(Status::failed_precondition(
+                "a previous run's container for this step is still being reclaimed; retry",
+            ));
+        }
+        let mounts: Vec<crate::container::BindMount> = container
+            .mounts
+            .iter()
+            .filter_map(|m| crate::container::parse_mount(m).ok())
+            .collect();
+        let username = env
+            .get("USER")
+            .or_else(|| env.get("LOGNAME"))
+            .cloned()
+            .unwrap_or_default();
+        let home_dir = env
+            .get("HOME")
+            .cloned()
+            .unwrap_or_else(|| format!("/home/{username}"));
+        let mut container_cfg = crate::container::ContainerConfig {
+            image: container.image.clone(),
+            mounts,
+            workdir: if !container.workdir.is_empty() {
+                Some(container.workdir.clone())
+            } else if !work_dir.is_empty() {
+                Some(work_dir.to_string())
+            } else {
+                None
+            },
+            name: if container.name.is_empty() {
+                None
+            } else {
+                Some(container.name.clone())
+            },
+            readonly: container.readonly,
+            mount_home: container.mount_home,
+            remap_root: container.remap_root,
+            gpu_devices: gpu_devices.to_vec(),
+            environment: env.clone(),
+            // Deny GPU visibility for a zero-GPU step, matching the batch path:
+            // without this a user could smuggle ROCR_VISIBLE_DEVICES through
+            // --container-env on a step with no GPU allocation.
+            container_env: {
+                let mut ce = container.env.clone();
+                maybe_deny_gpu_env(&mut ce, gpu_devices);
+                ce
+            },
+            entrypoint: if container.entrypoint.is_empty() {
+                None
+            } else {
+                Some(container.entrypoint.clone())
+            },
+            uid,
+            gid,
+            username: if username.is_empty() {
+                "spur".to_string()
+            } else {
+                username
+            },
+            home_dir,
+            device_plan: container_device_plan,
+        };
+        crate::container::maybe_bind_auth_socket(
+            &mut container_cfg.mounts,
+            &self.cluster_id,
+            uid,
+            self.allow_root_jobs,
+        );
+
+        let image_path = crate::container::resolve_image(&container.image, None, Some(uid))
+            .map_err(|e| Status::failed_precondition(e.to_string()))?;
+        // Per-step rootfs namespace, disjoint from the batch job's (`job_<id>`),
+        // so a step can never resolve to or delete a batch rootfs, and with no
+        // id arithmetic that could overflow.
+        let step_base = crate::container::step_rootfs_base(job_id, step_id);
+        let (rootfs, rootfs_mode) =
+            crate::container::setup_rootfs(&image_path, &step_base, container_cfg.name.as_deref())
+                .map_err(|e| Status::internal(format!("step container setup failed: {e}")))?;
+
+        Ok((container_cfg, rootfs, rootfs_mode))
     }
 
     /// Discard a supervisor whose terminal this agent could not take up. The
@@ -8991,90 +9109,19 @@ impl SlurmAgent for AgentService {
         {
             match req.container.as_ref().filter(|c| !c.image.is_empty()) {
                 Some(c) => {
-                    // Refuse a requeue that lands here before a restart-recovered
-                    // orphan of a prior attempt finishes tearing down the same path.
-                    if self.reaping_orphans.lock().await.contains(&step_key) {
-                        return Err(Status::failed_precondition(
-                            "a previous run's container for this step is still being \
-                                 reclaimed; retry",
-                        ));
-                    }
-                    let mounts: Vec<crate::container::BindMount> = c
-                        .mounts
-                        .iter()
-                        .filter_map(|m| crate::container::parse_mount(m).ok())
-                        .collect();
-                    let username = env
-                        .get("USER")
-                        .or_else(|| env.get("LOGNAME"))
-                        .cloned()
-                        .unwrap_or_default();
-                    let home_dir = env
-                        .get("HOME")
-                        .cloned()
-                        .unwrap_or_else(|| format!("/home/{username}"));
-                    let mut container_cfg = crate::container::ContainerConfig {
-                        image: c.image.clone(),
-                        mounts,
-                        workdir: if !c.workdir.is_empty() {
-                            Some(c.workdir.clone())
-                        } else if !work_dir.is_empty() {
-                            Some(work_dir.clone())
-                        } else {
-                            None
-                        },
-                        name: if c.name.is_empty() {
-                            None
-                        } else {
-                            Some(c.name.clone())
-                        },
-                        readonly: c.readonly,
-                        mount_home: c.mount_home,
-                        remap_root: c.remap_root,
-                        gpu_devices: gpu_devices.clone(),
-                        environment: env.clone(),
-                        // Deny GPU visibility for a zero-GPU step, matching the batch
-                        // path: without this a user could smuggle ROCR_VISIBLE_DEVICES
-                        // through --container-env on a step with no GPU allocation.
-                        container_env: {
-                            let mut ce = c.env.clone();
-                            maybe_deny_gpu_env(&mut ce, &gpu_devices);
-                            ce
-                        },
-                        entrypoint: if c.entrypoint.is_empty() {
-                            None
-                        } else {
-                            Some(c.entrypoint.clone())
-                        },
-                        uid: req.uid,
-                        gid: req.gid,
-                        username: if username.is_empty() {
-                            "spur".to_string()
-                        } else {
-                            username
-                        },
-                        home_dir,
-                        device_plan: container_device_plan.clone(),
-                    };
-                    crate::container::maybe_bind_auth_socket(
-                        &mut container_cfg.mounts,
-                        &self.cluster_id,
-                        req.uid,
-                        self.allow_root_jobs,
-                    );
-
-                    let image_path = crate::container::resolve_image(&c.image, None, Some(req.uid))
-                        .map_err(|e| Status::failed_precondition(e.to_string()))?;
-                    // Per-step rootfs namespace, disjoint from the batch job's
-                    // (`job_<id>`), so a step can never resolve to or delete a
-                    // batch rootfs, and with no id arithmetic that could overflow.
-                    let step_base = crate::container::step_rootfs_base(job_id, step_id);
-                    let (rootfs, rootfs_mode) = crate::container::setup_rootfs(
-                        &image_path,
-                        &step_base,
-                        container_cfg.name.as_deref(),
-                    )
-                    .map_err(|e| Status::internal(format!("step container setup failed: {e}")))?;
+                    let (container_cfg, rootfs, rootfs_mode) = self
+                        .build_step_container(
+                            job_id,
+                            step_id,
+                            c,
+                            &work_dir,
+                            &env,
+                            req.uid,
+                            req.gid,
+                            &gpu_devices,
+                            container_device_plan.clone(),
+                        )
+                        .await?;
 
                     // Multi-task and labeled commands use agent-generated wrappers. A
                     // fresh container cannot see their host paths after pivot_root.
@@ -10006,10 +10053,10 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
-        // Dispatch mirrors run_command's three cases. A parent job with live
-        // namespaces (containerized sbatch/salloc) is entered via nsenter; a step
-        // that requested its own image with no such parent builds a fresh
-        // container; otherwise the command runs on the host.
+        // A step with its own image and no running parent container builds a
+        // fresh one inside launch_supervised_terminal below, the same way a
+        // run_command step does — genuinely spurstepd-supervised rather than a
+        // fork this agent owns directly.
         let step_image = init
             .container
             .as_ref()
@@ -10019,59 +10066,9 @@ impl SlurmAgent for AgentService {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
 
-        if !parent_has_namespaces && !step_image.is_empty() {
-            // Case 2: fresh container for this interactive PTY step.
-            let container = init
-                .container
-                .as_ref()
-                .expect("image is non-empty in this arm");
-            let (master_fd, child_pid, rootfs_guard) = self
-                .spawn_containerized_pty_step(
-                    init.job_id,
-                    init.step_id,
-                    container,
-                    &argv,
-                    &entry,
-                    winsize.as_ref(),
-                )
-                .await?;
-
-            info!(
-                job_id = init.job_id,
-                child_pid,
-                image = %step_image,
-                "interactive container session started"
-            );
-
-            let active_steps = self.active_steps.clone();
-            let step_key = (init.job_id, init.step_id);
-            let wait_pid = nix::unistd::Pid::from_raw(child_pid);
-            tokio::spawn(async move {
-                // Hold the rootfs guard and the active-steps entry for the whole
-                // session: both drop when the bridge returns (child exit, client
-                // disconnect, or scancel), cleaning up the rootfs and the
-                // cancellation registration.
-                let _rootfs_guard = rootfs_guard;
-                let _step_guard = ActiveStepGuard {
-                    steps: active_steps,
-                    key: step_key,
-                };
-                let wait_exit = async move {
-                    tokio::task::spawn_blocking(move || waitpid_exit_code(wait_pid))
-                        .await
-                        .unwrap_or(128)
-                };
-                let _ =
-                    Self::run_pty_bridge(master_fd, wait_exit, child_pid, interactive, inbound, tx)
-                        .await;
-            });
-
-            return Ok(Response::new(ReceiverStream::new(rx)));
-        }
-
-        if !step_image.is_empty() {
-            // Case 1: the parent job already provides a container; the step joins
-            // its namespaces via nsenter rather than building a new one. Leave a
+        if parent_has_namespaces && !step_image.is_empty() {
+            // The parent job already provides a container; the step joins its
+            // namespaces via nsenter rather than building a new one. Leave a
             // trace rather than silently dropping the requested image.
             warn!(
                 job_id = init.job_id,
@@ -11470,247 +11467,6 @@ impl AgentService {
             }
         }
         Ok(())
-    }
-
-    /// Launch an interactive PTY step in a fresh container rootfs, using the
-    /// controller-resolved effective image. Like `run_command`'s Case 2, but wires
-    /// the child's stdio to a PTY slave and returns the master fd for
-    /// [`Self::run_pty_bridge`]. The caller holds the returned rootfs guard for the
-    /// session so the rootfs is torn down when it ends.
-    async fn spawn_containerized_pty_step(
-        &self,
-        job_id: u32,
-        step_id: u32,
-        container: &ContainerSpec,
-        argv: &[String],
-        entry: &crate::job_entry::JobEntry,
-        winsize: Option<&crate::pty::WindowSize>,
-    ) -> Result<(std::os::fd::OwnedFd, i32, StepRootfsGuard), Status> {
-        use std::os::fd::AsRawFd;
-
-        let (gpu_devices, partition, nodelist, step_run_attempt) = {
-            let jobs = self.running.lock().await;
-            let tracked = jobs.get(&job_id).ok_or_else(|| {
-                Status::not_found(format!("job {job_id} not running on this node"))
-            })?;
-            let nodelist = if tracked.nodelist.is_empty() {
-                hostname::get()
-                    .map(|h| h.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| "localhost".into())
-            } else {
-                tracked.nodelist.clone()
-            };
-            (
-                tracked.gpu_devices.clone(),
-                tracked.partition.clone(),
-                nodelist,
-                tracked.run_attempt,
-            )
-        };
-
-        // GPU device injection plan for the step's allocated GPUs (mirror Case 2).
-        let (mut gpu_env, container_device_plan) = if gpu_devices.is_empty() {
-            (HashMap::new(), None)
-        } else {
-            let (host_plan, container_plan) = self
-                .device_registry
-                .lock()
-                .await
-                .build_job_injection_plans("gpu", &gpu_devices, entry.uid, entry.gid)
-                .map_err(|e| {
-                    Status::failed_precondition(format!("GPU injection plan failed: {e}"))
-                })?;
-            (host_plan.env, Some(container_plan))
-        };
-        maybe_deny_gpu_env(&mut gpu_env, &gpu_devices);
-
-        // User identity for the container shadow/home, resolved from the job's uid.
-        let user = (entry.uid > 0)
-            .then(|| {
-                nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(entry.uid))
-                    .ok()
-                    .flatten()
-            })
-            .flatten();
-        let username = user
-            .as_ref()
-            .map(|u| u.name.clone())
-            .unwrap_or_else(|| "spur".to_string());
-        let home_dir = user
-            .as_ref()
-            .map(|u| u.dir.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("/home/{username}"));
-
-        // Session env: job identity + GPU visibility + user identity, layered later
-        // over the image's own config.Env.
-        let mut senv = SpurEnv::new();
-        senv.set_with_slurm_twin("SPUR_JOB_ID", job_id);
-        senv.set_with_slurm_twin("SPUR_JOBID", job_id);
-        senv.set_with_slurm_twin("SPUR_JOB_PARTITION", &partition);
-        senv.set_with_slurm_twin("SPUR_NODELIST", &nodelist);
-        senv.set_with_slurm_twin("SPUR_JOB_NODELIST", &nodelist);
-        let mut env = senv.into_map();
-        env.extend(gpu_env);
-        env.entry("TERM".to_string())
-            .or_insert_with(|| "xterm-256color".to_string());
-        env.insert("HOME".to_string(), home_dir.clone());
-        env.insert("USER".to_string(), username.clone());
-        env.insert("LOGNAME".to_string(), username.clone());
-
-        let mounts: Vec<crate::container::BindMount> = container
-            .mounts
-            .iter()
-            .filter_map(|m| crate::container::parse_mount(m).ok())
-            .collect();
-
-        let mut container_cfg = crate::container::ContainerConfig {
-            image: container.image.clone(),
-            mounts,
-            workdir: if !container.workdir.is_empty() {
-                Some(container.workdir.clone())
-            } else if !entry.work_dir.is_empty() {
-                Some(entry.work_dir.clone())
-            } else {
-                None
-            },
-            name: (!container.name.is_empty()).then(|| container.name.clone()),
-            readonly: container.readonly,
-            mount_home: container.mount_home,
-            remap_root: container.remap_root,
-            gpu_devices: gpu_devices.clone(),
-            environment: env.clone(),
-            container_env: {
-                let mut ce = container.env.clone();
-                maybe_deny_gpu_env(&mut ce, &gpu_devices);
-                ce
-            },
-            entrypoint: (!container.entrypoint.is_empty()).then(|| container.entrypoint.clone()),
-            uid: entry.uid,
-            gid: entry.gid,
-            username,
-            home_dir,
-            device_plan: container_device_plan,
-        };
-        crate::container::maybe_bind_auth_socket(
-            &mut container_cfg.mounts,
-            &self.cluster_id,
-            entry.uid,
-            self.allow_root_jobs,
-        );
-
-        let image_path = crate::container::resolve_image(&container.image, None, Some(entry.uid))
-            .map_err(|e| Status::failed_precondition(e.to_string()))?;
-        let step_base = crate::container::step_rootfs_base(job_id, step_id);
-        let (rootfs, rootfs_mode) =
-            crate::container::setup_rootfs(&image_path, &step_base, container_cfg.name.as_deref())
-                .map_err(|e| Status::internal(format!("step container setup failed: {e}")))?;
-        let mut rootfs_guard = StepRootfsGuard {
-            base: step_base,
-            mode: rootfs_mode,
-            pid: None,
-        };
-
-        // Interactive command: the image's default shell (empty argv) or the
-        // requested command, exec'd in place so it owns the PTY.
-        let cmdline = if argv.is_empty() {
-            None
-        } else {
-            Some(
-                shlex::try_join(argv.iter().map(String::as_str)).map_err(|e| {
-                    Status::invalid_argument(format!("command is not shell-safe: {e}"))
-                })?,
-            )
-        };
-        let child_cmd = StepChildCommand::Shell {
-            cmdline,
-            entrypoint: container_cfg.entrypoint.clone(),
-        };
-        reject_nul_bytes(&child_cmd)?;
-
-        let env_base = spur_net::oci::container_base_env(&rootfs, env);
-
-        let (master, slave) = crate::pty::openpty_with_winsize(winsize)
-            .map_err(|e| Status::internal(format!("openpty: {e}")))?;
-        let raw_io = crate::executor::JobIoRaw::Pty {
-            master: master.as_raw_fd(),
-            slave: slave.as_raw_fd(),
-        };
-
-        let (ready_r, ready_w) =
-            nix::unistd::pipe().map_err(|e| Status::internal(format!("pipe failed: {e}")))?;
-        nix::fcntl::fcntl(
-            &ready_r,
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-        )
-        .ok();
-
-        let cgroup_join = executor::CgroupJoin::for_cgroup(entry.cgroup_path.as_deref());
-        let memlock = self.limits.memlock;
-
-        match unsafe {
-            nix::unistd::fork().map_err(|e| Status::internal(format!("fork failed: {e}")))?
-        } {
-            nix::unistd::ForkResult::Child => {
-                // === CHILD PROCESS — synchronous only ===
-                drop(ready_r);
-                unsafe {
-                    libc::signal(libc::SIGCHLD, libc::SIG_DFL);
-                    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-                    // Wire the PTY slave as the controlling terminal (setsid +
-                    // TIOCSCTTY + dup2 slave->0/1/2 + close master) before
-                    // container_init pivots into the rootfs.
-                    if raw_io.wire().is_err() {
-                        std::process::exit(127);
-                    }
-                }
-                container_child_exec(
-                    &container_cfg,
-                    &rootfs,
-                    ready_w,
-                    memlock,
-                    &cgroup_join,
-                    env_base,
-                    child_cmd,
-                    // Interactive sessions have no restart-recovery path yet.
-                    None,
-                );
-            }
-            nix::unistd::ForkResult::Parent { child: child_pid } => {
-                // === PARENT ===
-                drop(ready_w);
-                drop(slave);
-
-                container_parent_ready(
-                    child_pid,
-                    ready_r,
-                    self.cgroup.required,
-                    entry.cgroup_path.as_deref(),
-                )?;
-
-                // Non-blocking so the bridge's AsyncFd reads/writes are correct.
-                nix::fcntl::fcntl(
-                    &master,
-                    nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-                )
-                .map_err(|e| Status::internal(format!("fcntl O_NONBLOCK: {e}")))?;
-
-                let raw_pid = child_pid.as_raw();
-                rootfs_guard.pid = Some(raw_pid);
-
-                // Register so scancel and the allocation-cancel path can signal it.
-                self.active_steps.lock().await.insert(
-                    (job_id, step_id),
-                    ActiveStep {
-                        epoch: next_step_epoch(),
-                        pid: Some(raw_pid as u32),
-                        run_attempt: step_run_attempt,
-                        ..Default::default()
-                    },
-                );
-
-                Ok((master, raw_pid, rootfs_guard))
-            }
-        }
     }
 
     /// Read environment variables from a running process via /proc.
@@ -15226,6 +14982,7 @@ mod tests {
             terminal_job_facts(),
             spur_core::config::MemlockLimit::Unlimited,
             CgroupConfig::default(),
+            None,
         )
         .expect("a terminal launch config")
     }
@@ -18232,6 +17989,72 @@ mod tests {
         assert!(
             err.message().contains("not found"),
             "expected an image-resolution failure reached via the supervised path, got: {}",
+            err.message()
+        );
+    }
+
+    /// `build_step_container` is the helper both `run_command` and the
+    /// interactive terminal path (`launch_supervised_terminal`) share to build
+    /// a step's own fresh container. Covered directly here rather than only
+    /// through `run_command`'s RPC, since the terminal path cannot easily be
+    /// driven at the unit level (a client-streaming RPC).
+    #[tokio::test]
+    async fn build_step_container_reports_a_missing_image() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let container = spur_proto::proto::ContainerSpec {
+            image: "/nonexistent/bogus-terminal-image.sqsh".into(),
+            ..Default::default()
+        };
+        let err = svc
+            .build_step_container(4200, 0, &container, "", &HashMap::new(), 0, 0, &[], None)
+            .await
+            .expect_err("a missing image must not silently resolve to no container");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("not found"),
+            "expected an image-resolution failure, got: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn build_step_container_refuses_a_step_still_being_reaped() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 4201;
+        let step_id = 2;
+        svc.reaping_orphans.lock().await.insert((job_id, step_id));
+        let container = spur_proto::proto::ContainerSpec {
+            image: "/nonexistent/bogus-terminal-image.sqsh".into(),
+            ..Default::default()
+        };
+        let err = svc
+            .build_step_container(
+                job_id,
+                step_id,
+                &container,
+                "",
+                &HashMap::new(),
+                0,
+                0,
+                &[],
+                None,
+            )
+            .await
+            .expect_err("a step still being reaped must not start a fresh container");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("still being reclaimed"),
+            "expected the reaping-orphans guard, not image resolution, got: {}",
             err.message()
         );
     }
@@ -25442,32 +25265,6 @@ mod tests {
 
         let err = svc.job_entry(9999).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
-    }
-
-    // The PTY bridge reaps a raw-forked container step through `waitpid_exit_code`
-    // (there is no `tokio::process::Child` to `wait()` on), so exit-code mapping
-    // must match what the bridge reports to the client.
-    #[test]
-    fn waitpid_exit_code_reports_normal_exit() {
-        match unsafe { nix::unistd::fork() }.expect("fork") {
-            nix::unistd::ForkResult::Child => unsafe { libc::_exit(7) },
-            nix::unistd::ForkResult::Parent { child } => {
-                assert_eq!(waitpid_exit_code(child), 7);
-            }
-        }
-    }
-
-    #[test]
-    fn waitpid_exit_code_reports_signal_death_as_128_plus_signal() {
-        match unsafe { nix::unistd::fork() }.expect("fork") {
-            nix::unistd::ForkResult::Child => loop {
-                unsafe { libc::pause() };
-            },
-            nix::unistd::ForkResult::Parent { child } => {
-                unsafe { libc::kill(child.as_raw(), libc::SIGKILL) };
-                assert_eq!(waitpid_exit_code(child), 128 + libc::SIGKILL);
-            }
-        }
     }
 
     /// A bridge over a PTY running `argv`, with handles on both ends of the

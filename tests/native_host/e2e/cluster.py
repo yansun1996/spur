@@ -515,6 +515,18 @@ class SpurCluster:
         code = stdout.channel.recv_exit_status()
         return code, stdout.read().decode() + stderr.read().decode()
 
+    def srun_pty_background(self, args: list[str]):
+        """Start `srun` without waiting for it to finish, so the caller can act
+        (e.g. restart the agent) while the session is still open. Returns the
+        paramiko (stdin, stdout, stderr) channel objects — same shape as
+        `client.exec_command`, just not drained here. Call
+        `stdout.channel.recv_exit_status()` afterward to block for completion.
+        """
+        cmd_parts = self._cli_env_assignments()
+        cmd_parts.append(shlex.quote(f"{self.bin_dir}/srun"))
+        cmd_parts.extend(shlex.quote(a) for a in args)
+        return self.nodes[0].client.exec_command(" ".join(cmd_parts))
+
     def srun_in_allocation(
         self,
         job_id: int,

@@ -972,3 +972,73 @@ class TestContainerStepAgentRestart:
             )
         finally:
             cluster.scancel(str(job_id))
+
+
+def _supervisor_pids(cluster, node_index: int = 0) -> set:
+    """Supervisors under this cluster's own state dir. Same convention as
+    test_stepd_step_supervision.py / test_stepd_restart_survival.py: pid
+    *identity* (not just presence) is what proves a session survived an agent
+    restart rather than being silently respawned."""
+    node = cluster.nodes[node_index]
+    out = node.exec_allow_fail("ps -eww -o pid=,args= 2>/dev/null || true")
+    pids = set()
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or not fields[1].endswith("spurstepd"):
+            continue
+        if fields[2] == cluster.state_dir:
+            pids.add(fields[0])
+    return pids
+
+
+class TestSrunPtyContainerStepSupervision:
+    """An interactive `srun --pty --container-image` session must be
+    spurstepd-supervised, not a raw fork the agent owns directly — otherwise
+    an agent restart kills the session outright. Proven the same way
+    test_stepd_restart_survival.py proves it for a batch job: the same
+    supervisor pid survives an agent restart, and the session (inside the
+    container) keeps running and completes correctly afterward.
+    """
+
+    def test_pty_container_session_survives_an_agent_restart(
+        self, step_container_cluster
+    ):
+        cluster = step_container_cluster
+        node = cluster.node_names[0]
+        baseline = _supervisor_pids(cluster)
+
+        _, stdout, stderr = cluster.srun_pty_background([
+            "-N", "1", "-w", node, "-t", "0:02", "--pty",
+            f"--container-image={cluster.step_container_image}",
+            "bash", "-c",
+            f"for i in $(seq 1 15); do echo tick $i; sleep 2; done; "
+            f"cat {MARKER_PATH}; echo SURVIVED",
+        ])
+
+        # The session has its own supervisor as soon as it actually starts;
+        # give it a window to appear before restarting the agent out from
+        # under it.
+        deadline = time.time() + 30
+        before = set()
+        while time.time() < deadline:
+            before = _supervisor_pids(cluster) - baseline
+            if before:
+                break
+            time.sleep(1)
+        assert before, "an interactive container session must have a supervisor"
+
+        cluster.restart_agent(0)
+
+        after = _supervisor_pids(cluster)
+        assert before <= after, (
+            "the supervisor must outlive the agent that spawned it: "
+            f"{sorted(before)} before the restart, {sorted(after)} after"
+        )
+
+        code = stdout.channel.recv_exit_status()
+        out = stdout.read().decode() + stderr.read().decode()
+        assert code == 0, f"srun --pty --container-image failed (exit {code}):\n{out}"
+        assert MARKER_CONTENT in out, f"session did not run inside the container:\n{out}"
+        assert out.count("tick 1\n") == 1, (
+            f"the session must not have been restarted from the top:\n{out}"
+        )
