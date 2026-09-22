@@ -3437,12 +3437,6 @@ fn reap_orphaned_step_rootfs(base: &str) {
     crate::container::cleanup_rootfs(base, &mode);
 }
 
-/// A step that builds its own container keeps the agent in its exec path, so it
-/// cannot be handed to a supervisor. Entering a parent job's namespaces can.
-fn step_can_be_supervised(container_image: &str) -> bool {
-    container_image.is_empty()
-}
-
 /// The plan a step's supervisor hosts its PMIx server from. Re-keyed to the step
 /// being launched: a server and a plan naming different steps rendezvous nowhere.
 fn supervised_step_pmix(
@@ -4765,6 +4759,7 @@ impl AgentService {
         step_files: crate::executor::StepOutputFiles,
         step_key: (u32, u32),
         persist_cred: (String, String, String),
+        container_rootfs_mode: Option<crate::container::RootfsMode>,
     ) -> Result<Option<std::process::ExitStatus>, Status> {
         let (job_id, step_id) = step_key;
         let run_attempt = cfg.run_attempt;
@@ -4796,7 +4791,7 @@ impl AgentService {
             StepdLaunchOptions {
                 step_id,
                 allocation_only: false,
-                container_rootfs_mode: None,
+                container_rootfs_mode,
                 hooks: (*self.hooks).clone(),
                 plugstack_path: self.plugstack_path.clone(),
                 pmix,
@@ -8809,8 +8804,7 @@ impl SlurmAgent for AgentService {
         }
         // Decided here rather than at the dispatch chain below because who runs
         // the step also decides who hosts its PMIx server.
-        let supervise_step =
-            step_can_be_supervised(req.container.as_ref().map_or("", |c| c.image.as_str()));
+        let supervise_step = true;
         #[cfg(test)]
         let supervise_step = supervise_step && !self.force_legacy_launch;
 
@@ -8983,6 +8977,167 @@ impl SlurmAgent for AgentService {
         }
 
         let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
+
+        // A step with its own image but no running parent container to join
+        // builds a fresh rootfs for itself, resolved here so it can carry
+        // straight into the supervised launch config below — the same shape
+        // a job-level container already hands to `launch_stepd`/
+        // `executor::launch_job`. A step whose parent already has namespaces
+        // joins those instead (`joins_parent_namespaces` above): its own
+        // image, if any, is ignored with a warning, exactly as before.
+        let mut step_container_rootfs_mode: Option<crate::container::RootfsMode> = None;
+        let step_container: Option<executor::ContainerLaunchConfig> = if supervise_step
+            && !joins_parent_namespaces
+        {
+            match req.container.as_ref().filter(|c| !c.image.is_empty()) {
+                Some(c) => {
+                    // Refuse a requeue that lands here before a restart-recovered
+                    // orphan of a prior attempt finishes tearing down the same path.
+                    if self.reaping_orphans.lock().await.contains(&step_key) {
+                        return Err(Status::failed_precondition(
+                            "a previous run's container for this step is still being \
+                                 reclaimed; retry",
+                        ));
+                    }
+                    let mounts: Vec<crate::container::BindMount> = c
+                        .mounts
+                        .iter()
+                        .filter_map(|m| crate::container::parse_mount(m).ok())
+                        .collect();
+                    let username = env
+                        .get("USER")
+                        .or_else(|| env.get("LOGNAME"))
+                        .cloned()
+                        .unwrap_or_default();
+                    let home_dir = env
+                        .get("HOME")
+                        .cloned()
+                        .unwrap_or_else(|| format!("/home/{username}"));
+                    let mut container_cfg = crate::container::ContainerConfig {
+                        image: c.image.clone(),
+                        mounts,
+                        workdir: if !c.workdir.is_empty() {
+                            Some(c.workdir.clone())
+                        } else if !work_dir.is_empty() {
+                            Some(work_dir.clone())
+                        } else {
+                            None
+                        },
+                        name: if c.name.is_empty() {
+                            None
+                        } else {
+                            Some(c.name.clone())
+                        },
+                        readonly: c.readonly,
+                        mount_home: c.mount_home,
+                        remap_root: c.remap_root,
+                        gpu_devices: gpu_devices.clone(),
+                        environment: env.clone(),
+                        // Deny GPU visibility for a zero-GPU step, matching the batch
+                        // path: without this a user could smuggle ROCR_VISIBLE_DEVICES
+                        // through --container-env on a step with no GPU allocation.
+                        container_env: {
+                            let mut ce = c.env.clone();
+                            maybe_deny_gpu_env(&mut ce, &gpu_devices);
+                            ce
+                        },
+                        entrypoint: if c.entrypoint.is_empty() {
+                            None
+                        } else {
+                            Some(c.entrypoint.clone())
+                        },
+                        uid: req.uid,
+                        gid: req.gid,
+                        username: if username.is_empty() {
+                            "spur".to_string()
+                        } else {
+                            username
+                        },
+                        home_dir,
+                        device_plan: container_device_plan.clone(),
+                    };
+                    crate::container::maybe_bind_auth_socket(
+                        &mut container_cfg.mounts,
+                        &self.cluster_id,
+                        req.uid,
+                        self.allow_root_jobs,
+                    );
+
+                    let image_path = crate::container::resolve_image(&c.image, None, Some(req.uid))
+                        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                    // Per-step rootfs namespace, disjoint from the batch job's
+                    // (`job_<id>`), so a step can never resolve to or delete a
+                    // batch rootfs, and with no id arithmetic that could overflow.
+                    let step_base = crate::container::step_rootfs_base(job_id, step_id);
+                    let (rootfs, rootfs_mode) = crate::container::setup_rootfs(
+                        &image_path,
+                        &step_base,
+                        container_cfg.name.as_deref(),
+                    )
+                    .map_err(|e| Status::internal(format!("step container setup failed: {e}")))?;
+
+                    // Multi-task and labeled commands use agent-generated wrappers. A
+                    // fresh container cannot see their host paths after pivot_root.
+                    if let Some(ref scripts) = _step_script_guard {
+                        scripts
+                            .stage_in_rootfs(&rootfs, req.uid, req.gid)
+                            .map_err(|e| {
+                                Status::internal(format!(
+                                    "failed to stage step scripts in container: {e}"
+                                ))
+                            })?;
+                    }
+
+                    // The supervisor's own exec path looks for the script at this
+                    // fixed name inside the rootfs, exactly like a job-level
+                    // container does (see executor::launch_container_job).
+                    let step_script_content = {
+                        let joined = shlex::try_join(
+                            std::iter::once(program.as_str())
+                                .chain(program_args.iter().map(String::as_str)),
+                        )
+                        .map_err(|e| {
+                            Status::invalid_argument(format!("step command is not shell-safe: {e}"))
+                        })?;
+                        format!("#!/bin/bash\n{joined}\n")
+                    };
+                    let script_in_rootfs =
+                        format!("{}/tmp/spur_job_{}.sh", rootfs.display(), job_id);
+                    std::fs::write(&script_in_rootfs, &step_script_content).map_err(|e| {
+                        Status::internal(format!("failed to write step script: {e}"))
+                    })?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &script_in_rootfs,
+                            std::fs::Permissions::from_mode(0o755),
+                        );
+                    }
+
+                    step_container_rootfs_mode = Some(rootfs_mode);
+                    Some(executor::ContainerLaunchConfig {
+                        config: container_cfg,
+                        rootfs,
+                    })
+                }
+                None => None,
+            }
+        } else {
+            if let Some(c) = req.container.as_ref().filter(|c| !c.image.is_empty()) {
+                if joins_parent_namespaces {
+                    warn!(
+                        job_id,
+                        step_id,
+                        image = %c.image,
+                        "step --container-image ignored: joining the parent job's \
+                         running container instead of building a new one"
+                    );
+                }
+            }
+            None
+        };
+
         let mut supervised_step_cfg = if supervise_step {
             let command: Vec<String> = std::iter::once(program.clone())
                 .chain(program_args.iter().cloned())
@@ -9017,7 +9172,7 @@ impl SlurmAgent for AgentService {
                 cpu_ids: Vec::new(),
                 uid: req.uid,
                 gid: req.gid,
-                container: None,
+                container: step_container,
                 prolog_script: None,
                 task_prolog_script: None,
                 task_epilog_script: None,
@@ -9099,6 +9254,7 @@ impl SlurmAgent for AgentService {
                 step_files,
                 step_key,
                 persist_cred,
+                step_container_rootfs_mode,
             )
             .await?
         } else if job_entry.has_namespaces() && job_entry.pid > 0 {
@@ -14124,16 +14280,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_plain_host_step_is_supervisable() {
-        assert!(step_can_be_supervised(""));
-    }
-
-    #[test]
-    fn a_step_building_its_own_container_is_not_supervisable() {
-        assert!(!step_can_be_supervised("docker://alpine"));
-    }
-
     fn proto_pmix_plan(
         job_id: u32,
         step_id: u32,
@@ -18049,6 +18195,43 @@ mod tests {
         assert!(
             err.message().contains("not found"),
             "expected an image-resolution failure, got: {}",
+            err.message()
+        );
+    }
+
+    /// A step with its own container image used to be barred from supervision
+    /// entirely (`step_can_be_supervised` forced it onto the legacy path). Now
+    /// that gate is gone, the supervised branch must build the container
+    /// itself rather than pass `container: None` and silently run the step on
+    /// the host — proven the same way as #777's regression, but reached
+    /// through `supervised_agent` instead of the legacy dispatch.
+    #[tokio::test]
+    async fn run_command_supervises_a_step_with_its_own_container_image() {
+        let svc = supervised_agent("/nonexistent/spur/spur_mpi_pmix.so");
+        let job_id = 8901;
+        svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
+        let work_dir = tempfile::tempdir().expect("work dir");
+        let req = Request::new(RunCommandRequest {
+            command: vec!["echo".into(), "would-succeed-on-host".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: work_dir.path().to_string_lossy().into_owned(),
+            environment: HashMap::new(),
+            job_id,
+            container: Some(spur_proto::proto::ContainerSpec {
+                image: "/nonexistent/bogus-step-image.sqsh".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let err = svc
+            .run_command(req)
+            .await
+            .expect_err("a supervised container step must not fall through to a host echo");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message().contains("not found"),
+            "expected an image-resolution failure reached via the supervised path, got: {}",
             err.message()
         );
     }
