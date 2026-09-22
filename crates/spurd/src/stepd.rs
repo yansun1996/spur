@@ -2168,35 +2168,28 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         }
     };
     let runtime_environment = launch_spec.environment.clone();
-    let (job, launched_cgroup, launched_output, task_environment, launched_master) =
-        if launch_spec.allocation_only {
-            (
-                RunningJob::AllocationOnly,
-                None,
-                None,
-                HashMap::new(),
-                None,
-            )
-        } else {
-            match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref())
-                .await
-            {
-                Ok(result) => (
-                    result.job,
-                    result.cgroup_path,
-                    Some((result.stdout_path, result.stderr_path)),
-                    result.task_environment,
-                    result.pty_master,
-                ),
-                Err(error) => {
-                    if let Some(pmix) = pmix.as_ref() {
-                        pmix.stop();
-                    }
-                    cleanup_failed_launch(&error);
-                    return Err(anyhow::anyhow!(error.to_string()));
+    let (job, launched_cgroup, launched_output, task_environment, launched_master) = if launch_spec
+        .allocation_only
+    {
+        (RunningJob::AllocationOnly, None, None, HashMap::new(), None)
+    } else {
+        match crate::executor::launch_job(&launch_spec.into_launch_config(), spank.as_ref()).await {
+            Ok(result) => (
+                result.job,
+                result.cgroup_path,
+                Some((result.stdout_path, result.stderr_path)),
+                result.task_environment,
+                result.pty_master,
+            ),
+            Err(error) => {
+                if let Some(pmix) = pmix.as_ref() {
+                    pmix.stop();
                 }
+                cleanup_failed_launch(&error);
+                return Err(anyhow::anyhow!(error.to_string()));
             }
-        };
+        }
+    };
     let workload_pid = job.pid().unwrap_or(0);
     // Custody before anything can observe the launch: dropping the master would
     // hang the terminal up under the shell that just got its slave.

@@ -3312,6 +3312,7 @@ mod step_output_still_pending_tests {
                 cancel_requested: false,
                 pid: Some(1234),
                 epoch: 0,
+                run_attempt: 0,
                 stdout_path: String::new(),
                 stderr_path: String::new(),
             },
@@ -12713,9 +12714,12 @@ mod tests {
             .await
             .allocate_for_job(42, 1, 1, 128, &[])
             .expect("reserve old attempt");
-        allocation.lock().await.release_job(ReleaseWarrant::controller_cancelled(
-            RunKey::new(42, 1).expect("nonzero attempt"),
-        ));
+        allocation
+            .lock()
+            .await
+            .release_job(ReleaseWarrant::controller_cancelled(
+                RunKey::new(42, 1).expect("nonzero attempt"),
+            ));
         allocation
             .lock()
             .await
