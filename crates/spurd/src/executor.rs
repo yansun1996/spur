@@ -884,13 +884,15 @@ async fn spawn_job_process(
         // Launch the process
         let piped_mpi_stdio = cfg.pmix_multi_task && cfg.io_mode == LaunchIo::File;
         let mut cmd = Command::new(&launch_cmd);
+        cmd.args(&launch_args).current_dir(work_dir).envs(&env);
         // Always its own process group (run_command does the same for pmix step
         // launches) so signal()/kill_signal's group-kill reaches the whole job
         // regardless of PMIx — only namespace isolation is pmix-conditional above.
-        cmd.args(&launch_args)
-            .current_dir(work_dir)
-            .envs(&env)
-            .process_group(0);
+        // A terminal's own setsid() makes the group. Asking for one here first makes
+        // the child a group leader, for which setsid() is EPERM and the spawn fails.
+        if !cfg.io_mode.is_pty() {
+            cmd.process_group(0);
+        }
         if piped_mpi_stdio {
             cmd.stdin(Stdio::null())
                 .stdout(Stdio::piped())

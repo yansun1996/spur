@@ -7931,6 +7931,21 @@ impl SlurmAgent for AgentService {
         self.launch_acceptance
             .cancel_attempt(job_id, req.run_attempt);
 
+        // A wildcard cancel's only evidence of which attempt it means may be a
+        // dead stepd's descriptor — and the signal path below can itself claim
+        // and remove that descriptor while fencing it (`fence_dead_stepd`).
+        // Snapshotting it first keeps that evidence from vanishing out from
+        // under the fallback below, which would otherwise mistake "the stepd
+        // that named this attempt is now gone" for "nothing ever named an
+        // attempt" and fall through to whatever a newer redispatch charges.
+        let pre_signal_supervised_attempt = if req.run_attempt == 0 {
+            stepds_for_job(&*self.stepds.lock().await, job_id)
+                .first()
+                .map(|descriptor| descriptor.run_attempt)
+        } else {
+            None
+        };
+
         if req.signal > 0 {
             self.send_explicit_signal(job_id, req.run_attempt, req.signal)
                 .await;
@@ -7955,7 +7970,8 @@ impl SlurmAgent for AgentService {
         let supervised_attempt = match (req.run_attempt, tracked_attempt) {
             (0, None) => stepds_for_job(&*self.stepds.lock().await, job_id)
                 .first()
-                .map(|descriptor| descriptor.run_attempt),
+                .map(|descriptor| descriptor.run_attempt)
+                .or(pre_signal_supervised_attempt),
             _ => None,
         };
         let doomed_attempt = match req.run_attempt {
@@ -15464,9 +15480,16 @@ mod tests {
     }
 
     fn test_reporter() -> Arc<NodeReporter> {
+        test_reporter_with_controller("http://localhost:6817")
+    }
+
+    /// Like [`test_reporter`], pointed at a real (mock) controller address —
+    /// needed by anything that must actually acknowledge a completion report
+    /// rather than have the RPC fail to connect.
+    fn test_reporter_with_controller(controller_addr: &str) -> Arc<NodeReporter> {
         Arc::new(NodeReporter::new(
             "test-node".into(),
-            "http://localhost:6817".into(),
+            controller_addr.into(),
             ResourceSet {
                 cpus: 4,
                 memory_mb: 8192,
@@ -18695,6 +18718,16 @@ mod tests {
     }
 
     fn test_reporter_with_gpus(device_ids: &[u32]) -> Arc<NodeReporter> {
+        test_reporter_with_gpus_and_controller(device_ids, "http://localhost:6817")
+    }
+
+    /// Like [`test_reporter_with_gpus`], pointed at a real (mock) controller
+    /// address — needed by anything that must actually acknowledge a
+    /// completion report rather than have the RPC fail to connect.
+    fn test_reporter_with_gpus_and_controller(
+        device_ids: &[u32],
+        controller_addr: &str,
+    ) -> Arc<NodeReporter> {
         use spur_core::resource::{GpuLinkType, GpuResource};
         let gpus = device_ids
             .iter()
@@ -18708,7 +18741,7 @@ mod tests {
             .collect();
         Arc::new(NodeReporter::new(
             "test-node".into(),
-            "http://localhost:6817".into(),
+            controller_addr.into(),
             ResourceSet {
                 cpus: 4,
                 memory_mb: 8192,
@@ -20856,10 +20889,14 @@ mod tests {
         }
         let while_held = svc.allocation.lock().await.free_cpus();
 
+        // A non-lethal signal: `signal_expected_to_terminate` skips the RPC's own
+        // synchronous wait_for_exit_and_teardown, so this cancel only marks the
+        // record cancelled and leaves the run tracked — teardown finishing is
+        // simulated separately below, exactly the gap the sweep exists to close.
         svc.cancel_job(Request::new(AgentCancelJobRequest {
             job_id: 7,
             run_attempt: 1,
-            signal: 9,
+            signal: nix::sys::signal::Signal::SIGUSR1 as i32,
         }))
         .await
         .expect("cancel");
@@ -22529,10 +22566,13 @@ mod tests {
 
     // A session cancelled before `Start` has nothing that pushes completion; left
     // to the 15s crash watchdog, GPU release would lag well past the cancel RPC.
+    // Reaching this test's release requires a real completion acknowledgement
+    // (the ledger-gated release chokepoint), so it needs a live mock controller.
     #[tokio::test]
     async fn send_explicit_signal_fences_a_session_that_never_started() {
+        let (controller_addr, _reports) = spawn_mock_controller();
         let svc = AgentService::new(
-            test_reporter_with_gpus(&[0]),
+            test_reporter_with_gpus_and_controller(&[0], &controller_addr),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
@@ -22553,6 +22593,10 @@ mod tests {
             .lock()
             .await
             .insert(stepd_key(&descriptor), descriptor.clone());
+        // The ledger-gated release chokepoint frees a slice only against an
+        // admitted run's record; without one the acknowledgement has nothing
+        // to settle.
+        admit_a_launch(&svc, descriptor.job_id);
         let mut tracked = TrackedJob::allocation_only(None);
         tracked.run_attempt = descriptor.run_attempt;
         svc.insert_test_job(descriptor.job_id, tracked).await;
@@ -22939,11 +22983,15 @@ mod tests {
     }
 
     // If a supervised job's stepd pid is already confirmed gone, its teardown
-    // will never come, so the cancel must force the release itself.
+    // will never come, so the cancel must force the release itself. Reaching
+    // that release requires a real completion acknowledgement (the
+    // ledger-gated release chokepoint), so this needs a live mock controller
+    // and an admitted run for it to settle.
     #[tokio::test]
     async fn graceful_cancel_reclaims_a_confirmed_dead_supervised_jobs_ledger() {
+        let (controller_addr, _reports) = spawn_mock_controller();
         let svc = AgentService::new(
-            test_reporter(),
+            test_reporter_with_controller(&controller_addr),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
@@ -22966,6 +23014,7 @@ mod tests {
             .await
             .insert(stepd_key(&descriptor), descriptor.clone());
 
+        admit_a_launch(&svc, job_id);
         svc.allocation
             .lock()
             .await
@@ -23096,11 +23145,15 @@ mod tests {
     }
 
     // send_explicit_signal has the identical gap as graceful_cancel for a
-    // supervised job; cover it through this entry point too.
+    // supervised job; cover it through this entry point too. Reaching that
+    // release requires a real completion acknowledgement (the ledger-gated
+    // release chokepoint), so this needs a live mock controller and an
+    // admitted run for it to settle.
     #[tokio::test]
     async fn send_explicit_signal_reclaims_a_confirmed_dead_supervised_jobs_ledger() {
+        let (controller_addr, _reports) = spawn_mock_controller();
         let svc = AgentService::new(
-            test_reporter(),
+            test_reporter_with_controller(&controller_addr),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
@@ -23123,6 +23176,7 @@ mod tests {
             .await
             .insert(stepd_key(&descriptor), descriptor.clone());
 
+        admit_a_launch(&svc, job_id);
         svc.allocation
             .lock()
             .await
@@ -23150,10 +23204,14 @@ mod tests {
     // A non-lethal signal never spawns spawn_stepd_release_wait (release_wait
     // is None unless supervised && lethal), so reap_dead_supervised_stepds is
     // the only thing that can notice an already-dead stepd on this path.
+    // Reaching that release requires a real completion acknowledgement (the
+    // ledger-gated release chokepoint), so this needs a live mock controller
+    // and an admitted run for it to settle.
     #[tokio::test]
     async fn send_explicit_signal_reclaims_a_confirmed_dead_stepd_on_a_non_lethal_signal() {
+        let (controller_addr, _reports) = spawn_mock_controller();
         let svc = AgentService::new(
-            test_reporter(),
+            test_reporter_with_controller(&controller_addr),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
@@ -23176,6 +23234,7 @@ mod tests {
             .await
             .insert(stepd_key(&descriptor), descriptor.clone());
 
+        admit_a_launch(&svc, job_id);
         svc.allocation
             .lock()
             .await

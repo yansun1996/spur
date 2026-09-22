@@ -6840,7 +6840,7 @@ mod tests {
             let job_id = submit_and_wait(&cm, batch_spec(job_name, 1));
 
             let outcome = confirm_dispatch_pending_job(&cm, job_id, &["n1"]).await;
-            assert!(matches!(outcome, DispatchConfirmOutcome::Aborted));
+            assert!(matches!(outcome, DispatchConfirmOutcome::AbortedAndSettled));
             assert!(
                 cm.nodes_on_dispatch_cooldown().is_empty(),
                 "a rejected launch must not put the node on cooldown"
