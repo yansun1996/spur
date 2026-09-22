@@ -138,9 +138,6 @@ pub struct ControllerService {
     /// Native plugin handshake advertised on Ping. Empty when plugin is not `spur`.
     auth_audience: String,
     auth_epoch: u64,
-    /// When each node's asked-for ledger pull last started. One node's standing
-    /// condition must not turn its heartbeat into a pull per heartbeat.
-    asked_ledger_pulls: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
 }
 
 enum StepdRecoveryCohortState {
@@ -5207,7 +5204,6 @@ pub async fn serve(
         incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
         auth_audience,
         auth_epoch,
-        asked_ledger_pulls: parking_lot::Mutex::new(HashMap::new()),
     };
 
     let stats_layer = RpcStatsLayer::new(rpc_stats, raft_handle);
@@ -6995,7 +6991,6 @@ mod tests {
             incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
             auth_audience: String::new(),
             auth_epoch: 0,
-            asked_ledger_pulls: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -10726,7 +10721,6 @@ mod tests {
             incomplete_stepd_recoveries: Mutex::new(HashMap::new()),
             auth_audience: String::new(),
             auth_epoch: 0,
-            asked_ledger_pulls: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
