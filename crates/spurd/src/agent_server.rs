@@ -7029,9 +7029,11 @@ impl SlurmAgent for AgentService {
         let run_attempt = req.run_attempt;
         let run_key = named_run(job_id, run_attempt)
             .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to launch"))?;
-        // Only the batch fallback reaches here with a pty; supervising it would put
-        // the script's terminal in custody, where a reclaim hands it to any client.
-        let stepd_enabled = !spec.pty;
+        // Every launch is spurstepd-supervised now, the batch fallback's pty
+        // included: its terminal takes custody the same way a numbered
+        // interactive step's does, and `sattach`-style reclaim is exactly how
+        // Slurm lets an operator reattach to a salloc/extern step's shell.
+        let stepd_enabled = true;
         #[cfg(test)]
         let stepd_enabled = stepd_enabled && !self.force_legacy_launch;
 
@@ -7563,18 +7565,10 @@ impl SlurmAgent for AgentService {
             gid: spec.gid,
             container: container_launch,
             prolog_script: None,
-            // A --pty job takes the legacy path, whose teardown runs no TaskEpilog, so
-            // keep both task hooks off for this deferred mode rather than run an unpaired prolog.
-            task_prolog_script: if spec.pty {
-                None
-            } else {
-                self.hooks.task_prolog.clone()
-            },
-            task_epilog_script: if spec.pty {
-                None
-            } else {
-                self.hooks.task_epilog.clone()
-            },
+            // A supervised launch's own teardown is epilog-gated regardless of
+            // pty, so both hooks apply the same way for every launch now.
+            task_prolog_script: self.hooks.task_prolog.clone(),
+            task_epilog_script: self.hooks.task_epilog.clone(),
             partition: spec.partition.clone(),
             nodelist: spec.nodelist.clone(),
             mpi: spec.mpi.clone(),
@@ -15598,6 +15592,53 @@ mod tests {
         assert!(
             resp.is_ok(),
             "with allow_root_jobs the guard must not reject: {resp:?}"
+        );
+    }
+
+    /// The batch-fallback pty path must take the exact same supervised
+    /// dispatch as any other launch — proven the same way
+    /// `a_supervised_step_takes_the_attempt_of_the_job_it_joins` proves it for
+    /// steps: the spawn fails without a built `spurstepd`, which only happens
+    /// if the launch actually reached `launch_stepd` rather than the legacy
+    /// `executor::launch_job` path (which would have simply run `true`).
+    #[tokio::test]
+    async fn launch_job_supervises_a_pty_batch_fallback() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        )
+        .with_supervised_launch()
+        .with_runtime_state_dir(
+            std::env::temp_dir().join(format!("spur-test-runtime-{}", uuid::Uuid::new_v4())),
+        );
+
+        let resp = svc
+            .launch_job(Request::new(LaunchJobRequest {
+                run_attempt: 1,
+                job_id: 4321,
+                spec: Some(JobSpec {
+                    name: "pty-batch-fallback".into(),
+                    script: "#!/bin/bash\ntrue\n".into(),
+                    pty: true,
+                    num_tasks: 1,
+                    num_nodes: 1,
+                    cpus_per_task: 1,
+                    work_dir: std::env::temp_dir().to_string_lossy().into_owned(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+            .await
+            .expect("a failed spawn is a launch outcome, not a transport error")
+            .into_inner();
+
+        assert!(!resp.success);
+        assert!(
+            resp.error.contains("failed to exec spurstepd"),
+            "a pty launch must reach the supervised spawn like any other, got: {}",
+            resp.error
         );
     }
 
