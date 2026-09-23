@@ -202,10 +202,15 @@ comes back after it is still told the step is unknown. A session that nothing
 can ever settle — one whose supervisor was killed before it recorded an exit —
 is kept for a day and then swept.
 
-One case is not covered: a step given its own ``--container-image``. It ends
-when the agent stops, and leaves its unpacked rootfs behind. A standalone
-``srun --pty`` that allocates its own job loses the job as well: ``srun``
-cancels the job it created as soon as its connection drops. Take an allocation
+``spur exec`` runs its command under the same supervision as everything else,
+so an agent restart no longer kills it outright — but the specific ``spur
+exec`` invocation in flight during the restart still sees its connection
+drop, with no way to reconnect and collect the result; the command itself
+completes correctly regardless.
+
+A standalone ``srun --pty`` that allocates its own job loses the job as well:
+``srun`` cancels the job it created as soon as its connection drops (this is
+client-side behavior, unrelated to agent supervision). Take an allocation
 first and run ``srun --pty`` inside it, so a restart costs you the terminal
 rather than the work:
 

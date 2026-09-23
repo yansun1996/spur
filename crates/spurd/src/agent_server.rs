@@ -8248,38 +8248,109 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
-        let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(entry.uid, entry.gid);
+        // A one-shot exec gets its own ephemeral, unnumbered step id: it is
+        // never listed or reattached, only supervised for the life of this
+        // call, so there is no reason to coordinate it with the controller's
+        // numbered-step sequence. High bit set to stay well clear of both
+        // real user steps (small sequential integers) and the reserved
+        // batch/extern/interactive sentinels near u32::MAX.
+        let step_id = (uuid::Uuid::new_v4().as_u128() as u32) | 0x8000_0000;
+        let step_key = (req.job_id, step_id);
 
-        let plan = build_launch_plan(&entry, priv_drop.as_ref(), &req.command);
-        let mut cmd = tokio::process::Command::new(&plan.program);
-        cmd.args(&plan.args);
-        if plan.apply_priv_in_child {
-            // Direct spawn only: the parent applies this before exec, in the
-            // host's mount namespace, where a job's work_dir need not exist.
-            cmd.current_dir(&entry.work_dir);
-        }
-        // env_clear so spurd's own environment (secrets included) never leaks in.
-        cmd.env_clear();
-        cmd.env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        );
-        for (k, v) in Self::session_environ(&entry) {
-            cmd.env(k, v);
-        }
-        ChildContainment::for_plan(&plan, &entry, priv_drop, self.cgroup.required)
-            .register(&mut cmd);
+        let (run_attempt, cpus, memory_mb, gpu_devices, partition, nodelist) = {
+            let jobs = self.running.lock().await;
+            let tracked = jobs.get(&req.job_id).ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "job {} is not running on this node",
+                    req.job_id
+                ))
+            })?;
+            (
+                tracked.run_attempt,
+                tracked.cpus,
+                tracked.memory_mb,
+                tracked.gpu_devices.clone(),
+                tracked.partition.clone(),
+                tracked.nodelist.clone(),
+            )
+        };
 
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| Status::internal(format!("nsenter failed: {}", e)))?;
+        // The job's own environment (not a freshly synthesized session one):
+        // execing into a job means seeing what it itself sees.
+        let environment: HashMap<String, String> =
+            Self::session_environ(&entry).into_iter().collect();
+        let user = environment
+            .get("USER")
+            .or_else(|| environment.get("LOGNAME"))
+            .cloned()
+            .unwrap_or_default();
+
+        let step_files =
+            crate::executor::open_step_output_files(req.job_id, step_id, entry.uid, entry.gid)
+                .map_err(|e| Status::internal(format!("step output files: {e}")))?;
+        let stdout_path = step_files.stdout_path.to_string_lossy().into_owned();
+        let stderr_path = step_files.stderr_path.to_string_lossy().into_owned();
+
+        let cfg = executor::JobLaunchConfig {
+            job_id: req.job_id,
+            step_id,
+            run_attempt,
+            script: supervised_step_script(&entry, entry.uid, entry.gid, &req.command)?,
+            joins_parent_namespaces: entry.has_namespaces() && entry.pid > 0,
+            allocation_holder: false,
+            work_dir: entry.work_dir.clone(),
+            name: format!("{}.{}", req.job_id, step_id),
+            user,
+            node: self.reporter.hostname.clone(),
+            array_job_id: None,
+            array_task_id: None,
+            environment,
+            // The spool files already exist, so the supervisor must not
+            // truncate them when it opens them again.
+            open_mode: Some("append".into()),
+            stdout_path,
+            stderr_path,
+            stdin_path: String::new(),
+            cpus,
+            memory_mb,
+            gpu_devices,
+            cpu_ids: Vec::new(),
+            uid: entry.uid,
+            gid: entry.gid,
+            container: None,
+            prolog_script: None,
+            task_prolog_script: None,
+            task_epilog_script: None,
+            partition,
+            nodelist,
+            mpi: String::new(),
+            host_device_plan: None,
+            memlock: self.limits.memlock,
+            cgroup: self.cgroup.clone(),
+            io_mode: executor::LaunchIo::File,
+            pmix_multi_task: false,
+        };
+
+        let status = self
+            .run_supervised_step_to_spool(
+                &cfg,
+                None,
+                step_files,
+                step_key,
+                (String::new(), String::new(), String::new()),
+                None,
+            )
+            .await?;
+        let status = match status {
+            Some(s) => s,
+            None => return Err(Status::aborted("exec was cancelled before it ran")),
+        };
 
         Ok(Response::new(ExecInJobResponse {
-            success: output.status.success(),
-            exit_code: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            success: status.success(),
+            exit_code: spur_core::process::shell_exit_code(&status),
+            stdout: read_back_step_output(req.job_id, step_id, false).await,
+            stderr: read_back_step_output(req.job_id, step_id, true).await,
         }))
     }
 
@@ -17139,83 +17210,41 @@ mod tests {
         assert_ne!(code, Some(tonic::Code::PermissionDenied));
     }
 
-    // `spur exec` enters the job's namespaces; without this it keeps spurd's
-    // cgroup and so escapes the job's device filter.
+    /// `exec_in_job` used to run the command as a direct child of `spurd`
+    /// itself (a `ChildContainment`-managed nsenter/fork with no restart
+    /// survival). It now goes through the same `launch_stepd` dispatch as
+    /// every other job/step launch — proven the same way the other
+    /// supervised-launch tests are: the spawn fails without a built
+    /// `spurstepd`, which only happens if the launch actually reached the
+    /// supervised path. Cgroup-join enforcement for a supervised step is
+    /// covered generically (not specific to exec) by
+    /// `a_required_cgroup_catches_a_live_step_that_did_not_join` and
+    /// `a_required_cgroup_refuses_an_allocation_it_cannot_enforce`.
     #[tokio::test]
-    async fn exec_into_a_job_joins_its_cgroup() {
+    async fn exec_in_job_is_spurstepd_supervised() {
         let svc = AgentService::new(
             test_reporter(),
             HooksConfig::default(),
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        // A plain file stands in for `cgroup.procs`: the child opens and writes
-        // it exactly as it would the kernel's, so no root and no cgroupfs.
-        let cgroup = tempfile::tempdir().expect("tempdir");
-        std::fs::write(cgroup.path().join("cgroup.procs"), "").expect("cgroup.procs");
-        svc.insert_test_job(
-            46,
-            TrackedJob::allocation_only(Some(cgroup.path().to_path_buf())),
-        )
-        .await;
-
-        // `$$` is the exec'd shell's own pid, which is the pid the child wrote.
-        let resp = svc
-            .exec_in_job(Request::new(ExecInJobRequest {
-                job_id: 46,
-                command: vec!["sh".into(), "-c".into(), "echo $$".into()],
-                user: "testuser".into(),
-            }))
-            .await
-            .expect("the owner may exec into their own job")
-            .into_inner();
-        assert!(resp.success, "exec failed: {}", resp.stderr);
-
-        let joined =
-            std::fs::read_to_string(cgroup.path().join("cgroup.procs")).expect("read cgroup.procs");
-        assert_eq!(
-            joined.trim(),
-            resp.stdout.trim(),
-            "the exec'd child must join the job's cgroup"
-        );
-    }
-
-    // run outside the job's device filter when `[cgroup] required` and the join fails.
-    #[tokio::test]
-    async fn a_required_join_that_cannot_land_aborts_the_exec() {
-        let svc = AgentService::with_cluster_config(
-            test_reporter(),
-            HooksConfig::default(),
-            Arc::new(Mutex::new(DeviceRegistry::new())),
-            &spur_core::config::ClusterConfig::default(),
-            spur_core::config::JobLimits::default(),
-            CgroupConfig {
-                enabled: false,
-                required: true,
-                ..CgroupConfig::default()
-            },
-            MpiConfig::default(),
-            new_running_jobs(),
-            false, // allow_root_jobs
-        )
-        .with_root_override(false);
-
-        // A path with no cgroup.procs: the pre-exec join open fails.
-        svc.insert_test_job(
-            47,
-            TrackedJob::allocation_only(Some("/nonexistent/spur-exec-required/job_47".into())),
-        )
-        .await;
+        svc.insert_test_job(46, TrackedJob::dummy(std::process::id()))
+            .await;
 
         let err = svc
             .exec_in_job(Request::new(ExecInJobRequest {
-                job_id: 47,
-                command: vec!["true".into()],
+                job_id: 46,
+                command: vec!["echo".into(), "hello".into()],
                 user: "testuser".into(),
             }))
             .await
-            .expect_err("a required join that cannot land must fail the exec");
+            .expect_err("a spawn failure is expected without a built spurstepd");
         assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(
+            err.message().contains("step supervisor failed to start"),
+            "expected to reach the supervised launch, got: {}",
+            err.message()
+        );
     }
 
     fn user_identity(name: &str) -> spur_core::auth::Identity {
