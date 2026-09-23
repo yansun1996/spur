@@ -1041,21 +1041,30 @@ async fn teardown_completed_job(
         return;
     }
 
-    crate::container::cleanup_rootfs(
-        &crate::container::job_rootfs_base(job_id),
-        &completed.rootfs_mode,
-    );
-    crate::executor::cleanup_job_spool(job_id);
-    if let Some(ref cgroup) = completed.cgroup {
-        crate::executor::cleanup_cgroup(cgroup);
+    // Unmounting/removing a rootfs and walking cgroupfs are blocking syscalls; run
+    // them off this async worker so a slow or large one can't stall every other
+    // task cooperatively scheduled on it, same reasoning as the fsyncs below.
+    let rootfs_mode = completed.rootfs_mode.clone();
+    let cgroup = completed.cgroup.clone();
+    let run_attempt = completed.run_attempt;
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        crate::container::cleanup_rootfs(&crate::container::job_rootfs_base(job_id), &rootfs_mode);
+        crate::executor::cleanup_job_spool(job_id);
+        if let Some(ref cgroup) = cgroup {
+            crate::executor::cleanup_cgroup(cgroup);
+        }
+        // The node above whatever was recorded: an allocation's is a step's leaf,
+        // and nothing else removes the job's own. Derived from identity because the
+        // recorded path is a leaf in one shape and absent in another.
+        crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
+            job_id,
+            run_attempt,
+        ));
+    })
+    .await
+    {
+        warn!(job_id, %error, "the task cleaning up a completed job's rootfs/cgroups failed");
     }
-    // The node above whatever was recorded: an allocation's is a step's leaf,
-    // and nothing else removes the job's own. Derived from identity because the
-    // recorded path is a leaf in one shape and absent in another.
-    crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
-        job_id,
-        completed.run_attempt,
-    ));
     // Marked, not removed: the record is the evidence a later reconcile reads,
     // and the sweep collects it once nothing is still owed.
     if let Some(run) = named_run(job_id, completed.run_attempt) {
@@ -6503,18 +6512,34 @@ struct StepRootfsGuard {
 
 impl Drop for StepRootfsGuard {
     fn drop(&mut self) {
-        if let Some(pid) = self.pid {
-            // SIGKILL (it may be PID 1 in its namespace and ignore SIGTERM) and reap it so the
-            // process is fully gone before we unmount/remove the rootfs it lives in.
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-            let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None);
+        let base = std::mem::take(&mut self.base);
+        let mode = self.mode.clone();
+        let pid = self.pid;
+        let work = move || {
+            if let Some(pid) = pid {
+                // SIGKILL (it may be PID 1 in its namespace and ignore SIGTERM) and reap it so the
+                // process is fully gone before we unmount/remove the rootfs it lives in.
+                let _ = nix::sys::signal::kill(
+                    nix::unistd::Pid::from_raw(pid),
+                    nix::sys::signal::Signal::SIGKILL,
+                );
+                let _ = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None);
+            }
+            // The agent is alive to see this through; a restart's markers are moot.
+            crate::container::remove_step_markers(&base);
+            crate::container::cleanup_rootfs(&base, &mode);
+        };
+        // `waitpid` here has no `WNOHANG`: SIGKILL is deferred by the kernel until
+        // a D-state child's own blocking syscall returns, so this can hang
+        // indefinitely. Detach onto a blocking thread instead of stalling
+        // whatever tokio worker happens to be running this drop; fall back to
+        // running inline where no runtime is current (e.g. a sync test).
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(work);
+            }
+            Err(_) => work(),
         }
-        // The agent is alive to see this through; a restart's markers are moot.
-        crate::container::remove_step_markers(&self.base);
-        crate::container::cleanup_rootfs(&self.base, &self.mode);
     }
 }
 
@@ -20868,6 +20893,41 @@ mod tests {
             !run.slice_released,
             "slice_released stays false until a real ack"
         );
+    }
+
+    // A wedged child would hang an untimed `waitpid` forever; the drop must
+    // detach that reap onto a blocking thread rather than run it inline.
+    #[tokio::test]
+    async fn step_rootfs_guard_reaps_its_child_off_the_calling_task() {
+        // `Child`'s own `Drop` does not wait on or kill the process (std's
+        // documented behavior), so letting it fall out of scope here leaves a
+        // real, unreaped child for the guard's own Drop to signal and reap.
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a real child to reap");
+        let pid = child.id() as i32;
+        drop(child);
+
+        {
+            let _guard = StepRootfsGuard {
+                base: format!("step-rootfs-guard-test-{pid}"),
+                mode: crate::container::RootfsMode::Extracted,
+                pid: Some(pid),
+            };
+            // Dropped here: if the reap ran inline, the process would already be
+            // gone by the time this block ends.
+        }
+
+        // Bounded poll for a detached side effect, same convention used
+        // elsewhere in this codebase for async-drop-triggered work.
+        for _ in 0..200 {
+            if nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err() {
+                return; // ESRCH: the guard's spawned task reaped it.
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the guard's drop never reaped its child");
     }
 
     // A restart must not re-charge a run whose teardown finished. The record

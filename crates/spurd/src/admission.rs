@@ -1452,6 +1452,45 @@ impl AdmissionStore {
         })
     }
 
+    /// As [`Self::sweep`]'s per-run body, but re-validated fresh under this run's
+    /// own lock immediately before deleting -- so a write that lands between
+    /// `sweep`'s unlocked scan and this call (a relaunch, a fresh admit reusing
+    /// the same job id and attempt) can't have its brand-new record swept away
+    /// on the strength of the stale snapshot that decided to look at it.
+    fn remove_run_if_eligible(
+        &self,
+        run_key: RunKey,
+        now_unix_ms: u64,
+        retention_ms: u64,
+        charged: &HashSet<RunKey>,
+    ) -> io::Result<bool> {
+        self.with_run_lock(run_key, || {
+            let run = match self.load_run(run_key) {
+                Ok(run) => run,
+                // Already gone -- another sweep, or the run's own teardown beat
+                // us to it. Either way there is nothing left to remove.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if run.conflict_hold.is_some() || run.fence_is_live(now_unix_ms) {
+                return Ok(false);
+            }
+            if charge_covers(charged, run.job_id, run.run_attempt) {
+                return Ok(false);
+            }
+            let (participants, _) = self.participants(run_key)?;
+            let admitted = AdmittedRun { run, participants };
+            if !(admitted.is_settled() || admitted.aged_out(now_unix_ms, retention_ms)) {
+                return Ok(false);
+            }
+            match fs::remove_dir_all(self.run_dir(run_key)?) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
     /// Three removal rules, and nothing else may delete a record: settled because it
     /// owes nothing, aged out because it never can, unreadable because only age can.
     pub fn sweep(
@@ -1476,8 +1515,11 @@ impl AdmissionStore {
             if charge_covers(charged, run.job_id, run.run_attempt) {
                 continue;
             }
-            if admitted.is_settled() || admitted.aged_out(now_unix_ms, retention_ms) {
-                self.remove_run(run_key)?;
+            // This snapshot only picks candidates worth locking for; the actual
+            // delete decision is re-made fresh under the lock, above.
+            if (admitted.is_settled() || admitted.aged_out(now_unix_ms, retention_ms))
+                && self.remove_run_if_eligible(run_key, now_unix_ms, retention_ms, charged)?
+            {
                 removed += 1;
             }
         }
@@ -1618,7 +1660,7 @@ pub fn current_boot_id() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use spur_core::step::STEP_BATCH;
+    use spur_core::step::{STEP_BATCH, STEP_INTERACTIVE};
 
     fn key(job_id: u32, run_attempt: u32) -> RunKey {
         RunKey::new(job_id, run_attempt).expect("attempts start at 1")
@@ -1990,6 +2032,36 @@ mod tests {
             store.sweep(u64::MAX, 1, &HashSet::new()).unwrap(),
             1,
             "a settled cancel must leave nothing behind"
+        );
+    }
+
+    #[test]
+    fn remove_run_if_eligible_re_checks_under_the_lock_instead_of_trusting_a_stale_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1_000)).unwrap();
+        let mut owed = ParticipantAdmission::new(7, 1, STEP_BATCH, "n1", Default::default());
+        owed.final_report.required = true;
+        store.admit_participant(&owed).unwrap();
+        assert!(store.settle_acknowledged_run(key(7, 1)).unwrap());
+
+        // Simulates a write landing between `sweep`'s unlocked scan (which would
+        // have seen the settled snapshot above) and the locked recheck below --
+        // a fresh, still-unacknowledged participant for the same run.
+        let mut fresh = ParticipantAdmission::new(7, 1, STEP_INTERACTIVE, "n1", Default::default());
+        fresh.final_report.required = true;
+        store.admit_participant(&fresh).unwrap();
+
+        let removed = store
+            .remove_run_if_eligible(key(7, 1), u64::MAX, 1, &HashSet::new())
+            .unwrap();
+        assert!(
+            !removed,
+            "a fresh unacknowledged participant must block the delete a stale snapshot decided on"
+        );
+        assert!(
+            store.load_run(key(7, 1)).is_ok(),
+            "the record, and the participant that just landed, must survive"
         );
     }
 
