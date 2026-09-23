@@ -1828,9 +1828,6 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Start a job on specific nodes.
-    /// Transition a pending job to Running and record its allocation. Returns
-    /// the run epoch assigned to this dispatch (threaded into the launch RPC).
     /// Record a placement in Raft before dispatching against it, so a leader
     /// change mid-dispatch finds the slice charged rather than free.
     pub fn reserve_placement(
