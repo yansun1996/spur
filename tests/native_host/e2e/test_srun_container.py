@@ -133,6 +133,23 @@ def _parse_probe(content: str) -> dict:
     return out
 
 
+def _supervisor_pids(cluster, node_index: int = 0) -> set:
+    """Supervisors under this cluster's own state dir. Same convention as
+    test_stepd_step_supervision.py / test_stepd_restart_survival.py: pid
+    *identity* (not just presence) is what proves a session survived an agent
+    restart rather than being silently respawned."""
+    node = cluster.nodes[node_index]
+    out = node.exec_allow_fail("ps -eww -o pid=,args= 2>/dev/null || true")
+    pids = set()
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or not fields[1].endswith("spurstepd"):
+            continue
+        if fields[2] == cluster.state_dir:
+            pids.add(fields[0])
+    return pids
+
+
 @pytest.fixture
 def step_container_cluster(cluster, tmp_path):
     cluster.container_preflight()
@@ -864,12 +881,67 @@ class TestSrunPtyContainerStep:
         finally:
             cluster.scancel(job_id)
 
+    def test_pty_container_cancellation_terminates_and_cleans_up(
+        self, step_container_cluster
+    ):
+        """scancel of an interactive `srun --pty --container-image` session
+        terminates the container (no orphan) — the pty equivalent of
+        `TestSrunContainerStepNewRootfs.test_cancellation_terminates_container_step`.
+        """
+        cluster = step_container_cluster
+        img = cluster.step_container_image
+        node = cluster.node_names[0]
+        name = "cancel-ctr-pty-step"
+
+        _, stdout, stderr = cluster.srun_pty_background([
+            "-J", name, "-N", "1", "-w", node, "-t", "0:05",
+            f"--container-image={img}",
+            "sleep", "300",
+        ])
+
+        job_id = None
+        for _ in range(30):
+            ids = cluster.running_job_ids_by_name(name)
+            if ids:
+                job_id = ids[0]
+                break
+            time.sleep(1)
+        assert job_id is not None, "interactive containerized srun step never reached running"
+
+        cluster.scancel(str(job_id))
+
+        state = wait_job(cluster, job_id, timeout=45)
+        assert state in ("CA", "F", "COMPLETED", "GONE"), (
+            f"cancelled interactive containerized step should be terminal, got {state}"
+        )
+
+        # The container's sleep must not linger (allow for the SIGKILL escalation
+        # and the srun client teardown).
+        assert _wait_no_process(cluster, "sleep 300", timeout=20), (
+            "interactive container step process lingered after cancel:\n"
+            + cluster.nodes[0].exec_allow_fail("pgrep -af '[s]leep 300' || echo NONE")
+        )
+
+        # The staged rootfs must not linger either — same leak class the
+        # buffered path already guards in TestContainerStepAgentRestart.
+        leftover = cluster.nodes[0].exec_allow_fail(
+            f"find ~/.spur/containers /var/spool/spur/containers "
+            f"-maxdepth 1 -name 'step_{job_id}_*' 2>/dev/null || true"
+        ).strip()
+        assert not leftover, (
+            f"the interactive step's staged container rootfs leaked after "
+            f"cancel: {leftover}"
+        )
+
+        stdout.channel.close()
+        stderr.channel.close()
+
 
 # ---------------------------------------------------------------------------
-# Agent restart mid-step: a standalone container step is deliberately
-# unsupervised (a direct child of spurd's own exec path, not a
-# spurstepd-parented tree). A restart must recover its real exit code and
-# full stdout, not fabricate FAILED/1 and drop the output.
+# Agent restart mid-step: a standalone container step is now
+# spurstepd-supervised (routed through launch_stepd, not a direct child of
+# spurd's own exec path) — a restart must not just recover its real exit code
+# and full stdout, but leave the same supervisor pid running throughout.
 # ---------------------------------------------------------------------------
 
 
@@ -882,6 +954,7 @@ class TestContainerStepAgentRestart:
         node = cluster.node_names[0]
         out_path = f"{cluster.remote_dir}/restart-recovery.out"
         name = "container-step-restart"
+        baseline = _supervisor_pids(cluster)
         launch = (
             f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
             f"PATH={shlex.quote(cluster.bin_dir)}:$PATH "
@@ -923,6 +996,12 @@ class TestContainerStepAgentRestart:
                 "restart window closed"
             )
 
+            # Identity, not just presence: a supervisor killed with the agent
+            # and respawned afterwards would satisfy any "still one running"
+            # check without actually proving supervision.
+            before = _supervisor_pids(cluster) - baseline
+            assert before, "a running containerized step must have a supervisor"
+
             # A graceful stop (SIGTERM) lets spurd's in-flight RPC-handler
             # future unwind normally, dropping its rootfs-cleanup guard and
             # erasing the marker files this recovery path depends on --
@@ -936,6 +1015,13 @@ class TestContainerStepAgentRestart:
             time.sleep(1)
             cluster.nodes[0].exec(cluster._spurd_start_cmd(0))
             cluster.wait_agent_serving(0)
+
+            after = _supervisor_pids(cluster)
+            assert before <= after, (
+                "the supervisor must outlive the agent that spawned it, not "
+                f"be silently respawned: {sorted(before)} before the "
+                f"restart, {sorted(after)} after"
+            )
 
             state = wait_job(cluster, job_id, timeout=120)
             assert state == "CD", (
@@ -972,23 +1058,6 @@ class TestContainerStepAgentRestart:
             )
         finally:
             cluster.scancel(str(job_id))
-
-
-def _supervisor_pids(cluster, node_index: int = 0) -> set:
-    """Supervisors under this cluster's own state dir. Same convention as
-    test_stepd_step_supervision.py / test_stepd_restart_survival.py: pid
-    *identity* (not just presence) is what proves a session survived an agent
-    restart rather than being silently respawned."""
-    node = cluster.nodes[node_index]
-    out = node.exec_allow_fail("ps -eww -o pid=,args= 2>/dev/null || true")
-    pids = set()
-    for line in out.splitlines():
-        fields = line.split()
-        if len(fields) < 3 or not fields[1].endswith("spurstepd"):
-            continue
-        if fields[2] == cluster.state_dir:
-            pids.add(fields[0])
-    return pids
 
 
 class TestSrunPtyContainerStepSupervision:
