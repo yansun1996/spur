@@ -121,11 +121,9 @@ pub struct VirtualAgent {
     hostname: String,
     auth_audience: String,
     auth_epoch: u64,
-    /// (job_id, run_attempt) -> the cutoff `fence_run` last recorded for it. A
-    /// launch issued at or before its own run's cutoff is refused, mirroring
-    /// spurd's `LaunchFences` -- without this a fence here was accepted and
-    /// immediately discarded, so nothing it protected against (a stale launch
-    /// retry racing a cancel or a settled run) was ever actually enforced.
+    /// (job_id, run_attempt) -> cutoff from the last `fence_run` (launches at or
+    /// before it are refused), mirroring spurd's `LaunchFences` so a stale
+    /// retry can't race a cancel/settle.
     fences: std::sync::Mutex<std::collections::HashMap<(u32, u32), u64>>,
 }
 
@@ -141,6 +139,20 @@ impl VirtualAgent {
             auth_audience: String::new(),
             auth_epoch: 0,
             fences: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Refuses a controller-only RPC unless the verified caller is the cluster controller,
+    /// mirroring spurd's `AgentService::require_controller` for the same three RPCs.
+    fn require_controller<T>(request: &Request<T>) -> Result<(), Status> {
+        match request.extensions().get::<spur_core::auth::Identity>() {
+            Some(id) if id.is_controller() => Ok(()),
+            Some(id) => Err(Status::permission_denied(format!(
+                "this RPC is reachable only by the cluster controller; caller '{}' is not the \
+                 controller — route the request through spurctld",
+                id.user
+            ))),
+            None => Ok(()),
         }
     }
 
@@ -705,21 +717,22 @@ impl SlurmAgent for VirtualAgent {
     /// A virtual node keeps no local ledger; its pods are the only state.
     async fn request_node_ledger(
         &self,
-        _request: Request<spur_proto::proto::RequestNodeLedgerRequest>,
+        request: Request<spur_proto::proto::RequestNodeLedgerRequest>,
     ) -> Result<Response<spur_proto::proto::RequestNodeLedgerResponse>, Status> {
+        Self::require_controller(&request)?;
         Ok(Response::new(
             spur_proto::proto::RequestNodeLedgerResponse { ledger: None },
         ))
     }
 
-    /// A virtual node has no local ledger, so unlike spurd there is no admitted
-    /// digest or expiry to check -- but the cutoff itself must still be kept
-    /// and enforced on the next `launch_job` for this run, or a stale launch
-    /// racing a cancel/settle is admitted as if nothing had fenced it.
+    /// No local ledger means no admitted digest/expiry to check like spurd, but
+    /// the cutoff must still be kept and enforced on the next `launch_job`, or
+    /// a stale launch slips through unfenced.
     async fn fence_run(
         &self,
         request: Request<spur_proto::proto::FenceRunRequest>,
     ) -> Result<Response<spur_proto::proto::FenceRunResponse>, Status> {
+        Self::require_controller(&request)?;
         let req = request.into_inner();
         let mut fences = self.fences.lock().unwrap_or_else(|e| e.into_inner());
         fences
@@ -737,8 +750,9 @@ impl SlurmAgent for VirtualAgent {
     /// none to answer: the ledger a settle would clear is always empty.
     async fn settle_run(
         &self,
-        _request: Request<spur_proto::proto::SettleRunRequest>,
+        request: Request<spur_proto::proto::SettleRunRequest>,
     ) -> Result<Response<spur_proto::proto::SettleRunResponse>, Status> {
+        Self::require_controller(&request)?;
         Ok(Response::new(spur_proto::proto::SettleRunResponse {
             released: true,
             error: String::new(),
@@ -1814,9 +1828,8 @@ mod fence_tests {
             .await
             .unwrap();
 
-        // Proceeds past the fence check into resolve_job (which the seeded
-        // server answers), then fails later only because this request carries
-        // no job spec -- proof it was not refused by the fence.
+        // Proceeds past the fence check into resolve_job (seeded server answers),
+        // failing later only for missing job spec -- proof the fence didn't refuse it.
         let err = agent
             .launch_job(launch_request(1, 20_000))
             .await
@@ -1851,6 +1864,118 @@ mod fence_tests {
             .await
             .expect_err("no spec was provided");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // --- controller-only RPC gating ---
+
+    fn user_identity(name: &str) -> spur_core::auth::Identity {
+        spur_core::auth::Identity::posix(name, 1000, 1000, false)
+    }
+
+    fn controller_identity() -> spur_core::auth::Identity {
+        spur_core::auth::Identity::posix(spur_core::auth::CONTROLLER_SUBJECT, 0, 0, true)
+    }
+
+    fn unused_client() -> Client {
+        FakeApiServer::answering(StatusCode::OK, &serde_json::json!({})).client()
+    }
+
+    #[test]
+    fn require_controller_admits_only_the_controller() {
+        let mut user_req = Request::new(());
+        user_req.extensions_mut().insert(user_identity("attacker"));
+        let err = VirtualAgent::require_controller(&user_req)
+            .expect_err("a plain user credential must not drive a controller-only RPC");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let mut ctl_req = Request::new(());
+        ctl_req.extensions_mut().insert(controller_identity());
+        VirtualAgent::require_controller(&ctl_req)
+            .expect("the controller's own credential must pass");
+
+        let anon_req = Request::new(());
+        VirtualAgent::require_controller(&anon_req)
+            .expect("no credential is tolerated (permissive/disabled)");
+    }
+
+    #[tokio::test]
+    async fn request_node_ledger_rejects_a_non_controller_caller() {
+        let agent = VirtualAgent::new(unused_client());
+        let mut req = Request::new(RequestNodeLedgerRequest {
+            reason: "test".into(),
+        });
+        req.extensions_mut().insert(user_identity("attacker"));
+        let err = agent
+            .request_node_ledger(req)
+            .await
+            .expect_err("a user token must not pull this node's ledger");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn fence_run_rejects_a_non_controller_caller() {
+        let agent = VirtualAgent::new(unused_client());
+        let mut req = Request::new(FenceRunRequest {
+            job_id: 1,
+            run_attempt: 1,
+            reject_before_unix_ms: 0,
+        });
+        req.extensions_mut().insert(user_identity("attacker"));
+        let err = agent
+            .fence_run(req)
+            .await
+            .expect_err("a user token must not fence a run on this node");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn settle_run_rejects_a_non_controller_caller() {
+        let agent = VirtualAgent::new(unused_client());
+        let mut req = Request::new(SettleRunRequest {
+            job_id: 1,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(user_identity("attacker"));
+        let err = agent
+            .settle_run(req)
+            .await
+            .expect_err("a user token must not settle a run on this node");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn the_controller_can_still_reach_all_three_gated_rpcs() {
+        let agent = VirtualAgent::new(unused_client());
+
+        let mut req = Request::new(RequestNodeLedgerRequest {
+            reason: "test".into(),
+        });
+        req.extensions_mut().insert(controller_identity());
+        agent
+            .request_node_ledger(req)
+            .await
+            .expect("the controller must still be able to pull the ledger");
+
+        let mut req = Request::new(FenceRunRequest {
+            job_id: 1,
+            run_attempt: 1,
+            reject_before_unix_ms: 0,
+        });
+        req.extensions_mut().insert(controller_identity());
+        agent
+            .fence_run(req)
+            .await
+            .expect("the controller must still be able to fence a run");
+
+        let mut req = Request::new(SettleRunRequest {
+            job_id: 1,
+            run_attempt: 1,
+        });
+        req.extensions_mut().insert(controller_identity());
+        agent
+            .settle_run(req)
+            .await
+            .expect("the controller must still be able to settle a run");
     }
 }
 

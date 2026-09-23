@@ -3,6 +3,11 @@
 
 //! Authenticates callers of the operator's cluster-wide-pod-create agent surface via the shared
 //! `spur_core::auth::authenticate_bearer` (mirrors spurd's `AgentAuthLayer`, duplicated since spurd is a binary crate).
+//!
+//! On success the verified [`spur_core::auth::Identity`] is inserted into the request extensions,
+//! same as spurd, so the controller-only RPCs this agent hosts (`RequestNodeLedger`, `FenceRun`,
+//! `SettleRun`) can refuse a caller that merely holds a valid cluster credential but is not the
+//! controller itself.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -69,7 +74,7 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, req: Request<B>) -> Self::Future {
+    fn call(&mut self, mut req: Request<B>) -> Self::Future {
         if spur_core::auth::is_unauthenticated_auth_handshake(req.uri().path()) {
             let mut inner = self.inner.clone();
             return Box::pin(async move { inner.call(req).await.map_err(Into::into) });
@@ -81,9 +86,12 @@ where
             .map(str::to_owned);
 
         match decide(&self.config, header.as_deref()) {
-            // The operator does not act *as* the caller — it creates what the controller allocated —
-            // so the identity is not carried into handlers; verifying the credential is the point.
-            BearerOutcome::Authenticated(_) => {}
+            // The operator mostly does not act *as* the caller — it creates what the
+            // controller allocated — but a handful of RPCs are controller-only, so the
+            // identity is still carried into handlers for those to check.
+            BearerOutcome::Authenticated(identity) => {
+                req.extensions_mut().insert(*identity);
+            }
             BearerOutcome::Anonymous => {
                 if self.config.mode == AuthMode::Permissive {
                     warn!(
