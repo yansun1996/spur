@@ -51,6 +51,7 @@ pub enum ScontrolCommand {
     ///   scontrol update PartitionName=gpu MaxTime=48:00:00 State=DOWN
     ///   scontrol update JobId=42 Priority=100
     ///   scontrol update NodeName=n1 State=drain Reason=maintenance
+    ///   scontrol update NodeName=n1 Reconcile=yes
     Update {
         /// key=value pairs
         params: Vec<String>,
