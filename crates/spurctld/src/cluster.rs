@@ -419,13 +419,13 @@ pub(crate) fn claim_ledger_pull_slot(
     now: std::time::Instant,
 ) -> bool {
     if let Some(started) = started_at.get(node) {
-        if now.duration_since(*started) < LEDGER_PULL_COOLDOWN {
+        if now.saturating_duration_since(*started) < LEDGER_PULL_COOLDOWN {
             return false;
         }
     }
     // A node that stopped triggering must not keep an entry once its cooldown
     // has lapsed, or the map outlives the nodes it names.
-    started_at.retain(|_, started| now.duration_since(*started) < LEDGER_PULL_COOLDOWN);
+    started_at.retain(|_, started| now.saturating_duration_since(*started) < LEDGER_PULL_COOLDOWN);
     started_at.insert(node.to_string(), now);
     true
 }
