@@ -50,6 +50,8 @@ pub struct StepdLaunchSpec {
     pub nodelist: String,
     pub memlock: StepdMemlock,
     #[serde(default)]
+    pub io_mode: crate::executor::LaunchIo,
+    #[serde(default)]
     pub container: Option<crate::executor::ContainerLaunchConfig>,
     #[serde(default)]
     pub host_device_plan: Option<spur_devices::inject::HostInjectionPlan>,
@@ -202,6 +204,7 @@ impl TryFrom<&crate::executor::JobLaunchConfig> for StepdLaunchSpec {
             partition: config.partition.clone(),
             nodelist: config.nodelist.clone(),
             memlock: config.memlock.into(),
+            io_mode: config.io_mode,
             container: config.container.clone(),
             host_device_plan: config.host_device_plan.clone(),
             container_rootfs_mode: None,
@@ -274,13 +277,15 @@ impl StepdLaunchSpec {
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,
             memlock: self.memlock.into(),
+            // `pty` is the field an older build persisted before `io_mode` existed, so a
+            // spec reloaded from that format carries it but not a matching `io_mode` —
+            // deriving from `pty` covers both that case and a freshly built spec, where
+            // `TryFrom` keeps the two fields in agreement anyway.
             io_mode: match self.pty {
-                // A zeroed size means the client never said; forcing 0x0 on the
-                // terminal would be worse than leaving the kernel default.
                 Some(winsize) => crate::executor::LaunchIo::Pty(
                     (winsize != crate::pty::WindowSize::default()).then_some(winsize),
                 ),
-                None => crate::executor::LaunchIo::File,
+                None => self.io_mode,
             },
             pmix_multi_task: self.pmix_multi_task,
             joins_parent_namespaces: self.joins_parent_namespaces,
@@ -361,44 +366,59 @@ fn recv_custody(sock: std::os::fd::RawFd) -> nix::Result<(Vec<u8>, Vec<std::os::
     Ok((buf[..read].to_vec(), fds))
 }
 
-async fn connect_custody(
+/// A reply's `sendmsg` is as blocking as the request's `recvmsg`, so it gets
+/// the same blocking-pool-plus-timeout treatment (the caller drops its
+/// custody-map lock first, so this can't stall other terminals either).
+async fn bounded_custody_reply(
+    raw: std::os::fd::RawFd,
+    payload: [u8; 5],
+    fds: Vec<std::os::fd::OwnedFd>,
+) -> io::Result<()> {
+    let send = tokio::task::spawn_blocking(move || {
+        use std::os::fd::AsRawFd;
+        let raw_fds: Vec<_> = fds.iter().map(std::os::fd::OwnedFd::as_raw_fd).collect();
+        send_custody(raw, &payload, &raw_fds)
+    });
+    let joined = match request_timeout() {
+        Some(bound) => tokio::time::timeout(bound, send)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "custody peer did not read"))?,
+        None => send.await,
+    };
+    joined
+        .map_err(|error| io::Error::other(format!("custody reply task failed: {error}")))?
+        .map_err(|error| io::Error::other(format!("send custody reply: {error}")))
+}
+
+/// Runs one custody request/reply on the blocking pool, bounded like a stepd
+/// control request, so an unresponsive peer can't strand a worker thread.
+async fn custody_exchange(
     session_dir: &std::path::Path,
-) -> io::Result<std::os::unix::net::UnixStream> {
+    payload: [u8; 5],
+    fds: Vec<std::os::fd::RawFd>,
+    expect_reply: bool,
+) -> io::Result<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
     let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
     let stream = stream.into_std()?;
     stream.set_nonblocking(false)?;
-    Ok(stream)
-}
-
-/// Ask, then wait for the answer on a blocking thread. Passing a descriptor
-/// needs `recvmsg`, which has no async form a runtime worker could yield on.
-async fn custody_exchange(
-    stream: std::os::unix::net::UnixStream,
-    opcode: u8,
-    session_id: u32,
-) -> io::Result<(Vec<u8>, Vec<std::os::fd::OwnedFd>)> {
-    tokio::task::spawn_blocking(move || {
+    let exchange = tokio::task::spawn_blocking(move || -> io::Result<_> {
         use std::os::fd::AsRawFd;
         let raw = stream.as_raw_fd();
-        send_custody(raw, &custody_payload(opcode, session_id), &[])
-            .map_err(|error| io::Error::other(format!("request: {error}")))?;
-        recv_custody(raw).map_err(|error| io::Error::other(format!("reply: {error}")))
-    })
-    .await
-    .map_err(io::Error::other)?
-}
-
-/// Blocking receive that hands the stream back, so the reply can go out on it.
-fn recv_custody_owned(
-    stream: std::os::unix::net::UnixStream,
-) -> nix::Result<(
-    std::os::unix::net::UnixStream,
-    Vec<u8>,
-    Vec<std::os::fd::OwnedFd>,
-)> {
-    use std::os::fd::AsRawFd;
-    let (payload, fds) = recv_custody(stream.as_raw_fd())?;
-    Ok((stream, payload, fds))
+        send_custody(raw, &payload, &fds)
+            .map_err(|error| io::Error::other(format!("send custody request: {error}")))?;
+        if !expect_reply {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        recv_custody(raw)
+            .map_err(|error| io::Error::other(format!("recv custody response: {error}")))
+    });
+    let joined = match request_timeout() {
+        Some(bound) => tokio::time::timeout(bound, exchange)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "custody peer did not answer"))?,
+        None => exchange.await,
+    };
+    joined.map_err(|error| io::Error::other(format!("custody exchange task failed: {error}")))?
 }
 
 /// Ask the supervisor to hold a dup of one shell's pty master, so that terminal
@@ -410,15 +430,14 @@ pub async fn deposit_pty_master(
     master: std::os::fd::BorrowedFd<'_>,
 ) -> io::Result<()> {
     use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    send_custody(
-        stream.as_raw_fd(),
-        &custody_payload(CUSTODY_DEPOSIT, session_id),
-        &[master.as_raw_fd()],
+    custody_exchange(
+        session_dir,
+        custody_payload(CUSTODY_DEPOSIT, session_id),
+        vec![master.as_raw_fd()],
+        false,
     )
-    .map_err(|error| io::Error::other(format!("deposit pty master: {error}")))
+    .await?;
+    Ok(())
 }
 
 /// Claim a terminal the job has left orphaned, returning its shell id with the
@@ -427,28 +446,29 @@ pub async fn deposit_pty_master(
 pub async fn reclaim_orphaned_pty(
     session_dir: &std::path::Path,
 ) -> io::Result<Option<(u32, std::os::fd::OwnedFd)>> {
-    let stream = connect_custody(session_dir).await?;
-    let (payload, fds) = custody_exchange(stream, CUSTODY_RECLAIM_ANY, 0)
-        .await
-        .map_err(|error| io::Error::other(format!("reclaim orphaned pty: {error}")))?;
-    match parse_custody_payload(&payload) {
-        Some((CUSTODY_FOUND, session_id)) => Ok(fds.into_iter().next().map(|fd| (session_id, fd))),
-        _ => Ok(None),
-    }
+    let (payload, fds) = custody_exchange(
+        session_dir,
+        custody_payload(CUSTODY_RECLAIM_ANY, 0),
+        Vec::new(),
+        true,
+    )
+    .await?;
+    Ok(match parse_custody_payload(&payload) {
+        Some((CUSTODY_FOUND, session_id)) => fds.into_iter().next().map(|fd| (session_id, fd)),
+        _ => None,
+    })
 }
 
 /// Stop holding a terminal that has closed.
 pub async fn release_pty_master(session_dir: &std::path::Path, session_id: u32) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let stream = UnixStream::connect(session_dir.join(PTY_CUSTODY_SOCKET_NAME)).await?;
-    let stream = stream.into_std()?;
-    stream.set_nonblocking(false)?;
-    send_custody(
-        stream.as_raw_fd(),
-        &custody_payload(CUSTODY_RELEASE, session_id),
-        &[],
+    custody_exchange(
+        session_dir,
+        custody_payload(CUSTODY_RELEASE, session_id),
+        Vec::new(),
+        false,
     )
-    .map_err(|error| io::Error::other(format!("release pty master: {error}")))
+    .await?;
+    Ok(())
 }
 
 /// Reclaim one shell's master, so a replacement agent resumes that terminal
@@ -457,14 +477,17 @@ pub async fn reclaim_pty_master(
     session_dir: &std::path::Path,
     session_id: u32,
 ) -> io::Result<Option<std::os::fd::OwnedFd>> {
-    let stream = connect_custody(session_dir).await?;
-    let (payload, fds) = custody_exchange(stream, CUSTODY_RECLAIM, session_id)
-        .await
-        .map_err(|error| io::Error::other(format!("reclaim pty master: {error}")))?;
-    match parse_custody_payload(&payload) {
-        Some((CUSTODY_FOUND, _)) => Ok(fds.into_iter().next()),
-        _ => Ok(None),
-    }
+    let (payload, fds) = custody_exchange(
+        session_dir,
+        custody_payload(CUSTODY_RECLAIM, session_id),
+        Vec::new(),
+        true,
+    )
+    .await?;
+    Ok(match parse_custody_payload(&payload) {
+        Some((CUSTODY_FOUND, _)) => fds.into_iter().next(),
+        _ => None,
+    })
 }
 
 const OBLIGATION_FILE: &str = "obligations.jsonl";
@@ -1501,24 +1524,13 @@ async fn try_notify_agent(
     serde_json::from_str(&line).map_err(io::Error::other)
 }
 
-/// Every open terminal this session holds, keyed by the shell's pid. A hand-back
-/// retains custody, so the terminal outlives however many agents come and go.
-pub type PtyCustody = Arc<Mutex<HashMap<u32, std::os::fd::OwnedFd>>>;
-
-/// Take custody of a terminal this supervisor opened for its own launch, so the
-/// master outlives the launch and the agent can claim it under the shell's pid.
-async fn hold_launched_pty(held: &PtyCustody, workload_pid: u32, master: std::os::fd::OwnedFd) {
-    if workload_pid == 0 {
-        tracing::warn!("a terminal was opened for a launch with no process; releasing it");
-        return;
-    }
-    held.lock().await.insert(workload_pid, master);
-}
-
-/// Serves the custody socket against a map the launch path can also write, so a
-/// terminal the supervisor opened itself needs no round trip to be held.
-async fn serve_pty_custody(listener: UnixListener, held: PtyCustody) {
+/// Holds each open terminal's pty master for this job. Keyed per shell, since a
+/// job can have several at once, and retained after a hand-back so the terminal
+/// still outlives however many agents come and go.
+async fn serve_pty_custody(listener: UnixListener) {
     use std::os::fd::AsRawFd;
+    let held: std::sync::Arc<Mutex<HashMap<u32, std::os::fd::OwnedFd>>> =
+        std::sync::Arc::new(Mutex::new(HashMap::new()));
     while let Ok((stream, _)) = listener.accept().await {
         let held = held.clone();
         tokio::spawn(async move {
@@ -1528,13 +1540,24 @@ async fn serve_pty_custody(listener: UnixListener, held: PtyCustody) {
             if stream.set_nonblocking(false).is_err() {
                 return;
             }
-            // Off the runtime: a peer that connects and never speaks would
-            // otherwise hold a worker thread against every other task.
-            let received = tokio::task::spawn_blocking(move || recv_custody_owned(stream)).await;
-            let Ok(Ok((stream, payload, fds))) = received else {
+            // Raw blocking recvmsg (fd-passing needs it), so a silent client
+            // strands a blocking-pool thread, not a worker this process needs.
+            let raw = stream.as_raw_fd();
+            let received = match request_timeout() {
+                Some(bound) => tokio::time::timeout(
+                    bound,
+                    tokio::task::spawn_blocking(move || recv_custody(raw)),
+                )
+                .await
+                .ok()
+                .and_then(|joined| joined.ok()),
+                None => tokio::task::spawn_blocking(move || recv_custody(raw))
+                    .await
+                    .ok(),
+            };
+            let Some(Ok((payload, fds))) = received else {
                 return;
             };
-            let raw = stream.as_raw_fd();
             let Some((opcode, session_id)) = parse_custody_payload(&payload) else {
                 tracing::warn!("malformed pty custody request");
                 return;
@@ -1550,12 +1573,22 @@ async fn serve_pty_custody(listener: UnixListener, held: PtyCustody) {
                 },
                 CUSTODY_RECLAIM_ANY => {
                     tracing::debug!(held = custody.len(), "pty custody: reclaim-any");
-                    let claimed = custody.iter().next().map(|(id, fd)| (*id, fd.as_raw_fd()));
+                    let claimed = custody.iter().next().map(|(id, fd)| (*id, fd.try_clone()));
+                    // A duplicate, not the map's own fd: the deferred reply below
+                    // outlives this lock, and the map entry can be removed or
+                    // replaced (a concurrent release/deposit) before it runs.
                     let (reply, id, fds) = match claimed {
-                        Some((id, raw_fd)) => (CUSTODY_FOUND, id, vec![raw_fd]),
+                        Some((id, Ok(dup))) => (CUSTODY_FOUND, id, vec![dup]),
+                        Some((_, Err(error))) => {
+                            tracing::warn!(%error, "failed to duplicate an orphaned pty's fd");
+                            (CUSTODY_ABSENT, 0, Vec::new())
+                        }
                         None => (CUSTODY_ABSENT, 0, Vec::new()),
                     };
-                    if let Err(error) = send_custody(raw, &custody_payload(reply, id), &fds) {
+                    drop(custody);
+                    if let Err(error) =
+                        bounded_custody_reply(raw, custody_payload(reply, id), fds).await
+                    {
                         tracing::warn!(%error, "failed to hand back an orphaned pty");
                     }
                 }
@@ -1563,11 +1596,20 @@ async fn serve_pty_custody(listener: UnixListener, held: PtyCustody) {
                     custody.remove(&session_id);
                 }
                 CUSTODY_RECLAIM => {
-                    let (reply, fds) = match custody.get(&session_id) {
-                        Some(master) => (CUSTODY_FOUND, vec![master.as_raw_fd()]),
+                    let (reply, fds) = match custody
+                        .get(&session_id)
+                        .map(std::os::fd::OwnedFd::try_clone)
+                    {
+                        Some(Ok(dup)) => (CUSTODY_FOUND, vec![dup]),
+                        Some(Err(error)) => {
+                            tracing::warn!(session_id, %error, "failed to duplicate a pty master's fd");
+                            (CUSTODY_ABSENT, Vec::new())
+                        }
                         None => (CUSTODY_ABSENT, Vec::new()),
                     };
-                    if let Err(error) = send_custody(raw, &custody_payload(reply, session_id), &fds)
+                    drop(custody);
+                    if let Err(error) =
+                        bounded_custody_reply(raw, custody_payload(reply, session_id), fds).await
                     {
                         tracing::warn!(session_id, %error, "failed to hand back a pty master");
                     }
@@ -1896,10 +1938,10 @@ async fn serve_supervisor_connection(
 /// A step's rootfs is kept out of the job's namespace so it can never resolve to
 /// (and later delete) a batch job's live rootfs.
 fn rootfs_base(job_id: u32, step_id: spur_core::step::StepId) -> String {
-    if spur_core::step::is_user_step(step_id) {
-        crate::container::step_rootfs_base(job_id, step_id)
-    } else {
+    if spur_core::step::owns_job_lifetime(step_id) {
         crate::container::job_rootfs_base(job_id)
+    } else {
+        crate::container::step_rootfs_base(job_id, step_id)
     }
 }
 
@@ -2078,13 +2120,12 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // created it, so the terminal survives a restart and can be picked back up.
     let custody_path = session_dir.join(PTY_CUSTODY_SOCKET_NAME);
     let _ = std::fs::remove_file(&custody_path);
-    let custody: PtyCustody = Arc::new(Mutex::new(HashMap::new()));
-    if let Ok(listener) = UnixListener::bind(&custody_path) {
+    if let Ok(custody) = UnixListener::bind(&custody_path) {
         let _ = std::fs::set_permissions(
             &custody_path,
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
         );
-        tokio::spawn(serve_pty_custody(listener, custody.clone()));
+        tokio::spawn(serve_pty_custody(custody));
     }
     let container_rootfs_mode = launch_spec.container_rootfs_mode.clone();
     let stderr_path = launch_spec.stderr_path.clone();
@@ -2137,10 +2178,10 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             // — but they must be, or the session is never prunable.
             let _ = std::fs::remove_file(&socket_path);
             record_launch_failure(&session_dir, &stderr_path, &error);
-            if spur_core::step::is_user_step(step_id) {
-                crate::executor::cleanup_step_spool(job_id, step_id);
-            } else {
+            if spur_core::step::owns_job_lifetime(step_id) {
                 crate::executor::cleanup_job_spool(job_id);
+            } else {
+                crate::executor::cleanup_step_spool(job_id, step_id);
             }
             return Err(error);
         }
@@ -2152,10 +2193,10 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
-        if spur_core::step::is_user_step(step_id) {
-            crate::executor::cleanup_step_spool(job_id, step_id);
-        } else {
+        if spur_core::step::owns_job_lifetime(step_id) {
             crate::executor::cleanup_job_spool(job_id);
+        } else {
+            crate::executor::cleanup_step_spool(job_id, step_id);
         }
     };
     // Before the workload execs: the ranks look the server up through the
@@ -2168,7 +2209,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         }
     };
     let runtime_environment = launch_spec.environment.clone();
-    let (job, launched_cgroup, launched_output, task_environment, launched_master) = if launch_spec
+    let (job, launched_cgroup, launched_output, task_environment, pty_master) = if launch_spec
         .allocation_only
     {
         (RunningJob::AllocationOnly, None, None, HashMap::new(), None)
@@ -2191,14 +2232,19 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         }
     };
     let workload_pid = job.pid().unwrap_or(0);
-    // Custody before anything can observe the launch: dropping the master would
-    // hang the terminal up under the shell that just got its slave.
-    if let Some(master) = launched_master {
-        hold_launched_pty(&custody, workload_pid, master).await;
-    }
     if workload_pid > 0 {
         descriptor.workload_pid = workload_pid;
         descriptor.workload_start_ticks = process_start_ticks(workload_pid).unwrap_or(0);
+    }
+    // Self-deposit: the agent's interactive-session handler reclaims this by
+    // pid over the same custody protocol an agent restart already uses, so a
+    // fresh attach and a post-restart reattach both just reclaim a master.
+    if let Some(master) = pty_master.as_ref() {
+        if let Err(error) =
+            deposit_pty_master(&session_dir, workload_pid, std::os::fd::AsFd::as_fd(master)).await
+        {
+            tracing::warn!(job_id, %error, "failed to deposit this step's own pty master");
+        }
     }
     if let Some(cgroup_path) = launched_cgroup.as_deref() {
         descriptor.cgroup_path = cgroup_path.to_path_buf();
@@ -2254,7 +2300,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             // The agent reaps the job node once its last step releases; this
             // covers the case where teardown here runs and that never does.
             // Removing an absent directory is a no-op, so both trying is safe.
-            if !spur_core::step::is_user_step(step_id) {
+            if spur_core::step::owns_job_lifetime(step_id) {
                 if let Some(job_cgroup) = cgroup.parent() {
                     crate::executor::cleanup_cgroup(job_cgroup);
                 }
@@ -2263,9 +2309,9 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
         if let Some(rootfs_mode) = container_rootfs_mode.as_ref() {
             crate::container::cleanup_rootfs(&rootfs_base(job_id, step_id), rootfs_mode);
         }
-        // A user step's spool outlives teardown: this runs before the agent is
-        // notified, and the agent still has to read the step's output back.
-        if !spur_core::step::is_user_step(step_id) {
+        // A non-owning step's spool outlives teardown, since the agent still
+        // has to read its output back after this runs.
+        if spur_core::step::owns_job_lifetime(step_id) {
             crate::executor::cleanup_job_spool(job_id);
         }
     };
@@ -2291,9 +2337,8 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
     // unbounded operator code, and a crash in them must not read as "never ran".
     obligations.append(&StepdObligation::ExitObserved { exit_code, signal })?;
     teardown(cgroup).await;
-    // The node epilog and SPANK exit hooks are per-job-per-node, so only the step
-    // that owns the job's lifetime runs them — a numbered step would re-run them.
-    let owns_job_lifetime = !spur_core::step::is_user_step(step_id);
+    // Per-job-per-node hooks: only the step owning the job's lifetime runs them.
+    let owns_job_lifetime = spur_core::step::owns_job_lifetime(step_id);
     let epilog_failed = match hooks.epilog.as_deref().filter(|_| owns_job_lifetime) {
         Some(epilog) => {
             match crate::epilog::run_bounded(epilog, &hook_context, hooks.epilog_timeout_secs).await
@@ -2448,9 +2493,8 @@ impl StepdStore {
         if !matches!(stepd_liveness(descriptor), Ok(StepdLiveness::Stale)) {
             return Ok(false);
         }
-        // A numbered step's loss is that step's failure; only a job-level
-        // session speaks for the allocation the controller is holding.
-        if spur_core::step::is_user_step(descriptor.step_id) {
+        // Only the step owning the job's lifetime speaks for the allocation.
+        if !spur_core::step::owns_job_lifetime(descriptor.step_id) {
             return Ok(false);
         }
         if self
@@ -3157,76 +3201,6 @@ mod pty_custody_tests {
         assert_eq!(parse_custody_payload(&[CUSTODY_DEPOSIT]), None);
         assert_eq!(parse_custody_payload(&[CUSTODY_DEPOSIT, 1, 2]), None);
     }
-
-    /// Serves a custody socket over `held` the way the supervisor's own launch
-    /// path does, so the reclaim under test crosses the real socket.
-    async fn serve_custody_over(
-        dir: &std::path::Path,
-        held: super::PtyCustody,
-    ) -> tokio::task::JoinHandle<()> {
-        let listener = tokio::net::UnixListener::bind(dir.join(super::PTY_CUSTODY_SOCKET_NAME))
-            .expect("bind custody socket");
-        tokio::spawn(super::serve_pty_custody(listener, held))
-    }
-
-    // Single-threaded on purpose: with one worker, a reclaim that blocked it
-    // could never be answered, so this pins the exchange off the runtime.
-    #[tokio::test]
-    async fn a_master_the_supervisor_launched_is_handed_back_still_usable() {
-        use std::io::{Read, Write};
-
-        let dir = tempfile::tempdir().expect("temp dir");
-        let held: super::PtyCustody =
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let server = serve_custody_over(dir.path(), held.clone()).await;
-
-        let (master, slave) =
-            crate::pty::openpty_with_winsize(None).expect("openpty for the custody test");
-        super::hold_launched_pty(&held, 4242, master).await;
-
-        let reclaimed = super::reclaim_pty_master(dir.path(), 4242)
-            .await
-            .expect("reclaim must not error")
-            .expect("the launched master must be in custody");
-
-        let mut writer = std::fs::File::from(reclaimed);
-        writer.write_all(b"ping\n").expect("write to the terminal");
-        writer.flush().expect("flush the terminal");
-
-        let mut reader = std::fs::File::from(slave);
-        let mut buf = [0u8; 5];
-        reader.read_exact(&mut buf).expect("read on the slave");
-        assert_eq!(&buf, b"ping\n");
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn a_reclaim_for_a_terminal_nobody_launched_is_absent_not_a_hang() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let held: super::PtyCustody =
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let server = serve_custody_over(dir.path(), held).await;
-
-        let reclaimed = super::reclaim_pty_master(dir.path(), 4242)
-            .await
-            .expect("reclaim must not error");
-        assert!(reclaimed.is_none());
-
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn a_terminal_for_a_launch_with_no_process_is_not_left_held() {
-        let held: super::PtyCustody =
-            std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-        let (master, _slave) =
-            crate::pty::openpty_with_winsize(None).expect("openpty for the custody test");
-
-        super::hold_launched_pty(&held, 0, master).await;
-
-        assert!(held.lock().await.is_empty());
-    }
 }
 
 #[cfg(test)]
@@ -3513,6 +3487,7 @@ mod tests {
             partition: "default".into(),
             nodelist: "node-a".into(),
             memlock: StepdMemlock::Inherit,
+            io_mode: crate::executor::LaunchIo::File,
             container: None,
             host_device_plan: None,
             container_rootfs_mode: None,
@@ -3537,6 +3512,26 @@ mod tests {
         let mut spec = launch_spec();
         spec.pmix_multi_task = true;
         assert!(spec.into_launch_config().pmix_multi_task);
+    }
+
+    // A stepd relaunched from a persisted spec must honor Pty just as the
+    // original launch did, or a restart silently drops back to File.
+    #[test]
+    fn launch_spec_preserves_pty_io_mode() {
+        let mut spec = launch_spec();
+        spec.io_mode = crate::executor::LaunchIo::Pty(None);
+        assert_eq!(
+            spec.into_launch_config().io_mode,
+            crate::executor::LaunchIo::Pty(None)
+        );
+    }
+
+    #[test]
+    fn job_launch_config_round_trip_preserves_pty_io_mode() {
+        let mut config = launch_spec().into_launch_config();
+        config.io_mode = crate::executor::LaunchIo::Pty(None);
+        let spec = StepdLaunchSpec::try_from(&config).expect("valid config");
+        assert_eq!(spec.io_mode, crate::executor::LaunchIo::Pty(None));
     }
 
     fn pmix_spec(step_id: spur_core::step::StepId, ranks: u32, plugin: &str) -> StepdPmix {
@@ -5334,6 +5329,18 @@ mod tests {
         );
     }
 
+    // A terminal supervisor is reserved like the batch/extern steps but owns no
+    // workload; retiring it must not re-run a job-ending hook.
+    #[tokio::test]
+    async fn a_terminal_placeholder_does_not_run_the_node_epilog() {
+        let AgentNotification::StepdCompleted { epilog_failed, .. } =
+            supervised_completion_notice(spur_core::step::STEP_INTERACTIVE).await;
+        assert!(
+            !epilog_failed,
+            "a terminal placeholder must leave the node epilog to the step owning the job"
+        );
+    }
+
     fn gate_descriptor() -> StepdDescriptor {
         StepdDescriptor::new(
             7,
@@ -5617,5 +5624,44 @@ mod tests {
             greeted.load(Ordering::Acquire),
             "the bound must cover the request, not just the handshake"
         );
+    }
+
+    // On a single-threaded runtime, a custody exchange blocking that one
+    // thread directly (instead of on the blocking pool) starves unrelated work.
+    #[tokio::test]
+    async fn a_wedged_custody_peer_does_not_starve_unrelated_work() {
+        REQUEST_TIMEOUT.with(|timeout| timeout.set(Some(std::time::Duration::from_millis(200))));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let listener = UnixListener::bind(dir.path().join(PTY_CUSTODY_SOCKET_NAME)).expect("bind");
+
+        // Accepts the connection, same as a live stepd, but never answers —
+        // the state an orphaned `<defunct>` child can leave its supervisor in.
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            drop(stream);
+        });
+
+        let session_dir = dir.path().to_path_buf();
+        let reclaim = tokio::spawn(async move { reclaim_orphaned_pty(&session_dir).await });
+
+        let unrelated = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            42
+        });
+        let unrelated_result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), unrelated)
+                .await
+                .expect("unrelated work must not be starved by a stuck custody peer")
+                .expect("join");
+        assert_eq!(unrelated_result, 42);
+
+        let error = reclaim
+            .await
+            .expect("join")
+            .expect_err("a wedged custody peer must time out, not hang forever");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 }

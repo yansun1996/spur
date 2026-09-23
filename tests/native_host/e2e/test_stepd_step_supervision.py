@@ -33,7 +33,9 @@ def _step_ids(sessions: list[str], job_id: int) -> set[int]:
 
 def _supervisor_pids(cluster, node_index: int = 0) -> set[str]:
     """Supervisors under this cluster's own state dir. A node-wide pgrep also
-    counts leftovers from another cluster, which nothing here keeps alive."""
+    counts a leftover from a previous test's cluster, which nothing here keeps
+    alive, and would otherwise fail a restart-survival assertion on a
+    supervisor the product was never asked to keep running."""
     node = cluster.nodes[node_index]
     out = node.exec_allow_fail("ps -eww -o pid=,args= 2>/dev/null || true")
     pids = set()
