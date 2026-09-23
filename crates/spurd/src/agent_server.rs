@@ -1041,9 +1041,8 @@ async fn teardown_completed_job(
         return;
     }
 
-    // Unmounting/removing a rootfs and walking cgroupfs are blocking syscalls; run
-    // them off this async worker so a slow or large one can't stall every other
-    // task cooperatively scheduled on it, same reasoning as the fsyncs below.
+    // Rootfs unmount and cgroupfs walk are blocking syscalls; offload so a slow
+    // one can't stall other tasks on this worker (same reasoning as the fsyncs below).
     let rootfs_mode = completed.rootfs_mode.clone();
     let cgroup = completed.cgroup.clone();
     let run_attempt = completed.run_attempt;
@@ -1053,9 +1052,8 @@ async fn teardown_completed_job(
         if let Some(ref cgroup) = cgroup {
             crate::executor::cleanup_cgroup(cgroup);
         }
-        // The node above whatever was recorded: an allocation's is a step's leaf,
-        // and nothing else removes the job's own. Derived from identity because the
-        // recorded path is a leaf in one shape and absent in another.
+        // Also remove the job-level cgroup by computed path: the recorded path may be
+        // a step's leaf, and nothing else cleans up the job's own.
         crate::executor::cleanup_cgroup(&crate::executor::expected_cgroup_path(
             job_id,
             run_attempt,
@@ -3788,13 +3786,10 @@ fn reject_nul_bytes(cmd: &StepChildCommand) -> Result<(), Status> {
     Ok(())
 }
 
-/// Runs in a freshly forked child after its stdio has been wired to the spool
-/// files: joins the job cgroup while still root, runs `container_init`
-/// (namespace unshare, mounts, device injection, pivot_root, priv drop), signals
-/// readiness on `ready_w`, then execs `cmd`. Never returns. The whole namespace
-/// setup is shared by the buffered and PTY containerized-step paths.
-// A fork/exec helper — each input is a distinct piece of the child's context.
-#[allow(clippy::too_many_arguments)]
+/// Runs in a forked child with stdio wired to the spool: joins the job cgroup
+/// while root, runs `container_init` (namespace/mounts/pivot_root/priv drop),
+/// signals `ready_w`, execs `cmd`. Never returns.
+#[allow(clippy::too_many_arguments)] // each arg is a distinct piece of the child's context
 fn container_child_exec(
     container_cfg: &crate::container::ContainerConfig,
     rootfs: &std::path::Path,
@@ -4363,9 +4358,8 @@ impl AgentService {
         self
     }
 
-    /// Override the store built above with one a caller already constructed
-    /// elsewhere (e.g. main.rs's reporter/retry-loop store), so every user of
-    /// this node's admission records shares one lock map, not independent ones.
+    /// Override the store built above with a caller-constructed one (e.g. main.rs's
+    /// reporter/retry-loop store) so every user shares one lock map, not independent ones.
     pub fn with_admissions(mut self, admissions: crate::admission::AdmissionStore) -> Self {
         self.admissions = admissions;
         self
@@ -5806,8 +5800,12 @@ pub(crate) async fn settle_acknowledged_completion(
     let recorded = tokio::task::spawn_blocking(move || {
         // Scoped to the step: a user step's exit settles its own participation,
         // and the store refuses the run-level write to anything but the owner.
-        let _ = store.record_acknowledged_completion(run, step_id, raft_index);
-        let _ = store.record_report_acknowledged(run, step_id);
+        if let Err(error) = store.record_acknowledged_completion(run, step_id, raft_index) {
+            warn!(%run, %error, "failed to record an acknowledged completion");
+        }
+        if let Err(error) = store.record_report_acknowledged(run, step_id) {
+            warn!(%run, %error, "failed to record a report acknowledgement");
+        }
     })
     .await;
     if let Err(error) = recorded {
@@ -5920,7 +5918,9 @@ fn record_run_epilog(
     if spur_core::step::is_user_step(step_id) {
         return;
     }
-    let _ = admissions.record_epilog(run, state);
+    if let Err(error) = admissions.record_epilog(run, state) {
+        warn!(%run, %error, "failed to record an epilog's outcome");
+    }
 }
 
 /// How long a hook may hold a slice before it is called out by name. An epilog
@@ -6583,11 +6583,8 @@ impl Drop for StepRootfsGuard {
             crate::container::remove_step_markers(&base);
             crate::container::cleanup_rootfs(&base, &mode);
         };
-        // `waitpid` here has no `WNOHANG`: SIGKILL is deferred by the kernel until
-        // a D-state child's own blocking syscall returns, so this can hang
-        // indefinitely. Detach onto a blocking thread instead of stalling
-        // whatever tokio worker happens to be running this drop; fall back to
-        // running inline where no runtime is current (e.g. a sync test).
+        // No `WNOHANG`: SIGKILL is deferred until a D-state child's blocking syscall
+        // returns, so this can hang; spawn_blocking to avoid stalling this drop's tokio worker.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn_blocking(work);
@@ -14446,10 +14443,8 @@ mod tests {
         assert!(script.contains("4242"), "{script}");
     }
 
-    // A host-side chdir does not survive entering the container's pivoted
-    // mount namespace (nsenter --wd is unreliable under a rootless user
-    // namespace too), so the cd must run in a shell *inside* the namespace
-    // nsenter just entered — not before nsenter execs.
+    // A host-side chdir doesn't survive entering the pivoted mount namespace (nsenter --wd
+    // is unreliable under a rootless userns too), so cd must run inside the entered namespace.
     #[test]
     fn a_namespaced_steps_script_cds_into_its_work_dir_after_entering() {
         let mut entry = plain_job_entry();
@@ -15075,10 +15070,8 @@ mod tests {
         }
     }
 
-    // Reproduces the gap between the launch gate opening and `run_supervisor`
-    // actually starting to accept control connections: `launch_job` (openpty,
-    // container rootfs staging, priv drop) runs in between, and nothing serves
-    // `QueryState` on the socket until it returns.
+    // Reproduces the gap between the launch gate opening and `run_supervisor` accepting
+    // connections: `launch_job` (openpty, rootfs staging, priv drop) runs in between, serving nothing.
     #[tokio::test(start_paused = true)]
     async fn supervised_step_workload_pid_survives_a_supervisor_that_is_slow_to_start_serving() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -16826,10 +16819,8 @@ mod tests {
         }
     }
 
-    // STEP_INTERACTIVE (a non-owning step, since this PR) sits between user
-    // steps and STEP_BATCH/STEP_EXTERN in id order; directory order is
-    // otherwise arbitrary, so the job's own cgroup must win regardless of
-    // which descriptor recovery processes first.
+    // STEP_INTERACTIVE is a non-owning step sitting between user steps and
+    // STEP_BATCH/STEP_EXTERN in id order; the job's own cgroup must win regardless of order.
     #[tokio::test]
     async fn a_terminal_sessions_own_leaf_cgroup_never_becomes_the_jobs() {
         let mut terminal = crate::stepd::StepdDescriptor::new(
@@ -21287,9 +21278,8 @@ mod tests {
     // detach that reap onto a blocking thread rather than run it inline.
     #[tokio::test]
     async fn step_rootfs_guard_reaps_its_child_off_the_calling_task() {
-        // `Child`'s own `Drop` does not wait on or kill the process (std's
-        // documented behavior), so letting it fall out of scope here leaves a
-        // real, unreaped child for the guard's own Drop to signal and reap.
+        // `Child::drop` doesn't wait or kill (std's documented behavior), so dropping it
+        // here leaves a real, unreaped child for the guard's own Drop to signal and reap.
         let child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -23311,11 +23301,8 @@ mod tests {
         );
     }
 
-    // A terminal placeholder or container step owns no workload of its own
-    // (excluded from `owns_job_lifetime`), but its stepd can still wedge — it
-    // must get the same active-fencing safety net as a batch supervisor, not
-    // the unconditional, liveness-blind release `drop_tracked_job` gives an
-    // allocation with no stepd at all.
+    // A terminal/container step owns no workload (excluded from `owns_job_lifetime`) but its
+    // stepd can still wedge, so it needs active fencing, not `drop_tracked_job`'s blind release.
     #[tokio::test]
     async fn graceful_cancel_does_not_reclaim_a_live_interactive_only_jobs_ledger() {
         let svc = AgentService::new(
@@ -24433,6 +24420,50 @@ mod tests {
                 .epilog,
             crate::admission::HookState::Succeeded,
             "and the step that owns the hook still answers for it"
+        );
+    }
+
+    // A write that fails must say so: the epilog gate this record drives
+    // (`settle_permit`/`release_is_due`) has no other way to surface a run
+    // stuck because its disk, not its hook, is the thing that failed.
+    #[test]
+    fn a_failed_epilog_write_is_logged_not_silently_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let log = CapturingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _trace_guard = tracing::subscriber::set_default(subscriber);
+
+        let state = tempfile::tempdir().expect("state dir");
+        let admissions = crate::admission::AdmissionStore::new(state.path(), "n1");
+        admit_a_supervised_run(&admissions, "n1", 63, vec![0], Some(a_live_supervisor()));
+        std::fs::set_permissions(
+            admissions.run_dir(key(63, 1)).expect("run dir"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .expect("drop write permission");
+
+        record_run_epilog(
+            &admissions,
+            key(63, 1),
+            spur_core::step::STEP_BATCH,
+            crate::admission::HookState::Succeeded,
+        );
+
+        // Restore write access so the tempdir can clean itself up.
+        std::fs::set_permissions(
+            admissions.run_dir(key(63, 1)).expect("run dir"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("restore write permission");
+
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).expect("utf8 log");
+        assert!(
+            logged.contains("failed to record an epilog's outcome"),
+            "a write failure here must be logged, not swallowed: {logged}"
         );
     }
 
