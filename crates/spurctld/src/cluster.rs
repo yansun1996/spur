@@ -776,28 +776,17 @@ impl ClusterManager {
 
     /// Drop every debt whose victim has handed its slice back. Charged, not
     /// Preempted: a cancel-mode victim holds its slice through its epilog too.
+    ///
+    /// Held across the whole decide-and-remove so a concurrent `record_preempt_debt`
+    /// for the same beneficiary (a fresh victim assigned mid-pass) can't have its
+    /// entry discharged here on the strength of a stale, already-superseded read.
     pub(crate) fn discharge_preempt_debt(&self) {
-        let taken: Vec<(JobId, JobId)> = self
-            .preempt_debt
-            .read()
-            .iter()
-            .map(|(&beneficiary, &victim)| (beneficiary, victim))
-            .collect();
-        if taken.is_empty() {
+        let mut debt = self.preempt_debt.write();
+        if debt.is_empty() {
             return;
         }
-        let discharged: Vec<JobId> = {
-            let jobs = self.jobs.read();
-            taken
-                .into_iter()
-                .filter(|(_, victim)| !jobs.get(victim).is_some_and(Job::holds_a_placement))
-                .map(|(beneficiary, _)| beneficiary)
-                .collect()
-        };
-        let mut debt = self.preempt_debt.write();
-        for beneficiary in discharged {
-            debt.remove(&beneficiary);
-        }
+        let jobs = self.jobs.read();
+        debt.retain(|_, victim| jobs.get(victim).is_some_and(Job::holds_a_placement));
     }
 
     /// Names still within their dispatch cooldown, pruning any that have expired.
@@ -2880,6 +2869,10 @@ impl ClusterManager {
         labels: HashMap<String, String>,
         caller_privileged: bool,
         runs_job_epilog: bool,
+        // Whether a first-time registration should come up already gated. The
+        // caller passes this only when it also has a ledger to reconcile — a gate
+        // with nothing to ever clear it would strand the node forever.
+        reconcile_pending: bool,
     ) -> Result<(), RegisterNodeError> {
         let hostname = if hostname.is_empty() {
             name.clone()
@@ -2965,6 +2958,7 @@ impl ClusterManager {
                     labels,
                     source: source.clone(),
                     runs_job_epilog,
+                    reconcile_pending,
                 })
                 .map_err(|e| RegisterNodeError::Internal(e.to_string()))?;
                 if let Some(node) = self.nodes.write().get_mut(&name) {
@@ -6374,16 +6368,16 @@ impl ClusterManager {
 
     /// Requeue after a dispatch failure or Timeout/NodeFail: counts against
     /// `max_batch_requeue`.
-    fn reset_job_for_requeue(job: &mut Job) {
+    fn reset_job_for_requeue(job: &mut Job, nodes: &HashMap<String, Node>) {
         job.requeue_count += 1;
-        Self::clear_run_state_for_requeue(job);
+        Self::defer_or_clear_run_state_for_requeue(job, nodes);
     }
 
     /// Requeue after a refusal the job did not cause: paces the next retry like
     /// a charged one, and bounds how many refusals the exemption covers.
-    fn reset_job_for_spared_requeue(job: &mut Job) {
+    fn reset_job_for_spared_requeue(job: &mut Job, nodes: &HashMap<String, Node>) {
         job.spared_requeue_count += 1;
-        Self::clear_run_state_for_requeue(job);
+        Self::defer_or_clear_run_state_for_requeue(job, nodes);
     }
 
     /// Requeue after preemption: tracked separately since it isn't a failure
@@ -6589,9 +6583,9 @@ impl ClusterManager {
                 let per_node_map = job.per_node_alloc.clone();
                 let already = Self::slices_no_longer_held(job);
                 if *spare_requeue_budget {
-                    Self::reset_job_for_spared_requeue(job);
+                    Self::reset_job_for_spared_requeue(job, &nodes);
                 } else {
-                    Self::reset_job_for_requeue(job);
+                    Self::reset_job_for_requeue(job, &nodes);
                 }
                 job.spec.begin_time = Some(*begin_time);
                 job.set_pending_reason(PendingReason::JobLaunchFailure);
@@ -7337,9 +7331,11 @@ impl ClusterManager {
                 labels,
                 source,
                 runs_job_epilog,
+                reconcile_pending,
             } => {
                 let mut node = Node::new(name.clone(), resources.clone());
                 node.runs_job_epilog = *runs_job_epilog;
+                node.reconcile_pending = *reconcile_pending;
                 node.hostname = if hostname.is_empty() {
                     name.clone()
                 } else {
@@ -7502,6 +7498,14 @@ impl ClusterManager {
                 // not report, and the only thing that ends a hold it never ends.
                 for job in jobs.values_mut() {
                     job.epilog_gated_nodes.remove(name);
+                    // A Pending job pruned down to "just the gated node" by an
+                    // earlier requeue would otherwise keep naming a node that no
+                    // longer exists, forever -- nothing else revisits its
+                    // `allocated_nodes` outside an actual state transition.
+                    if job.state == JobState::Pending {
+                        job.allocated_nodes.retain(|n| n != name);
+                        job.per_node_alloc.remove(name);
+                    }
                 }
                 if let Some(node) = nodes.get(name) {
                     if node.alloc_resources.cpus > 0 || node.alloc_resources.has_devices() {
@@ -10158,6 +10162,7 @@ mod tests {
             HashMap::new(),
             true,
             false,
+            false, // reconcile_pending: no ledger to reconcile in this test
         )
         .unwrap();
         let n = name.to_string();
@@ -10450,6 +10455,7 @@ mod tests {
                 HashMap::from([("pool".to_string(), pool.to_string())]),
                 privileged,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
         };
 
@@ -10503,6 +10509,7 @@ mod tests {
             HashMap::new(),
             true,
             false,
+            false, // reconcile_pending: no ledger to reconcile in this test
         )
         .unwrap();
         let n = name.to_string();
@@ -11935,6 +11942,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "gpu-node".into(),
             hostname: String::new(),
             resources: ResourceSet {
@@ -11961,6 +11969,45 @@ mod tests {
             "node should be assigned to default partition"
         );
         assert_eq!(node.partitions[0], "default");
+    }
+
+    // Closes the register-then-gate window: a first-time registration with a
+    // ledger to reconcile must never be visible-and-schedulable even for one
+    // tick before its gate is set, because the two used to be separate proposals.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_first_registration_with_a_gate_is_never_schedulable_before_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+
+        cm.apply_operation(&WalOperation::NodeRegister {
+            runs_job_epilog: false,
+            reconcile_pending: true,
+            name: "gpu-node".into(),
+            hostname: String::new(),
+            resources: ResourceSet {
+                cpus: 64,
+                memory_mb: 256000,
+                ..Default::default()
+            },
+            address: "10.0.0.1".into(),
+            port: 6818,
+            wg_pubkey: String::new(),
+            version: "1.0".into(),
+            labels: HashMap::new(),
+            source: NodeSource::default(),
+        });
+
+        let node = cm.get_node("gpu-node").unwrap();
+        assert_eq!(
+            node.state,
+            NodeState::Idle,
+            "still comes up Idle, same as an ungated registration"
+        );
+        assert!(
+            !node.is_schedulable(),
+            "a node registered with a gate must be ungated from the same WAL entry \
+             that created it, not a second, later proposal"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -22965,6 +23012,7 @@ mod tests {
         for name in &node_names {
             cm.apply_operation(&WalOperation::NodeRegister {
                 runs_job_epilog: false,
+                reconcile_pending: false,
                 name: name.clone(),
                 hostname: name.clone(),
                 resources: ResourceSet {
@@ -23518,6 +23566,7 @@ mod tests {
         let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
         cm.apply_operation(&WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "n1".into(),
             hostname: "n1".into(),
             resources: ResourceSet {
@@ -23595,6 +23644,7 @@ mod tests {
             labels: HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
             runs_job_epilog: runs_epilog,
+            reconcile_pending: false,
         });
     }
 
@@ -23996,6 +24046,7 @@ mod tests {
             HashMap::new(),
             true,
             true,
+            false, // reconcile_pending: no ledger to reconcile in this test
         )
         .unwrap();
         wait_for("declaration recorded", || {
@@ -24145,6 +24196,48 @@ mod tests {
         );
     }
 
+    // Deregistering a node a Pending job is still gated on must also stop that
+    // job's record from naming it, not just clear the gate itself -- a rebuild
+    // and squeue's NodeList must not keep pointing at a node the cluster forgot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_a_node_stops_a_pending_job_from_still_naming_it() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::Timeout,
+        });
+        re_pend(&cm, 1, JobState::Timeout);
+        let job = cm.get_job(1).expect("job 1");
+        assert_eq!(job.state, JobState::Pending);
+        assert_eq!(job.allocated_nodes, vec!["n1".to_string()]);
+        drop(job);
+
+        cm.apply_operation(&WalOperation::NodeRemove {
+            name: "n1".into(),
+            reason: Some("decommissioned".into()),
+            at: None,
+        });
+
+        let job = cm.get_job(1).expect("job 1");
+        assert!(
+            job.epilog_gated_nodes.is_empty(),
+            "the gate itself is already known to clear"
+        );
+        assert!(
+            job.allocated_nodes.is_empty(),
+            "must not keep naming a node the cluster no longer has"
+        );
+        assert!(
+            !job.per_node_alloc.contains_key("n1"),
+            "must not keep a per-node slice for a node that no longer exists"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_preempt_cancel_holds_a_node_that_still_owes_an_epilog() {
         let dir = TempDir::new().unwrap();
@@ -24237,6 +24330,58 @@ mod tests {
         );
     }
 
+    // JobDispatchBackoff is a third requeue trigger (a transient dispatch
+    // failure), separate from the JobStateChange path the test above covers --
+    // it must preserve an epilog gate's job-record bookkeeping the same way,
+    // not just its two siblings. (The gate's *live* CPU count is governed
+    // separately by the derive-from-job-records rebuild, asserted below via
+    // `recompute_node_allocations`, same as the sibling test.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dispatch_backoff_keeps_the_slice_its_gate_is_still_holding() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::Timeout,
+        });
+        re_pend(&cm, 1, JobState::Timeout);
+        assert!(cm
+            .get_job(1)
+            .expect("job 1")
+            .epilog_gated_nodes
+            .contains("n1"));
+
+        cm.apply_operation(&WalOperation::JobDispatchBackoff {
+            job_id: 1,
+            begin_time: Utc::now(),
+            spare_requeue_budget: false,
+        });
+        let job = cm.get_job(1).expect("job 1");
+        assert!(
+            job.epilog_gated_nodes.contains("n1"),
+            "the gate must survive a dispatch backoff, not just an ordinary requeue"
+        );
+        assert_eq!(
+            job.allocated_nodes,
+            vec!["n1".to_string()],
+            "the record must keep naming the node its gate still binds"
+        );
+        drop(job);
+        cm.recompute_node_allocations();
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            6,
+            "a rebuild from job records must agree the slice is still held"
+        );
+
+        report_node_done(&cm, 1, "n1");
+        assert!(cm.get_job(1).expect("job 1").epilog_gated_nodes.is_empty());
+    }
+
     // Three ways a node can already be off this run's books -- it reported, the
     // completion freed it, or it was never gated -- against one that is not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -24293,6 +24438,45 @@ mod tests {
         assert_eq!(alloc_cpus(&cm, "n1"), 0, "the gate's own report frees it");
         assert_eq!(alloc_cpus(&cm, "n2"), 4, "a second free would rob job 2");
         assert_eq!(alloc_cpus(&cm, "n3"), 4, "a second free would rob job 3");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discharge_preempt_debt_keeps_a_debt_whose_victim_still_holds_its_slice() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", false);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(4, 1000));
+
+        cm.record_preempt_debt(2, 1);
+        assert!(cm.owed_a_preempted_slice(2));
+
+        cm.discharge_preempt_debt();
+        assert!(
+            cm.owed_a_preempted_slice(2),
+            "the victim still holds its placement; nothing to discharge yet"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discharge_preempt_debt_drops_a_debt_once_its_victim_gives_up_its_slice() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", false);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(4, 1000));
+
+        cm.record_preempt_debt(2, 1);
+        cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
+            job_id: 1,
+            exit_code: 0,
+            state: JobState::Completed,
+        });
+
+        cm.discharge_preempt_debt();
+        assert!(
+            !cm.owed_a_preempted_slice(2),
+            "the victim (no epilog to gate it) gave its slice back; the debt is paid"
+        );
     }
 
     // A deferred requeue's Pending job also "holds a placement," but the sweep
@@ -24572,6 +24756,7 @@ mod tests {
         let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
         cm.apply_operation(&WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "n1".into(),
             hostname: "n1".into(),
             resources: ResourceSet {
@@ -24633,6 +24818,7 @@ mod tests {
         let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
         cm.apply_operation(&WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "n1".into(),
             hostname: "n1".into(),
             resources: ResourceSet {
@@ -24702,6 +24888,7 @@ mod tests {
         let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
         let register = WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "n1".into(),
             hostname: "n1".into(),
             resources: ResourceSet {
@@ -24763,6 +24950,7 @@ mod tests {
         };
         cm.apply_operation(&WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "n1".into(),
             hostname: "n1".into(),
             resources: resources.clone(),
@@ -24782,6 +24970,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "n2".into(),
             hostname: "n2".into(),
             resources,
@@ -24804,6 +24993,7 @@ mod tests {
         let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
         cm.apply_operation(&WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "n1".into(),
             hostname: "n1".into(),
             resources: ResourceSet {
@@ -25776,6 +25966,7 @@ mod tests {
             HashMap::new(),
             true,
             false,
+            false, // reconcile_pending: no ledger to reconcile in this test
         )
         .unwrap();
         let node = cm.get_node("locked").unwrap();
@@ -28040,6 +28231,7 @@ mod tests {
             HashMap::from([("role".into(), "infer".into())]),
             true,
             false,
+            false, // reconcile_pending: no ledger to reconcile in this test
         )
         .unwrap();
         wait_for("node registered", || cm.get_node("dyn-node").is_some());
@@ -28109,6 +28301,7 @@ mod tests {
             HashMap::from([("pool".into(), "train".into())]),
             true,
             false,
+            false, // reconcile_pending: no ledger to reconcile in this test
         )
         .unwrap();
         wait_for("node registered", || cm.get_node("worker1").is_some());
@@ -28134,6 +28327,7 @@ mod tests {
             HashMap::from([("pool".into(), "infer".into()), ("tier".into(), "1".into())]),
             true,
             false,
+            false, // reconcile_pending: no ledger to reconcile in this test
         )
         .unwrap();
         wait_for("labels synced", || {
@@ -28169,6 +28363,7 @@ mod tests {
             HashMap::new(),
             true,
             false,
+            false, // reconcile_pending: no ledger to reconcile in this test
         )
         .unwrap();
         wait_for("node registered", || cm.get_node("worker1").is_some());
@@ -28185,6 +28380,7 @@ mod tests {
             HashMap::new(),
             true,
             false,
+            false, // reconcile_pending: no ledger to reconcile in this test
         )
         .unwrap();
         wait_for("comm address updated", || {
@@ -28224,6 +28420,7 @@ mod tests {
             HashMap::from([("pool".into(), "train".into())]),
             true,
             false,
+            false, // reconcile_pending: no ledger to reconcile in this test
         )
         .unwrap();
         wait_for("node registered", || cm.get_node("worker1").is_some());
@@ -28258,6 +28455,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "worker1".into(),
             hostname: "worker1".into(),
             resources: ResourceSet {
@@ -28298,6 +28496,7 @@ mod tests {
         // Register a node directly via WAL apply
         cm.apply_operation(&WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "gpu-node".into(),
             hostname: String::new(),
             resources: ResourceSet {
@@ -28346,6 +28545,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "gpu-node".into(),
             hostname: String::new(),
             resources: ResourceSet {
@@ -28394,6 +28594,7 @@ mod tests {
 
         cm.apply_operation(&WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "cpu-node".into(),
             hostname: String::new(),
             resources: ResourceSet {
@@ -28839,6 +29040,7 @@ mod tests {
             labels: HashMap::new(),
             source: spur_core::node::NodeSource::NativeHost,
             runs_job_epilog: false,
+            reconcile_pending: false,
         });
         assert!(cm.get_node("n1").unwrap().last_heartbeat.is_some());
 

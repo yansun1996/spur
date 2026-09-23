@@ -2974,6 +2974,9 @@ impl SlurmController for ControllerService {
                 req.labels,
                 caller_privileged,
                 req.runs_job_epilog,
+                // Only worth gating if a ledger arrived to eventually clear it — a gate
+                // with nothing to reconcile would strand the node forever.
+                ledger.is_some(),
             )
             // A rejected registration runs no reconcile, so a gate set for one above would
             // be held by nothing and take the node out until the next leadership change.
@@ -2984,11 +2987,10 @@ impl SlurmController for ControllerService {
                 register_node_rpc_status(error)
             })?;
 
-        // A first registration builds the node record from scratch, which is
-        // also the earliest moment the gate has anything to be recorded on.
-        if ledger.is_some() && !known_before {
-            self.cluster.set_reconcile_pending(&req.hostname, true);
-        }
+        // A first registration now carries its own gate atomically (the
+        // `reconcile_pending` passed into `register_node` above lands in the same
+        // WAL entry that creates the node), so there is no longer a second,
+        // separate proposal to race the scheduler here.
 
         // Recorded only once the registration has been accepted, and before the
         // reconcile below: a rejected one must disown no other lifetime.
@@ -7669,6 +7671,7 @@ mod tests {
     fn register_a_node(cluster: &Arc<ClusterManager>, name: &str) {
         cluster.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: name.into(),
             hostname: name.into(),
             resources: spur_core::resource::ResourceSet {
@@ -8334,6 +8337,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .expect("point the node at its probe agent");
 
@@ -8536,6 +8540,7 @@ mod tests {
         let cluster = Arc::new(ClusterManager::new(step_test_config(), dir.path()).unwrap());
         cluster.apply_operation(&spur_core::wal::WalOperation::NodeRegister {
             runs_job_epilog: false,
+            reconcile_pending: false,
             name: "n1".into(),
             hostname: "n1".into(),
             resources: spur_core::resource::ResourceSet {
@@ -11818,6 +11823,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .expect("update recovery probe address");
     }
@@ -11842,6 +11848,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .expect("point the node at its probe agent");
         for _ in 0..200 {
@@ -12127,6 +12134,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .expect("point n1 at its live probe agent");
 
@@ -12148,6 +12156,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .expect("register the untouched peer");
         for name in ["n1", "n2"] {
@@ -12470,6 +12479,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .unwrap();
         for _ in 0..200 {
@@ -12696,6 +12706,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .unwrap();
         for _ in 0..200 {
@@ -12866,6 +12877,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .unwrap();
         for _ in 0..200 {
@@ -13317,6 +13329,7 @@ mod tests {
                     std::collections::HashMap::new(),
                     true,
                     false,
+                    false, // reconcile_pending: no ledger to reconcile in this test
                 )
                 .unwrap();
         }
@@ -13424,6 +13437,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .unwrap();
         for _ in 0..200 {
@@ -13789,6 +13803,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .unwrap();
         for _ in 0..200 {
@@ -13874,6 +13889,7 @@ mod tests {
                     std::collections::HashMap::new(),
                     true,
                     false,
+                    false, // reconcile_pending: no ledger to reconcile in this test
                 )
                 .unwrap();
             svc.cluster
@@ -14010,6 +14026,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .unwrap();
         svc.cluster
@@ -14094,6 +14111,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .unwrap();
     }
@@ -15462,6 +15480,7 @@ mod tests {
                     std::collections::HashMap::new(),
                     true,
                     false,
+                    false, // reconcile_pending: no ledger to reconcile in this test
                 )
                 .unwrap();
         }

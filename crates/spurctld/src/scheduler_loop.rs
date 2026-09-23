@@ -4606,6 +4606,7 @@ mod tests {
                 HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .unwrap();
             let n = name.to_string();
@@ -4619,6 +4620,7 @@ mod tests {
 
             cm.apply_operation(&WalOperation::NodeRegister {
                 runs_job_epilog: false,
+                reconcile_pending: false,
                 name: name.into(),
                 hostname: name.into(),
                 resources: ResourceSet {
@@ -6084,6 +6086,7 @@ mod tests {
                 HashMap::new(),
                 true,
                 false,
+                false, // reconcile_pending: no ledger to reconcile in this test
             )
             .unwrap();
             let n = name.to_string();
@@ -6866,6 +6869,7 @@ mod tests {
 
             cm.apply_operation(&WalOperation::NodeRegister {
                 runs_job_epilog: true,
+                reconcile_pending: false,
                 name: name.into(),
                 hostname: name.into(),
                 resources: ResourceSet {

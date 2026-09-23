@@ -254,6 +254,12 @@ pub enum WalOperation {
         /// a pre-declaration entry, which replays as a node that never gates.
         #[serde(default)]
         runs_job_epilog: bool,
+        /// Hold the node out of scheduling from the instant this entry applies, so
+        /// a first-time registration with a ledger to reconcile never has a window
+        /// where it is visible and schedulable before the gate is set. `false` on a
+        /// pre-gate entry, which replays as a node that came up already trusted.
+        #[serde(default)]
+        reconcile_pending: bool,
     },
     NodeUpdate {
         name: String,
@@ -1347,6 +1353,94 @@ mod deregistration_wal_tests {
             assert_eq!(address, "10.0.0.1:6818");
             assert_eq!((port, wg_pubkey.as_str()), (6818, ""));
             assert_eq!((version.as_str(), source), ("0.8.0", NodeSource::default()));
+        }
+    }
+
+    // First-time registration carries its own gate atomically now, riding the
+    // same variant a pre-upgrade controller already knows how to skip.
+    #[test]
+    fn a_pre_upgrade_node_register_carries_no_reconcile_gate() {
+        const REGISTER: &str = r#"{"NodeRegister":{"name":"n1","hostname":"n1","resources":{"cpus":2,"memory_mb":1000,"gpus":[],"generic":{}},"address":"10.0.0.1","port":6818,"wg_pubkey":"","version":"0.11.0","labels":{},"source":{"type":"NativeHost"}}}"#;
+        let op: WalOperation = serde_json::from_str(REGISTER)
+            .expect("frozen NodeRegister must deserialize; a new field needs #[serde(default)]");
+        match op {
+            WalOperation::NodeRegister {
+                name,
+                reconcile_pending,
+                ..
+            } => {
+                assert_eq!(name, "n1");
+                assert!(
+                    !reconcile_pending,
+                    "an entry that predates the gate must replay as already trusted"
+                );
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // The other half of the upgrade: a controller predating the gate has to read
+    // an entry carrying it, which holds only while unknown fields stay ignored.
+    #[test]
+    fn a_pre_upgrade_controller_still_reads_a_register_entry_carrying_the_gate() {
+        #[derive(Deserialize)]
+        enum PreGateWalOperation {
+            NodeRegister {
+                name: String,
+                #[serde(default)]
+                hostname: String,
+                resources: ResourceSet,
+                address: String,
+                #[serde(default = "default_port")]
+                port: u16,
+                #[serde(default)]
+                wg_pubkey: String,
+                #[serde(default)]
+                version: String,
+                #[serde(default)]
+                labels: HashMap<String, String>,
+                #[serde(default)]
+                source: NodeSource,
+            },
+        }
+
+        for gate in [false, true] {
+            let encoded = serde_json::to_string(&WalOperation::NodeRegister {
+                name: "n1".into(),
+                hostname: "n1".into(),
+                resources: ResourceSet::default(),
+                address: "10.0.0.1".into(),
+                port: 6818,
+                wg_pubkey: String::new(),
+                version: "0.12.0".into(),
+                labels: HashMap::new(),
+                source: NodeSource::default(),
+                runs_job_epilog: false,
+                reconcile_pending: gate,
+            })
+            .expect("serialize");
+
+            let PreGateWalOperation::NodeRegister {
+                name,
+                hostname,
+                resources,
+                address,
+                port,
+                wg_pubkey,
+                version,
+                labels,
+                source,
+            } = serde_json::from_str(&encoded).unwrap_or_else(|e| {
+                panic!("a controller without the gate field must still parse {encoded}: {e}")
+            });
+            assert_eq!((name.as_str(), hostname.as_str()), ("n1", "n1"));
+            assert_eq!(resources, ResourceSet::default());
+            assert_eq!(address, "10.0.0.1");
+            assert_eq!((port, wg_pubkey.as_str()), (6818, ""));
+            assert_eq!(
+                (version.as_str(), labels, source),
+                ("0.12.0", HashMap::new(), NodeSource::default())
+            );
         }
     }
 
