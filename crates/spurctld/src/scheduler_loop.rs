@@ -2860,8 +2860,12 @@ pub async fn pull_all_node_ledgers(cluster: &Arc<ClusterManager>, reason: &str) 
 }
 
 /// Refuse any launch for this run issued before now. Sent before the cancel,
-/// which alone races an in-flight launch and loses.
-async fn fence_run_on_nodes(
+/// which alone races an in-flight launch and loses. Also called on a run's
+/// normal settlement (`report_job_status`'s `AllDone` arm in server.rs) for the
+/// same reason: a scheduler-side dispatch retry that raced the run's own fast
+/// completion must not be admitted after the fact just because it settled
+/// before the retry's `LaunchJob` happened to arrive.
+pub(crate) async fn fence_run_on_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
     run_attempt: u32,
@@ -6354,6 +6358,38 @@ mod tests {
                 0,
                 "a graceful completion must not arm the stale-launch fence a real cancel needs"
             );
+        }
+
+        // The other half of the settlement fence (server.rs's `report_job_status`
+        // AllDone arm calls exactly this, with exactly this data, once a run's
+        // last node reports in) -- proves the mechanism a stale dispatch retry
+        // needs reaches the same node a real batch job actually ran on.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn fence_run_on_nodes_reaches_the_node_a_batch_job_settled_on() {
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _cancel_calls, fence_calls) = spawn_mock_agent_counting_fences().await;
+            register_node_at(&cm, "n1", addr);
+
+            let job_id = submit_and_wait(&cm, batch_spec("settles-then-fences", 1));
+            let started = process_assignment(cm.clone(), assignment(job_id, &["n1"])).await;
+            assert!(started, "the job must dispatch before it can settle");
+
+            let job = cm.get_job(job_id).unwrap();
+            assert!(
+                cm.node_complete(job_id, "n1", 0, 0, job.run_attempt)
+                    .is_ok(),
+                "the last node's report must settle the run"
+            );
+
+            // Mirrors report_job_status's AllDone arm: fence the exact run and
+            // nodes that just settled, so a retry racing this completion is
+            // refused instead of admitted after the fact.
+            fence_run_on_nodes(&cm, job_id, job.run_attempt, &job.allocated_nodes).await;
+
+            wait_for("fence_run reached the node the job settled on", || {
+                fence_calls.load(Ordering::SeqCst) >= 1
+            });
         }
 
         // A reservation failure here commits nothing, so without an explicit cancel

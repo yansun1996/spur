@@ -3118,10 +3118,28 @@ impl SlurmController for ControllerService {
 
         match completion_result {
             Some(Ok(NodeCompleteResult::AllDone { raft_index, .. })) => {
-                // node_complete only ends the job; this also tells the node to shut down
-                // STEP_EXTERN. Only a standalone srun's own step needs it (rare job fetch).
-                if is_owning_srun_step {
-                    if let Some(job) = self.cluster.get_job(req.job_id) {
+                if let Some(job) = self.cluster.get_job(req.job_id) {
+                    // A scheduler-side dispatch retry that raced this run's own
+                    // fast completion must be refused if it arrives after the
+                    // run has already settled here, not admitted as if it were
+                    // a fresh launch. Same fence the cancel path already sends,
+                    // just triggered by settlement instead of a cancellation.
+                    let cluster = self.cluster.clone();
+                    let job_id = req.job_id;
+                    let run_attempt = job.run_attempt;
+                    let nodes = job.allocated_nodes.clone();
+                    tokio::spawn(async move {
+                        crate::scheduler_loop::fence_run_on_nodes(
+                            &cluster,
+                            job_id,
+                            run_attempt,
+                            &nodes,
+                        )
+                        .await;
+                    });
+                    // node_complete only ends the job; this also tells the node to shut down
+                    // STEP_EXTERN. Only a standalone srun's own step needs it (rare job fetch).
+                    if is_owning_srun_step {
                         let cluster = self.cluster.clone();
                         tokio::spawn(async move {
                             crate::scheduler_loop::release_srun_allocation_on_agents(
