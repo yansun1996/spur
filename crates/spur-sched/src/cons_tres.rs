@@ -30,9 +30,8 @@ pub enum ReleaseGround {
     /// The controller dispatched a newer attempt onto this job id, and that
     /// dispatch is the decision which ends the attempt being displaced.
     SupersededByNewerAttempt,
-    /// Teardown finished: the run's processes are gone and local cleanup is
-    /// done. The record still exists (state `Cleaned`) until an ack clears it,
-    /// but the cores are physically idle and may be re-used.
+    /// Teardown finished and the cores are idle, though the record persists
+    /// (state `Cleaned`) until an ack clears it.
     TeardownComplete,
 }
 
@@ -534,9 +533,6 @@ impl NodeAllocation {
         self.owners.get(&job_id).map(|owned| owned.run_attempt)
     }
 
-    /// Release owned allocations whose job is neither live nor launching within
-    /// `launching_ttl`, returning the reclaimed ids. Recovers a failed teardown
-    /// or a dropped launch instead of stranding the node until spurd restart.
     /// Claims with nothing tracked behind them. A query, not a reclaim: a
     /// missing entry is not evidence that the job's work finished.
     pub fn unbacked_claims(
