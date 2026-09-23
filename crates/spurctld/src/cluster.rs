@@ -9778,8 +9778,33 @@ mod tests {
         // this handle alone reads as not ready, as its own test asserts.
         cm.set_raft(raft_that_cannot_apply(&raft_dir).await.raft);
 
+        // This substituted handle can never reach quorum (its one peer is
+        // unreachable), so it never stops retrying its own election -- its
+        // term is a genuinely moving target for as long as the handle lives,
+        // not just at startup. Priming the latch to a term read a moment
+        // earlier can lose the race to that background retry, especially
+        // under load; re-reading and re-priming immediately before each
+        // attempt, retried a bounded number of times with no sleep (each
+        // attempt is a handful of synchronous reads, not a real wait), is
+        // what actually closes the window instead of narrowing it.
+        let mut passed = false;
+        for _ in 0..50 {
+            let term = cm
+                .raft
+                .read()
+                .as_ref()
+                .unwrap()
+                .metrics()
+                .borrow()
+                .current_term;
+            cm.state_machine_ready_term.store(term, Ordering::Relaxed);
+            if cm.state_machine_ready(std::time::Duration::ZERO).await {
+                passed = true;
+                break;
+            }
+        }
         assert!(
-            cm.state_machine_ready(std::time::Duration::ZERO).await,
+            passed,
             "a controller that has caught up in this term must not have to wait again"
         );
     }
