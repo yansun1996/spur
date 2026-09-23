@@ -564,8 +564,13 @@ async fn main() -> anyhow::Result<()> {
     let agent_listener = tokio::net::TcpListener::bind(listen_addr).await?;
     info!(addr = %listen_addr, "agent port bound");
 
-    // Register with controller
-    reporter.register().await?;
+    // Register with controller. Bounded retry rides out a brief blip (the
+    // controller mid-restart, a network hiccup); anything longer than that is
+    // left to the process supervisor (e.g. systemd's own restart) rather than
+    // built into a longer in-process backoff here.
+    reporter
+        .register_with_retry(5, std::time::Duration::from_secs(2))
+        .await?;
 
     // Start the heartbeat loop right after registration, before the
     // completion-replay step below: replaying unacknowledged completions

@@ -394,6 +394,12 @@ For production, run the agent as a systemd service:
    Description=Spur Node Agent (spurd)
    After=network-online.target
    Wants=network-online.target
+   # Unbounded: systemd's default (5 restarts / 10s) can otherwise leave spurd
+   # permanently stopped after a controller outage longer than that, needing
+   # a manual `systemctl reset-failed` -- spurd itself already retries its
+   # first registration a few times before giving up, so a restart this soon
+   # is a real, repeated failure worth retrying forever, not a crash loop.
+   StartLimitIntervalSec=0
 
    [Service]
    Type=simple

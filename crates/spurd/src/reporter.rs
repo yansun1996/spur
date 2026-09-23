@@ -228,6 +228,21 @@ impl NodeReporter {
         Ok(())
     }
 
+    /// `register`, retried a few times with a short fixed delay on failure --
+    /// long enough to ride out the controller mid-restart or a brief network
+    /// blip, short enough that a genuinely unreachable controller still fails
+    /// fast. Unlike re-registration from the heartbeat loop (retried forever,
+    /// never fatal), this is the very first registration: failing it stops
+    /// `spurd` from ever starting, so it gets a bounded retry of its own
+    /// instead of depending solely on the process supervisor to restart it.
+    pub async fn register_with_retry(
+        &self,
+        attempts: u32,
+        delay: std::time::Duration,
+    ) -> anyhow::Result<()> {
+        retry_bounded(attempts, delay, || self.register()).await
+    }
+
     /// Notify the controller that this agent is shutting down.
     pub async fn deregister(&self, reason: &str) -> anyhow::Result<()> {
         let current_token = self.node_token.read().unwrap().clone();
@@ -339,6 +354,34 @@ impl NodeReporter {
                 }
                 Err(e) => warn!(error = %e, "heartbeat connection failed"),
             }
+        }
+    }
+}
+
+/// Retries `attempt` up to `attempts` times with a fixed `delay` between
+/// failures, returning the last error once exhausted. Deliberately simple --
+/// a fixed delay, not exponential backoff with jitter -- since this exists to
+/// ride out a short blip, not to be a general-purpose retry policy.
+async fn retry_bounded<F, Fut, T>(
+    attempts: u32,
+    delay: std::time::Duration,
+    mut attempt: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let attempts = attempts.max(1);
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) if tries < attempts => {
+                warn!(tries, attempts, %error, "attempt failed, retrying");
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => return Err(error),
         }
     }
 }
@@ -611,6 +654,49 @@ mod tests {
     use spur_devices::cdi::cache::CdiCache;
     use spur_devices::cdi::spec::{CdiDevice, CdiSpec, ContainerEdits, DeviceNode};
     use spur_devices::{DeviceRegistry, GresCache, GresEntry};
+    use std::sync::atomic::AtomicU32;
+
+    #[tokio::test]
+    async fn retry_bounded_stops_at_the_first_success() {
+        let calls = AtomicU32::new(0);
+        let result = retry_bounded(5, std::time::Duration::from_millis(1), || {
+            let calls = &calls;
+            async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if calls.load(Ordering::Relaxed) < 3 {
+                    anyhow::bail!("not yet")
+                }
+                Ok(())
+            }
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            3,
+            "must not retry once it has already succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_bounded_gives_up_after_its_budget_and_propagates_the_error() {
+        let calls = AtomicU32::new(0);
+        let result: anyhow::Result<()> =
+            retry_bounded(3, std::time::Duration::from_millis(1), || {
+                let calls = &calls;
+                async move {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    anyhow::bail!("controller unreachable")
+                }
+            })
+            .await;
+        assert!(result.is_err(), "must propagate once the budget is spent");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            3,
+            "exactly `attempts` tries, no more"
+        );
+    }
 
     fn a_reporter() -> NodeReporter {
         NodeReporter::new(
