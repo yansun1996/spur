@@ -673,6 +673,13 @@ impl AdmissionStore {
         }
     }
 
+    /// Identity of the shared lock map, so a test can prove two handles are
+    /// clones of the same store rather than independent, unshared instances.
+    #[cfg(test)]
+    pub(crate) fn run_lock_map_identity(&self) -> usize {
+        Arc::as_ptr(&self.run_locks) as usize
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -695,8 +702,23 @@ impl AdmissionStore {
         body: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<T> {
         let lock = self.run_lock(run_key);
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        body()
+        let result = {
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            body()
+        };
+        self.prune_run_lock(run_key, lock);
+        result
+    }
+
+    /// Drop a run's lock entry once nothing else holds it, so a long-lived
+    /// agent's lock map doesn't grow for every run it has ever admitted.
+    fn prune_run_lock(&self, run_key: RunKey, lock: Arc<Mutex<()>>) {
+        let mut locks = self.run_locks.lock().unwrap_or_else(|e| e.into_inner());
+        // Under this lock, a strong count of 2 (the map's own entry plus ours)
+        // means no concurrent caller has been handed a clone to contend on it.
+        if Arc::strong_count(&lock) <= 2 {
+            locks.remove(&run_key);
+        }
     }
 
     pub(crate) fn participant_path(&self, run_key: RunKey, step_id: StepId) -> io::Result<PathBuf> {
@@ -3329,6 +3351,24 @@ mod tests {
                 "round {round}: the lower fence's writer must never win the race"
             );
         }
+    }
+
+    // Every mutator goes through with_run_lock, which must prune its map entry
+    // once nothing else references it, or a long-lived agent's lock map for
+    // every run it has ever admitted only grows.
+    #[test]
+    fn with_run_lock_prunes_its_entry_once_uncontended() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        for i in 0..50u32 {
+            store.admit_run(&run_with(i, 1, 1)).unwrap();
+            store.fence_run(key(i, 1), 2).unwrap();
+        }
+        assert_eq!(
+            store.run_locks.lock().unwrap().len(),
+            0,
+            "no run's lock should still be held once every mutator call has returned"
+        );
     }
 
     // A race that leaves the owner unset must not let whichever sibling acks

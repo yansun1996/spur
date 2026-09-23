@@ -4040,6 +4040,9 @@ pub struct AgentService {
     lifecycle: crate::job_lifecycle::JobLifecycle,
     stepds: Arc<Mutex<StepdMap>>,
     stepd_state_dir: std::path::PathBuf,
+    /// Shared so its per-run locks actually serialize concurrent RPCs; a fresh
+    /// store per call would give each caller its own, unshared lock map.
+    admissions: crate::admission::AdmissionStore,
     /// Unit tests exercise launch mechanics without a built `spurstepd`, so they
     /// keep the legacy path. Production always supervises.
     #[cfg(test)]
@@ -4094,9 +4097,10 @@ impl AgentService {
         )
     }
 
-    /// The entitlement ledger, keyed to the node this agent serves.
+    /// The entitlement ledger, keyed to the node this agent serves. Cloning shares the
+    /// same per-run locks, so concurrent callers actually serialize against each other.
     pub(crate) fn admissions(&self) -> crate::admission::AdmissionStore {
-        crate::admission::AdmissionStore::new(&self.stepd_state_dir, &self.reporter.hostname)
+        self.admissions.clone()
     }
 }
 
@@ -4201,6 +4205,12 @@ impl AgentService {
             None
         };
 
+        let stepd_state_dir = std::env::var("SPUR_STEPD_STATE_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/var/spool/spur"));
+        let admissions =
+            crate::admission::AdmissionStore::new(&stepd_state_dir, &reporter.hostname);
+
         Self {
             reporter,
             running,
@@ -4221,9 +4231,8 @@ impl AgentService {
             stepds: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             force_legacy_launch: true,
-            stepd_state_dir: std::env::var("SPUR_STEPD_STATE_DIR")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| std::path::PathBuf::from("/var/spool/spur")),
+            stepd_state_dir,
+            admissions,
             allow_root_jobs,
             spurd_is_root: crate::privdrop::spurd_runs_as_root(),
             auth_audience: String::new(),
@@ -4285,6 +4294,8 @@ impl AgentService {
 
     pub fn with_runtime_state_dir(mut self, state_dir: impl Into<std::path::PathBuf>) -> Self {
         self.stepd_state_dir = state_dir.into();
+        self.admissions =
+            crate::admission::AdmissionStore::new(&self.stepd_state_dir, &self.reporter.hostname);
         self
     }
 
@@ -7724,8 +7735,6 @@ impl SlurmAgent for AgentService {
                 // like the monitor loop's completion teardown would (which never runs since `running` is never entered).
                 if !committed {
                     drop(jobs);
-                    reservation_guard.mark_reaped();
-                    reservation_guard.release().await;
                     warn!(
                         job_id,
                         "reservation reclaimed during launch; aborting to avoid running unbacked"
@@ -7741,6 +7750,10 @@ impl SlurmAgent for AgentService {
                         }
                     }
                     let _ = result.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
+                    // Release only once the kill signal is sent, so the slice is never
+                    // freed while the old process could still be running.
+                    reservation_guard.mark_reaped();
+                    reservation_guard.release().await;
                     let cgroup = result.cgroup_path.take();
                     let running = self.running.clone();
                     // The guard moves into the task: reaping can outlive this call, and
@@ -15195,6 +15208,26 @@ mod tests {
         .with_runtime_state_dir(configured.clone());
 
         assert_eq!(service.stepd_state_dir, configured);
+        // The rebuilt store must follow the override, not the constructor-time default.
+        assert_eq!(service.admissions().root(), configured.join("admission"));
+    }
+
+    // A fresh AdmissionStore per call would give each RPC handler its own,
+    // unshared lock map, silently defeating with_run_lock's serialization.
+    #[test]
+    fn admissions_returns_clones_of_one_shared_store() {
+        let service = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+
+        assert_eq!(
+            service.admissions().run_lock_map_identity(),
+            service.admissions().run_lock_map_identity(),
+            "two calls to admissions() must share the same lock map"
+        );
     }
 
     fn test_gpu_registry() -> DeviceRegistry {
