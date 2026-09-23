@@ -14,7 +14,6 @@
 //! - NVIDIA: bind-mount /dev/nvidia* + libnvidia-container or driver libs
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -506,8 +505,12 @@ pub fn infer_rootfs_mode(base: &str) -> RootfsMode {
 
 /// Sibling files to a step's rootfs (never inside it, so pivot_root can't hide
 /// them): `.launch` is the pid to watch, `.exit` its real recovered outcome.
+fn step_marker_name(base: &str, suffix: &str) -> String {
+    format!("{base}.{suffix}")
+}
+
 fn step_marker_path(base: &str, suffix: &str) -> PathBuf {
-    container_dir().join(format!("{base}.{suffix}"))
+    container_dir().join(step_marker_name(base, suffix))
 }
 
 /// Computed before the fork so the path can be handed to the child to write.
@@ -518,9 +521,11 @@ pub fn step_exit_marker_path(base: &str) -> PathBuf {
 /// A launch precondition, not best-effort — the sweep trusts a missing
 /// marker to mean a step never got this far.
 pub fn write_step_launch_marker(base: &str, pid: i32, run_attempt: u32) -> std::io::Result<()> {
-    let file = std::fs::File::create(step_marker_path(base, "launch"))?;
-    (&file).write_all(format!("{pid}\n{run_attempt}\n").as_bytes())?;
-    file.sync_all()
+    crate::stepd::publish_private(
+        &container_dir(),
+        &step_marker_name(base, "launch"),
+        format!("{pid}\n{run_attempt}\n").as_bytes(),
+    )
 }
 
 pub fn read_step_launch_marker(base: &str) -> Option<(i32, u32)> {
@@ -1153,8 +1158,15 @@ fn wait_and_mirror_exit_code(child: nix::unistd::Pid, exit_marker: Option<&Path>
         _ => 1,
     };
     if let Some(path) = exit_marker {
-        let write = std::fs::File::create(path)
-            .and_then(|mut f| f.write_all(code.to_string().as_bytes()).and(f.sync_all()));
+        let write = match (path.parent(), path.file_name()) {
+            (Some(dir), Some(name)) => {
+                let name = name.to_string_lossy();
+                crate::stepd::publish_private(dir, &name, code.to_string().as_bytes())
+            }
+            _ => Err(std::io::Error::other(
+                "exit marker path has no parent/file name",
+            )),
+        };
         if let Err(e) = write {
             warn!(path = %path.display(), error = %e, "failed to record a step's exit marker");
         }
@@ -1162,10 +1174,8 @@ fn wait_and_mirror_exit_code(child: nix::unistd::Pid, exit_marker: Option<&Path>
     code
 }
 
-/// Fork to enter a new PID namespace. The child (PID 1 inside the namespace)
-/// returns Ok(()); the parent waits for the child and exits. The child also
-/// gets its own mount namespace: shared with the parent, its later pivot_root
-/// would sever the parent's own host access, needed to write `exit_marker`.
+/// Fork into a new PID namespace (child is PID 1, returns `Ok(())`; parent waits).
+/// The child also unshares mount ns so its pivot_root can't sever the parent's host access needed to write `exit_marker`.
 fn fork_into_pid_namespace(exit_marker: Option<&Path>) -> anyhow::Result<()> {
     match unsafe { nix::unistd::fork().context("fork for PID namespace")? } {
         nix::unistd::ForkResult::Child => {
@@ -2079,9 +2089,33 @@ pub(crate) mod tests {
         });
     }
 
+    /// Lists names in `dir` still bearing `publish_private`'s `.tmp` suffix —
+    /// a leftover would mean a write path fell back to a non-atomic create+write.
+    fn leftover_tmp_files(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn write_step_launch_marker_goes_through_the_atomic_publish_path() {
+        with_container_dir(|dir| {
+            write_step_launch_marker("step_7_3", 555, 2).unwrap();
+            assert_eq!(read_step_launch_marker("step_7_3"), Some((555, 2)));
+            assert_eq!(
+                leftover_tmp_files(dir),
+                Vec::<String>::new(),
+                "an atomic marker write must rename its temp file away, never leave it behind"
+            );
+        });
+    }
+
     #[test]
     fn an_exit_marker_written_by_the_wait_helper_is_readable_by_base() {
-        with_container_dir(|_| {
+        with_container_dir(|dir| {
             let path = step_exit_marker_path("step_9_1");
             match unsafe { nix::unistd::fork().unwrap() } {
                 nix::unistd::ForkResult::Child => std::process::exit(5),
@@ -2094,6 +2128,11 @@ pub(crate) mod tests {
                 read_step_exit_marker("step_9_1"),
                 Some(5),
                 "the exit marker written by the wait helper must be readable back by base name"
+            );
+            assert_eq!(
+                leftover_tmp_files(dir),
+                Vec::<String>::new(),
+                "the wait helper's exit-marker write must also go through the atomic publish path"
             );
         });
     }
@@ -2108,9 +2147,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// True when this host lets an unprivileged process create user + mount
-    /// namespaces. Some hardened kernels disable this via sysctl; that's a
-    /// host property the test should skip on, not fail against.
+    /// True when this host allows unprivileged user+mount namespaces (some
+    /// hardened kernels disable this via sysctl) — a skip condition, not a failure.
     fn unprivileged_namespaces_supported() -> bool {
         match unsafe { nix::unistd::fork().unwrap() } {
             nix::unistd::ForkResult::Child => {
@@ -2125,10 +2163,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// A child sharing its wrapper's mount namespace loses the wrapper's own
-    /// host filesystem access the moment the child pivot_roots (container.rs's
-    /// real launch path, via pivot_into_rootfs) — including the exit marker
-    /// the wrapper must still write after reaping the child.
+    /// A child sharing its wrapper's mount ns would lose host filesystem access on
+    /// pivot_root — including the exit marker the wrapper must write after reaping it.
     #[test]
     fn a_pivoting_child_does_not_break_the_wrappers_exit_marker_write() {
         if !unprivileged_namespaces_supported() {
@@ -2146,11 +2182,8 @@ pub(crate) mod tests {
 
             match unsafe { nix::unistd::fork().unwrap() } {
                 nix::unistd::ForkResult::Child => {
-                    // Mirrors container_init's rootless setup path: a fresh
-                    // user+pid namespace, then fork into the pid-namespace
-                    // wrapper exactly as a real container launch does. Every
-                    // failure exits this forked child directly rather than
-                    // unwinding a panic through it.
+                    // Mirrors container_init's rootless setup path; failures exit
+                    // this forked child directly rather than unwinding a panic through it.
                     if let Err(error) = setup_user_namespace(
                         nix::unistd::getuid().as_raw(),
                         nix::unistd::getgid().as_raw(),

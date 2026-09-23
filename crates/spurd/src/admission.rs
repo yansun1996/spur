@@ -4,10 +4,11 @@
 //! The node's entitlement ledger. `runtime/` answers "is it alive"; this answers
 //! "what is it entitled to", and survives the supervisor that earned it.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use spur_core::job::{LedgerDisposition, RunKey, LAUNCH_LIFETIME_MS};
@@ -132,16 +133,14 @@ pub struct ControllerAck {
     #[serde(default)]
     pub release_raft_index: Option<u64>,
     /// Legacy: the controller answered a claim it had no record of. Retained
-    /// for on-disk compatibility with records written before this field was
-    /// removed. New code ignores it: only a real Raft index counts.
+    /// for on-disk compatibility; new code ignores it and trusts only a real index.
     #[serde(default, skip_serializing)]
     pub settled_unrecorded_claim: bool,
 }
 
 impl ControllerAck {
-    /// Whether the controller has committed this run's completion. Only a real
-    /// Raft index counts; zero means the controller had no record (so no commit),
-    /// and `None` means no acknowledgement at all.
+    /// Whether the controller has committed this run's completion. Zero means
+    /// no record (so no commit); `None` means no acknowledgement at all.
     pub fn is_committed(&self) -> bool {
         self.release_raft_index.is_some_and(|idx| idx > 0)
     }
@@ -523,11 +522,13 @@ impl LaunchFences {
         if self.expires_at_unix_ms > 0 && now_unix_ms > self.expires_at_unix_ms {
             return Some(LaunchRefusal::Expired);
         }
+        // An unstamped launch (pre-upgrade controller) is the one legitimate
+        // empty digest; a stamped one must not read an empty digest as a repeat.
+        let unstamped = self.issued_at_unix_ms == 0;
         match admitted_digest {
             Some(admitted)
-                if !admitted.is_empty()
-                    && !self.command_digest.is_empty()
-                    && admitted != self.command_digest =>
+                if admitted != self.command_digest
+                    && !(unstamped && (admitted.is_empty() || self.command_digest.is_empty())) =>
             {
                 Some(LaunchRefusal::ConflictingDigest)
             }
@@ -643,25 +644,59 @@ pub struct LoadedAdmissions {
 pub struct AdmissionStore {
     root: PathBuf,
     node: String,
-}
-
-/// Whether this step answers for the run's lifetime. A run that named an owner
-/// is answered for by it alone; one that named none has only itself to speak.
-fn step_answers_for_run(run: &RunAdmission, step_id: StepId) -> bool {
-    run.lifecycle_owner_step
-        .is_none_or(|owner| owner == step_id)
+    /// One mutex per run, guarding its load-mutate-write cycle so concurrent
+    /// callers serialize per run rather than node-wide. Shared by every clone.
+    run_locks: Arc<Mutex<HashMap<RunKey, Arc<Mutex<()>>>>>,
 }
 
 impl AdmissionStore {
+    /// Whether this step answers for the run: the named owner alone, or --
+    /// with none named -- any single participant, but only while it has one.
+    fn step_answers_for_run(
+        &self,
+        run: &RunAdmission,
+        run_key: RunKey,
+        step_id: StepId,
+    ) -> io::Result<bool> {
+        if let Some(owner) = run.lifecycle_owner_step {
+            return Ok(owner == step_id);
+        }
+        let (participants, _) = self.participants(run_key)?;
+        Ok(participants.len() <= 1)
+    }
+
     pub fn new(state_dir: impl Into<PathBuf>, node: impl Into<String>) -> Self {
         Self {
             root: state_dir.into().join("admission"),
             node: node.into(),
+            run_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The mutex for one run's identity, created on first use. Held for a
+    /// whole load-mutate-write cycle, never just the write.
+    fn run_lock(&self, run_key: RunKey) -> Arc<Mutex<()>> {
+        let mut locks = self.run_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(run_key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Runs `body` with this run's lock held for its entire duration, so no
+    /// other mutator can observe or clobber a half-applied update to it.
+    fn with_run_lock<T>(
+        &self,
+        run_key: RunKey,
+        body: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let lock = self.run_lock(run_key);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        body()
     }
 
     pub(crate) fn participant_path(&self, run_key: RunKey, step_id: StepId) -> io::Result<PathBuf> {
@@ -700,6 +735,13 @@ impl AdmissionStore {
     /// fields carry forward, so a relaunch cannot re-admit what a cutoff fenced.
     pub fn admit_run(&self, run: &RunAdmission) -> io::Result<()> {
         let key = run.key().ok_or_else(|| unaddressable(run.job_id))?;
+        self.with_run_lock(key, || self.admit_run_locked(run))
+    }
+
+    /// The merge-and-write body of `admit_run`, for a caller that already
+    /// holds this run's lock -- so it neither deadlocks on nor re-pays for it.
+    fn admit_run_locked(&self, run: &RunAdmission) -> io::Result<()> {
+        let key = run.key().ok_or_else(|| unaddressable(run.job_id))?;
         let mut run = run.clone();
         // Only a genuinely absent record starts from a blank slate; any other
         // read failure would silently reset the cutoffs a launch is fenced by.
@@ -711,11 +753,19 @@ impl AdmissionStore {
                 run.max_launch_expiry_unix_ms = run
                     .max_launch_expiry_unix_ms
                     .max(existing.max_launch_expiry_unix_ms);
-                // Carried forward only while this write is not itself clearing it.
-                // Any acknowledgement (real commit or "no record" with index 0) clears
-                // the hold; only the absence of an ack preserves it.
+                // Cleared only by a write that itself carries a fresh ack.
                 if run.conflict_hold.is_none() && run.controller_ack.release_raft_index.is_none() {
                     run.conflict_hold = existing.conflict_hold;
+                }
+                // A relaunch is always built fresh; without this, one arriving
+                // after the controller ends this run would un-decide it here.
+                if existing.state == RunState::Cleaned {
+                    run.state = RunState::Cleaned;
+                }
+                run.cancelled_by_controller |= existing.cancelled_by_controller;
+                run.slice_released |= existing.slice_released;
+                if run.controller_ack.release_raft_index.is_none() {
+                    run.controller_ack = existing.controller_ack;
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -899,59 +949,61 @@ impl AdmissionStore {
     /// Read-modify-write so cleanup cannot discard a hold or the creation time.
     /// The epilog debt only ever widens here: clearing one is the hook's to do.
     pub fn mark_run_cleaned(&self, run_key: RunKey, epilog: EpilogOwed) -> io::Result<bool> {
-        let mut run = match self.load_run(run_key) {
-            Ok(run) => run,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        let already_cleaned = run.state == RunState::Cleaned;
-        let epilog = match (epilog, run.cleanup.epilog) {
-            (EpilogOwed::Yes, HookState::NotStarted) => HookState::Pending,
-            // A re-mark may add a debt but never settle one: only the first
-            // stands for the teardown that could have lost the hook's owner.
-            (_, recorded) if already_cleaned => recorded,
-            (_, recorded) => recorded.settled_after_owner_loss(),
-        };
-        if already_cleaned && run.cleanup.epilog == epilog {
-            return Ok(true);
-        }
-        run.state = RunState::Cleaned;
-        run.cleanup.epilog = epilog;
-        self.admit_run(&run)?;
-        Ok(true)
+        self.with_run_lock(run_key, || {
+            let mut run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            let already_cleaned = run.state == RunState::Cleaned;
+            let epilog = match (epilog, run.cleanup.epilog) {
+                (EpilogOwed::Yes, HookState::NotStarted) => HookState::Pending,
+                // A re-mark may add a debt but never settle one: only the first
+                // stands for the teardown that could have lost the hook's owner.
+                (_, recorded) if already_cleaned => recorded,
+                (_, recorded) => recorded.settled_after_owner_loss(),
+            };
+            if already_cleaned && run.cleanup.epilog == epilog {
+                return Ok(true);
+            }
+            run.state = RunState::Cleaned;
+            run.cleanup.epilog = epilog;
+            self.admit_run_locked(&run)?;
+            Ok(true)
+        })
     }
 
-    /// Settle a run the controller has answered, sparing a hook the record still
-    /// has in flight: only the teardown that owns one may call it lost.
-    /// The controller's answer and the cleaned state it settles, under one read
-    /// and one write; split, they cost the completion path a second fsync pair.
+    /// Settle a run the controller has answered, sparing a hook still in
+    /// flight -- the answer and the cleaned state it settles, in one write.
     pub fn record_acknowledged_completion(
         &self,
         run_key: RunKey,
         answered_by: StepId,
         release_raft_index: u64,
     ) -> io::Result<bool> {
-        let mut run = match self.load_run(run_key) {
-            Ok(run) => run,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        // A step that does not answer for the run cannot acknowledge it: its own
-        // exit is not the controller's word that the run is over.
-        if !step_answers_for_run(&run, answered_by) {
-            return Ok(false);
-        }
-        run.controller_ack.release_raft_index = Some(release_raft_index);
-        // An acknowledged completion resolves exactly what a hold taken for an
-        // untracked claim was preserving, and nothing else would ever clear it.
-        run.conflict_hold = None;
-        // Settling a hook still in flight is the teardown's to do, never an
-        // acknowledgement's: the controller cannot see whose hook is still running.
-        if !run.cleanup.epilog.is_in_flight() {
-            run.state = RunState::Cleaned;
-        }
-        self.admit_run(&run)?;
-        Ok(true)
+        self.with_run_lock(run_key, || {
+            let mut run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            // A step that does not answer for the run cannot acknowledge it: its own
+            // exit is not the controller's word that the run is over.
+            if !self.step_answers_for_run(&run, run_key, answered_by)? {
+                return Ok(false);
+            }
+            run.controller_ack.release_raft_index = Some(release_raft_index);
+            // An acknowledged completion resolves exactly what a hold taken for an
+            // untracked claim was preserving, and nothing else would ever clear it.
+            run.conflict_hold = None;
+            // Settling a hook still in flight is the teardown's to do, never an
+            // acknowledgement's: the controller cannot see whose hook is still running.
+            if !run.cleanup.epilog.is_in_flight() {
+                run.state = RunState::Cleaned;
+            }
+            self.admit_run_locked(&run)?;
+            Ok(true)
+        })
     }
 
     /// Record a hook the run has heard nothing about yet, deciding and writing
@@ -961,17 +1013,19 @@ impl AdmissionStore {
         run_key: RunKey,
         state: HookState,
     ) -> io::Result<bool> {
-        let mut run = match self.load_run(run_key) {
-            Ok(run) => run,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        if run.cleanup.epilog != HookState::NotStarted {
-            return Ok(false);
-        }
-        run.cleanup.epilog = state;
-        self.admit_run(&run)?;
-        Ok(true)
+        self.with_run_lock(run_key, || {
+            let mut run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if run.cleanup.epilog != HookState::NotStarted {
+                return Ok(false);
+            }
+            run.cleanup.epilog = state;
+            self.admit_run_locked(&run)?;
+            Ok(true)
+        })
     }
 
     /// One run and everything admitted under it, plus what could not be read: a
@@ -1025,42 +1079,60 @@ impl AdmissionStore {
         step_id: StepId,
         supervisor: SupervisorRef,
     ) -> io::Result<bool> {
-        let path = self.participant_path(run_key, step_id)?;
-        let mut participant = match self.load_participant(&path, run_key) {
-            Ok(participant) => participant,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        participant.supervisor = Some(supervisor);
-        participant.lifecycle = ParticipantLifecycle::Running;
-        self.admit_participant(&participant)?;
-        Ok(true)
+        self.with_run_lock(run_key, || {
+            let path = self.participant_path(run_key, step_id)?;
+            let mut participant = match self.load_participant(&path, run_key) {
+                Ok(participant) => participant,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            // A registration for a participant already past Running is stale or
+            // reordered; adopting it would resurrect a finished record instead.
+            if !matches!(
+                participant.lifecycle,
+                ParticipantLifecycle::Admitted | ParticipantLifecycle::Starting
+            ) {
+                tracing::debug!(
+                    %run_key,
+                    %step_id,
+                    lifecycle = ?participant.lifecycle,
+                    "ignoring a supervisor registration for a participant past Running"
+                );
+                return Ok(false);
+            }
+            participant.supervisor = Some(supervisor);
+            participant.lifecycle = ParticipantLifecycle::Running;
+            self.admit_participant(&participant)?;
+            Ok(true)
+        })
     }
 
     /// Mark a run as needing the controller's attention, preserving everything
     /// already on it. Idempotent: the first reason recorded is the one kept.
     pub fn take_conflict_hold(&self, run_key: RunKey, reason: &str) -> io::Result<HoldOutcome> {
-        let mut run = match self.load_run(run_key) {
-            Ok(run) => run,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(HoldOutcome::NoRecord)
+        self.with_run_lock(run_key, || {
+            let mut run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(HoldOutcome::NoRecord)
+                }
+                Err(error) => return Err(error),
+            };
+            // A release landing after the caller read its snapshot would otherwise
+            // leave a record claiming to hold a core it has already given back.
+            if run.controller_ack.is_committed() {
+                return Ok(HoldOutcome::AlreadyReleased);
             }
-            Err(error) => return Err(error),
-        };
-        // A release landing after the caller read its snapshot would otherwise
-        // leave a record claiming to hold a core it has already given back.
-        if run.controller_ack.is_committed() {
-            return Ok(HoldOutcome::AlreadyReleased);
-        }
-        if run.conflict_hold.is_some() {
-            return Ok(HoldOutcome::AlreadyHeld);
-        }
-        run.conflict_hold = Some(ConflictHold {
-            reason: reason.to_string(),
-            observed_at_unix_ms: now_unix_ms(),
-        });
-        self.admit_run(&run)?;
-        Ok(HoldOutcome::Taken)
+            if run.conflict_hold.is_some() {
+                return Ok(HoldOutcome::AlreadyHeld);
+            }
+            run.conflict_hold = Some(ConflictHold {
+                reason: reason.to_string(),
+                observed_at_unix_ms: now_unix_ms(),
+            });
+            self.admit_run_locked(&run)?;
+            Ok(HoldOutcome::Taken)
+        })
     }
 
     /// Raise a run's cutoff. Monotonic: a lower value is ignored, so a reordered
@@ -1071,30 +1143,32 @@ impl AdmissionStore {
         // it prevents, behind can lower a cutoff past a launch that should fence.
         let reject_before_unix_ms =
             reject_before_unix_ms.min(now_unix_ms().saturating_add(LAUNCH_LIFETIME_MS));
-        let mut run = match self.load_run(run_key) {
-            Ok(run) => run,
-            // Fencing a run this node has no record of still has to hold: the
-            // record is created below so a launch already in flight is refused.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let mut fresh = RunAdmission::new(
-                    run_key.job_id(),
-                    attempt,
-                    &self.node,
-                    AdmittedResources::default(),
-                    now_unix_ms(),
-                );
-                fresh.reject_before_unix_ms = reject_before_unix_ms;
-                self.admit_run(&fresh)?;
-                return Ok(reject_before_unix_ms);
+        self.with_run_lock(run_key, || {
+            let mut run = match self.load_run(run_key) {
+                Ok(run) => run,
+                // Fencing a run this node has no record of still has to hold: the
+                // record is created below so a launch already in flight is refused.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let mut fresh = RunAdmission::new(
+                        run_key.job_id(),
+                        attempt,
+                        &self.node,
+                        AdmittedResources::default(),
+                        now_unix_ms(),
+                    );
+                    fresh.reject_before_unix_ms = reject_before_unix_ms;
+                    self.admit_run_locked(&fresh)?;
+                    return Ok(reject_before_unix_ms);
+                }
+                Err(error) => return Err(error),
+            };
+            if reject_before_unix_ms <= run.reject_before_unix_ms {
+                return Ok(run.reject_before_unix_ms);
             }
-            Err(error) => return Err(error),
-        };
-        if reject_before_unix_ms <= run.reject_before_unix_ms {
-            return Ok(run.reject_before_unix_ms);
-        }
-        run.reject_before_unix_ms = reject_before_unix_ms;
-        self.admit_run(&run)?;
-        Ok(reject_before_unix_ms)
+            run.reject_before_unix_ms = reject_before_unix_ms;
+            self.admit_run_locked(&run)?;
+            Ok(reject_before_unix_ms)
+        })
     }
 
     /// The cutoff this run enforces, or none if it has no record yet. Read on
@@ -1119,7 +1193,7 @@ impl AdmissionStore {
         };
         // Without this the release fires for whichever participant happens to be
         // acknowledged first, which for a multi-step run is not the owner.
-        if !step_answers_for_run(&run, step_id) {
+        if !self.step_answers_for_run(&run, run_key, step_id)? {
             return Ok(None);
         }
         if run.cleanup.epilog.is_in_flight() {
@@ -1159,17 +1233,19 @@ impl AdmissionStore {
     /// Record how this run's epilog is going. The gate reads this, so a hook
     /// whose outcome never lands here is a gate that cannot bite.
     pub fn record_epilog(&self, run_key: RunKey, state: HookState) -> io::Result<bool> {
-        let mut run = match self.load_run(run_key) {
-            Ok(run) => run,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        if run.cleanup.epilog == state {
-            return Ok(true);
-        }
-        run.cleanup.epilog = state;
-        self.admit_run(&run)?;
-        Ok(true)
+        self.with_run_lock(run_key, || {
+            let mut run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if run.cleanup.epilog == state {
+                return Ok(true);
+            }
+            run.cleanup.epilog = state;
+            self.admit_run_locked(&run)?;
+            Ok(true)
+        })
     }
 
     /// Record that the controller has committed this run's completion. The
@@ -1185,14 +1261,13 @@ impl AdmissionStore {
         })
     }
 
-    /// Record the controller's answer to a claim it has no record of. An answer
-    /// and not a commit, so the release names it as such rather than a real index.
-    /// It answers for the whole run, so no step speaks for it.
+    /// Record the controller's answer to a claim it has no record of -- an
+    /// answer, not a commit. It answers for the whole run, so no step does.
     pub fn record_settled_claim(&self, run_key: RunKey) -> io::Result<bool> {
         self.take_controller_ack(run_key, None, |ack| {
             ack.settled_unrecorded_claim = true;
-            // Zero means "no record at controller" - not a real commit, but the
-            // run should be settled locally to free resources.
+            // Zero means "no record at controller", not a real commit -- but
+            // still settled enough to free resources.
             ack.release_raft_index = Some(0);
         })
     }
@@ -1203,54 +1278,62 @@ impl AdmissionStore {
         answered_by: Option<StepId>,
         record: impl FnOnce(&mut ControllerAck),
     ) -> io::Result<bool> {
-        let mut run = match self.load_run(run_key) {
-            Ok(run) => run,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        // A step that does not answer for the run cannot acknowledge it: its own
-        // exit is not the controller's word that the run is over.
-        if answered_by.is_some_and(|step_id| !step_answers_for_run(&run, step_id)) {
-            return Ok(false);
-        }
-        record(&mut run.controller_ack);
-        // An acknowledged completion resolves exactly what a hold taken for an
-        // untracked claim was preserving, and nothing else would ever clear it.
-        run.conflict_hold = None;
-        self.admit_run(&run)?;
-        Ok(true)
+        self.with_run_lock(run_key, || {
+            let mut run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            // A step that does not answer for the run cannot acknowledge it: its
+            // own exit is not the controller's word that the run is over.
+            if let Some(step_id) = answered_by {
+                if !self.step_answers_for_run(&run, run_key, step_id)? {
+                    return Ok(false);
+                }
+            }
+            record(&mut run.controller_ack);
+            // An acknowledged completion resolves exactly what a hold taken for an
+            // untracked claim was preserving, and nothing else would ever clear it.
+            run.conflict_hold = None;
+            self.admit_run_locked(&run)?;
+            Ok(true)
+        })
     }
 
     /// Record the controller's cancel. Never creates a record: a cancel for a
     /// run this node never admitted has nothing to settle.
     pub fn mark_controller_cancelled(&self, run_key: RunKey) -> io::Result<bool> {
-        let mut run = match self.load_run(run_key) {
-            Ok(run) => run,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        if run.cancelled_by_controller {
-            return Ok(true);
-        }
-        run.cancelled_by_controller = true;
-        self.admit_run(&run)?;
-        Ok(true)
+        self.with_run_lock(run_key, || {
+            let mut run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if run.cancelled_by_controller {
+                return Ok(true);
+            }
+            run.cancelled_by_controller = true;
+            self.admit_run_locked(&run)?;
+            Ok(true)
+        })
     }
 
     /// Note that a run's slice has gone back to the node. Callers must have
     /// released it against an acknowledgement, not merely intend to.
     pub fn record_slice_released(&self, run_key: RunKey) -> io::Result<bool> {
-        let mut run = match self.load_run(run_key) {
-            Ok(run) => run,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        if run.slice_released {
-            return Ok(true);
-        }
-        run.slice_released = true;
-        self.admit_run(&run)?;
-        Ok(true)
+        self.with_run_lock(run_key, || {
+            let mut run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            if run.slice_released {
+                return Ok(true);
+            }
+            run.slice_released = true;
+            self.admit_run_locked(&run)?;
+            Ok(true)
+        })
     }
 
     /// Discharge every report a run still owes. Sound only once the controller
@@ -1276,16 +1359,18 @@ impl AdmissionStore {
     /// Mark a participant's completion as acknowledged, so the durable retry
     /// stops rediscovering it.
     pub fn record_report_acknowledged(&self, run_key: RunKey, step_id: StepId) -> io::Result<bool> {
-        let path = self.participant_path(run_key, step_id)?;
-        let mut participant = match self.load_participant(&path, run_key) {
-            Ok(participant) => participant,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        participant.final_report.acknowledged = true;
-        participant.lifecycle = ParticipantLifecycle::Exited;
-        self.admit_participant(&participant)?;
-        Ok(true)
+        self.with_run_lock(run_key, || {
+            let path = self.participant_path(run_key, step_id)?;
+            let mut participant = match self.load_participant(&path, run_key) {
+                Ok(participant) => participant,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error),
+            };
+            participant.final_report.acknowledged = true;
+            participant.lifecycle = ParticipantLifecycle::Exited;
+            self.admit_participant(&participant)?;
+            Ok(true)
+        })
     }
 
     pub fn remove_participant(&self, run_key: RunKey, step_id: StepId) -> io::Result<()> {
@@ -2526,9 +2611,8 @@ mod tests {
         assert!(store.ledger_cut("session-a").entries.is_empty());
     }
 
-    // A NoSuchRun (controller has no record) still releases the slice - holding
-    // resources for a run the controller cannot acknowledge is pointless. But it
-    // does not count as "committed" because no Raft write happened.
+    // A NoSuchRun still releases the slice, holding it serves nothing -- but
+    // it is not "committed", since it names no real Raft write.
     #[test]
     fn a_nosuchrun_releases_the_slice_but_is_not_committed() {
         let dir = tempfile::tempdir().unwrap();
@@ -3125,6 +3209,210 @@ mod tests {
         assert_eq!(recorded.boot_scope(None), BootScope::Unknown);
         assert_eq!(recorded.boot_scope(Some("abc")), BootScope::Same);
         assert_eq!(recorded.boot_scope(Some("def")), BootScope::Different);
+    }
+
+    // A stale or replayed registration arriving after the participant moved
+    // on must be a no-op, not a resurrection back to Running.
+    #[test]
+    fn a_stale_supervisor_registration_does_not_resurrect_a_finished_participant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        let mut exited = ParticipantAdmission::new(7, 1, STEP_BATCH, "n1", Default::default());
+        exited.lifecycle = ParticipantLifecycle::Exited;
+        store.admit_participant(&exited).unwrap();
+
+        let resurrecting = SupervisorRef {
+            pid: 12345,
+            start_ticks: 1,
+            boot_id: current_boot_id(),
+        };
+        assert!(!store
+            .record_supervisor(key(7, 1), STEP_BATCH, resurrecting)
+            .unwrap());
+
+        let (participants, _) = store.participants(key(7, 1)).unwrap();
+        assert_eq!(
+            participants[0].lifecycle,
+            ParticipantLifecycle::Exited,
+            "a stale registration must not resurrect a finished participant"
+        );
+        assert!(participants[0].supervisor.is_none());
+    }
+
+    #[test]
+    fn a_fresh_supervisor_registration_still_adopts_a_just_admitted_participant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store
+            .admit_participant(&ParticipantAdmission::new(
+                7,
+                1,
+                STEP_BATCH,
+                "n1",
+                Default::default(),
+            ))
+            .unwrap();
+
+        assert!(store
+            .record_supervisor(
+                key(7, 1),
+                STEP_BATCH,
+                SupervisorRef {
+                    pid: 999,
+                    start_ticks: 1,
+                    boot_id: current_boot_id(),
+                }
+            )
+            .unwrap());
+
+        let (participants, _) = store.participants(key(7, 1)).unwrap();
+        assert_eq!(participants[0].lifecycle, ParticipantLifecycle::Running);
+        assert!(participants[0].supervisor.is_some());
+    }
+
+    // A relaunch is always constructed fresh; without carrying these forward,
+    // a stale one arriving after the controller ends a run un-decides it.
+    #[test]
+    fn a_relaunch_cannot_un_cancel_un_commit_or_un_release_a_finished_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::No).unwrap();
+        store.mark_controller_cancelled(key(7, 1)).unwrap();
+        store
+            .record_controller_ack(key(7, 1), STEP_BATCH, 42)
+            .unwrap();
+        store.record_slice_released(key(7, 1)).unwrap();
+
+        // A stale relaunch, built the same way a real one is: fresh defaults.
+        store.admit_run(&run_with(7, 1, 9_000)).unwrap();
+
+        let after = store.load_run(key(7, 1)).unwrap();
+        assert_eq!(after.state, RunState::Cleaned, "must stay cleaned");
+        assert!(after.cancelled_by_controller, "must stay cancelled");
+        assert!(after.slice_released, "must stay released");
+        assert_eq!(
+            after.controller_ack.release_raft_index,
+            Some(42),
+            "must keep the real commit"
+        );
+    }
+
+    // fence_run's own read-check-write is the case B4 names: two racing
+    // callers must not let the lower cutoff's writer clobber the higher one.
+    #[test]
+    fn concurrent_fence_run_calls_on_one_key_never_lose_the_higher_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        let run_key = key(7, 1);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+
+        for round in 0..200u64 {
+            let low = 1_000 + round * 10;
+            let high = low + 5;
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    store.fence_run(run_key, low).unwrap();
+                });
+                scope.spawn(|| {
+                    barrier.wait();
+                    store.fence_run(run_key, high).unwrap();
+                });
+            });
+            assert_eq!(
+                store.reject_before(run_key),
+                Some(high),
+                "round {round}: the lower fence's writer must never win the race"
+            );
+        }
+    }
+
+    // A race that leaves the owner unset must not let whichever sibling acks
+    // first free a slice the other is still drawing on.
+    #[test]
+    fn an_unset_owner_with_a_sibling_present_answers_for_neither_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store
+            .admit_participant(&ParticipantAdmission::new(
+                7,
+                1,
+                STEP_BATCH,
+                "n1",
+                Default::default(),
+            ))
+            .unwrap();
+        store
+            .admit_participant(&ParticipantAdmission::new(
+                7,
+                1,
+                3,
+                "n1",
+                Default::default(),
+            ))
+            .unwrap();
+
+        assert!(!store
+            .record_controller_ack(key(7, 1), STEP_BATCH, 42)
+            .unwrap());
+        assert!(store
+            .release_is_due(key(7, 1), STEP_BATCH)
+            .unwrap()
+            .is_none());
+        assert!(store.release_is_due(key(7, 1), 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unset_owner_with_no_sibling_still_answers_for_its_only_participant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store
+            .admit_participant(&ParticipantAdmission::new(
+                7,
+                1,
+                STEP_BATCH,
+                "n1",
+                Default::default(),
+            ))
+            .unwrap();
+
+        assert!(store
+            .record_controller_ack(key(7, 1), STEP_BATCH, 42)
+            .unwrap());
+        assert!(store
+            .release_is_due(key(7, 1), STEP_BATCH)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn a_stamped_empty_digest_does_not_bypass_a_conflicting_recorded_one() {
+        let fences = LaunchFences {
+            issued_at_unix_ms: 100,
+            command_digest: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(
+            fences.check(200, 0, Some("aaa")),
+            Some(LaunchRefusal::ConflictingDigest),
+            "a stamped launch's empty digest must not read as an automatic repeat"
+        );
+    }
+
+    #[test]
+    fn two_empty_digests_on_a_stamped_launch_are_still_an_idempotent_repeat() {
+        let fences = LaunchFences {
+            issued_at_unix_ms: 100,
+            command_digest: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(fences.check(200, 0, Some("")), None);
     }
 
     #[test]
