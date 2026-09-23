@@ -3394,9 +3394,8 @@ mod tests {
         );
     }
 
-    // Same reasoning as the relaunch test above, for the epilog debt: settle_permit
-    // trusts cleanup.epilog to gate release, so a relaunch resetting it to
-    // NotStarted would let a run release while its epilog is still running.
+    // Same reasoning as above: settle_permit trusts cleanup.epilog to gate release,
+    // so resetting it to NotStarted would release while the epilog is still running.
     #[test]
     fn a_relaunch_cannot_erase_a_real_in_flight_epilog_debt() {
         let dir = tempfile::tempdir().unwrap();

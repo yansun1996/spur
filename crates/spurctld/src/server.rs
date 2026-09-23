@@ -2436,8 +2436,8 @@ impl SlurmController for ControllerService {
             .requeue_job_by_user(req.job_id, &req.user, caller_is_admin, req.hold)
             .map_err(cluster_err_to_precondition_status)?;
 
-        // Kill the old processes for jobs that were Running/Suspended; the
-        // requeue already freed their allocations and re-pended them.
+        // Kill the old processes for jobs that were Running/Suspended; the requeue
+        // already re-pended them (a still-epilog-gated node's slice stays charged).
         for job in outcome.killed {
             let cluster = self.cluster.clone();
             tokio::spawn(async move {

@@ -129,8 +129,8 @@ impl NodeReporter {
         Some(ledger_to_proto(cut))
     }
 
-    /// Whether to ask the controller to reconcile this node. Unlatched, so it
-    /// clears when the reconcile lands; off the runtime, because it reads disk.
+    /// Whether to ask the controller to reconcile this node. A latch: once set it
+    /// stays set until `note_ledger_pulled` clears it, not just while still true.
     pub(crate) async fn wants_reconcile(&self) -> bool {
         let Some(admissions) = self.admissions.get().cloned() else {
             return false;

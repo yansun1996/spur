@@ -208,8 +208,9 @@ pub enum WalOperation {
     },
     /// Evict a single job to NodeFail: same effect as a node health-check
     /// failure (frees allocations, feeds the auto-requeue path), but scoped
-    /// to one job instead of every job on a node. Used when a subset of a
-    /// job's assigned nodes never received the launch dispatch.
+    /// to one job instead of every job on a node. Used both for a launch
+    /// dispatch some assigned nodes never received, and for a node reconcile
+    /// finds no longer holds a job it was actually running.
     JobEvict {
         job_id: JobId,
         /// Human-readable bootstrap failure (shown via scontrol / logs).

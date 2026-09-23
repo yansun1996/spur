@@ -3550,7 +3550,7 @@ fn terminal_launch_config(
         gid: entry.gid,
         container,
         prolog_script: None,
-        // This legacy pty path's teardown runs no TaskEpilog, so keep both
+        // The supervised terminal's teardown runs no TaskEpilog, so keep both
         // task hooks off rather than run an unpaired prolog.
         task_prolog_script: None,
         task_epilog_script: None,

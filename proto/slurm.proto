@@ -1023,7 +1023,7 @@ message LaunchJobRequest {
   uint64 issued_at_unix_ms = 14;
   uint64 expires_at_unix_ms = 15;
   // Digest of the resolved command. An exact repeat is idempotent; a different
-  // command under the same identity is refused rather than silently relaunched.
+  // one is refused unless unstamped (issued_at_unix_ms = 0, legacy).
   string command_digest = 16;
 }
 
