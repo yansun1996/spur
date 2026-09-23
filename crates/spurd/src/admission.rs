@@ -701,22 +701,35 @@ impl AdmissionStore {
         run_key: RunKey,
         body: impl FnOnce() -> io::Result<T>,
     ) -> io::Result<T> {
-        let lock = self.run_lock(run_key);
-        let result = {
-            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            body()
+        // A struct so pruning still runs (via Drop) if `body` panics, rather
+        // than leaking this run's map entry on every unwind past this call.
+        struct PruneOnDrop<'a> {
+            store: &'a AdmissionStore,
+            run_key: RunKey,
+            lock: Arc<Mutex<()>>,
+        }
+        impl Drop for PruneOnDrop<'_> {
+            fn drop(&mut self) {
+                self.store.prune_run_lock(self.run_key, &self.lock);
+            }
+        }
+
+        let holder = PruneOnDrop {
+            store: self,
+            run_key,
+            lock: self.run_lock(run_key),
         };
-        self.prune_run_lock(run_key, lock);
-        result
+        let _guard = holder.lock.lock().unwrap_or_else(|e| e.into_inner());
+        body()
     }
 
     /// Drop a run's lock entry once nothing else holds it, so a long-lived
     /// agent's lock map doesn't grow for every run it has ever admitted.
-    fn prune_run_lock(&self, run_key: RunKey, lock: Arc<Mutex<()>>) {
+    fn prune_run_lock(&self, run_key: RunKey, lock: &Arc<Mutex<()>>) {
         let mut locks = self.run_locks.lock().unwrap_or_else(|e| e.into_inner());
         // Under this lock, a strong count of 2 (the map's own entry plus ours)
         // means no concurrent caller has been handed a clone to contend on it.
-        if Arc::strong_count(&lock) <= 2 {
+        if Arc::strong_count(lock) <= 2 {
             locks.remove(&run_key);
         }
     }
@@ -784,6 +797,14 @@ impl AdmissionStore {
                 if existing.state == RunState::Cleaned {
                     run.state = RunState::Cleaned;
                 }
+                // Same reasoning for the epilog debt: only a relaunch's fresh
+                // NotStarted default is refused, never a caller's forward move
+                // (e.g. record_epilog progressing it to Running/Succeeded).
+                if run.cleanup.epilog == HookState::NotStarted
+                    && existing.cleanup.epilog != HookState::NotStarted
+                {
+                    run.cleanup = existing.cleanup;
+                }
                 run.cancelled_by_controller |= existing.cancelled_by_controller;
                 run.slice_released |= existing.slice_released;
                 if run.controller_ack.release_raft_index.is_none() {
@@ -817,6 +838,15 @@ impl AdmissionStore {
     }
 
     pub fn admit_participant(&self, participant: &ParticipantAdmission) -> io::Result<()> {
+        let key = participant
+            .key()
+            .ok_or_else(|| unaddressable(participant.job_id))?;
+        self.with_run_lock(key, || self.admit_participant_locked(participant))
+    }
+
+    /// The write body of `admit_participant`, for a caller that already holds
+    /// this run's lock -- so it neither deadlocks on nor re-pays for it.
+    fn admit_participant_locked(&self, participant: &ParticipantAdmission) -> io::Result<()> {
         let key = participant
             .key()
             .ok_or_else(|| unaddressable(participant.job_id))?;
@@ -1124,7 +1154,7 @@ impl AdmissionStore {
             }
             participant.supervisor = Some(supervisor);
             participant.lifecycle = ParticipantLifecycle::Running;
-            self.admit_participant(&participant)?;
+            self.admit_participant_locked(&participant)?;
             Ok(true)
         })
     }
@@ -1390,26 +1420,30 @@ impl AdmissionStore {
             };
             participant.final_report.acknowledged = true;
             participant.lifecycle = ParticipantLifecycle::Exited;
-            self.admit_participant(&participant)?;
+            self.admit_participant_locked(&participant)?;
             Ok(true)
         })
     }
 
     pub fn remove_participant(&self, run_key: RunKey, step_id: StepId) -> io::Result<()> {
-        let path = self.participant_path(run_key, step_id)?;
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        self.with_run_lock(run_key, || {
+            let path = self.participant_path(run_key, step_id)?;
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        })
     }
 
     pub fn remove_run(&self, run_key: RunKey) -> io::Result<()> {
-        match fs::remove_dir_all(self.run_dir(run_key)?) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        self.with_run_lock(run_key, || {
+            match fs::remove_dir_all(self.run_dir(run_key)?) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        })
     }
 
     /// Three removal rules, and nothing else may delete a record: settled because it
@@ -3322,6 +3356,30 @@ mod tests {
         );
     }
 
+    // Same reasoning as the relaunch test above, for the epilog debt: settle_permit
+    // trusts cleanup.epilog to gate release, so a relaunch resetting it to
+    // NotStarted would let a run release while its epilog is still running.
+    #[test]
+    fn a_relaunch_cannot_erase_a_real_in_flight_epilog_debt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::Yes).unwrap();
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap().cleanup.epilog,
+            HookState::Pending
+        );
+
+        // A stale relaunch, built the same way a real one is: fresh defaults.
+        store.admit_run(&run_with(7, 1, 9_000)).unwrap();
+
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap().cleanup.epilog,
+            HookState::Pending,
+            "must not erase a real in-flight epilog debt"
+        );
+    }
+
     // fence_run's own read-check-write is the case B4 names: two racing
     // callers must not let the lower cutoff's writer clobber the higher one.
     #[test]
@@ -3354,8 +3412,7 @@ mod tests {
     }
 
     // Every mutator goes through with_run_lock, which must prune its map entry
-    // once nothing else references it, or a long-lived agent's lock map for
-    // every run it has ever admitted only grows.
+    // once unreferenced, or a long-lived agent's lock map only grows.
     #[test]
     fn with_run_lock_prunes_its_entry_once_uncontended() {
         let dir = tempfile::tempdir().unwrap();
