@@ -468,8 +468,7 @@ pub struct ClusterManager {
     reservations: RwLock<Vec<Reservation>>,
     steps: RwLock<HashMap<(JobId, u32), JobStep>>,
     /// Next numbered step id per job, reserved synchronously so two racing
-    /// `create_job_step` calls for one job can't compute the same id from an
-    /// uncommitted `steps` snapshot. See `allocate_step_id`.
+    /// `create_job_step` calls can't derive the same id. See `allocate_step_id`.
     next_step_id: RwLock<HashMap<JobId, u32>>,
     /// Configured cluster-wide license totals (immutable; from config). Current
     /// availability is derived as total minus the licenses held by active jobs
@@ -622,11 +621,8 @@ pub struct RequeueOutcome {
     pub skipped: Vec<String>,
 }
 
-/// Whether a dispatch backoff spends one of the job's `max_batch_requeue`
-/// retries. A node refusing work it already holds is a controller-vs-node
-/// drift the job neither caused nor can influence, so that refusal is
-/// [`Spared`](RequeueCharge::Spared): it still waits out the backoff, but the
-/// budget is reserved for failures the job is actually implicated in.
+/// Whether a dispatch backoff spends a `max_batch_requeue` retry; a node refusing
+/// work it already holds isn't the job's fault, so that case is [`Spared`](RequeueCharge::Spared).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequeueCharge {
     Charged,
@@ -1268,10 +1264,8 @@ impl ClusterManager {
         self.jobs.read().get(&job_id).cloned()
     }
 
-    /// The handful of fields a step-completion report needs to decide
-    /// whether it ends the job, read without paying for a full `Job` clone
-    /// on every report — only the rare ones that end up needing the rest of
-    /// the job (to release its allocation) go on to call `get_job`.
+    /// The handful of fields a step-completion report needs, read without paying
+    /// for a full `Job` clone; only reports that end the job call `get_job`.
     pub(crate) fn job_shape_for_step_completion(
         &self,
         job_id: JobId,
@@ -1860,6 +1854,11 @@ impl ClusterManager {
             if job.state != JobState::Pending {
                 anyhow::bail!("job {} cannot start from state {:?}", job_id, job.state);
             }
+            // A second reservation on top of one already charged would double the
+            // node's charge and collide two runs onto the same run_attempt.
+            if job.holds_a_placement() {
+                anyhow::bail!("job {} already holds a placement", job_id);
+            }
             job.run_attempt.saturating_add(1)
         };
         // `JobStart`'s apply has no state guard, so it charges the slice while
@@ -2057,9 +2056,10 @@ impl ClusterManager {
             let job = jobs
                 .get(&job_id)
                 .ok_or(NodeCompleteError::JobNotFound { job_id })?;
-            // Finalized, not terminal: a preempted run rests here mid-epilog, and
-            // its gated node's report is the one a finished job must still take.
-            was_gated = job.state.is_finalized() && job.is_epilog_gated_on(node_name);
+            // A finalized run resting mid-epilog, or a Pending one whose own
+            // requeue outran its gate, must still take that node's report.
+            was_gated = (job.state.is_finalized() || job.state == JobState::Pending)
+                && job.is_epilog_gated_on(node_name);
             if job.state.is_finalized() && !was_gated {
                 return Ok(NodeCompleteResult::AlreadyTerminal);
             }
@@ -2747,10 +2747,8 @@ impl ClusterManager {
     /// Pending. `requeue_after_launch_failure` can't be reused: its `requeue_count`
     /// bookkeeping is gated on a real transition out of Running, so without this a
     /// flaky node's job would be reassigned to it every tick, forever unbounded.
-    ///
-    /// `charge` decides whether the hold also spends a slot of the job's
-    /// `max_batch_requeue` budget; see [`RequeueCharge`]. Returns whether the
-    /// backoff it proposed is what frees the job's placement.
+    /// `charge` decides whether this spends `max_batch_requeue` budget (see
+    /// [`RequeueCharge`]); returns whether the backoff frees the job's placement.
     pub(crate) fn backoff_pending_job_after_dispatch_failure(
         &self,
         job_id: JobId,
@@ -3957,10 +3955,8 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Reserve the next numbered step id for a job, read-and-bump under one
-    /// lock so two racing calls can't derive the same id from an uncommitted
-    /// `steps` snapshot. Never cleared once seeded, or a step-create proposal
-    /// still in flight when the job finalizes could be reissued.
+    /// Reserve the next numbered step id, read-and-bump under one lock so two
+    /// racing calls can't derive the same id. Never cleared once seeded.
     pub fn allocate_step_id(&self, job_id: JobId) -> u32 {
         let mut next = self.next_step_id.write();
         let counter = next.entry(job_id).or_insert_with(|| {
@@ -4063,8 +4059,7 @@ impl ClusterManager {
         let mut candidates: Vec<PendingJobCandidate> = jobs
             .values()
             .filter(|job| job.state == JobState::Pending)
-            // A reservation is charged while the job is still Pending, so scheduling one
-            // again charges its nodes a second time for the same run.
+            // Skip early to avoid a wasted cycle; `reserve_placement` also enforces this.
             .filter(|job| !job.holds_a_placement())
             .filter(|job| !job.pending_reason.is_scheduling_hold())
             .filter_map(|job| {
@@ -5128,9 +5123,8 @@ impl ClusterManager {
         }
     }
 
-    /// Whether a finished job's epilog hold still protects anything. A node that
-    /// is gone or unheard from runs no hook this could be shielding, and a node
-    /// that returns re-presents the claim through the normal reconcile path.
+    /// Whether a finished job's epilog hold still protects anything; a Down
+    /// node runs no hook this could be shielding.
     fn epilog_gate_still_binds(job: &Job, nodes: &HashMap<String, Node>) -> bool {
         job.epilog_gated_nodes
             .iter()
@@ -6031,10 +6025,8 @@ impl ClusterManager {
             }
         }
         drop(steps);
-        // `next_step_id[job_id]` is deliberately left in place: a step-create
-        // proposal this finalization races can still be in flight, and clearing
-        // the seed here would let it re-derive from `steps` before that
-        // proposal lands, reissuing its id. See `allocate_step_id`.
+        // `next_step_id[job_id]` is deliberately left in place: a still-in-flight
+        // step-create proposal could otherwise re-derive and reissue its id.
         // Licenses are not returned here: usage is derived from running jobs, so a
         // job leaving the running set frees its licenses automatically.
     }
@@ -6089,9 +6081,12 @@ impl ClusterManager {
             .collect()
     }
 
-    /// Nodes a requeue must not hand back, because this run is no longer charged
-    /// there. Read before a transition or clear rewrites what decides it.
+    /// Nodes a requeue must not hand back: not held anymore, or (once already
+    /// finalized) already handled by the whole-job dealloc except its epilog gate.
     fn slices_no_longer_held(job: &Job) -> Vec<String> {
+        if job.state.is_finalized() {
+            return job.allocated_nodes.clone();
+        }
         job.allocated_nodes
             .iter()
             .filter(|name| !job.is_held_on(name))
@@ -6247,9 +6242,8 @@ impl ClusterManager {
         }
     }
 
-    /// Give up every reservation this controller cannot finish dispatching. `reserve_placement`
-    /// charges a slice before the launch and the dispatcher gives it back if the launch fails,
-    /// so a leader that died in between left the charge with nobody to answer for it.
+    /// Give up every reservation this controller cannot finish dispatching: a
+    /// leader that died between charging and dispatch left it unanswered.
     pub fn abort_orphaned_placements(&self) {
         // Read after the job records, never before: a reservation taken between the two
         // reads would then be absent from one and present in the other, and taken back.
@@ -6258,6 +6252,9 @@ impl ClusterManager {
         let orphaned: Vec<JobId> = jobs
             .values()
             .filter(|job| job.state == JobState::Pending && job.holds_a_placement())
+            // A set exit_code means a finished run's own gate deferred the clear,
+            // not an unconfirmed reservation; that debt is real, not abandoned.
+            .filter(|job| job.exit_code.is_none())
             .map(|job| job.job_id)
             .filter(|job_id| !in_flight.contains(job_id))
             .collect();
@@ -6283,9 +6280,8 @@ impl ClusterManager {
         }
     }
 
-    /// Release every reconcile gate left standing. Only the pass that set one clears it, so a
-    /// leader that died mid-reconcile leaves its nodes unschedulable until their agents restart.
-    /// A pass still running here can still clear its own, so those are left alone.
+    /// Release every reconcile gate left standing by a leader that died mid-reconcile;
+    /// a pass still running here clears its own, so those are left alone.
     pub fn release_stranded_reconcile_gates(&self) {
         let live = self.reconciling_nodes.lock().clone();
         let gated: Vec<String> = self
@@ -6359,6 +6355,17 @@ impl ClusterManager {
         job.actual_stderr_path = None;
     }
 
+    /// Defer the clear while a gate still binds, pruning `allocated_nodes` to the
+    /// gated subset so nothing re-derives a charge for a node already given back.
+    fn defer_or_clear_run_state_for_requeue(job: &mut Job, nodes: &HashMap<String, Node>) {
+        if Self::epilog_gate_still_binds(job, nodes) {
+            let still_gated = job.epilog_gated_nodes.clone();
+            job.allocated_nodes.retain(|n| still_gated.contains(n));
+        } else {
+            Self::clear_run_state_for_requeue(job);
+        }
+    }
+
     pub fn set_job_launch_failure_detail(
         &self,
         job_id: JobId,
@@ -6406,14 +6413,6 @@ impl ClusterManager {
             None => "preempted".to_string(),
         };
         job.set_pending_reason_desc(PendingReason::Preempted, desc);
-    }
-
-    /// Requeue by admin action (`scontrol requeue`): tracked separately since it
-    /// is an operator decision, never a failure, and must never contribute to
-    /// the `max_batch_requeue` hold.
-    fn reset_job_for_user_requeue(job: &mut Job) {
-        job.user_requeue_count += 1;
-        Self::clear_run_state_for_requeue(job);
     }
 
     /// Evict a single job by ID: transition to NodeFail, then free its
@@ -6546,8 +6545,6 @@ impl ClusterManager {
                     // Gated on a real transition so a replay doesn't re-wipe
                     // fields or double-count requeue_count.
                     if outcome == TransitionOutcome::Applied && *new_state == JobState::Pending {
-                        // The requeue erases the record naming these nodes, so
-                        // nothing after it could hand their slice back.
                         Self::deallocate_job_slices(
                             &mut nodes,
                             &job.allocated_nodes,
@@ -6558,10 +6555,9 @@ impl ClusterManager {
                         );
                         let max = self.config().controller.max_batch_requeue;
                         if job.requeue_count < max {
-                            Self::reset_job_for_requeue(job);
-                        } else {
-                            Self::clear_run_state_for_requeue(job);
+                            job.requeue_count += 1;
                         }
+                        Self::defer_or_clear_run_state_for_requeue(job, &nodes);
                         let reason = pending_reason.clone().unwrap_or(PendingReason::None);
                         match pending_reason_desc {
                             Some(desc) => job.set_pending_reason_desc(reason, desc.clone()),
@@ -6750,7 +6746,8 @@ impl ClusterManager {
                         warn!(job_id = *job_id, error = %e, "invalid requeue transition in WAL apply");
                         return ClientResponse::default();
                     }
-                    Self::reset_job_for_user_requeue(job);
+                    job.user_requeue_count += 1;
+                    Self::defer_or_clear_run_state_for_requeue(job, &nodes);
                     if *hold {
                         job.priority = 0;
                         job.set_pending_reason(PendingReason::Held);
@@ -7027,11 +7024,11 @@ impl ClusterManager {
                     if *run_attempt != 0 && job.run_attempt != 0 && *run_attempt < job.run_attempt {
                         return ClientResponse::default();
                     }
-                    // The epilog outlives the run, so a finalized job still takes
-                    // the report that ends the hook — it just frees the one slice.
+                    // The epilog outlives the run, so a finalized job (or a Pending
+                    // one whose auto-requeue outran its own gate) still takes this.
                     if !job.state.is_active() {
-                        let owed =
-                            job.state.is_finalized() && job.epilog_gated_nodes.remove(node_name);
+                        let owed = (job.state.is_finalized() || job.state == JobState::Pending)
+                            && job.epilog_gated_nodes.remove(node_name);
                         if !owed {
                             return ClientResponse::default();
                         }
@@ -7060,10 +7057,14 @@ impl ClusterManager {
                             node = %node_name,
                             "node finished this run's epilog; releasing its slice"
                         );
-                        // The preempted run is only now fully off its nodes, so
-                        // this is where the deferred half of the requeue lands.
+                        // `else if`: the Preempted branch already transitions to
+                        // Pending, and re-clearing below would wipe the reason it just set.
                         if job.state == JobState::Preempted && job.epilog_gated_nodes.is_empty() {
                             Self::finish_preempt_requeue(job);
+                        } else if job.state == JobState::Pending
+                            && job.epilog_gated_nodes.is_empty()
+                        {
+                            Self::clear_run_state_for_requeue(job);
                         }
                         return ClientResponse::default();
                     }
@@ -12589,9 +12590,8 @@ mod tests {
         }
     }
 
-    // A step whose create proposal failed after allocate_step_id reserved its
-    // id leaves a gap in `steps`; a count-based reseed would recompute the
-    // same id as an existing, later step and collide with it.
+    // A failed step-create leaves a gap in `steps`; a count-based reseed would
+    // recompute an id that collides with an existing, later step.
     #[test]
     fn allocate_step_id_skips_a_gap_left_by_a_burned_id() {
         let dir = TempDir::new().unwrap();
@@ -12610,10 +12610,8 @@ mod tests {
         assert_eq!(cm.allocate_step_id(1), 5);
     }
 
-    // The step an id was reserved for can still be an in-flight Raft proposal
-    // when the job's own completion finalizes it; clearing the counter there
-    // would let the next call re-derive it from `steps` (still missing the
-    // in-flight step) and reissue the same id.
+    // A reserved id's step can still be an in-flight proposal when the job's
+    // own completion finalizes it; clearing the counter there would reissue it.
     #[test]
     fn a_reserved_id_survives_the_jobs_own_finalization() {
         let dir = TempDir::new().unwrap();
@@ -22884,9 +22882,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_from_snapshot_drops_stale_live_partition() {
-        // A partition present in the target's live memory but absent from the
-        // snapshot (and not tombstoned) must not survive a snapshot install —
-        // otherwise a follower diverges from the leader's partition table.
+        // A live partition absent from the (non-tombstoned) snapshot must not
+        // survive install, or a follower diverges from the leader's table.
         let src = TempDir::new().unwrap();
         let cm = test_cluster(&src).await;
         let data = cm.snapshot_state().unwrap();
@@ -22907,9 +22904,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_from_snapshot_rebuilds_k0s_role_counts() {
-        // The target never applies the source's NodeK0sAssign op itself — it only loads the
-        // already-assigned Node from the snapshot's node list — so this only passes if restore
-        // recomputes k0s_role_counts from scratch rather than relying on incremental apply().
+        // The target loads already-assigned Nodes from the snapshot rather than
+        // applying NodeK0sAssign, so this only passes if restore recomputes counts.
         use spur_core::k0s::K0sRole;
         let src = TempDir::new().unwrap();
         let cm = test_cluster(&src).await;
@@ -23270,9 +23266,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_evict_that_lost_to_a_requeue_does_not_end_the_run_that_replaced_it() {
-        // The eviction is proposed against the run the caller was holding, and a
-        // requeue can commit before it applies. Its sibling JobNodeComplete re-checks
-        // the attempt on apply for the same reason.
+        // The eviction targets the run the caller was holding, and a requeue can
+        // commit before it applies; JobNodeComplete re-checks the attempt too.
         let dir = TempDir::new().unwrap();
         let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
         register_epilog_node(&cm, "n1", false);
@@ -23332,9 +23327,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reservation_a_leader_left_behind_is_not_scheduled_a_second_time() {
-        // The failover ordering, in the order a new leader runs it: rebuild the totals
-        // from the job records, then classify. A reservation charges its slice while the
-        // job is still Pending, so a classification that ignores it charges the node twice.
+        // Failover order: rebuild totals from job records, then classify, so a
+        // charged-but-Pending reservation isn't scheduled onto the node again.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_node(&cm, "n1", 8, 16000);
@@ -23672,7 +23666,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn requeueing_a_cancelled_run_returns_the_slice_its_gate_was_holding() {
+    async fn requeueing_a_cancelled_run_keeps_the_slice_its_gate_is_still_holding() {
         let dir = TempDir::new().unwrap();
         let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
         register_epilog_node(&cm, "n1", true);
@@ -23688,11 +23682,14 @@ mod tests {
         });
         assert_eq!(
             alloc_cpus(&cm, "n1"),
-            0,
-            "the requeue drops the gate, so it must hand back what the gate held"
+            6,
+            "the requeue must not release a slice its gate still holds"
         );
         cm.recompute_node_allocations();
-        assert_eq!(alloc_cpus(&cm, "n1"), 0, "and the rebuild must agree");
+        assert_eq!(alloc_cpus(&cm, "n1"), 6, "and a rebuild must agree");
+
+        report_node_done(&cm, 1, "n1");
+        assert_eq!(alloc_cpus(&cm, "n1"), 0, "the node's own report frees it");
     }
 
     fn preempt_requeue(cm: &ClusterManager, job_id: JobId, begin_time: DateTime<Utc>) {
@@ -24210,10 +24207,10 @@ mod tests {
         });
     }
 
-    // The requeue erases the record naming the gated node, so if it does not hand
-    // the slice back here nothing ever can: no pass rebuilds totals in steady state.
+    // Releasing early reopens the exact oversubscription window the gate exists to
+    // close, so the requeue must leave it standing until the node's own report clears it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_auto_requeue_hands_back_the_slice_its_gate_was_holding() {
+    async fn an_auto_requeue_keeps_the_slice_its_gate_is_still_holding() {
         let dir = TempDir::new().unwrap();
         let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
         register_epilog_node(&cm, "n1", true);
@@ -24229,14 +24226,17 @@ mod tests {
         re_pend(&cm, 1, JobState::Timeout);
         assert_eq!(
             alloc_cpus(&cm, "n1"),
-            0,
-            "the requeue drops the gate, so it must hand back what the gate held"
+            6,
+            "the requeue must not release a slice its gate still holds"
         );
         cm.recompute_node_allocations();
+        assert_eq!(alloc_cpus(&cm, "n1"), 6, "and a rebuild must agree");
+
+        report_node_done(&cm, 1, "n1");
         assert_eq!(
             alloc_cpus(&cm, "n1"),
             0,
-            "and no rebuild could have found the charge to correct it"
+            "only the node's own report is what finally frees it"
         );
     }
 
@@ -24270,9 +24270,60 @@ mod tests {
         assert_eq!(alloc_cpus(&cm, "n3"), 4, "freed on report; job 3 remains");
 
         re_pend(&cm, 1, JobState::NodeFail);
-        assert_eq!(alloc_cpus(&cm, "n1"), 0, "the gate's charge must come back");
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            4,
+            "still gated; must not release early"
+        );
         assert_eq!(alloc_cpus(&cm, "n2"), 4, "a second free would rob job 2");
         assert_eq!(alloc_cpus(&cm, "n3"), 4, "a second free would rob job 3");
+
+        // The pending job must not still name n2/n3 as held, or a rebuild would
+        // re-derive a charge for nodes this run already gave back.
+        cm.recompute_node_allocations();
+        assert_eq!(
+            alloc_cpus(&cm, "n2"),
+            4,
+            "a rebuild must not re-charge job 2's node"
+        );
+        assert_eq!(
+            alloc_cpus(&cm, "n3"),
+            4,
+            "a rebuild must not re-charge job 3's node"
+        );
+
+        report_node_done(&cm, 1, "n1");
+        assert_eq!(alloc_cpus(&cm, "n1"), 0, "the gate's own report frees it");
+        assert_eq!(alloc_cpus(&cm, "n2"), 4, "a second free would rob job 2");
+        assert_eq!(alloc_cpus(&cm, "n3"), 4, "a second free would rob job 3");
+    }
+
+    // A deferred requeue's Pending job also "holds a placement," but the sweep
+    // exists for lost dispatches, not a real, still-running epilog debt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_orphan_sweep_does_not_abort_a_gate_a_requeue_deferred() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        cm.apply_operation(&WalOperation::JobComplete {
+            at: None,
+            job_id: 1,
+            exit_code: -1,
+            state: JobState::Timeout,
+        });
+        re_pend(&cm, 1, JobState::Timeout);
+        assert_eq!(alloc_cpus(&cm, "n1"), 6, "still gated after the requeue");
+
+        cm.abort_orphaned_placements();
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            6,
+            "the lost-dispatch sweep must not touch a real, live epilog debt"
+        );
+
+        report_node_done(&cm, 1, "n1");
+        assert_eq!(alloc_cpus(&cm, "n1"), 0);
     }
 
     // The apply already spares a gated record; without the same rule here the
@@ -24401,6 +24452,10 @@ mod tests {
             hold: false,
             begin_time: None,
         });
+        // The first run's own gate must clear for real before a second run can
+        // reserve the node at all; only then is n1 free for a second charge.
+        report_node_done(&cm, 1, "n1");
+        assert_eq!(alloc_cpus(&cm, "n1"), 0);
 
         re_dispatch(&cm, 1, &["n1"], scalar_alloc(6, 1000), 2);
         cancel(&cm, 1);
@@ -29154,10 +29209,8 @@ mod tests {
         ));
     }
 
-    // A salloc session holds its placeholder through the ordinary batch-launch
-    // mechanism (srun_step_dispatch stays false), unlike raw srun's native step
-    // dispatch — so it must not be rejected by the step-dispatch check that
-    // guards the srun shape.
+    // A salloc session holds its placeholder via the ordinary batch-launch path
+    // (srun_step_dispatch stays false), so the srun-shape check must not reject it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finish_srun_job_completes_an_interactive_salloc_session() {
         let dir = TempDir::new().unwrap();
@@ -29172,9 +29225,8 @@ mod tests {
         assert_eq!(cm.get_job(id).unwrap().exit_code, Some(0));
     }
 
-    // An interactive session has no `srun_step_dispatch` proxy for "has this
-    // actually started" the way raw srun does, so a still-Pending salloc job
-    // must be rejected on its own, not silently accepted as complete.
+    // Interactive sessions have no `srun_step_dispatch` proxy for "has this
+    // started", so a still-Pending salloc job must be rejected, not accepted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn finish_srun_job_rejects_pending_interactive_session() {
         let dir = TempDir::new().unwrap();

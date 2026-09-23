@@ -973,9 +973,8 @@ impl ControllerService {
         }
     }
 
-    /// Admin bar for an operation that can end running work, on a cluster that may authenticate
-    /// nobody. A verified identity settles it; failing that the client's own word does, which is
-    /// an operator-error guard and not a boundary — the same trade `is_k0s_admin` documents.
+    /// Admin bar for an operation that can end running work. A verified identity settles it;
+    /// failing that, the client's own assertion does -- an operator-error guard, not a boundary.
     #[allow(clippy::result_large_err)]
     fn require_admin_by_assertion<T>(
         &self,
@@ -1192,11 +1191,8 @@ async fn open_reconcile_license<'a>(
     })
 }
 
-/// Direction A: the node asserts a claim Raft has no record of. Reasons from a
-/// presence, which an incomplete cut does not weaken. Every such claim gets an
-/// answer -- ended, released, or named as one only an operator can clear.
-/// False when a claim went unanswered, leaving `outcome.unresolved` a part of
-/// this node's account rather than the whole of it.
+/// Direction A: the node asserts a claim Raft has no record of; every such claim gets an
+/// answer. Returns false when a claim went unanswered, leaving `outcome.unresolved` partial.
 async fn answer_unrecorded_claims(
     cluster: &Arc<ClusterManager>,
     node: &str,
@@ -1269,9 +1265,8 @@ async fn answer_unrecorded_claims(
             outcome.unresolved.push(entry.job_id);
             continue;
         }
-        // "Cannot tell" is never "dead" -- unless the agent's own replay already
-        // ruled out a live process for it (conflict_hold); that claim is as
-        // killable as an ordinary unrecorded one, so it takes the same path.
+        // "Cannot tell" is never "dead" -- unless the agent's own replay ruled out a live
+        // process (conflict_hold); that claim is as killable as an ordinary unrecorded one.
         if disposition.already_accounted_for() && !entry.conflict_hold {
             warn!(
                 node = %node,
@@ -1371,15 +1366,17 @@ async fn reconcile_node_ledger_after(
         }
     }
 
-    // Direction C: both agree the run exists but the slices differ. Correcting
-    // means rewriting the record the controller derives its totals from.
+    // Direction C: same run, slices may differ. No auto-rewrite -- this only surfaces the
+    // agent's own `conflict_hold` signal for claims it could not resolve on its own.
     for entry in ledger.entries.iter().take(MAX_LEDGER_ENTRIES) {
         if entry.conflict_hold {
             warn!(
                 node = %node,
                 job_id = entry.job_id,
                 disposition = %entry.disposition,
-                "agent is holding evidence it cannot resolve on its own"
+                "agent holds unresolved slice evidence for this job; the controller does not \
+                 auto-correct it -- inspect and cancel/requeue the job, or wait for the next \
+                 requested-snapshot reconcile (reconnect/failover/re-registration) to clear it"
             );
         }
     }
@@ -1563,9 +1560,8 @@ fn claim_hold_state(node: &Node) -> NodeState {
     }
 }
 
-/// Put a node back in service once its claims are answered. Lifting is an inference from
-/// absence, so it needs a complete cut and the tag -- but the same bar naming took, or a
-/// cut that may drain a node could never undrain it and every hold would be permanent.
+/// Put a node back in service once its claims are answered. Lifting needs a complete cut,
+/// the same bar naming took -- else a cut that may drain a node could never undrain it.
 fn release_unresolved_claim_hold(
     cluster: &Arc<ClusterManager>,
     current: &Node,
@@ -2174,10 +2170,8 @@ impl SlurmController for ControllerService {
             )
             .map_err(|e| match e {
                 crate::cluster::SrunCompleteError::NotFound(_) => Status::not_found(e.to_string()),
-                // Distinct from the other preconditions: the job's own task
-                // step can end it before the client calls CompleteJob, and
-                // that "already done" case must read differently from a
-                // genuine precondition failure.
+                // Distinct from the other preconditions: the job's own task step can end it
+                // before CompleteJob runs, and that "already done" case must read differently.
                 crate::cluster::SrunCompleteError::AlreadyTerminal { .. } => {
                     Status::already_exists(e.to_string())
                 }
@@ -2958,6 +2952,8 @@ impl SlurmController for ControllerService {
         let held_gate = ledger
             .is_some()
             .then(|| self.cluster.hold_reconcile_gate(req.hostname.clone()));
+        // First-time registration still has a schedule-before-gate gap here: `register_node`
+        // commits the node before this same-request gate-set lands (two separate proposals).
         let known_before = ledger.is_some() && self.cluster.get_node(&req.hostname).is_some();
         if known_before {
             self.cluster.set_reconcile_pending(&req.hostname, true);
@@ -3062,9 +3058,8 @@ impl SlurmController for ControllerService {
         // Non-empty `reporting_node` means a per-node completion report. The final
         // job outcome is still derived from aggregated exit codes in
         // `Job::derived_completion`.
-        //
-        // A user step's own report normally speaks only for itself; a
-        // standalone srun's one-shot step is the exception (`is_standalone_srun_shape`).
+        // A user step's own report normally speaks only for itself; a standalone srun's
+        // one-shot step is the exception (`is_standalone_srun_shape`).
         let has_report = !req.reporting_node.is_empty();
         let is_owning_srun_step = has_report
             && req.step_id.is_some_and(spur_core::step::is_user_step)
@@ -3121,10 +3116,8 @@ impl SlurmController for ControllerService {
 
         match completion_result {
             Some(Ok(NodeCompleteResult::AllDone { raft_index, .. })) => {
-                // node_complete only ends the job; this is what tells the
-                // node to shut down STEP_EXTERN, same as CompleteJob does.
-                // Only a standalone srun's own step needs it, so the (rare)
-                // job fetch happens here rather than on every report above.
+                // node_complete only ends the job; this also tells the node to shut down
+                // STEP_EXTERN. Only a standalone srun's own step needs it (rare job fetch).
                 if is_owning_srun_step {
                     if let Some(job) = self.cluster.get_job(req.job_id) {
                         let cluster = self.cluster.clone();
@@ -6356,10 +6349,8 @@ fn reports_whole_job(step_id: Option<spur_core::step::StepId>) -> bool {
     step_id.is_none_or(|id| !spur_core::step::is_user_step(id))
 }
 
-/// A standalone srun's allocation-only shape (never salloc, which doesn't set
-/// `spec.srun_job`). `report_job_status` uses this to let a user step's own
-/// completion end the job — no client is guaranteed to still be around to
-/// report it via CompleteJob, the way a salloc session's own life does.
+/// A standalone srun's allocation-only shape (never salloc). Lets a user step's own completion
+/// end the job, since no client is guaranteed to still be around to call CompleteJob.
 fn is_standalone_srun_shape(srun_job: bool, srun_step_dispatch: bool) -> bool {
     srun_job && srun_step_dispatch
 }
@@ -7552,11 +7543,8 @@ mod tests {
         );
     }
 
-    /// GATE: `auth.jwt_key` is captured at startup and must NOT change on
-    /// `reconfigure`. Swapping it live would instantly invalidate every
-    /// outstanding node token. This drives the real capture path
-    /// (`resolve_startup_jwt_key`) and the real `reconfigure`, then proves the
-    /// running controller still verifies a token minted with the startup key.
+    /// GATE: `auth.jwt_key` is captured at startup and must NOT change on `reconfigure` --
+    /// swapping it live would invalidate every outstanding node token; this proves it doesn't.
     #[tokio::test]
     async fn reconfigure_does_not_adopt_new_jwt_key() {
         use spur_core::admission::{generate_node_token, verify_node_token};
@@ -7605,9 +7593,8 @@ mod tests {
             Some("new-secret"),
             "reconfigure must swap the live config"
         );
-        // ...but the controller's captured key is unchanged, so tokens minted
-        // with the startup key still verify. A live-reloaded key would reject
-        // this token.
+        // ...but the controller's captured key is unchanged, so tokens minted with the
+        // startup key still verify (a live-reloaded key would reject this token).
         assert_eq!(startup_key, "old-secret", "captured key must not change");
         assert!(
             verify_node_token(&token, startup_key.as_bytes()).is_ok(),
@@ -8111,9 +8098,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_disposition_this_controller_cannot_read_is_named_rather_than_killed() {
-        // A rolling upgrade runs newer agents under an older controller. A word this
-        // controller has no meaning for says something about the claim; killing it
-        // because the word is unfamiliar is the one answer the word cannot license.
+        // A rolling upgrade runs newer agents under an older controller. An unfamiliar
+        // disposition word still says something; killing on it is the one thing it can't license.
         let dir = tempfile::TempDir::new().unwrap();
         let (_svc, cluster) = service_with_a_job_on_a_node(&dir).await;
         let mut cut = ledger(true, vec![(7, 1), (99, 1)]);
@@ -10032,11 +10018,8 @@ mod tests {
             .collect()
     }
 
-    // The terminator behind the dispatch-refusal requeue exemption: a job whose
-    // budget is never charged retries forever unless naming the claim takes the
-    // node out of candidacy. `-w n1` is the worst case -- it also waives the
-    // dispatch cooldown, so the hold is the only thing left standing between
-    // this job and the same conflicted node every tick.
+    // The terminator behind the dispatch-refusal requeue exemption: naming the claim must
+    // take the node out of candidacy, or `-w n1` (which also waives the cooldown) retries forever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn naming_an_unresolved_claim_takes_the_node_out_of_the_scheduler_s_candidate_set() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -10817,9 +10800,8 @@ mod tests {
         );
     }
 
-    /// A standalone srun's task step is the whole reason its allocation
-    /// exists, so its completion push must end the job with the real exit
-    /// code rather than leave it Running until TimeLimit fabricates one.
+    /// A standalone srun's task step is the whole reason its allocation exists, so its
+    /// completion must end the job with the real exit code, not TimeLimit's fabricated one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_standalone_paths_own_task_step_completion_ends_its_job() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -10874,9 +10856,8 @@ mod tests {
         assert_eq!(job.exit_code, Some(137));
     }
 
-    /// A two-node standalone srun must wait for both nodes' task-step reports
-    /// before ending: the first already moves the job to Completing, and
-    /// that must not stop the second's report from reaching `node_complete`.
+    /// A two-node standalone srun must wait for both nodes' task-step reports before ending --
+    /// the first moves the job to Completing but must not block the second's `node_complete`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_multi_node_standalone_srun_waits_for_every_node_before_ending() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -10958,9 +10939,8 @@ mod tests {
         );
     }
 
-    /// The client's own `CompleteJob` can race the job's own task step
-    /// ending it first; that race must read as `AlreadyExists`; a client
-    /// that mistook it for a real failure would fire a pointless cancel.
+    /// The client's own `CompleteJob` can race the job's own task step ending it first;
+    /// that race must read as `AlreadyExists`, or a client would mistake it for a real failure.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn complete_job_reports_already_exists_when_the_task_step_beat_it_there() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -13265,9 +13245,8 @@ mod tests {
         assert_eq!(resp.into_inner().node_addr, "127.0.0.1:6818");
     }
 
-    // Two steps for the same job dispatched close together must never be
-    // handed the same id. Drives the real RPC path from genuinely concurrent
-    // tasks: the bug was a TOCTOU between a step count read and its own commit.
+    // Two steps for the same job dispatched close together must never be handed the same id
+    // (the bug was a TOCTOU between a step count read and its own commit).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn create_job_step_never_hands_out_the_same_id_to_concurrent_callers() {
         let dir = tempfile::TempDir::new().unwrap();
