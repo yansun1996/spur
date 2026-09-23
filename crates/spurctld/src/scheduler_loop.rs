@@ -2386,9 +2386,8 @@ async fn enforce_time_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>
     }
 }
 
-/// Below this, a single missed keepalive (one lost UDP-ish ping, one slow
-/// tick) would read as client death; two full intervals is the same floor
-/// `inactive_limit_secs` itself is validated against in `config.rs`.
+/// Two intervals, so one missed keepalive doesn't read as client death;
+/// `inactive_limit_secs` is validated against the same floor in `config.rs`.
 const SRUN_JOB_KEEPALIVE_FLOOR_SECS: i64 = 2 * spur_core::config::KEEPALIVE_INTERVAL_SECS as i64;
 
 /// A missing entry (nothing seen yet this stint) is never past the floor —
@@ -2399,11 +2398,8 @@ fn srun_job_past_keepalive_floor(now: DateTime<Utc>, last_seen: Option<DateTime<
     })
 }
 
-/// Reap interactive allocations (salloc/srun) whose client stopped sending
-/// keepalives, mirroring Slurm's `InactiveLimit`: SIGTERM -> grace -> SIGKILL.
-/// Salloc only reaps opt-in (`inactive_limit_secs`) and finalizes via TIMEOUT;
-/// a standalone srun always reaps on its own fixed floor and is never
-/// finalized here — its task's own stepd reports the real exit instead.
+/// Salloc only reaps opt-in (`inactive_limit_secs`) via TIMEOUT; a standalone
+/// srun always reaps on its own fixed floor — its stepd reports the real exit.
 async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHandle>) {
     use spur_core::job::{JobId, JobState};
 
@@ -2453,9 +2449,8 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
             .interactive_reap_candidates(&ids, now, limit_secs)
             .into_iter()
             .collect();
-        // A standalone srun reaps on its own fixed floor, independent of
-        // whether the admin enabled InactiveLimit at all. The call above
-        // already seeded and pruned this job's entry for every id in `ids`.
+        // A standalone srun reaps on its own fixed floor regardless of InactiveLimit;
+        // the call above already seeded/pruned this job's entry for every id in `ids`.
         for job in running.iter().filter(|j| j.spec.srun_job) {
             if stale_set.contains(&job.job_id) {
                 continue;
@@ -2508,10 +2503,8 @@ async fn enforce_inactive_limits(cluster: Arc<ClusterManager>, raft: Arc<RaftHan
                         "InactiveLimit grace expired — force-killing allocation"
                     );
 
-                    // A task-dispatch srun reports its own real exit once
-                    // killed; finalizing it here would race that report. A
-                    // `--pty` session reports no user step, so it still needs
-                    // this synthetic finalization exactly as before.
+                    // A task-dispatch srun reports its own real exit; finalizing here
+                    // would race it. A `--pty` session has no user step to report it.
                     if job.spec.pty || !job.spec.srun_job {
                         if let Err(e) = cluster.complete_job(job_id, -1, JobState::Timeout) {
                             warn!(job_id, error = %e, "failed to reap inactive allocation");
@@ -5549,11 +5542,8 @@ mod tests {
             submit_and_wait(cm, spec)
         }
 
-        // A node refusing work it already holds is controller-vs-node drift the
-        // job neither caused nor can influence. Charging its retry budget for
-        // that buries a healthy job at priority 0 for an operator to dig out.
-        // Driven through `process_assignment`, because the second backoff that
-        // used to charge the job anyway is the caller's, not the dispatch's.
+        // A node refusing work it already holds is controller-vs-node drift the job
+        // didn't cause; charging its retry budget would bury a healthy job at priority 0.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn a_node_side_conflict_never_spends_the_job_s_requeue_budget() {
             use spur_core::job::{JobState, PendingReason};
@@ -6363,11 +6353,8 @@ mod tests {
             );
         }
 
-        // By the time the reservation is attempted the interactive path has a
-        // real allocation on the node -- cpu_ids, memory, GPUs and a cgroup. A
-        // failure here commits nothing, so `abort_orphaned_placements` cannot
-        // see the node holding it either: without a cancel the slice is stranded
-        // until the hourly ledger sweep.
+        // A reservation failure here commits nothing, so without an explicit cancel
+        // the node's already-registered allocation would strand until the sweep.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn a_reservation_that_fails_gives_the_registered_allocation_back() {
             use spur_core::job::JobState;

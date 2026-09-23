@@ -2157,9 +2157,7 @@ mod tests {
         );
     }
 
-    // A token with no `=` reaches no branch in the param loops, so accepting it
-    // silently applies nothing and reports success. Driven through the dispatch,
-    // so dropping the check from a verb is what this notices.
+    // A bare token reaches no branch in the param loop, so it would silently apply nothing.
     #[tokio::test]
     async fn a_token_that_is_not_a_pair_is_refused_rather_than_dropped() {
         for verb in ["update", "create", "delete"] {

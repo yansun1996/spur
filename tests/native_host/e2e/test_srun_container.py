@@ -937,12 +937,8 @@ class TestSrunPtyContainerStep:
         stderr.channel.close()
 
 
-# ---------------------------------------------------------------------------
-# Agent restart mid-step: a standalone container step is now
-# spurstepd-supervised (routed through launch_stepd, not a direct child of
-# spurd's own exec path) — a restart must not just recover its real exit code
-# and full stdout, but leave the same supervisor pid running throughout.
-# ---------------------------------------------------------------------------
+# Container steps are now spurstepd-supervised (via launch_stepd, not a spurd
+# child), so a restart must also keep the same supervisor pid, not just recover output.
 
 
 class TestContainerStepAgentRestart:
@@ -996,17 +992,13 @@ class TestContainerStepAgentRestart:
                 "restart window closed"
             )
 
-            # Identity, not just presence: a supervisor killed with the agent
-            # and respawned afterwards would satisfy any "still one running"
-            # check without actually proving supervision.
+            # Identity, not just presence: a respawned supervisor would pass any
+            # "still running" check without proving it survived the restart.
             before = _supervisor_pids(cluster) - baseline
             assert before, "a running containerized step must have a supervisor"
 
-            # A graceful stop (SIGTERM) lets spurd's in-flight RPC-handler
-            # future unwind normally, dropping its rootfs-cleanup guard and
-            # erasing the marker files this recovery path depends on --
-            # that is a controlled shutdown, not the crash being
-            # characterized here, so this kills the exact pid instead.
+            # SIGTERM would let spurd unwind gracefully and erase the recovery
+            # markers, so kill -9 the exact pid to simulate a real crash instead.
             spurd_pid = cluster.nodes[0].exec(
                 f"pgrep -f {shlex.quote(_bracket(cluster.bin_dir + '/spurd'))}"
             ).strip()
@@ -1044,10 +1036,8 @@ class TestContainerStepAgentRestart:
                 f"restart:\n{content}"
             )
 
-            # The staged rootfs for this step must not linger once the job
-            # is done. Scoped to the two real container-dir candidates
-            # (never a whole-filesystem find), so a colliding low job id
-            # from an unrelated concurrent session can't false-positive.
+            # The staged rootfs must not linger after completion. Scoped to the known
+            # container dirs (not a filesystem-wide find) to avoid job-id collisions.
             leftover = cluster.nodes[0].exec_allow_fail(
                 f"find ~/.spur/containers /var/spool/spur/containers "
                 f"-maxdepth 1 -name 'step_{job_id}_*' 2>/dev/null || true"
@@ -1084,9 +1074,8 @@ class TestSrunPtyContainerStepSupervision:
             f"cat {MARKER_PATH}; echo SURVIVED",
         ])
 
-        # The session has its own supervisor as soon as it actually starts;
-        # give it a window to appear before restarting the agent out from
-        # under it.
+        # Wait for the session's own supervisor to appear before restarting the
+        # agent, so the restart can't race ahead of the session actually starting.
         deadline = time.time() + 30
         before = set()
         while time.time() < deadline:

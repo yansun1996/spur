@@ -1,9 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Running a job's node epilog under a bound. The hook holds the job's CPU slice
-//! and its `Job` record until it returns, so one that never does holds both for
-//! as long as the node keeps heartbeating.
+//! Running a job's node epilog under a bound: an epilog that never returns
+//! would otherwise hold the job's CPU slice and record forever.
 
 use std::fmt;
 use std::time::Duration;
@@ -50,10 +49,8 @@ fn hook_bound(timeout_secs: u64) -> Option<Duration> {
     (timeout_secs > 0).then(|| Duration::from_secs(timeout_secs))
 }
 
-/// Run a node epilog, abandoning the wait after `timeout_secs`.
-///
-/// Elapsed time is not evidence a hook finished, so giving up on one is a
-/// deliberate exception: the alternative is holding the slice indefinitely.
+/// Run a node epilog, abandoning the wait after `timeout_secs`: elapsed time is
+/// not evidence the hook finished, but the alternative is holding the slice forever.
 pub(crate) async fn run_bounded(
     script: &str,
     ctx: &spur_core::hooks::HookContext,
@@ -73,11 +70,8 @@ pub(crate) async fn run_bounded(
     }
 }
 
-/// Run one completed job's epilog and record how it ended, yielding the reason to
-/// drain this node when it did not succeed.
-///
-/// The record is what ends the hold on the run's slice, so every way out of the
-/// hook — returned, failed, or abandoned — has to write one.
+/// Run one completed job's epilog, recording how it ended so every way out —
+/// returned, failed, or abandoned — releases the hold on the run's slice.
 pub(crate) async fn run_job_epilog(
     admissions: &AdmissionStore,
     script: &str,

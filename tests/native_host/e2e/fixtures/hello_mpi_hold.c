@@ -1,9 +1,8 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Like hello_mpi.c, but holds open past MPI_Init/wireup (a barrier) so a
-// test can restart the agent while ranks are alive and past MPI_Init
-// itself, not during it.
+// Holds open past MPI_Init (via barrier) so a test can restart the agent
+// while ranks are alive and past init, not during it.
 
 #include <mpi.h>
 #include <stdio.h>

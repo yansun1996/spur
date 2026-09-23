@@ -7,11 +7,8 @@
 //! Follows the same shape as the `MockAgent` harness in `spurctld`: bind an
 //! ephemeral localhost port, serve a hand-written service on it, and hand the
 //! caller back the address plus a shared record of what the server observed.
-//! Only a handful of RPCs are implemented (`SubmitJob`, `GetJob`,
-//! `JobKeepalive`, `CreateJobStep`, `CompleteJobStep`, `RunStep`, `GetNode`,
-//! `GetNodes`, `UpdateNode`, `DrainNode`, `DeregisterNode`, `CompleteJob`,
-//! `CancelJob`); every other RPC reports `unimplemented` so an unexpected
-//! call fails loudly instead of silently returning a default.
+//! Only a handful of RPCs are implemented; every other RPC reports
+//! `unimplemented` so an unexpected call fails loudly instead of silently returning a default.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;

@@ -33,9 +33,8 @@ class TestRawSrunClientDeath:
     def test_a_killed_clients_job_ends_within_the_keepalive_floor(self, cluster):
         node = cluster.node_names[0]
         name = "raw-srun-client-death"
-        # Long enough that the task itself would never finish before the
-        # fixed keepalive-floor reaper acts -- the floor plus grace plus one
-        # reaper tick is on the order of ~100s (see scheduler_loop.rs).
+        # Long enough the task itself never finishes first; the keepalive-floor
+        # reaper acts around ~100s (floor + grace + one tick, see scheduler_loop.rs).
         launch = (
             f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
             f"PATH={shlex.quote(cluster.bin_dir)}:$PATH "
@@ -64,21 +63,16 @@ class TestRawSrunClientDeath:
             before = _supervisor_pids(cluster)
             assert before, "a running raw srun job must have a supervisor"
 
-            # A few seconds in: close on the heels of detecting Running
-            # externally, the client's own internal wait-for-running loop
-            # may not yet have gotten far enough to spawn its keepalive
-            # pinger, and a client that never pings never goes stale.
+            # Give the client's keepalive pinger time to start -- kill too soon
+            # and it never pinged, so it never goes stale by this reap.
             time.sleep(10)
 
             # Kill only the local client -- the remote task (sleep 600) and
             # its supervisor are untouched by this.
             cluster.nodes[0].exec_allow_fail(f"kill -9 {srun_pid}")
 
-            # Floor (2x the 30s keepalive interval) + grace (30s) + a 10s
-            # reaper tick, with headroom: ~100-110s observed live. A
-            # TimeLimit-driven recovery would take far longer (or never
-            # happen, since this job has no explicit -t), so a generous
-            # timeout still discriminates.
+            # ~100-110s observed for the keepalive-floor reap (floor + grace + tick);
+            # a TimeLimit recovery takes far longer or never fires, so this still discriminates.
             try:
                 state = wait_job(cluster, job_id, timeout=180)
             except TimeoutError:

@@ -406,10 +406,8 @@ class TestReleaseIndexOnPtyWithEpilog:
         assert match, f"could not find salloc's job id in its output:\n{out}"
         job_id = int(match.group(1))
 
-        # Poll tightly: the sweep can remove a settled srun/salloc record off disk within
-        # a few seconds, so the "released, not yet swept" window is short.
-        # Keep the last record seen before it disappears (or None, if it was
-        # never observed at all) rather than re-reading after the fact.
+        # The sweep can drop the record within seconds, so poll tightly and keep
+        # the last record seen rather than re-reading after it may be gone.
         last_seen = None
         deadline = time.time() + 30
         while time.time() < deadline:

@@ -167,11 +167,8 @@ class TestTerminalOverreach:
         wait_job_state(cluster, job_id, "R")
 
         try:
-            # The attach's own remote command, not the local client's death,
-            # is what the agent's bridge waits on before it even considers
-            # ending anything -- so this must outlive the local kill below
-            # by enough margin to actually exercise that check once the
-            # bridge ends.
+            # The bridge waits on the attach's remote command, not the local
+            # client's death, so this must outlive the kill to exercise that check.
             attach_secs = 8
             launch = (
                 f"SPUR_CONTROLLER_ADDR={shlex.quote(cluster.controller_addr)} "
@@ -212,11 +209,8 @@ class TestTerminalOverreach:
     def test_salloc_survives_an_inner_pty_clients_death(self, cluster):
         node = cluster.node_names[0]
         marker = f"{cluster.remote_dir}/salloc-inner-pty-marker"
-        # The inner pty's own remote command (not the local client dying) is
-        # what the agent's bridge waits on before it even looks at ending
-        # anything, so the outer shell must wait past it -- with margin --
-        # before proving the allocation is still usable, or the check below
-        # would pass on timing alone without ever exercising that path.
+        # The bridge waits on the inner pty's remote command, not the local
+        # client's death, so the outer shell must wait past it before checking.
         inner_secs = 8
         shell_body = (
             f"nohup {cluster.bin_dir}/srun --pty bash -c 'sleep {inner_secs}' "
@@ -321,9 +315,8 @@ class TestPtyAgentRestartFailsSafe:
         try:
             time.sleep(2)
 
-            # `pgrep -f` on a bracket-escaped pattern so it never matches the
-            # shell invoking pgrep itself (its own cmdline literally contains
-            # the unescaped pattern).
+            # Bracket-escaped so pgrep -f doesn't match the shell running pgrep
+            # itself (its own cmdline contains the unescaped pattern).
             spurd_pid = cluster.nodes[0].exec(
                 f"pgrep -f {shlex.quote(_bracket(cluster.bin_dir + '/spurd'))}"
             ).strip()

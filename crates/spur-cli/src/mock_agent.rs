@@ -6,10 +6,8 @@
 //!
 //! Same shape as [`crate::mock_controller`]: bind an ephemeral localhost port,
 //! serve a hand-written service on it, and hand the caller back the address plus
-//! a shared record of what the server observed. Only `StreamJobOutput` and the
-//! opening handshake of `InteractiveSession` are implemented; every other RPC
-//! reports `unimplemented` so a test that drifts onto an unmocked call fails
-//! loudly instead of silently succeeding.
+//! a shared record of what the server observed. Only a handful of RPCs are
+//! mocked; everything else reports `unimplemented` so drift fails loudly, not silently.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

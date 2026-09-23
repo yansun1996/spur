@@ -556,9 +556,8 @@ async fn main() -> anyhow::Result<()> {
         &hostname,
     ));
 
-    // Bound before registering, not when the server starts serving. Registration
-    // makes the controller reconcile this node and call straight back; until the
-    // port is bound those calls are refused outright and never retried.
+    // Bound before registering: registration can trigger an immediate callback,
+    // which would be refused if the port isn't listening yet.
     let listen_addr: std::net::SocketAddr = args.listen.parse()?;
     let agent_listener = tokio::net::TcpListener::bind(listen_addr).await?;
     info!(addr = %listen_addr, "agent port bound");

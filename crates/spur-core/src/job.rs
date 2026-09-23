@@ -111,9 +111,8 @@ impl LedgerDisposition {
         }
     }
 
-    /// `None` for a name this controller does not know, which only a newer agent can
-    /// send; the caller must treat that as "cannot act", never as an ordinary claim.
-    /// An agent that predates the field sends nothing, which is the plain held claim.
+    /// `None` for an unknown name (only a newer agent sends one): treat as "cannot
+    /// act", never an ordinary claim. A pre-field agent sends nothing, i.e. held.
     pub fn from_wire(disposition: &str) -> Option<Self> {
         match disposition {
             "" | "held" => Some(Self::Held),
@@ -1016,9 +1015,8 @@ impl Job {
         self.epilog_gated_nodes.contains(node)
     }
 
-    /// Whether a placement is already charged for this job. `reserve_placement` commits the
-    /// charge while the job is still `Pending` and the transition follows the dispatch, so a
-    /// `Pending` job that answers yes is one a second placement would charge its nodes twice for.
+    /// Whether a placement is already charged. `reserve_placement` charges while still
+    /// `Pending`, before dispatch, so "yes" here means a second placement would double-charge.
     pub fn holds_a_placement(&self) -> bool {
         self.allocated_nodes
             .iter()

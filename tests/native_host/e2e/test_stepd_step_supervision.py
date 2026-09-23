@@ -453,8 +453,7 @@ class TestConcurrentStepLaunchRace:
                 )
 
         # Fencing/rejection log lines are the other direct evidence of the
-        # collision, checked once across the whole run rather than per trial
-        # since the log is shared and cheap to scan in one pass.
+        # collision; the shared log is cheap to scan once across the whole run.
         fencing = cluster.nodes[0].exec_allow_fail(
             f"grep -c 'fenced a run against in-flight launches' "
             f"{cluster.log_dir}/spurd.log || true"

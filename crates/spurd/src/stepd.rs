@@ -2992,9 +2992,8 @@ pub(crate) fn supervisor_liveness(
     {
         return Ok(StepdLiveness::Stale);
     }
-    // A zombie's start ticks still match (the kernel keeps them until reaped),
-    // but it has already exited and released everything — `process_liveness`
-    // is the one check here that knows to exclude it.
+    // A zombie's ticks still match (kernel keeps them until reaped); `process_liveness`
+    // is the check that knows to exclude it.
     match process_liveness(recorded.pid, recorded.start_ticks) {
         Ok(StepdLiveness::Live) => Ok(StepdLiveness::Live),
         Ok(StepdLiveness::Stale) => Ok(StepdLiveness::Stale),
