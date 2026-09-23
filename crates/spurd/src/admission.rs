@@ -797,9 +797,8 @@ impl AdmissionStore {
                 if existing.state == RunState::Cleaned {
                     run.state = RunState::Cleaned;
                 }
-                // Same reasoning for the epilog debt: only a relaunch's fresh
-                // NotStarted default is refused, never a caller's forward move
-                // (e.g. record_epilog progressing it to Running/Succeeded).
+                // Same reasoning for the epilog debt: only a relaunch's fresh default
+                // is refused, never a caller's own forward move (e.g. record_epilog).
                 if run.cleanup.epilog == HookState::NotStarted
                     && existing.cleanup.epilog != HookState::NotStarted
                 {
@@ -1008,12 +1007,11 @@ impl AdmissionStore {
                 Err(error) => return Err(error),
             };
             let already_cleaned = run.state == RunState::Cleaned;
+            // Owner-loss is resolve_supervised_epilogs's call to make, on real
+            // liveness evidence -- never this function's, first mark or not.
             let epilog = match (epilog, run.cleanup.epilog) {
                 (EpilogOwed::Yes, HookState::NotStarted) => HookState::Pending,
-                // A re-mark may add a debt but never settle one: only the first
-                // stands for the teardown that could have lost the hook's owner.
-                (_, recorded) if already_cleaned => recorded,
-                (_, recorded) => recorded.settled_after_owner_loss(),
+                (_, recorded) => recorded,
             };
             if already_cleaned && run.cleanup.epilog == epilog {
                 return Ok(true);
@@ -1238,48 +1236,56 @@ impl AdmissionStore {
         run_key: RunKey,
         step_id: StepId,
     ) -> io::Result<Option<ReleaseWarrant>> {
-        let run = match self.load_run(run_key) {
-            Ok(run) => run,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        // Without this the release fires for whichever participant happens to be
-        // acknowledged first, which for a multi-step run is not the owner.
-        if !self.step_answers_for_run(&run, run_key, step_id)? {
-            return Ok(None);
-        }
-        if run.cleanup.epilog.is_in_flight() {
-            return Ok(None);
-        }
-        Ok(run
-            .controller_ack
-            .release_raft_index
-            .map(|index| ReleaseWarrant::acknowledged(run_key, index)))
+        // Locked like a mutator: the run and, when the owner is unset, a second
+        // read of participants must come from one consistent instant, not two.
+        self.with_run_lock(run_key, || {
+            let run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            // Without this the release fires for whichever participant happens to be
+            // acknowledged first, which for a multi-step run is not the owner.
+            if !self.step_answers_for_run(&run, run_key, step_id)? {
+                return Ok(None);
+            }
+            if run.cleanup.epilog.is_in_flight() {
+                return Ok(None);
+            }
+            Ok(run
+                .controller_ack
+                .release_raft_index
+                .map(|index| ReleaseWarrant::acknowledged(run_key, index)))
+        })
     }
 
     /// Whether the controller's word that it is not accounting for this run may be
     /// acted on yet. The agent keeps the veto: only it can see the hooks.
     pub fn settle_permit(&self, run_key: RunKey) -> io::Result<SettlePermit> {
-        let run = match self.load_run(run_key) {
-            Ok(run) => run,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(SettlePermit::NoRecord)
+        // Locked like a mutator: the run and the participants fallback read
+        // below must come from one consistent instant, not two.
+        self.with_run_lock(run_key, || {
+            let run = match self.load_run(run_key) {
+                Ok(run) => run,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(SettlePermit::NoRecord)
+                }
+                Err(error) => return Err(error),
+            };
+            if run.state != RunState::Cleaned || run.cleanup.epilog.is_in_flight() {
+                return Ok(SettlePermit::NotQuiescent);
             }
-            Err(error) => return Err(error),
-        };
-        if run.state != RunState::Cleaned || run.cleanup.epilog.is_in_flight() {
-            return Ok(SettlePermit::NotQuiescent);
-        }
-        let step_id = match run.lifecycle_owner_step {
-            Some(step_id) => step_id,
-            None => self
-                .participants(run_key)?
-                .0
-                .first()
-                .map(|participant| participant.step_id)
-                .unwrap_or(spur_core::step::STEP_BATCH),
-        };
-        Ok(SettlePermit::Due(step_id))
+            let step_id = match run.lifecycle_owner_step {
+                Some(step_id) => step_id,
+                None => self
+                    .participants(run_key)?
+                    .0
+                    .first()
+                    .map(|participant| participant.step_id)
+                    .unwrap_or(spur_core::step::STEP_BATCH),
+            };
+            Ok(SettlePermit::Due(step_id))
+        })
     }
 
     /// Record how this run's epilog is going. The gate reads this, so a hook
@@ -1511,7 +1517,14 @@ impl AdmissionStore {
                 reason = %entry.reason,
                 "collecting an unreadable admission record past its retention"
             );
-            remove_path(&entry.path)?;
+            // Route through the run's own lock whenever the name resolves to one,
+            // so this delete can't race a concurrent locked writer for the same run.
+            match parse_run_dir_name(&entry.path)
+                .and_then(|(job_id, attempt)| RunKey::new(job_id, attempt))
+            {
+                Some(run_key) => self.remove_run(run_key)?,
+                None => remove_path(&entry.path)?,
+            }
             removed += 1;
         }
         Ok(removed)
@@ -2580,6 +2593,31 @@ mod tests {
             store.load_run(key(7, 1)).unwrap().cleanup.epilog,
             HookState::Running,
             "a caller that never saw the hook must not settle it"
+        );
+        assert!(matches!(
+            store.settle_permit(key(7, 1)).unwrap(),
+            SettlePermit::NotQuiescent
+        ));
+    }
+
+    // Real production order: hold_cancelled_run_for_epilog records Pending, then
+    // the process exit's first cleanup mark must not treat that as owner-loss.
+    #[test]
+    fn the_first_mark_never_settles_a_hook_already_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        store
+            .record_epilog_if_unstarted(key(7, 1), HookState::Pending)
+            .unwrap();
+
+        store.mark_run_cleaned(key(7, 1), EpilogOwed::Yes).unwrap();
+
+        assert_eq!(
+            store.load_run(key(7, 1)).unwrap().cleanup.epilog,
+            HookState::Pending,
+            "a hook already in flight when the run is first cleaned must stay \
+             trackable, not be settled as if its owner were already gone"
         );
         assert!(matches!(
             store.settle_permit(key(7, 1)).unwrap(),
