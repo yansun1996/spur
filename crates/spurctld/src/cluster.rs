@@ -774,12 +774,9 @@ impl ClusterManager {
         self.preempt_debt.read().contains_key(&beneficiary)
     }
 
-    /// Drop every debt whose victim has handed its slice back. Charged, not
-    /// Preempted: a cancel-mode victim holds its slice through its epilog too.
-    ///
-    /// Held across the whole decide-and-remove so a concurrent `record_preempt_debt`
-    /// for the same beneficiary (a fresh victim assigned mid-pass) can't have its
-    /// entry discharged here on the strength of a stale, already-superseded read.
+    /// Drops debts whose victim gave back its slice (Charged, not Preempted — cancel-mode
+    /// victims hold through their epilog too). Held for the pass so a fresh
+    /// victim assigned mid-pass isn't discharged on a stale read.
     pub(crate) fn discharge_preempt_debt(&self) {
         let mut debt = self.preempt_debt.write();
         if debt.is_empty() {
@@ -2869,9 +2866,8 @@ impl ClusterManager {
         labels: HashMap<String, String>,
         caller_privileged: bool,
         runs_job_epilog: bool,
-        // Whether a first-time registration should come up already gated. The
-        // caller passes this only when it also has a ledger to reconcile — a gate
-        // with nothing to ever clear it would strand the node forever.
+        // Whether a first-time registration should come up already gated; only set
+        // when the caller also has a ledger to reconcile, or the gate would never clear.
         reconcile_pending: bool,
     ) -> Result<(), RegisterNodeError> {
         let hostname = if hostname.is_empty() {
@@ -7498,10 +7494,9 @@ impl ClusterManager {
                 // not report, and the only thing that ends a hold it never ends.
                 for job in jobs.values_mut() {
                     job.epilog_gated_nodes.remove(name);
-                    // A Pending job pruned down to "just the gated node" by an
-                    // earlier requeue would otherwise keep naming a node that no
-                    // longer exists, forever -- nothing else revisits its
-                    // `allocated_nodes` outside an actual state transition.
+                    // A Pending job pruned to "just the gated node" would otherwise name a
+                    // removed node forever — nothing else revisits `allocated_nodes`
+                    // outside a state transition.
                     if job.state == JobState::Pending {
                         job.allocated_nodes.retain(|n| n != name);
                         job.per_node_alloc.remove(name);
@@ -9778,15 +9773,9 @@ mod tests {
         // this handle alone reads as not ready, as its own test asserts.
         cm.set_raft(raft_that_cannot_apply(&raft_dir).await.raft);
 
-        // This substituted handle can never reach quorum (its one peer is
-        // unreachable), so it never stops retrying its own election -- its
-        // term is a genuinely moving target for as long as the handle lives,
-        // not just at startup. Priming the latch to a term read a moment
-        // earlier can lose the race to that background retry, especially
-        // under load; re-reading and re-priming immediately before each
-        // attempt, retried a bounded number of times with no sleep (each
-        // attempt is a handful of synchronous reads, not a real wait), is
-        // what actually closes the window instead of narrowing it.
+        // This handle's peer is unreachable, so it never stops re-electing and its
+        // term keeps moving; retry with a fresh read+prime each iteration (bounded,
+        // no sleep) to close that race instead of just narrowing it.
         let mut passed = false;
         for _ in 0..50 {
             let term = cm
@@ -11996,9 +11985,8 @@ mod tests {
         assert_eq!(node.partitions[0], "default");
     }
 
-    // Closes the register-then-gate window: a first-time registration with a
-    // ledger to reconcile must never be visible-and-schedulable even for one
-    // tick before its gate is set, because the two used to be separate proposals.
+    // Closes the register-then-gate window: a first-time registration with a ledger
+    // to reconcile must never be visible-and-schedulable before its gate is set.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_first_registration_with_a_gate_is_never_schedulable_before_it() {
         let dir = TempDir::new().unwrap();
@@ -24221,9 +24209,9 @@ mod tests {
         );
     }
 
-    // Deregistering a node a Pending job is still gated on must also stop that
-    // job's record from naming it, not just clear the gate itself -- a rebuild
-    // and squeue's NodeList must not keep pointing at a node the cluster forgot.
+    // Deregistering a node a Pending job is gated on must also stop the job's
+    // record from naming it — squeue's NodeList must not keep pointing at a
+    // node the cluster forgot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn removing_a_node_stops_a_pending_job_from_still_naming_it() {
         let dir = TempDir::new().unwrap();
@@ -24355,12 +24343,9 @@ mod tests {
         );
     }
 
-    // JobDispatchBackoff is a third requeue trigger (a transient dispatch
-    // failure), separate from the JobStateChange path the test above covers --
-    // it must preserve an epilog gate's job-record bookkeeping the same way,
-    // not just its two siblings. (The gate's *live* CPU count is governed
-    // separately by the derive-from-job-records rebuild, asserted below via
-    // `recompute_node_allocations`, same as the sibling test.)
+    // JobDispatchBackoff is a third requeue trigger, separate from the
+    // JobStateChange path above; it must preserve the epilog gate's
+    // job-record bookkeeping the same way.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dispatch_backoff_keeps_the_slice_its_gate_is_still_holding() {
         let dir = TempDir::new().unwrap();
