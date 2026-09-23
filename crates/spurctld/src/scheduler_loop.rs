@@ -500,6 +500,18 @@ async fn process_assignment(
                     node = %name,
                     "node missing while building peer list"
                 );
+                // register_allocation_on_nodes above may already have charged a
+                // real allocation on these nodes; nothing else releases it.
+                if srun_step_dispatch {
+                    cancel_job_on_nodes(
+                        &cluster,
+                        job_id,
+                        prospective_run_attempt,
+                        &dispatch_nodes,
+                        0,
+                    )
+                    .await;
+                }
                 return false;
             };
             let Some(addr) = node_comm_socket(&n) else {
@@ -508,6 +520,16 @@ async fn process_assignment(
                     node = %name,
                     "no comm address for peer list"
                 );
+                if srun_step_dispatch {
+                    cancel_job_on_nodes(
+                        &cluster,
+                        job_id,
+                        prospective_run_attempt,
+                        &dispatch_nodes,
+                        0,
+                    )
+                    .await;
+                }
                 return false;
             };
             addrs.push(addr);
@@ -1523,11 +1545,9 @@ async fn dispatch_to_agent(
 
     let inner = response.into_inner();
     if !inner.success {
-        // An agent predating the classification sends UNSPECIFIED, which falls
-        // through to the generic requeue this has always done.
+        // A named reason lets the controller act in this round trip; an agent predating the
+        // classification sends UNSPECIFIED, which falls through to the generic requeue.
         use spur_proto::proto::LaunchFailureKind as Kind;
-        // A named reason lets the controller act in this round trip. An older
-        // agent sends UNSPECIFIED and falls through to the generic requeue.
         return Err(match Kind::try_from(inner.failure_kind) {
             Ok(Kind::LaunchFailureProlog) => DispatchError::PrologFailed(inner.error),
             Ok(Kind::LaunchFailureFenced) => DispatchError::Fenced(inner.error),
@@ -2859,12 +2879,9 @@ pub async fn pull_all_node_ledgers(cluster: &Arc<ClusterManager>, reason: &str) 
     while set.join_next().await.is_some() {}
 }
 
-/// Refuse any launch for this run issued before now. Sent before the cancel,
-/// which alone races an in-flight launch and loses. Also called on a run's
-/// normal settlement (`report_job_status`'s `AllDone` arm in server.rs) for the
-/// same reason: a scheduler-side dispatch retry that raced the run's own fast
-/// completion must not be admitted after the fact just because it settled
-/// before the retry's `LaunchJob` happened to arrive.
+/// Refuse any launch for this run issued before now. Sent before the cancel
+/// (which alone races an in-flight launch and loses), and also on normal
+/// settlement so a late dispatch retry can't be admitted after the fact.
 pub(crate) async fn fence_run_on_nodes(
     cluster: &Arc<ClusterManager>,
     job_id: spur_core::job::JobId,
@@ -6360,10 +6377,8 @@ mod tests {
             );
         }
 
-        // The other half of the settlement fence (server.rs's `report_job_status`
-        // AllDone arm calls exactly this, with exactly this data, once a run's
-        // last node reports in) -- proves the mechanism a stale dispatch retry
-        // needs reaches the same node a real batch job actually ran on.
+        // The other half of the settlement fence (server.rs's AllDone arm calls exactly this
+        // on the last node's report) -- proves it reaches the node a real batch job actually ran on.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn fence_run_on_nodes_reaches_the_node_a_batch_job_settled_on() {
             let dir = TempDir::new().unwrap();
@@ -6382,9 +6397,8 @@ mod tests {
                 "the last node's report must settle the run"
             );
 
-            // Mirrors report_job_status's AllDone arm: fence the exact run and
-            // nodes that just settled, so a retry racing this completion is
-            // refused instead of admitted after the fact.
+            // Mirrors report_job_status's AllDone arm: fence the run that just settled
+            // so a racing retry is refused instead of admitted after the fact.
             fence_run_on_nodes(&cm, job_id, job.run_attempt, &job.allocated_nodes).await;
 
             wait_for("fence_run reached the node the job settled on", || {
@@ -6497,6 +6511,50 @@ mod tests {
             wait_for("n1 registration rolled back with a cancel", || {
                 cancel_calls.load(Ordering::SeqCst) >= 1
             });
+        }
+
+        /// A node that vanishes from the cluster after registering an allocation, but
+        /// before the peer-list build that follows registration, cannot itself be
+        /// cancelled (there is no longer an address to reach it by) — but a sibling
+        /// node in the same multi-node job that registered just as successfully, and
+        /// is still very much reachable, must not be left holding its half forever
+        /// just because the other node's disappearance aborted the dispatch.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn process_assignment_cancels_a_surviving_peer_when_its_sibling_vanishes_first() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr1, cancel_calls) = spawn_mock_agent().await;
+            let (addr2, _) = spawn_mock_agent_with_register_delay(Duration::from_millis(200)).await;
+            register_node_at(&cm, "n1", addr1);
+            register_node_at(&cm, "n2", addr2);
+
+            let mut spec = batch_spec("srun-sibling-vanishes-before-peer-addrs", 2);
+            spec.srun_job = true;
+            let job_id = submit_and_wait(&cm, spec);
+
+            let cm_bg = cm.clone();
+            let assignment_task = tokio::spawn(async move {
+                process_assignment(cm_bg, assignment(job_id, &["n1", "n2"])).await
+            });
+
+            // n1's registration returns immediately; n2's is still in flight (its
+            // own 200ms delay), so n2 can be removed from the cluster before
+            // process_assignment reaches the peer-list build that follows
+            // registration — after n2 has already registered successfully.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cm.remove_node("n2", false, Some("test: vanished mid-dispatch".into()))
+                .unwrap();
+
+            let started = assignment_task.await.unwrap();
+
+            assert!(!started);
+            assert_eq!(cm.get_job(job_id).unwrap().state, JobState::Pending);
+            wait_for(
+                "n1's registration must be rolled back even though n2 could not be reached",
+                || cancel_calls.load(Ordering::SeqCst) >= 1,
+            );
         }
 
         /// Every node answering just past the deadline is the production shape of "all failed":
