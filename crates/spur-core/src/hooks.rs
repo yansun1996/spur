@@ -127,9 +127,8 @@ pub async fn run_hook(script_path: &str, ctx: &HookContext) -> anyhow::Result<()
     Ok(())
 }
 
-/// Kills the hook's process group when the wait for it was abandoned.
-/// `kill_on_drop` reaches the direct child only, so anything the hook spawned —
-/// the shape a real epilog has — would outlive the bound that released the slice.
+/// Kills the hook's process group when the wait for it was abandoned:
+/// `kill_on_drop` only reaches the direct child, not what a real epilog spawns.
 struct HookProcessGroup {
     pgid: i32,
     armed: bool,

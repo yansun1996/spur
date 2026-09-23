@@ -273,9 +273,8 @@ pub struct HooksConfig {
     /// Lua script defining `slurm_job_submit(job_desc, submit_uid)`, run in a
     /// sandbox at submission. Slurm `job_submit/lua` parity. Runs after `job_submit`.
     pub job_submit_lua: Option<String>,
-    /// Seconds to wait for the node `epilog` before recording it failed and
-    /// releasing the job's resources. `0` waits forever, matching Slurm's
-    /// `PrologEpilogTimeout` default.
+    /// Seconds to wait for the node `epilog` before recording it failed and releasing the
+    /// job's resources; `0` waits forever, matching Slurm's `PrologEpilogTimeout` default.
     #[serde(default = "default_epilog_timeout_secs")]
     pub epilog_timeout_secs: u64,
 }

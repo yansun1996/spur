@@ -168,12 +168,8 @@ class TestRequeueEpilogGate:
                 "holder job never reached RUNNING"
             )
 
-            # Cancel while the node's epilog is slow: the run ends right away
-            # (Cancelled) but the node still owes its epilog report, so the
-            # slice stays held. Then admin-requeue that now-terminal, still
-            # -gated job — the exact hand-off the bug this covers broke: the
-            # requeue used to release the slice right here, before the node's
-            # own (still running) epilog ever reported.
+            # Cancel while the epilog is slow (still-gated but terminal), then requeue
+            # it: the exact hand-off this test covers (requeue used to free it too soon).
             cluster.scancel(str(holder_id))
             cluster.scontrol("requeue", str(holder_id))
 
@@ -188,10 +184,8 @@ class TestRequeueEpilogGate:
             )
             assert blocked_id is not None, "blocked job did not submit"
 
-            # The requeued holder is pending again and would otherwise race
-            # the blocked job for the node the instant the epilog clears it;
-            # cancel it for good now. Its gate still binds regardless of the
-            # job's own state, so this does not free the node early either.
+            # Cancel the requeued holder for good so it can't win the re-dispatch
+            # race once the gate clears; its gate still binds regardless of state.
             cluster.scancel(str(holder_id))
 
             # Well inside the epilog's sleep window: the node must still be busy.
