@@ -121,6 +121,12 @@ pub struct VirtualAgent {
     hostname: String,
     auth_audience: String,
     auth_epoch: u64,
+    /// (job_id, run_attempt) -> the cutoff `fence_run` last recorded for it. A
+    /// launch issued at or before its own run's cutoff is refused, mirroring
+    /// spurd's `LaunchFences` -- without this a fence here was accepted and
+    /// immediately discarded, so nothing it protected against (a stale launch
+    /// retry racing a cancel or a settled run) was ever actually enforced.
+    fences: std::sync::Mutex<std::collections::HashMap<(u32, u32), u64>>,
 }
 
 impl VirtualAgent {
@@ -134,6 +140,7 @@ impl VirtualAgent {
                 .unwrap_or_default(),
             auth_audience: String::new(),
             auth_epoch: 0,
+            fences: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -267,6 +274,32 @@ impl SlurmAgent for VirtualAgent {
             verify_launch_credential(keys, &self.cluster_id, &self.hostname, &req)?;
         }
         let job_id = req.job_id;
+        if let Some(&reject_before) = self
+            .fences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(job_id, req.run_attempt))
+        {
+            // Mirrors spurd's LaunchFences::check: a launch issued at or before
+            // this run's own cutoff is a stale retry, not a fresh request.
+            if reject_before > 0
+                && req.issued_at_unix_ms > 0
+                && req.issued_at_unix_ms <= reject_before
+            {
+                warn!(
+                    job_id,
+                    run_attempt = req.run_attempt,
+                    "refusing a fenced launch"
+                );
+                return Ok(Response::new(LaunchJobResponse {
+                    conflict: None,
+                    success: false,
+                    error: "launch refused: Fenced".to_string(),
+                    failure_kind: LaunchFailureKind::LaunchFailureFenced as i32,
+                    ..Default::default()
+                }));
+            }
+        }
         let job = self.resolve_job(job_id).await?;
         let ns = job.namespace;
         let target_node = req.target_node.clone();
@@ -679,13 +712,20 @@ impl SlurmAgent for VirtualAgent {
         ))
     }
 
-    /// A virtual node has no local ledger to fence: its pods are the only state,
-    /// and cancel deletes them outright.
+    /// A virtual node has no local ledger, so unlike spurd there is no admitted
+    /// digest or expiry to check -- but the cutoff itself must still be kept
+    /// and enforced on the next `launch_job` for this run, or a stale launch
+    /// racing a cancel/settle is admitted as if nothing had fenced it.
     async fn fence_run(
         &self,
         request: Request<spur_proto::proto::FenceRunRequest>,
     ) -> Result<Response<spur_proto::proto::FenceRunResponse>, Status> {
         let req = request.into_inner();
+        let mut fences = self.fences.lock().unwrap_or_else(|e| e.into_inner());
+        fences
+            .entry((req.job_id, req.run_attempt))
+            .and_modify(|cutoff| *cutoff = (*cutoff).max(req.reject_before_unix_ms))
+            .or_insert(req.reject_before_unix_ms);
         Ok(Response::new(spur_proto::proto::FenceRunResponse {
             success: true,
             error: String::new(),
@@ -1689,6 +1729,128 @@ mod resolve_job_tests {
             "got {:?}",
             err.message()
         );
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+    use crate::test_support::{list_response, FakeApiServer};
+    use http::StatusCode;
+
+    const JOB_ID: u32 = 7;
+
+    fn a_matching_spurjob() -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "spur.amd.com/v1alpha1",
+            "kind": "SpurJob",
+            "metadata": {
+                "name": "train",
+                "namespace": "team-a",
+                "labels": { "spur.amd.com/job-id": JOB_ID.to_string() },
+            },
+            "spec": { "name": "train", "image": "busybox" },
+            "status": { "assignedNodes": [] },
+        })
+    }
+
+    fn launch_request(run_attempt: u32, issued_at_unix_ms: u64) -> Request<LaunchJobRequest> {
+        Request::new(LaunchJobRequest {
+            job_id: JOB_ID,
+            run_attempt,
+            issued_at_unix_ms,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn a_launch_issued_before_the_fence_is_refused_without_reaching_k8s() {
+        let server =
+            FakeApiServer::answering(StatusCode::OK, &list_response(&[a_matching_spurjob()]));
+        let agent = VirtualAgent::new(server.client());
+
+        agent
+            .fence_run(Request::new(FenceRunRequest {
+                job_id: JOB_ID,
+                run_attempt: 1,
+                reject_before_unix_ms: 10_000,
+            }))
+            .await
+            .expect("fence_run always succeeds");
+
+        let resp = agent
+            .launch_job(launch_request(1, 5_000))
+            .await
+            .expect("a refusal is still Ok(response), matching spurd's own convention")
+            .into_inner();
+
+        assert!(
+            !resp.success,
+            "a launch issued before the fence must be refused"
+        );
+        assert_eq!(
+            resp.failure_kind,
+            LaunchFailureKind::LaunchFailureFenced as i32
+        );
+        assert!(
+            server.requests().is_empty(),
+            "a fenced launch must be refused before it ever reaches the k8s API -- \
+             this is exactly the check that was previously a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_launch_issued_after_the_fence_is_not_refused() {
+        let server =
+            FakeApiServer::answering(StatusCode::OK, &list_response(&[a_matching_spurjob()]));
+        let agent = VirtualAgent::new(server.client());
+
+        agent
+            .fence_run(Request::new(FenceRunRequest {
+                job_id: JOB_ID,
+                run_attempt: 1,
+                reject_before_unix_ms: 10_000,
+            }))
+            .await
+            .unwrap();
+
+        // Proceeds past the fence check into resolve_job (which the seeded
+        // server answers), then fails later only because this request carries
+        // no job spec -- proof it was not refused by the fence.
+        let err = agent
+            .launch_job(launch_request(1, 20_000))
+            .await
+            .expect_err("no spec was provided");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("missing job spec"));
+        assert!(
+            !server.requests().is_empty(),
+            "an unfenced launch must still reach resolve_job"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fence_for_a_different_run_attempt_does_not_apply() {
+        let server =
+            FakeApiServer::answering(StatusCode::OK, &list_response(&[a_matching_spurjob()]));
+        let agent = VirtualAgent::new(server.client());
+
+        agent
+            .fence_run(Request::new(FenceRunRequest {
+                job_id: JOB_ID,
+                run_attempt: 1,
+                reject_before_unix_ms: 10_000,
+            }))
+            .await
+            .unwrap();
+
+        // A requeue's later attempt is a different run; the old attempt's
+        // fence must not reach across to it.
+        let err = agent
+            .launch_job(launch_request(2, 5_000))
+            .await
+            .expect_err("no spec was provided");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }
 
