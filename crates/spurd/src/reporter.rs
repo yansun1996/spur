@@ -228,13 +228,9 @@ impl NodeReporter {
         Ok(())
     }
 
-    /// `register`, retried a few times with a short fixed delay on failure --
-    /// long enough to ride out the controller mid-restart or a brief network
-    /// blip, short enough that a genuinely unreachable controller still fails
-    /// fast. Unlike re-registration from the heartbeat loop (retried forever,
-    /// never fatal), this is the very first registration: failing it stops
-    /// `spurd` from ever starting, so it gets a bounded retry of its own
-    /// instead of depending solely on the process supervisor to restart it.
+    /// `register`, retried with a short fixed delay to ride out a controller
+    /// restart or network blip. Unlike heartbeat re-registration (retried
+    /// forever), failing this stops `spurd` from starting.
     pub async fn register_with_retry(
         &self,
         attempts: u32,
@@ -358,10 +354,9 @@ impl NodeReporter {
     }
 }
 
-/// Retries `attempt` up to `attempts` times with a fixed `delay` between
-/// failures, returning the last error once exhausted. Deliberately simple --
-/// a fixed delay, not exponential backoff with jitter -- since this exists to
-/// ride out a short blip, not to be a general-purpose retry policy.
+/// Retries `attempt` up to `attempts` times with a fixed `delay`, returning the
+/// last error once exhausted. Deliberately simple (no backoff/jitter): this
+/// rides out a short blip, not a general retry policy.
 async fn retry_bounded<F, Fut, T>(
     attempts: u32,
     delay: std::time::Duration,

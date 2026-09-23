@@ -311,9 +311,8 @@ class TestEpilogHold:
 
 
 class TestRawInteractiveRecordSweep:
-    """A raw srun or a salloc job's admission record must be deleted on
-    natural completion, not just flipped to state="cleaned" with the
-    directory left behind."""
+    """A raw srun or salloc job's admission record must be deleted on natural
+    completion, not just flipped to state="cleaned" with the directory left."""
 
     def test_a_completed_raw_srun_jobs_record_is_deleted(self, cluster):
         node = cluster.node_names[0]
@@ -373,18 +372,8 @@ class TestRawInteractiveRecordSweep:
 
 
 class TestReleaseIndexOnPtyWithEpilog:
-    """A clean interactive-session exit with a configured epilog must record a
-    real, nonzero Raft commit index for the release — not a hardcoded/local
-    stand-in a restart could not tell apart from a genuine commit.
-
-    Uses `salloc`, not a bare standalone `srun --pty`: a bare pty step's own
-    task exit does not name a step that "answers for" the run (its lifecycle
-    owner is a separate extern step), so its release always goes through the
-    controller-cancel settle path, which records `release_raft_index: 0` by
-    design regardless of epilog. `salloc`'s own clean-exit report goes through
-    the acknowledged-completion path instead, which can carry a genuine
-    index — a materially different code path, and the one this test exercises.
-    """
+    """A clean salloc exit with an epilog must record a real, nonzero Raft commit
+    index, not a hardcoded stand-in like `srun --pty`'s zero-index cancel path."""
 
     def test_a_clean_salloc_exit_records_a_real_release_index(self, unstarted_cluster):
         cluster = unstarted_cluster

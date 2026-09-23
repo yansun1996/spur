@@ -135,10 +135,8 @@ def _parse_probe(content: str) -> dict:
 
 
 def _supervisor_pids(cluster, node_index: int = 0) -> set:
-    """Supervisors under this cluster's own state dir. Same convention as
-    test_stepd_step_supervision.py / test_stepd_restart_survival.py: pid
-    *identity* (not just presence) is what proves a session survived an agent
-    restart rather than being silently respawned."""
+    """Supervisors under this cluster's own state dir. Pid identity (not just
+    presence) proves a session survived a restart rather than being respawned."""
     node = cluster.nodes[node_index]
     out = node.exec_allow_fail("ps -eww -o pid=,args= 2>/dev/null || true")
     pids = set()
@@ -887,9 +885,8 @@ class TestSrunPtyContainerStep:
         self, step_container_cluster
     ):
         """scancel of an interactive `srun --pty --container-image` session
-        terminates the container (no orphan) — the pty equivalent of
-        `TestSrunContainerStepNewRootfs.test_cancellation_terminates_container_step`.
-        """
+        terminates the container (no orphan), the pty equivalent of
+        test_cancellation_terminates_container_step above."""
         cluster = step_container_cluster
         img = cluster.step_container_image
         node = cluster.node_names[0]
@@ -1054,12 +1051,9 @@ class TestContainerStepAgentRestart:
 
 class TestSrunPtyContainerStepSupervision:
     """An interactive `srun --pty --container-image` session must be
-    spurstepd-supervised, not a raw fork the agent owns directly — otherwise
-    an agent restart kills the session outright. Proven the same way
-    test_stepd_restart_survival.py proves it for a batch job: the same
-    supervisor pid survives an agent restart, and the session (inside the
-    container) keeps running and completes correctly afterward.
-    """
+    spurstepd-supervised, not a raw fork the agent owns, or a restart kills it
+    outright; proven by the same supervisor pid surviving and the session
+    finishing correctly, like a batch job."""
 
     def test_pty_container_session_survives_an_agent_restart(
         self, step_container_cluster

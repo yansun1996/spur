@@ -206,11 +206,8 @@ pub enum WalOperation {
         /// Controller-stamped instant of resume.
         at: chrono::DateTime<chrono::Utc>,
     },
-    /// Evict a single job to NodeFail: same effect as a node health-check
-    /// failure (frees allocations, feeds the auto-requeue path), but scoped
-    /// to one job instead of every job on a node. Used both for a launch
-    /// dispatch some assigned nodes never received, and for a node reconcile
-    /// finds no longer holds a job it was actually running.
+    /// Like a node health-check failure, but scoped to one job: a launch some
+    /// nodes never received, or a reconcile finding a job a node no longer holds.
     JobEvict {
         job_id: JobId,
         /// Human-readable bootstrap failure (shown via scontrol / logs).
@@ -254,10 +251,8 @@ pub enum WalOperation {
         /// a pre-declaration entry, which replays as a node that never gates.
         #[serde(default)]
         runs_job_epilog: bool,
-        /// Hold the node out of scheduling from the instant this entry applies, so
-        /// a first-time registration with a ledger to reconcile never has a window
-        /// where it is visible and schedulable before the gate is set. `false` on a
-        /// pre-gate entry, which replays as a node that came up already trusted.
+        /// Gates a first registration with a ledger to reconcile out of scheduling
+        /// immediately. `false` on a pre-gate entry replays as already-trusted.
         #[serde(default)]
         reconcile_pending: bool,
     },

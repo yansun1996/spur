@@ -1,14 +1,10 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! In-process `SlurmController` mock for exercising CLI code paths that hold a
-//! live [`SlurmControllerClient`].
-//!
-//! Follows the same shape as the `MockAgent` harness in `spurctld`: bind an
-//! ephemeral localhost port, serve a hand-written service on it, and hand the
-//! caller back the address plus a shared record of what the server observed.
-//! Only a handful of RPCs are implemented; every other RPC reports
-//! `unimplemented` so an unexpected call fails loudly instead of silently returning a default.
+//! In-process `SlurmController` mock for CLI paths holding a live
+//! [`SlurmControllerClient`]. Same shape as `spurctld`'s `MockAgent`: an
+//! ephemeral port, a handful of mocked RPCs, `unimplemented` for the rest
+//! so drift fails loudly.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;

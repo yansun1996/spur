@@ -202,9 +202,8 @@ class TestSrunPtyStepMultiNode:
 
 
 class TestTerminalOverreach:
-    """A batch job's own process tree must not depend on whoever happens to
-    be attached to it, and an outer `salloc` allocation must not depend on an
-    inner `--pty` client staying alive."""
+    """A batch job's process tree must not depend on whoever is attached to it,
+    and an outer `salloc` allocation must not depend on an inner `--pty` client staying alive."""
 
     def test_batch_job_survives_losing_its_attached_terminal(self, cluster):
         node = cluster.node_names[0]
@@ -306,9 +305,8 @@ class TestTerminalOverreach:
 
 
 def _bracket(pattern: str) -> str:
-    """Wrap the first char in a regex class so pgrep -f does not match the
-    shell that is running pgrep itself (its own cmdline contains the literal
-    pattern)."""
+    """Wrap the first char in a regex class so pgrep -f does not match the shell
+    running pgrep itself (its cmdline contains the literal pattern)."""
     return f"[{pattern[0]}]{pattern[1:]}" if pattern else pattern
 
 
@@ -337,11 +335,9 @@ def _supervisor_pids_pty(cluster, node_index: int = 0) -> set[str]:
 
 
 class TestPtyAgentRestartFailsSafe:
-    """A `srun --pty` job does not survive an agent restart (its connection
-    to spurd is the pty bridge itself, so killing spurd drops it in the same
-    instant) -- but the failure must be safe: no leaked process, no leaked
-    CPU/GPU hold, and any resulting node drain must self-clear with no
-    operator action."""
+    """A `srun --pty` job cannot survive an agent restart (its connection to spurd
+    is the pty bridge itself), but it must fail safe: no leaked process/CPU/GPU
+    hold, and any node drain must self-clear with no operator action."""
 
     def test_no_leak_and_the_node_self_heals(self, cluster):
         node = cluster.node_names[0]

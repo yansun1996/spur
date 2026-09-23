@@ -1,13 +1,10 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! In-process `SlurmAgent` mock for exercising CLI code paths that talk to a
-//! compute node directly, tailing a step's output or opening a terminal on it.
-//!
-//! Same shape as [`crate::mock_controller`]: bind an ephemeral localhost port,
-//! serve a hand-written service on it, and hand the caller back the address plus
-//! a shared record of what the server observed. Only a handful of RPCs are
-//! mocked; everything else reports `unimplemented` so drift fails loudly, not silently.
+//! In-process `SlurmAgent` mock for CLI paths that talk to a compute node
+//! directly (tailing a step's output, opening a terminal). Same shape as
+//! [`crate::mock_controller`]: an ephemeral port, a handful of mocked RPCs,
+//! `unimplemented` for the rest so drift fails loudly.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -190,10 +187,8 @@ mock_agent_impl! {
             let (tx, rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 match attempt {
-                    // A dropped sender surfaces to the client as `Ok(None)`,
-                    // matching a stepd that vanished mid-session. Hang and
-                    // AlreadyExists never reach here — both already returned
-                    // above.
+                    // A dropped sender reads as `Ok(None)`, matching a stepd that
+                    // vanished mid-session (Hang/AlreadyExists already returned above).
                     ScriptedSession::Disconnect
                     | ScriptedSession::Hang
                     | ScriptedSession::AlreadyExists => {}

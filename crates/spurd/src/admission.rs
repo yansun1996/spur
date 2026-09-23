@@ -1452,11 +1452,9 @@ impl AdmissionStore {
         })
     }
 
-    /// As [`Self::sweep`]'s per-run body, but re-validated fresh under this run's
-    /// own lock immediately before deleting -- so a write that lands between
-    /// `sweep`'s unlocked scan and this call (a relaunch, a fresh admit reusing
-    /// the same job id and attempt) can't have its brand-new record swept away
-    /// on the strength of the stale snapshot that decided to look at it.
+    /// As [`Self::sweep`]'s per-run body, but re-validated under this run's own
+    /// lock right before deleting, so a write landing between the unlocked
+    /// scan and this call can't be swept on a stale decision.
     fn remove_run_if_eligible(
         &self,
         run_key: RunKey,
@@ -2045,9 +2043,8 @@ mod tests {
         store.admit_participant(&owed).unwrap();
         assert!(store.settle_acknowledged_run(key(7, 1)).unwrap());
 
-        // Simulates a write landing between `sweep`'s unlocked scan (which would
-        // have seen the settled snapshot above) and the locked recheck below --
-        // a fresh, still-unacknowledged participant for the same run.
+        // Simulates a write landing between `sweep`'s unlocked scan (which saw the settled
+        // snapshot above) and the locked recheck below: a fresh, unacknowledged participant.
         let mut fresh = ParticipantAdmission::new(7, 1, STEP_INTERACTIVE, "n1", Default::default());
         fresh.final_report.required = true;
         store.admit_participant(&fresh).unwrap();

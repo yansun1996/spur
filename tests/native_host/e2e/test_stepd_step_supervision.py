@@ -382,13 +382,10 @@ class TestSupervisedJobReclaim:
 
 
 class TestConcurrentStepLaunchRace:
-    """Two `srun --exclusive` steps launched close together in one `sbatch`
-    script must never collide on the same numbered step id and end the job
-    on the fast step's completion instead of waiting for the slow one.
-    Reproduced live intermittently, so this repeats the repro shape many
-    times rather than trusting a single deterministic pass. STEP_RACE_TRIALS
-    trades confidence for time on a slower/CI run; each trial costs ~30s
-    here (dominated by the slow step)."""
+    """Two `srun --exclusive` steps in one `sbatch` script must never collide on
+    the same step id nor end the job on the fast step's completion. Reproduced
+    only intermittently live, so STEP_RACE_TRIALS repeats the repro shape many
+    times (~30s each) rather than trusting one pass."""
 
     def test_concurrent_exclusive_steps_never_end_the_job_early(self, cluster):
         trials = int(os.environ.get("STEP_RACE_TRIALS", "12"))

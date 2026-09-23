@@ -1,12 +1,10 @@
 # Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""A raw `srun` (no --pty, no salloc) has no allocation of its own: the client
-is normally the only thing that ends it. If the client dies before its task
-does, a fixed keepalive floor must reap the job with the task's own real
-signal/exit code -- not leave it RUNNING until a (possibly very long or
-absent) TimeLimit fabricates a `-1:0` result and leaks the session-supervisor
-`spurstepd` forever."""
+"""A raw `srun` has no allocation of its own, so nothing but the client ends it. If
+the client dies before its task does, a fixed keepalive floor must reap the job
+with the task's own real exit code, not leave it RUNNING until TimeLimit
+fabricates a `-1:0` result and leaks its `spurstepd` forever."""
 
 import shlex
 import time
