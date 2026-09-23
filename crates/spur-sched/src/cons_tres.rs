@@ -468,7 +468,10 @@ impl NodeAllocation {
             memory_mb,
         };
         // Committed outright: an adopted job is already running, and leaving it
-        // `launching` would let reconcile reclaim it once the TTL elapsed.
+        // `launching` would let the LAUNCHING_TTL sweep flag it as unbacked once
+        // the TTL elapsed (flag_unbacked_allocations only marks a claim as
+        // unbacked; it does not itself reclaim it -- that is the controller's
+        // call once its own reconcile agrees the job is gone).
         self.owners.insert(
             job_id,
             Owned {
@@ -481,10 +484,11 @@ impl NodeAllocation {
 
     /// Mark a job's allocation as committed (its process is now tracked), so it
     /// is no longer exempt from reconcile. Returns false if the reservation no
-    /// longer exists (reconcile reclaimed it after the launch exceeded the TTL)
-    /// or now belongs to a different `run_attempt` (a newer reservation for the
-    /// same job id superseded this one) — either way the caller must not treat
-    /// the job as backed by an allocation.
+    /// longer exists (the controller reclaimed it after the TTL flagged the
+    /// launch as unbacked and it agreed the job was gone) or now belongs to a
+    /// different `run_attempt` (a newer reservation for the same job id
+    /// superseded this one) — either way the caller must not treat the job as
+    /// backed by an allocation.
     pub fn commit_job(&mut self, job_id: u32, run_attempt: u32) -> bool {
         let owned = self
             .owners
@@ -1001,11 +1005,12 @@ mod tests {
 
     #[test]
     fn test_commit_job_rejects_a_superseded_attempt() {
-        // Attempt 1 reserves job 7, then something (a cancel, or the TTL
-        // reconcile) releases it believing it's gone before it ever commits —
-        // freeing the job id for a redispatch (attempt 2) to reserve and
-        // commit. Attempt 1, unaware it was superseded, must not have its own,
-        // now-stale commit adopt attempt 2's reservation as its own.
+        // Attempt 1 reserves job 7, then something (a cancel, or the controller
+        // agreeing the job was gone once the TTL flagged it as unbacked)
+        // releases it believing it's gone before it ever commits — freeing the
+        // job id for a redispatch (attempt 2) to reserve and commit. Attempt 1,
+        // unaware it was superseded, must not have its own, now-stale commit
+        // adopt attempt 2's reservation as its own.
         let mut node = make_node(64, 256_000, 0, "");
         node.allocate_for_job(7, 1, 8, 16_000, &[]).unwrap();
         node.release_job(ReleaseWarrant::controller_cancelled(RunKey::any_attempt(7)));
