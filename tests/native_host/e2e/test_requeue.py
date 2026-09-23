@@ -11,6 +11,13 @@ guards. Each test cancels its job in a finally block.
 import time
 
 from cluster import parse_job_id, job_state
+from test_prolog_epilog import _setup_hooks
+
+# Long enough that the "still pending" checkpoint in TestRequeueEpilogGate
+# lands well inside the window, short enough the test does not drag.
+SLOW_EPILOG_SECS = 8
+
+SLOW_EPILOG = f"#!/bin/bash\nsleep {SLOW_EPILOG_SECS}\n"
 
 
 def _cleanup(cluster, job_id):
@@ -130,6 +137,77 @@ class TestRequeueHold:
             )
         finally:
             _cleanup(cluster, job_id)
+
+
+class TestRequeueEpilogGate:
+    """A node's epilog-gated slice must survive `scontrol requeue`, not just
+    the completion that preceded it: requeuing a job whose node still owes a
+    slow epilog must not let a second job double-book that node."""
+
+    def test_requeue_of_a_gated_job_holds_the_node_until_its_epilog_completes(
+        self, unstarted_cluster
+    ):
+        cluster = unstarted_cluster
+        cluster.start(_setup_hooks(cluster, epilog=SLOW_EPILOG))
+
+        node = cluster.node_names[0]
+        holder_script = cluster.write_file(
+            "rq-epilog-holder.sh", "#!/bin/bash\nsleep 300\n"
+        )
+        holder_id = parse_job_id(
+            cluster.sbatch(
+                ["-J", "rq-epilog-holder", "-N", "1", "-w", node,
+                 "--exclusive", "-c", "1", holder_script]
+            )
+        )
+        assert holder_id is not None, "holder job did not submit"
+
+        blocked_id = None
+        try:
+            assert _wait_state(cluster, holder_id, "R", timeout=60), (
+                "holder job never reached RUNNING"
+            )
+
+            # Cancel while the node's epilog is slow: the run ends right away
+            # (Cancelled) but the node still owes its epilog report, so the
+            # slice stays held. Then admin-requeue that now-terminal, still
+            # -gated job — the exact hand-off the bug this covers broke: the
+            # requeue used to release the slice right here, before the node's
+            # own (still running) epilog ever reported.
+            cluster.scancel(str(holder_id))
+            cluster.scontrol("requeue", str(holder_id))
+
+            blocked_script = cluster.write_file(
+                "rq-epilog-blocked.sh", "#!/bin/bash\necho SHOULD_NOT_RUN\n"
+            )
+            blocked_id = parse_job_id(
+                cluster.sbatch(
+                    ["-J", "rq-epilog-blocked", "-N", "1", "-w", node,
+                     "--exclusive", "-c", "1", blocked_script]
+                )
+            )
+            assert blocked_id is not None, "blocked job did not submit"
+
+            # The requeued holder is pending again and would otherwise race
+            # the blocked job for the node the instant the epilog clears it;
+            # cancel it for good now. Its gate still binds regardless of the
+            # job's own state, so this does not free the node early either.
+            cluster.scancel(str(holder_id))
+
+            # Well inside the epilog's sleep window: the node must still be busy.
+            time.sleep(3)
+            assert job_state(cluster.squeue_all(), blocked_id) == "PD", (
+                "the node's slice must stay held until the epilog reports done"
+            )
+
+            # Once the epilog naturally finishes, the node frees and the
+            # blocked job — the only job still contending for it — gets its turn.
+            assert _wait_state(cluster, blocked_id, "R", timeout=60), (
+                "blocked job never ran after the epilog completed"
+            )
+        finally:
+            _cleanup(cluster, blocked_id)
+            _cleanup(cluster, holder_id)
 
 
 def _wait_named_running(cluster, name, want=1, timeout=90):
