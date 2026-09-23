@@ -127,7 +127,7 @@ pub struct ContainerLaunchConfig {
 /// Groups the resolved execution parameters that come from multiple sources
 /// (JobSpec, scheduler allocation, agent config) into a single value.
 /// How the job's I/O is connected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub enum LaunchIo {
     /// Traditional file-based stdout/stderr capture.
     #[default]
@@ -135,6 +135,33 @@ pub enum LaunchIo {
     /// PTY-backed: stdout/stderr/stdin all go through a pseudo-terminal.
     /// The master fd is returned in `LaunchResult::pty_master`.
     Pty(Option<crate::pty::WindowSize>),
+}
+
+/// A pre-window-size build wrote the unit variant `Pty` as the bare string
+/// `"Pty"`; a spec written by that build must still load, with no window
+/// size, rather than fail the whole `StepdLaunchSpec` parse.
+impl<'de> Deserialize<'de> for LaunchIo {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bare(String),
+            Tagged {
+                #[serde(rename = "Pty")]
+                pty: Option<crate::pty::WindowSize>,
+            },
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Bare(s) if s == "File" => Ok(LaunchIo::File),
+            Repr::Bare(s) if s == "Pty" => Ok(LaunchIo::Pty(None)),
+            Repr::Bare(other) => Err(serde::de::Error::unknown_variant(&other, &["File", "Pty"])),
+            Repr::Tagged { pty } => Ok(LaunchIo::Pty(pty)),
+        }
+    }
 }
 
 impl LaunchIo {

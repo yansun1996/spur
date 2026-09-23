@@ -277,10 +277,9 @@ impl StepdLaunchSpec {
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,
             memlock: self.memlock.into(),
-            // `pty` is the field an older build persisted before `io_mode` existed, so a
-            // spec reloaded from that format carries it but not a matching `io_mode` —
-            // deriving from `pty` covers both that case and a freshly built spec, where
-            // `TryFrom` keeps the two fields in agreement anyway.
+            // `pty` predates `io_mode`; an old-format reload carries `pty` but no
+            // matching `io_mode`. Deriving from `pty` covers both, since `TryFrom`
+            // keeps them in sync for a fresh spec.
             io_mode: match self.pty {
                 Some(winsize) => crate::executor::LaunchIo::Pty(
                     (winsize != crate::pty::WindowSize::default()).then_some(winsize),
@@ -3277,6 +3276,45 @@ mod launch_spec_compat {
         assert_eq!(
             spec.into_launch_config().io_mode,
             crate::executor::LaunchIo::File
+        );
+    }
+
+    /// Captured from the build that first shipped supervised terminals, before
+    /// `LaunchIo::Pty` carried a window size. `io_mode` was a bare `"Pty"` string
+    /// then; a supervisor re-reading this mid-upgrade needs it to keep decoding,
+    /// just with no remembered size.
+    /// Never regenerate this: its value is that it stays at the old shape.
+    const FROZEN_PTY_LAUNCH_JSON: &str = r##"{
+        "job_id": 42,
+        "script": "#!/bin/bash\necho hi\n",
+        "work_dir": "/tmp",
+        "name": "demo",
+        "user": "someone",
+        "node": "node-1",
+        "environment": {"SPUR_JOB_ID": "42"},
+        "stdout_path": "/tmp/out",
+        "stderr_path": "/tmp/err",
+        "stdin_path": "",
+        "cpus": 2,
+        "memory_mb": 1024,
+        "cpu_ids": [0, 1],
+        "open_mode": null,
+        "uid": 1000,
+        "gid": 1000,
+        "partition": "batch",
+        "nodelist": "node-1",
+        "memlock": "Unlimited",
+        "io_mode": "Pty"
+    }"##;
+
+    #[test]
+    fn a_bare_pty_io_mode_from_an_older_build_still_loads() {
+        let spec: StepdLaunchSpec = serde_json::from_str(FROZEN_PTY_LAUNCH_JSON)
+            .expect("a launch.json with the pre-window-size io_mode shape must still load");
+
+        assert_eq!(
+            spec.into_launch_config().io_mode,
+            crate::executor::LaunchIo::Pty(None)
         );
     }
 
