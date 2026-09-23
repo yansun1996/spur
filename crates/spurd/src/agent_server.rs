@@ -4299,6 +4299,14 @@ impl AgentService {
         self
     }
 
+    /// Override the store built above with one a caller already constructed
+    /// elsewhere (e.g. main.rs's reporter/retry-loop store), so every user of
+    /// this node's admission records shares one lock map, not independent ones.
+    pub fn with_admissions(mut self, admissions: crate::admission::AdmissionStore) -> Self {
+        self.admissions = admissions;
+        self
+    }
+
     pub async fn adopt_stepds(&self, descriptors: &[crate::stepd::StepdDescriptor]) {
         let mut sessions = self.stepds.lock().await;
         for descriptor in descriptors {

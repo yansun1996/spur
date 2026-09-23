@@ -549,12 +549,14 @@ async fn main() -> anyhow::Result<()> {
         spurd::agent_server::runs_job_epilog(&hooks_config),
     ));
 
+    // One store shared with agent_service and the retry loop below, so every
+    // writer of this node's admission records serializes through the same
+    // per-run locks rather than each holding its own, unshared lock map.
+    let admissions = spurd::admission::AdmissionStore::new(&stepd_state_dir, &hostname);
+
     // Wired before registration so the first cut carries this node's claims:
     // registering with no ledger tells the controller it has no evidence.
-    reporter.set_admissions(spurd::admission::AdmissionStore::new(
-        &stepd_state_dir,
-        &hostname,
-    ));
+    reporter.set_admissions(admissions.clone());
 
     // Bound before registering: registration can trigger an immediate callback,
     // which would be refused if the port isn't listening yet.
@@ -632,7 +634,8 @@ async fn main() -> anyhow::Result<()> {
         running_jobs,
         allow_root_jobs,
     )
-    .with_runtime_state_dir(stepd_state_dir.clone());
+    .with_runtime_state_dir(stepd_state_dir.clone())
+    .with_admissions(admissions.clone());
     if let Some(config) = config.as_ref() {
         agent_service.apply_auth_policy(&config.auth);
     }
@@ -660,7 +663,7 @@ async fn main() -> anyhow::Result<()> {
     let reconciled_stepd_completions: std::collections::HashSet<_> =
         agent_server::replay_unacknowledged_stepd_completions(
             &stepds,
-            &spurd::admission::AdmissionStore::new(&stepd_state_dir, &hostname),
+            &admissions,
             &agent_service.allocation_handle(),
             &args.controller,
             &hostname,
@@ -672,7 +675,7 @@ async fn main() -> anyhow::Result<()> {
     // a push notification deferred later needs the same reconciliation.
     agent_server::retry_unacknowledged_stepd_completions(
         stepds.clone(),
-        spurd::admission::AdmissionStore::new(&stepd_state_dir, &hostname),
+        admissions.clone(),
         agent_service.allocation_handle(),
         args.controller.clone(),
         hostname.clone(),
