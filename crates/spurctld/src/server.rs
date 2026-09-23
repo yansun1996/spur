@@ -2951,8 +2951,8 @@ impl SlurmController for ControllerService {
         let held_gate = ledger
             .is_some()
             .then(|| self.cluster.hold_reconcile_gate(req.hostname.clone()));
-        // First-time registration still has a schedule-before-gate gap here: `register_node`
-        // commits the node before this same-request gate-set lands (two separate proposals).
+        // A first registration gets its gate atomically from `register_node` below; a
+        // node already known must have it set here, in a second, separate proposal.
         let known_before = ledger.is_some() && self.cluster.get_node(&req.hostname).is_some();
         if known_before {
             self.cluster.set_reconcile_pending(&req.hostname, true);
@@ -2986,10 +2986,9 @@ impl SlurmController for ControllerService {
                 register_node_rpc_status(error)
             })?;
 
-        // A first registration now carries its own gate atomically (the
-        // `reconcile_pending` passed into `register_node` above lands in the same
-        // WAL entry that creates the node), so there is no longer a second,
-        // separate proposal to race the scheduler here.
+        // A first registration now carries its own gate atomically —
+        // `reconcile_pending` lands in the same WAL entry that creates the
+        // node, so there's no second proposal to race the scheduler here.
 
         // Recorded only once the registration has been accepted, and before the
         // reconcile below: a rejected one must disown no other lifetime.
@@ -3118,11 +3117,9 @@ impl SlurmController for ControllerService {
         match completion_result {
             Some(Ok(NodeCompleteResult::AllDone { raft_index, .. })) => {
                 if let Some(job) = self.cluster.get_job(req.job_id) {
-                    // A scheduler-side dispatch retry that raced this run's own
-                    // fast completion must be refused if it arrives after the
-                    // run has already settled here, not admitted as if it were
-                    // a fresh launch. Same fence the cancel path already sends,
-                    // just triggered by settlement instead of a cancellation.
+                    // A dispatch retry that raced this run's fast completion must be
+                    // refused, not admitted as a fresh launch — same fence the cancel
+                    // path sends, triggered by settlement instead.
                     let cluster = self.cluster.clone();
                     let job_id = req.job_id;
                     let run_attempt = job.run_attempt;
