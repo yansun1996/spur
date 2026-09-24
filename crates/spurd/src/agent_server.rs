@@ -90,10 +90,9 @@ fn resolve_stepd_executable() -> std::path::PathBuf {
     }
 }
 
-/// Double-fork+setsid detach (Slurm's `slurmstepd` spawn pattern): the
-/// grandchild reports its real pid over a pipe before exec, since
-/// `Command::spawn`'s return is just the immediately-exiting intermediate
-/// child that lets the grandchild reparent to init.
+/// Double-fork+setsid detach (Slurm's `slurmstepd` spawn pattern): the grandchild reports its
+/// real pid over a pipe before exec, since `Command::spawn`'s return is just the
+/// immediately-exiting intermediate child that lets the grandchild reparent to init.
 fn spawn_stepd_process(
     executable: &std::path::Path,
     args: &[std::path::PathBuf],
@@ -332,10 +331,9 @@ async fn launch_stepd(
     ))
 }
 
-/// Signals a stepd process directly by pid — there's no systemd unit to stop
-/// it through. A stale pid (already exited, or reused by an unrelated
-/// process) is confirmed via `stepd_liveness` before signaling, same check
-/// the crash watchdog uses.
+/// Signals a stepd process directly by pid — there's no systemd unit to stop it through. A
+/// stale pid (already exited, or reused by an unrelated process) is confirmed via
+/// `stepd_liveness` before signaling, same check the crash watchdog uses.
 async fn stop_stepd_process(descriptor: &crate::stepd::StepdDescriptor) -> std::io::Result<()> {
     match crate::stepd::stepd_liveness(descriptor)? {
         crate::stepd::StepdLiveness::Stale => Ok(()),
@@ -5333,8 +5331,9 @@ impl AgentService {
         })
     }
 
-    /// Spawns the completion-monitor loop. Must start after `recover_stepds`/`replay_admitted_allocations`:
-    /// the sweep trusts `running` as the live set, so a session adopted later misreads as unbacked.
+    /// Spawns the completion-monitor loop. Must start after
+    /// `recover_stepds`/`replay_admitted_allocations`: the sweep trusts `running` as the live
+    /// set, so a session adopted later misreads as unbacked.
     pub fn start_monitor(&self, controller_addr: String) {
         let running = self.running.clone();
         let allocation = self.allocation.clone();
@@ -5356,8 +5355,9 @@ impl AgentService {
                 for (job_id, tracked) in jobs.iter_mut() {
                     match tracked.job.try_wait() {
                         Ok(Some((exit_code, mut signal))) => {
-                            // Disambiguate an OOM kill from a plain SIGKILL by OR'ing a sentinel into the
-                            // reported signal; read before cleanup_cgroup removes the memory.events file.
+                            // Disambiguate an OOM kill from a plain SIGKILL by OR'ing a sentinel
+                            // into the reported signal; read before cleanup_cgroup removes the
+                            // memory.events file.
                             let cgroup = tracked.take_cgroup();
                             if let Some(ref cg) = cgroup {
                                 if crate::executor::cgroup_oom_killed(cg) {
@@ -5413,8 +5413,9 @@ impl AgentService {
                     .await;
                 }
 
-                // Reports allocations with no tracked, non-launching job. `running` is re-taken before
-                // `allocation` (commit_job's order), so the reclaim's live set can't race a committing launch.
+                // Reports allocations with no tracked, non-launching job. `running` is re-taken
+                // before `allocation` (commit_job's order), so the reclaim's live set can't
+                // race a committing launch.
                 {
                     let jobs = running.lock().await;
                     let unbacked = {
@@ -6341,8 +6342,9 @@ fn build_nsenter_argv(
 ) -> Vec<String> {
     let mut args = entry.nsenter_args();
 
-    // Rootless container: nsenter's credential reset (setgroups()) is forbidden there (EPERM) but
-    // unneeded — the job user is already mapped inside, so --preserve-credentials with no setpriv suffices.
+    // Rootless container: nsenter's credential reset (setgroups()) is forbidden there (EPERM)
+    // but unneeded — the job user is already mapped inside, so --preserve-credentials with no
+    // setpriv suffices.
     if entry.has_user_namespace {
         args.push("--preserve-credentials".into());
         args.push("--".into());
@@ -6368,8 +6370,9 @@ struct LaunchPlan {
     apply_priv_in_child: bool,
 }
 
-/// Decides how to enter a job and run `command`, shared by `exec_in_job` and a supervised step's
-/// script: live namespaces enter via `nsenter`+`setpriv` ([`build_nsenter_argv`]); otherwise spawn directly.
+/// Decides how to enter a job and run `command`, shared by `exec_in_job` and a supervised
+/// step's script: live namespaces enter via `nsenter`+`setpriv` ([`build_nsenter_argv`]);
+/// otherwise spawn directly.
 fn build_launch_plan(
     entry: &crate::job_entry::JobEntry,
     priv_drop: Option<&crate::privdrop::PrivDrop>,
@@ -6556,8 +6559,9 @@ impl Drop for StepScriptCleanup {
     }
 }
 
-/// Removes a step's container rootfs on drop so a mid-flight future cancellation (Ctrl-C, disconnect,
-/// RPC timeout) doesn't leak it. Kills any live child (`pid`) first so cleanup never races a pivoted process.
+/// Removes a step's container rootfs on drop so a mid-flight future cancellation (Ctrl-C,
+/// disconnect, RPC timeout) doesn't leak it. Kills any live child (`pid`) first so cleanup
+/// never races a pivoted process.
 struct StepRootfsGuard {
     base: String,
     mode: crate::container::RootfsMode,
@@ -6595,7 +6599,8 @@ impl Drop for StepRootfsGuard {
 }
 
 /// Builds the bash job script for a launch request: a non-empty `script` is used verbatim, else
-/// `argv` is shell-escaped so metacharacters stay data; `script_args` injects a `set --` line for positional params.
+/// `argv` is shell-escaped so metacharacters stay data; `script_args` injects a `set --` line
+/// for positional params.
 fn build_job_script(
     script: &str,
     argv: &[String],
@@ -6720,7 +6725,8 @@ impl CompletionOutcome {
     }
 
     /// The Raft index for this outcome: `Acknowledged` carries the real index, `NoSuchRun`
-    /// settles with 0 (no commit, but frees resources locally), `Undelivered` returns `None` (retry owed).
+    /// settles with 0 (no commit, but frees resources locally), `Undelivered` returns `None`
+    /// (retry owed).
     pub(crate) fn raft_index(self) -> Option<u64> {
         match self {
             Self::Acknowledged { raft_index } => Some(raft_index),
@@ -7203,8 +7209,9 @@ impl SlurmAgent for AgentService {
                 runtime_attempt_already_tracked(&self.stepds, job_id, launch_step, run_attempt)
                     .await;
             if already_tracked {
-                // Idempotent retry: this attempt is already tracked and alive (e.g. spurctld retried
-                // after losing a LaunchJob ack). Report success without touching the live allocation/session.
+                // Idempotent retry: this attempt is already tracked and alive (e.g. spurctld
+                // retried after losing a LaunchJob ack). Report success without touching the
+                // live allocation/session.
                 let paths = self
                     .running
                     .lock()
@@ -7229,8 +7236,9 @@ impl SlurmAgent for AgentService {
             }
         }
 
-        // Left empty rather than a flat shared DEFAULT_WORK_DIR: `executor::launch_job` resolves an
-        // empty work_dir into a per-job scratch directory once run_attempt is known, avoiding a shared anchor.
+        // Left empty rather than a flat shared DEFAULT_WORK_DIR: `executor::launch_job`
+        // resolves an empty work_dir into a per-job scratch directory once run_attempt is
+        // known, avoiding a shared anchor.
         let work_dir = spec.work_dir.clone();
 
         let allocation_holder =
@@ -7824,8 +7832,9 @@ impl SlurmAgent for AgentService {
                     }
                 }
 
-                // Claim the stepd slot before committing anything else: a concurrent LaunchJob retry may have
-                // already tracked a newer attempt, and this slower launch must not clobber or commit over it.
+                // Claim the stepd slot before committing anything else: a concurrent LaunchJob
+                // retry may have already tracked a newer attempt, and this slower launch must
+                // not clobber or commit over it.
                 if let Some(descriptor) = runtime_descriptor.clone() {
                     if let Err(descriptor) = claim_stepd_slot(&self.stepds, descriptor).await {
                         warn!(
@@ -7855,15 +7864,17 @@ impl SlurmAgent for AgentService {
                 }
 
                 let mut jobs = self.running.lock().await;
-                // Commit the reservation now that the job has a tracked process (no longer reconcile-exempt).
-                // Take the running lock first so it's never briefly absent from both `running` and `launching`.
+                // Commit the reservation now that the job has a tracked process (no longer
+                // reconcile-exempt). Take the running lock first so it's never briefly absent
+                // from both `running` and `launching`.
                 let committed = self.allocation.lock().await.commit_job(job_id, run_attempt);
                 if committed {
                     reservation_guard.disarm();
                 }
 
-                // Reconcile reclaimed the reservation mid-launch (TTL exceeded). Kill, reap, and clean up
-                // like the monitor loop's completion teardown would (which never runs since `running` is never entered).
+                // Reconcile reclaimed the reservation mid-launch (TTL exceeded). Kill, reap,
+                // and clean up like the monitor loop's completion teardown would (which never
+                // runs since `running` is never entered).
                 if !committed {
                     drop(jobs);
                     warn!(
@@ -7892,8 +7903,9 @@ impl SlurmAgent for AgentService {
                     tokio::spawn(async move {
                         let _lifecycle = lifecycle;
                         reap_killed_job(result.job).await;
-                        // rootfs, spool, and the job_<id> cgroup all derive from job_id, so a re-dispatch reuses
-                        // them — tearing any down now would destroy the live run.
+                        // rootfs, spool, and the job_<id> cgroup all derive from job_id, so a
+                        // re-dispatch reuses them — tearing any down now would destroy the live
+                        // run.
                         if !running.lock().await.contains_key(&job_id) {
                             crate::container::cleanup_rootfs(
                                 &crate::container::job_rootfs_base(job_id),
@@ -7947,8 +7959,9 @@ impl SlurmAgent for AgentService {
                     },
                 );
                 drop(jobs);
-                // Gate stays shut until StartJob confirms Running (avoids racing Pending); already claimed
-                // into `stepds`. A displaced older run is killed/reaped here (monitor no longer tracks it) — its cgroup is left for the new run to reuse.
+                // Gate stays shut until StartJob confirms Running (avoids racing Pending);
+                // already claimed into `stepds`. A displaced older run is killed/reaped here
+                // (monitor no longer tracks it) — its cgroup is left for the new run to reuse.
                 if let Some(old) = displaced {
                     if old.run_attempt < run_attempt {
                         let _ = old.job.kill_signal(nix::sys::signal::Signal::SIGKILL);
@@ -8093,8 +8106,9 @@ impl SlurmAgent for AgentService {
         self.launch_acceptance
             .cancel_attempt(job_id, req.run_attempt);
 
-        // A wildcard cancel's only evidence of the attempt may be a dead stepd's descriptor, which the
-        // signal path below can itself remove — snapshot it first so the fallback below can't misread that as "never named".
+        // A wildcard cancel's only evidence of the attempt may be a dead stepd's descriptor,
+        // which the signal path below can itself remove — snapshot it first so the fallback
+        // below can't misread that as "never named".
         let pre_signal_supervised_attempt = if req.run_attempt == 0 {
             stepds_for_job(&*self.stepds.lock().await, job_id)
                 .first()
@@ -8119,8 +8133,9 @@ impl SlurmAgent for AgentService {
         };
         let nothing_tracked = tracked_attempt.is_none();
 
-        // An allocation ends here (not via completion teardown), so its cgroup node is removed here too —
-        // steps only remove their own leaf. A cancel with no named attempt falls back to the one this node runs.
+        // An allocation ends here (not via completion teardown), so its cgroup node is removed
+        // here too — steps only remove their own leaf. A cancel with no named attempt falls
+        // back to the one this node runs.
         let supervised_attempt = match (req.run_attempt, tracked_attempt) {
             (0, None) => stepds_for_job(&*self.stepds.lock().await, job_id)
                 .first()
@@ -8282,8 +8297,9 @@ impl SlurmAgent for AgentService {
             "exec into running job"
         );
 
-        // Defense in depth: uid comes from the tracked job (validated at launch), reachable only if
-        // allow_root_jobs was toggled off mid-run; keeps "never uid 0 without opt-in" total, not just at the wire.
+        // Defense in depth: uid comes from the tracked job (validated at launch), reachable
+        // only if allow_root_jobs was toggled off mid-run; keeps "never uid 0 without opt-in"
+        // total, not just at the wire.
         if let Err(msg) = crate::privdrop::check_root_execution_allowed(
             entry.uid,
             self.allow_root_jobs,
@@ -8293,8 +8309,9 @@ impl SlurmAgent for AgentService {
             return Err(Status::permission_denied(msg));
         }
 
-        // A one-shot exec gets an ephemeral, unnumbered step id (never listed/reattached), so it needn't
-        // coordinate with the controller's sequence. High bit set clear of real steps and reserved sentinels.
+        // A one-shot exec gets an ephemeral, unnumbered step id (never listed/reattached), so
+        // it needn't coordinate with the controller's sequence. High bit set clear of real
+        // steps and reserved sentinels.
         let step_id = (uuid::Uuid::new_v4().as_u128() as u32) | 0x8000_0000;
         let step_key = (req.job_id, step_id);
 
@@ -8402,7 +8419,8 @@ impl SlurmAgent for AgentService {
     }
 
     /// Records a standalone-srun allocation on this node without launching a batch script.
-    /// Controller-only: `uid`/`user` reach the tracked job straight from the wire, so a non-controller caller setting both could impersonate anyone.
+    /// Controller-only: `uid`/`user` reach the tracked job straight from the wire, so a
+    /// non-controller caller setting both could impersonate anyone.
     async fn register_job_allocation(
         &self,
         request: Request<RegisterJobAllocationRequest>,
@@ -8455,8 +8473,9 @@ impl SlurmAgent for AgentService {
             }
         };
 
-        // Hold the running lock across the duplicate check, reserve+commit, and insert (same order
-        // as commit) so the job is never committed-but-absent-from-running, which reclaim reads as stale.
+        // Hold the running lock across the duplicate check, reserve+commit, and insert (same
+        // order as commit) so the job is never committed-but-absent-from-running, which reclaim
+        // reads as stale.
         let alloc_run = named_run(req.job_id, req.run_attempt).ok_or_else(|| {
             Status::invalid_argument("run attempt 0 names no run to hold an allocation")
         })?;
@@ -8698,8 +8717,9 @@ impl SlurmAgent for AgentService {
                 }
             }
 
-            // Claim the slot before committing anything else, mirroring LaunchJob: a concurrent registration
-            // for a newer attempt may already have tracked its own session while this one was being set up.
+            // Claim the slot before committing anything else, mirroring LaunchJob: a concurrent
+            // registration for a newer attempt may already have tracked its own session while
+            // this one was being set up.
             if let Err(descriptor) = claim_stepd_slot(&self.stepds, descriptor).await {
                 warn!(
                     job_id = req.job_id,
@@ -9242,8 +9262,9 @@ impl SlurmAgent for AgentService {
 
         let joins_parent_namespaces = job_entry.has_namespaces() && job_entry.pid > 0;
 
-        // A step with its own image but no parent container builds a fresh rootfs here, same shape a
-        // job-level container hands to `launch_stepd`. A step with parent namespaces joins those instead (image ignored, warned).
+        // A step with its own image but no parent container builds a fresh rootfs here, same
+        // shape a job-level container hands to `launch_stepd`. A step with parent namespaces
+        // joins those instead (image ignored, warned).
         let mut step_container_rootfs_mode: Option<crate::container::RootfsMode> = None;
         let step_container: Option<executor::ContainerLaunchConfig> = if supervise_step
             && !joins_parent_namespaces
@@ -9276,8 +9297,9 @@ impl SlurmAgent for AgentService {
                             })?;
                     }
 
-                    // The supervisor's exec path looks for the script at this fixed name inside the rootfs,
-                    // exactly like a job-level container does (see executor::launch_container_job).
+                    // The supervisor's exec path looks for the script at this fixed name inside
+                    // the rootfs, exactly like a job-level container does (see
+                    // executor::launch_container_job).
                     let step_script_content = {
                         let joined = shlex::try_join(
                             std::iter::once(program.as_str())
@@ -9445,8 +9467,9 @@ impl SlurmAgent for AgentService {
             )
             .await?
         } else if job_entry.has_namespaces() && job_entry.pid > 0 {
-            // Case 1: parent job is containerized — enter its namespaces via nsenter (srun inside
-            // sbatch/salloc --container-image). A step's own image is ignored here; leave a trace rather than silently dropping it.
+            // Case 1: parent job is containerized — enter its namespaces via nsenter (srun
+            // inside sbatch/salloc --container-image). A step's own image is ignored here;
+            // leave a trace rather than silently dropping it.
             if let Some(c) = req.container.as_ref() {
                 if !c.image.is_empty() {
                     warn!(
@@ -9458,8 +9481,9 @@ impl SlurmAgent for AgentService {
                     );
                 }
             }
-            // cd into work_dir *inside* the container via a shell after nsenter (host-side chdir and
-            // nsenter --wd don't survive/work here). Best-effort (`;` not `&&`) so a missing dir doesn't fail the command.
+            // cd into work_dir *inside* the container via a shell after nsenter (host-side
+            // chdir and nsenter --wd don't survive/work here). Best-effort (`;` not `&&`) so a
+            // missing dir doesn't fail the command.
             let inner = shlex::try_join(
                 std::iter::once(program.as_str()).chain(program_args.iter().map(String::as_str)),
             )
@@ -9477,8 +9501,9 @@ impl SlurmAgent for AgentService {
             let priv_drop = crate::privdrop::PrivDrop::resolve_if_needed(req.uid, req.gid);
             let plan = build_launch_plan(&job_entry, priv_drop.as_ref(), &full_command);
             let mut cmd = tokio::process::Command::new(&plan.program);
-            // Restore the pre-change unconditional cwd (a plain host/rootful-namespaced step honours it);
-            // entering a rootless container's pivoted mount namespace doesn't preserve it (best-effort).
+            // Restore the pre-change unconditional cwd (a plain host/rootful-namespaced step
+            // honours it); entering a rootless container's pivoted mount namespace doesn't
+            // preserve it (best-effort).
             cmd.args(&plan.args).current_dir(&work_dir).process_group(0);
             // Empty the environment first so spurd's own (secrets included) is not
             // inherited; the step's resolved environment is applied on top.
@@ -9504,8 +9529,9 @@ impl SlurmAgent for AgentService {
             )
             .await?
         } else if req.container.as_ref().is_some_and(|c| !c.image.is_empty()) {
-            // Case 2: standalone srun --container-image with no running parent container — set up a fresh
-            // rootfs. Refuse a requeue landing here before a restart-recovered orphan finishes tearing down the same path.
+            // Case 2: standalone srun --container-image with no running parent container — set
+            // up a fresh rootfs. Refuse a requeue landing here before a restart-recovered
+            // orphan finishes tearing down the same path.
             if self.reaping_orphans.lock().await.contains(&step_key) {
                 // failed_precondition, not unavailable: the latter reads as
                 // "lost the agent" and misroutes into the reawait_step path.
@@ -9559,8 +9585,9 @@ impl SlurmAgent for AgentService {
                 remap_root: c.remap_root,
                 gpu_devices: gpu_devices.clone(),
                 environment: env.clone(),
-                // Deny GPU visibility in container_env for zero-GPU steps (matches launch_job) — otherwise a
-                // user could smuggle ROCR_VISIBLE_DEVICES through --container-env with no GPU allocation.
+                // Deny GPU visibility in container_env for zero-GPU steps (matches
+                // launch_job) — otherwise a user could smuggle ROCR_VISIBLE_DEVICES through
+                // --container-env with no GPU allocation.
                 container_env: {
                     let mut ce = c.env.clone();
                     maybe_deny_gpu_env(&mut ce, &gpu_devices);
@@ -9650,8 +9677,9 @@ impl SlurmAgent for AgentService {
             // Script path inside the container (after pivot_root, host paths are gone).
             let script_in_container = format!("/tmp/spur_step_{}_{}.sh", job_id, step_id);
 
-            // Run the container step; the guard kills the child before removing the rootfs, preventing a
-            // live-process vs rm-rf race on mid-flight drop. pid is set right after the fork, before the wait.
+            // Run the container step; the guard kills the child before removing the rootfs,
+            // preventing a live-process vs rm-rf race on mid-flight drop. pid is set right
+            // after the fork, before the wait.
             let (maybe_status, child_pid) = run_containerized_step(
                 container_cfg,
                 rootfs,
@@ -9743,8 +9771,9 @@ impl SlurmAgent for AgentService {
             match tokio::fs::read(&path).await {
                 Ok(b) => String::from_utf8_lossy(&b).into_owned(),
                 Err(e) => {
-                    // Don't fail the step over a read-back error, but log it so a missing response body reads
-                    // as a filesystem fault, not as the step producing no output.
+                    // Don't fail the step over a read-back error, but log it so a missing
+                    // response body reads as a filesystem fault, not as the step producing
+                    // no output.
                     warn!(path = %path, error = %e, "failed to read back step output");
                     String::new()
                 }
@@ -9839,8 +9868,9 @@ impl SlurmAgent for AgentService {
         self.check_job_access(job_id, identity.as_ref(), &req.user, "read output of")
             .await?;
 
-        // Tail the per-step spool file (not the batch file, which ends only with the whole allocation)
-        // and finish when the step leaves active_steps — lets an srun step stream live and end at step exit.
+        // Tail the per-step spool file (not the batch file, which ends only with the whole
+        // allocation) and finish when the step leaves active_steps — lets an srun step
+        // stream live and end at step exit.
         if let Some(requested_step) = requested_step_of(&req) {
             let active_steps = self.active_steps.clone();
             let stepds = self.stepds.clone();
@@ -9851,8 +9881,9 @@ impl SlurmAgent for AgentService {
             let step_key = (job_id, step_id);
             let (tx, rx) = tokio::sync::mpsc::channel(32);
             tokio::spawn(async move {
-                // Wait for run_command to record the output path (spawned just before the child); fall back to
-                // the deterministic spool path if already on disk, giving up only if no file is ever produced.
+                // Wait for run_command to record the output path (spawned just before the
+                // child); fall back to the deterministic spool path if already on disk,
+                // giving up only if no file is ever produced.
                 const START_POLLS: u32 = 150; // 150 * 200ms = 30s startup grace
                 let mut file_path = String::new();
                 let mut seen = false;
@@ -9885,8 +9916,9 @@ impl SlurmAgent for AgentService {
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                 }
                 if file_path.is_empty() {
-                    // Couldn't resolve the step's spool file (failed to start, or wrong step_id) — signal an error,
-                    // not a clean EOF, so the client falls back to buffered RunStep output.
+                    // Couldn't resolve the step's spool file (failed to start, or wrong
+                    // step_id) — signal an error, not a clean EOF, so the client falls back
+                    // to buffered RunStep output.
                     let _ = tx
                         .send(Err(Status::not_found(format!(
                             "no output stream for job {job_id} step {step_id}"
@@ -9904,8 +9936,9 @@ impl SlurmAgent for AgentService {
                         return;
                     }
                 };
-                // Tail incrementally: seek to the last offset and read only newly appended bytes (avoids
-                // O(n^2) re-reads for high-volume steps); a reconnecting reader resumes rather than repeating output.
+                // Tail incrementally: seek to the last offset and read only newly appended
+                // bytes (avoids O(n^2) re-reads for high-volume steps); a reconnecting
+                // reader resumes rather than repeating output.
                 let mut offset: u64 = start_offset;
                 // An offset past the end means this isn't the file the reader was reading, so replay it
                 // whole — reprinting output is recoverable, dropping it silently is not.
@@ -10384,8 +10417,9 @@ impl SlurmAgent for AgentService {
     ) -> Result<Response<GetKubeconfigResponse>, Status> {
         Self::require_controller(&request)?;
         let req = request.into_inner();
-        // Empty user -> cluster-admin kubeconfig; set -> a scoped one. The controller gates admin
-        // kubeconfig behind `is_k0s_admin`+`allow_admin_kubeconfig`; requiring it here stops a direct-dial bypass.
+        // Empty user -> cluster-admin kubeconfig; set -> a scoped one. The controller gates
+        // admin kubeconfig behind `is_k0s_admin`+`allow_admin_kubeconfig`; requiring it here
+        // stops a direct-dial bypass.
         let result = if req.user.is_empty() {
             self.k0s.admin_kubeconfig().await
         } else {
@@ -10704,8 +10738,8 @@ impl AgentService {
                     )));
                 }
                 Err(AllocError::DuplicateJob) => {
-                    // A launch is already in flight for this job id (reserved, not yet committed/released) —
-                    // a concurrent duplicate, not resource exhaustion.
+                    // A launch is already in flight for this job id (reserved, not yet
+                    // committed/released) — a concurrent duplicate, not resource exhaustion.
                     warn!(
                         job_id,
                         "rejecting duplicate launch: a launch is already in flight for this job"
@@ -10884,8 +10918,8 @@ impl AgentService {
             // now instead of waiting out the release-wait bound below.
             self.reap_dead_supervised_stepds(&runtimes).await;
             if let Some(handle) = release_wait {
-                // Best-effort observe: the spawned task keeps running to completion regardless of whether
-                // this await, or the RPC that called us, gets cut short.
+                // Best-effort observe: the spawned task keeps running to completion
+                // regardless of whether this await, or the RPC that called us, gets cut short.
                 let _ = handle.await;
             }
             return;
@@ -10965,16 +10999,18 @@ impl AgentService {
         let _ = tracked.job.kill_signal(sig);
     }
 
-    /// Signals every in-flight step of an allocation-only job directly (no batch process owns them, so they'd
-    /// orphan otherwise): a container-init ignores SIGTERM, so SIGKILL follows after a grace period; supervised steps are skipped, `run_attempt == 0` is the wildcard.
+    /// Signals every in-flight step of an allocation-only job directly (no batch process owns
+    /// them, so they'd orphan otherwise): a container-init ignores SIGTERM, so SIGKILL follows
+    /// after a grace period; supervised steps are skipped, `run_attempt == 0` is the wildcard.
     async fn cancel_active_steps_for_job(&self, job_id: u32, run_attempt: u32, signal: i32) {
         let supervised: Vec<spur_core::step::StepId> =
             stepds_for_attempt(&*self.stepds.lock().await, job_id, run_attempt)
                 .iter()
                 .map(|descriptor| descriptor.step_id)
                 .collect();
-        // Snapshot (key, pid, epoch) under the lock, then signal outside it: signal_step_tree walks
-        // /proc, and holding active_steps across it would block concurrent run_command/ActiveStepGuard cleanup.
+        // Snapshot (key, pid, epoch) under the lock, then signal outside it: signal_step_tree
+        // walks /proc, and holding active_steps across it would block concurrent
+        // run_command/ActiveStepGuard cleanup.
         let targets: Vec<((u32, u32), u32, u64)> = {
             let mut steps = self.active_steps.lock().await;
             let mut targets = Vec::new();
@@ -11107,8 +11143,8 @@ impl AgentService {
             // now instead of waiting out the release-wait bound below.
             self.reap_dead_supervised_stepds(&runtimes).await;
             if let Some(handle) = release_wait {
-                // Best-effort observe: the spawned task keeps running to completion regardless of whether
-                // this await, or the RPC that called us, gets cut short.
+                // Best-effort observe: the spawned task keeps running to completion
+                // regardless of whether this await, or the RPC that called us, gets cut short.
                 let _ = handle.await;
             }
             return;
@@ -11204,14 +11240,16 @@ impl AgentService {
         }
     }
 
-    /// The verified identity for this request, if the auth layer authenticated one. `None` means no
-    /// credential was presented (only possible under `permissive`/`disabled`); its presence always means "verified".
+    /// The verified identity for this request, if the auth layer authenticated one. `None`
+    /// means no credential was presented (only possible under `permissive`/`disabled`); its
+    /// presence always means "verified".
     fn verified_identity<T>(request: &Request<T>) -> Option<&spur_core::auth::Identity> {
         request.extensions().get::<spur_core::auth::Identity>()
     }
 
-    /// Refuses a controller-only RPC unless the verified caller is the cluster controller: these drive
-    /// work/secrets a valid user token (which verifies identically under the shared key) must not reach directly.
+    /// Refuses a controller-only RPC unless the verified caller is the cluster controller:
+    /// these drive work/secrets a valid user token (which verifies identically under the
+    /// shared key) must not reach directly.
     fn require_controller<T>(request: &Request<T>) -> Result<(), Status> {
         match Self::verified_identity(request) {
             Some(id) if id.is_controller() => Ok(()),
@@ -11224,8 +11262,9 @@ impl AgentService {
         }
     }
 
-    /// Whether `node` names this agent's own host (either the reporter's node name or the OS hostname,
-    /// to tolerate short/long-name skew) — a mismatch means the launch was misrouted and must not run here.
+    /// Whether `node` names this agent's own host (either the reporter's node name or the OS
+    /// hostname, to tolerate short/long-name skew) — a mismatch means the launch was
+    /// misrouted and must not run here.
     fn agent_owns_node(&self, node: &str) -> bool {
         if node == self.reporter.hostname {
             return true;
@@ -11235,8 +11274,9 @@ impl AgentService {
             .unwrap_or(false)
     }
 
-    /// Gates attach/exec/stream on `job_id` by the verified identity, not the wire `user`: owner,
-    /// operator, admin, or the controller reach it; with none verified, `asserted_user` is trusted only as non-privileged.
+    /// Gates attach/exec/stream on `job_id` by the verified identity, not the wire `user`:
+    /// owner, operator, admin, or the controller reach it; with none verified,
+    /// `asserted_user` is trusted only as non-privileged.
     async fn check_job_access(
         &self,
         job_id: u32,
@@ -11274,8 +11314,9 @@ impl AgentService {
             .map_err(|e| Status::permission_denied(e.to_string()))
     }
 
-    /// Extracts a `JobEntry` from a tracked running job for namespace entry. Backs `exec_in_job`/
-    /// `interactive_session`, reachable only after Running is confirmed — no retry on a miss except a restart mid-job.
+    /// Extracts a `JobEntry` from a tracked running job for namespace entry. Backs
+    /// `exec_in_job`/`interactive_session`, reachable only after Running is confirmed — no
+    /// retry on a miss except a restart mid-job.
     async fn job_entry(&self, job_id: u32) -> Result<crate::job_entry::JobEntry, Status> {
         let supervised = self.supervised_state(job_id).await;
         let supervised_pid = supervised.as_ref().map(|state| state.job_pid);
@@ -11314,8 +11355,9 @@ impl AgentService {
         })
     }
 
-    /// Bidirectional PTY bridge: reads master fd, forwards inbound messages, drains output after exit.
-    /// `interactive` controls what closing client input means: TTY hangs up (SIGHUP+stop); script/pipe is stdin-EOF (keep draining).
+    /// Bidirectional PTY bridge: reads master fd, forwards inbound messages, drains output
+    /// after exit. `interactive` controls what closing client input means: TTY hangs up
+    /// (SIGHUP+stop); script/pipe is stdin-EOF (keep draining).
     async fn run_pty_bridge<S, F>(
         master: std::os::fd::OwnedFd,
         wait_exit: F,
@@ -11436,8 +11478,9 @@ impl AgentService {
                                 end = PtyBridgeEnd::ClientGone;
                                 break;
                             }
-                            // Non-interactive stdin-EOF: client still wants output. Stop forwarding input but keep draining
-                            // until exit; a truly-gone client is caught by a failing tx.send below.
+                            // Non-interactive stdin-EOF: client still wants output. Stop forwarding
+                            // input but keep draining until exit; a truly-gone client is caught by a
+                            // failing tx.send below.
                             input_open = false;
                         }
                     }
@@ -11551,8 +11594,9 @@ impl AgentService {
             .collect()
     }
 
-    /// The env a session entering a running job starts from: the job's own, never spurd's. A container
-    /// job's tracked pid is the shepherd (spurd's env), so read the workload (PID 1) instead; callers must `env_clear()` first.
+    /// The env a session entering a running job starts from: the job's own, never spurd's.
+    /// A container job's tracked pid is the shepherd (spurd's env), so read the workload
+    /// (PID 1) instead; callers must `env_clear()` first.
     fn session_environ(entry: &crate::job_entry::JobEntry) -> Vec<(String, String)> {
         if entry.pid <= 0 {
             return Vec::new();
@@ -12490,8 +12534,9 @@ mod tests {
         );
     }
 
-    // A bare `systemctl stop` only signals the supervisor, which by design ignores SIGTERM for its
-    // cgroup, so unit-stop failure alone can't be trusted — a confirming cgroup kill still releases tracking.
+    // A bare `systemctl stop` only signals the supervisor, which by design ignores SIGTERM
+    // for its cgroup, so unit-stop failure alone can't be trusted — a confirming cgroup kill
+    // still releases tracking.
     #[tokio::test]
     async fn rejected_recovery_releases_tracking_when_the_cgroup_confirms_the_job_is_gone() {
         let running = new_running_jobs();
@@ -12509,8 +12554,9 @@ mod tests {
         let cgroup_root = tempfile::tempdir().expect("cgroup root");
         // Named as the real thing: cleanup refuses a path that is not ours.
         let cgroup = TestCgroup::new(&cgroup_root);
-        // A plain tempdir can't model real cgroupfs, where writing "cgroup.kill" never leaves a stray
-        // directory entry — a directory at that path makes the write fail cleanly, removed shortly after so it ends up genuinely empty once retried.
+        // A plain tempdir can't model real cgroupfs, where writing "cgroup.kill" never leaves a
+        // stray directory entry — a directory at that path makes the write fail cleanly,
+        // removed shortly after so it ends up genuinely empty once retried.
         let blocker = cgroup.path().join("cgroup.kill");
         std::fs::create_dir(&blocker).expect("seed cgroup.kill blocker");
         let blocker_removed = blocker.clone();
@@ -14350,7 +14396,8 @@ mod tests {
     }
 
     // The reason reaches srun's terminal only via the buffered RunStep response, which srun
-    // suppresses once its live tail hits a clean eof — reject before the file exists so the tail can't claim it.
+    // suppresses once its live tail hits a clean eof — reject before the file exists so the
+    // tail can't claim it.
     #[tokio::test]
     async fn a_rejected_pmix_step_never_opens_the_spool_that_would_swallow_its_reason() {
         let svc = supervised_agent("/nonexistent/spur/spur_mpi_pmix.so");
@@ -15584,8 +15631,9 @@ mod tests {
             Arc::new(Mutex::new(DeviceRegistry::new())),
             spur_core::config::MemlockLimit::Unlimited,
         );
-        // A unique job_id per test gives each its own step spool dir so parallel tests don't clobber
-        // output; production step_ids are unique via create_job_step, only these fixed-id tests would collide.
+        // A unique job_id per test gives each its own step spool dir so parallel tests don't
+        // clobber output; production step_ids are unique via create_job_step, only these
+        // fixed-id tests would collide.
         static NEXT_JOB_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
         let job_id = NEXT_JOB_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         svc.insert_test_job(job_id, TrackedJob::dummy(0)).await;
@@ -15685,8 +15733,9 @@ mod tests {
         path
     }
 
-    /// Drives the refusal through the real RPC entry point, not just the helper: a root-spurd launch
-    /// asking for root must be denied before anything spawns. `with_root_override` makes this deterministic on an unprivileged runner.
+    /// Drives the refusal through the real RPC entry point, not just the helper: a
+    /// root-spurd launch asking for root must be denied before anything spawns.
+    /// `with_root_override` makes this deterministic on an unprivileged runner.
     #[tokio::test]
     async fn launch_job_refuses_uid_zero_when_spurd_is_root_and_not_opted_in() {
         let svc = AgentService::new(
@@ -15764,8 +15813,9 @@ mod tests {
         );
     }
 
-    /// The batch-fallback pty path must take the exact same supervised dispatch as any other launch —
-    /// proven like other supervised-launch tests: the spawn fails without a built `spurstepd`, which only happens via `launch_stepd`, not the legacy path.
+    /// The batch-fallback pty path must take the exact same supervised dispatch as any other
+    /// launch — proven like other supervised-launch tests: the spawn fails without a built
+    /// `spurstepd`, which only happens via `launch_stepd`, not the legacy path.
     #[tokio::test]
     async fn launch_job_supervises_a_pty_batch_fallback() {
         let svc = AgentService::new(
@@ -15809,8 +15859,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_prolog_is_reported_to_the_controller_as_a_prolog_failure() {
-        // The controller drains/holds on this kind, so the launch must come back classified, not an
-        // opaque rejection it can only string-match; pairing drain with hold is the controller's job, not the agent's.
+        // The controller drains/holds on this kind, so the launch must come back classified,
+        // not an opaque rejection it can only string-match; pairing drain with hold is the
+        // controller's job, not the agent's.
         let prolog = failing_hook_script(1);
         let svc = AgentService::new(
             test_reporter(),
@@ -15855,8 +15906,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_prolog_that_cannot_even_start_reports_the_underlying_errno() {
-        // `{e}` renders only the outermost context, reducing this to "prolog_slurmd script failed to
-        // execute: ..." and dropping the errno that says whether the script is missing, unreadable, or not executable.
+        // `{e}` renders only the outermost context, reducing this to "prolog_slurmd script
+        // failed to execute: ..." and dropping the errno that says whether the script is
+        // missing, unreadable, or not executable.
         let svc = AgentService::new(
             test_reporter(),
             HooksConfig {
@@ -16039,8 +16091,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A restart leaves a supervised step running with nothing in `active_steps`, so a reconnecting
-    /// tail must treat the adopted session as proof it's live — reading an empty spool as finished would eof the stream and drop everything printed afterward.
+    /// A restart leaves a supervised step running with nothing in `active_steps`, so a
+    /// reconnecting tail must treat the adopted session as proof it's live — reading an
+    /// empty spool as finished would eof the stream and drop everything printed afterward.
     #[tokio::test]
     async fn stream_job_output_keeps_tailing_a_step_the_restart_adopted() {
         use tokio_stream::StreamExt as _;
@@ -16082,8 +16135,9 @@ mod tests {
         assert_eq!(first.data, b"before-restart\n");
         assert!(!first.eof);
 
-        // Nothing is due while the step is merely quiet, so a chunk here is a premature eof — the only
-        // thing the tail sends when it misreads an adopted step as finished. Asserting silence is what makes this fail against that bug.
+        // Nothing is due while the step is merely quiet, so a chunk here is a premature eof —
+        // the only thing the tail sends when it misreads an adopted step as finished.
+        // Asserting silence is what makes this fail against that bug.
         let quiet =
             tokio::time::timeout(std::time::Duration::from_millis(500), stream.next()).await;
         assert!(
@@ -17430,7 +17484,8 @@ mod tests {
     }
 
     /// `exec_in_job` used to run as a direct child of `spurd` (no restart survival); it now goes
-    /// through the same `launch_stepd` dispatch as any job/step, proven the same way as other supervised-launch tests. Cgroup-join enforcement is covered generically elsewhere.
+    /// through the same `launch_stepd` dispatch as any job/step, proven the same way as other
+    /// supervised-launch tests. Cgroup-join enforcement is covered generically elsewhere.
     #[tokio::test]
     async fn exec_in_job_is_spurstepd_supervised() {
         let svc = AgentService::new(
@@ -18161,8 +18216,9 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
-    /// Regression: a step carrying `container_image` must take the container path, not silently run
-    /// on the host. A bogus image fails resolution before exec, so an Ok result would mean the flags were dropped.
+    /// Regression: a step carrying `container_image` must take the container path, not
+    /// silently run on the host. A bogus image fails resolution before exec, so an Ok result
+    /// would mean the flags were dropped.
     #[tokio::test]
     async fn run_command_with_container_image_takes_container_path_not_host() {
         let (svc, job_id) = run_command_test_setup().await;
@@ -18192,7 +18248,8 @@ mod tests {
     }
 
     /// A step with its own container image used to be barred from supervision entirely; now the
-    /// supervised branch must build the container itself rather than silently running on the host — proven the same way as the host-fallback regression, reached via `supervised_agent`.
+    /// supervised branch must build the container itself rather than silently running on the host —
+    /// proven the same way as the host-fallback regression, reached via `supervised_agent`.
     #[tokio::test]
     async fn run_command_supervises_a_step_with_its_own_container_image() {
         let svc = supervised_agent("/nonexistent/spur/spur_mpi_pmix.so");
@@ -18224,8 +18281,9 @@ mod tests {
         );
     }
 
-    /// `build_step_container` is the helper `run_command` and the interactive terminal path share to
-    /// build a step's own fresh container. Covered directly here since the terminal path (a client-streaming RPC) can't easily be driven at the unit level.
+    /// `build_step_container` is the helper `run_command` and the interactive terminal path
+    /// share to build a step's own fresh container. Covered directly here since the terminal
+    /// path (a client-streaming RPC) can't easily be driven at the unit level.
     #[tokio::test]
     async fn build_step_container_reports_a_missing_image() {
         let svc = AgentService::new(
@@ -18318,8 +18376,9 @@ mod tests {
         );
     }
 
-    /// The parent-container (nsenter) path takes precedence over a fresh container: a step whose
-    /// job has live namespaces must enter them, never call `resolve_image` — proven by the absence of an image-not-found error despite a bogus image.
+    /// The parent-container (nsenter) path takes precedence over a fresh container: a step
+    /// whose job has live namespaces must enter them, never call `resolve_image` — proven by
+    /// the absence of an image-not-found error despite a bogus image.
     #[tokio::test]
     async fn run_command_enters_parent_namespaces_before_new_container() {
         let (svc, job_id) = run_command_test_setup().await;
@@ -18342,8 +18401,9 @@ mod tests {
             }),
             ..Default::default()
         });
-        // The nsenter path was taken, not Case 2 (bogus image never resolved). On an unprivileged
-        // test runner setns is denied, so the step returns an nsenter trace on stderr, not an "image not found" error.
+        // The nsenter path was taken, not Case 2 (bogus image never resolved). On an
+        // unprivileged test runner setns is denied, so the step returns an nsenter trace on
+        // stderr, not an "image not found" error.
         match svc.run_command(req).await {
             Ok(resp) => {
                 let r = resp.into_inner();
@@ -19026,8 +19086,9 @@ mod tests {
         ))
     }
 
-    // A dispatch that records GPUs but fails before the job is tracked must release them, or the
-    // node keeps rejecting future dispatches while the controller sees it IDLE, stranding it until restart.
+    // A dispatch that records GPUs but fails before the job is tracked must release them, or
+    // the node keeps rejecting future dispatches while the controller sees it IDLE,
+    // stranding it until restart.
     #[tokio::test]
     async fn launch_failure_after_gpu_record_releases_allocation() {
         // Reporter advertises GPU device_id 0 so allocate_for_job succeeds, but the
@@ -19121,8 +19182,9 @@ mod tests {
         assert_eq!(inner.stderr_path, expected);
     }
 
-    /// Polls `path` until its content stabilizes (two consecutive identical reads) or `timeout_ms`
-    /// elapses. Waits out a script's execution without depending on job-completion reporting to a controller.
+    /// Polls `path` until its content stabilizes (two consecutive identical reads) or
+    /// `timeout_ms` elapses. Waits out a script's execution without depending on
+    /// job-completion reporting to a controller.
     async fn wait_for_stable_file(path: &std::path::Path, timeout_ms: u64) -> String {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
         let mut last = String::new();
@@ -19139,8 +19201,9 @@ mod tests {
         }
     }
 
-    // A file still being rewritten never satisfies the stability check, so the helper must give up
-    // after `timeout_ms` and return the last-seen value — exercises the timeout branch the tests above never reach.
+    // A file still being rewritten never satisfies the stability check, so the helper must
+    // give up after `timeout_ms` and return the last-seen value — exercises the timeout
+    // branch the tests above never reach.
     #[tokio::test]
     async fn wait_for_stable_file_gives_up_after_timeout() {
         let dir = tempfile::tempdir().unwrap();
@@ -19168,8 +19231,9 @@ mod tests {
         );
     }
 
-    // A plain (mpi=none) batch script must run exactly once per node regardless of --ntasks-per-node
-    // (fan-out is the script's own job, via srun) — otherwise launch_job forks the whole script per task, corrupting anything beyond a trivial command.
+    // A plain (mpi=none) batch script must run exactly once per node regardless of
+    // --ntasks-per-node (fan-out is the script's own job, via srun) — otherwise launch_job
+    // forks the whole script per task, corrupting anything beyond a trivial command.
     #[tokio::test]
     async fn sbatch_script_runs_exactly_once_regardless_of_ntasks_per_node() {
         let svc = AgentService::new(
@@ -19223,8 +19287,9 @@ mod tests {
         );
     }
 
-    // Counterpart: a standalone srun routed through the batch dispatch path sets `task_fanout: true`
-    // since the dispatched "script" there is the literal command run `tasks_per_node` times — must not regress to running once.
+    // Counterpart: a standalone srun routed through the batch dispatch path sets
+    // `task_fanout: true` since the dispatched "script" there is the literal command run
+    // `tasks_per_node` times — must not regress to running once.
     #[tokio::test]
     async fn task_fanout_dispatch_still_replicates_per_ntasks_per_node() {
         let svc = AgentService::new(
@@ -19307,8 +19372,8 @@ mod tests {
                 memory_mb: 0,
                 devices: std::collections::HashMap::new(),
             }),
-            // Default (false): a genuine sbatch job, not a routed srun request — no pmix_plan is supplied
-            // either, so reaching the multi-task wrapper would need one regardless.
+            // Default (false): a genuine sbatch job, not a routed srun request — no pmix_plan
+            // is supplied either, so reaching the multi-task wrapper would need one regardless.
             ..Default::default()
         });
 
@@ -19474,8 +19539,9 @@ mod tests {
         assert_eq!(svc.allocation.lock().await.free_cpus(), 8);
     }
 
-    // A killed `srun --pty` client ends the terminal step, not the allocation. That step's exit used
-    // to write the run's acknowledgement, letting the settle sweep free a slice the controller still charged.
+    // A killed `srun --pty` client ends the terminal step, not the allocation. That step's
+    // exit used to write the run's acknowledgement, letting the settle sweep free a slice
+    // the controller still charged.
     #[tokio::test]
     async fn a_user_steps_exit_cannot_acknowledge_the_run_that_hosts_it() {
         let state = tempfile::tempdir().expect("state dir");
@@ -21124,8 +21190,9 @@ mod tests {
         }
         let while_held = svc.allocation.lock().await.free_cpus();
 
-        // A non-lethal signal skips the RPC's synchronous wait_for_exit_and_teardown, so this cancel
-        // only marks the record cancelled and leaves the run tracked — teardown is simulated below, the gap the sweep closes.
+        // A non-lethal signal skips the RPC's synchronous wait_for_exit_and_teardown, so this
+        // cancel only marks the record cancelled and leaves the run tracked — teardown is
+        // simulated below, the gap the sweep closes.
         svc.cancel_job(Request::new(AgentCancelJobRequest {
             job_id: 7,
             run_attempt: 1,
@@ -21175,7 +21242,8 @@ mod tests {
     }
 
     // The controller's word that it's not accounting for a run is the one thing that unsticks a
-    // completion that never landed — an owed epilog hook makes this genuinely stranded, since teardown left the slice charged and nothing re-checks it once the hook finishes.
+    // completion that never landed — an owed epilog hook makes this genuinely stranded, since
+    // teardown left the slice charged and nothing re-checks it once the hook finishes.
     #[tokio::test]
     async fn a_settle_from_the_controller_releases_a_run_nothing_else_can_free() {
         let state = tempfile::tempdir().expect("state dir");
@@ -22859,8 +22927,9 @@ mod tests {
         server.await.expect("runtime control server");
     }
 
-    // A session cancelled before `Start` has nothing that pushes completion; left to the 15s crash
-    // watchdog, GPU release would lag well past the cancel RPC. Needs a real completion ack via a live mock controller.
+    // A session cancelled before `Start` has nothing that pushes completion; left to the 15s
+    // crash watchdog, GPU release would lag well past the cancel RPC. Needs a real completion
+    // ack via a live mock controller.
     #[tokio::test]
     async fn send_explicit_signal_fences_a_session_that_never_started() {
         let (controller_addr, _reports) = spawn_mock_controller();
@@ -22922,8 +22991,9 @@ mod tests {
         );
     }
 
-    /// A real, separate long-lived process standing in for a wedged stepd: genuinely alive (real pid,
-    /// matching start ticks), so `stepd_liveness` reports it `Live` exactly like a frozen supervisor would.
+    /// A real, separate long-lived process standing in for a wedged stepd: genuinely alive
+    /// (real pid, matching start ticks), so `stepd_liveness` reports it `Live` exactly like a
+    /// frozen supervisor would.
     async fn spawn_wedged_stepd_stub(
         job_id: u32,
         run_attempt: u32,
@@ -22948,8 +23018,9 @@ mod tests {
         (child, descriptor)
     }
 
-    /// `/proc`-based liveness can't tell a zombie from running; this test is the direct parent of its
-    /// stand-in (production double-forks stepd onto init), so check via `try_wait`, which actually reaps.
+    /// `/proc`-based liveness can't tell a zombie from running; this test is the direct
+    /// parent of its stand-in (production double-forks stepd onto init), so check via
+    /// `try_wait`, which actually reaps.
     async fn child_has_exited(child: &mut tokio::process::Child) -> bool {
         matches!(child.try_wait(), Ok(Some(_)))
     }
@@ -23037,8 +23108,9 @@ mod tests {
             nix::sys::signal::Signal::SIGKILL as i32,
         )
         .await;
-        // Lets a wrongly-immediate force-reclaim task (spawned right as send_explicit_signal returned)
-        // actually run before checking — otherwise this assertion could win the race and pass for the wrong reason.
+        // Lets a wrongly-immediate force-reclaim task (spawned right as send_explicit_signal
+        // returned) actually run before checking — otherwise this assertion could win the
+        // race and pass for the wrong reason.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         assert!(
@@ -23129,8 +23201,9 @@ mod tests {
         )
         .await;
 
-        // Simulates the job's tracking clearing by some other path while the stepd session stays live in
-        // the stepds map — a bare release_stepd_tracking would also clear that entry, hiding the running-tracked check this test covers.
+        // Simulates the job's tracking clearing by some other path while the stepd session
+        // stays live in the stepds map — a bare release_stepd_tracking would also clear that
+        // entry, hiding the running-tracked check this test covers.
         svc.running.lock().await.remove(&descriptor.job_id);
 
         tokio::time::sleep(FORCE_RECLAIM_TEST_WINDOW).await;
@@ -23240,8 +23313,9 @@ mod tests {
         let (run2, pid2) = spawn_trap(2);
         svc.insert_test_job(job_id, run2).await;
 
-        // Advance past the 5s grace period; the guard must skip the SIGKILL, so the epoch-2 process
-        // stays alive. Assert a live state ('S'/'R'), not mere /proc existence — a zombie would false-pass.
+        // Advance past the 5s grace period; the guard must skip the SIGKILL, so the epoch-2
+        // process stays alive. Assert a live state ('S'/'R'), not mere /proc existence — a
+        // zombie would false-pass.
         tokio::time::advance(tokio::time::Duration::from_secs(6)).await;
         tokio::task::yield_now().await;
         let state = proc_state(pid2);
@@ -23261,8 +23335,9 @@ mod tests {
         svc.running.lock().await.remove(&job_id);
     }
 
-    // If a supervised job's stepd pid is already confirmed gone, teardown never comes, so cancel must
-    // force the release — reaching it needs a real completion ack, hence a live mock controller and an admitted run.
+    // If a supervised job's stepd pid is already confirmed gone, teardown never comes, so
+    // cancel must force the release — reaching it needs a real completion ack, hence a live
+    // mock controller and an admitted run.
     #[tokio::test]
     async fn graceful_cancel_reclaims_a_confirmed_dead_supervised_jobs_ledger() {
         let (controller_addr, _reports) = spawn_mock_controller();
@@ -23471,8 +23546,9 @@ mod tests {
         );
     }
 
-    // send_explicit_signal has the identical gap as graceful_cancel for a supervised job; cover it
-    // here too. Reaching that release needs a real completion ack via a live mock controller and an admitted run.
+    // send_explicit_signal has the identical gap as graceful_cancel for a supervised job;
+    // cover it here too. Reaching that release needs a real completion ack via a live mock
+    // controller and an admitted run.
     #[tokio::test]
     async fn send_explicit_signal_reclaims_a_confirmed_dead_supervised_jobs_ledger() {
         let (controller_addr, _reports) = spawn_mock_controller();
@@ -23525,8 +23601,9 @@ mod tests {
         );
     }
 
-    // A non-lethal signal never spawns spawn_stepd_release_wait, so reap_dead_supervised_stepds is
-    // the only thing that notices an already-dead stepd here — needs a real completion ack via a live mock controller and an admitted run.
+    // A non-lethal signal never spawns spawn_stepd_release_wait, so
+    // reap_dead_supervised_stepds is the only thing that notices an already-dead stepd here —
+    // needs a real completion ack via a live mock controller and an admitted run.
     #[tokio::test]
     async fn send_explicit_signal_reclaims_a_confirmed_dead_stepd_on_a_non_lethal_signal() {
         let (controller_addr, _reports) = spawn_mock_controller();
@@ -23642,8 +23719,9 @@ mod tests {
         );
     }
 
-    // An attempt-less (reclaim-heartbeat) cancel resolves its doomed attempt from a still-registered
-    // dead stepd; a redispatch that already reserved a newer attempt for the same job_id must survive it.
+    // An attempt-less (reclaim-heartbeat) cancel resolves its doomed attempt from a
+    // still-registered dead stepd; a redispatch that already reserved a newer attempt for
+    // the same job_id must survive it.
     #[tokio::test]
     async fn cancel_with_no_named_attempt_spares_a_reused_job_ids_newer_reservation() {
         let svc = AgentService::new(
