@@ -9761,7 +9761,19 @@ mod tests {
     }
 
     async fn await_reconcile_gate(svc: &ControllerService, name: &str, expected: bool) {
-        for _ in 0..600 {
+        await_reconcile_gate_within(svc, name, expected, 600).await;
+    }
+
+    /// Same wait, with a caller-chosen poll budget: a test racing more than one
+    /// concurrent reconcile pass needs more patience under real CPU contention
+    /// than the default (which many single-pass tests already rely on).
+    async fn await_reconcile_gate_within(
+        svc: &ControllerService,
+        name: &str,
+        expected: bool,
+        iterations: u32,
+    ) {
+        for _ in 0..iterations {
             if svc
                 .cluster
                 .get_node(name)
@@ -9862,7 +9874,10 @@ mod tests {
         );
 
         release2.notify_one();
-        await_reconcile_gate(&svc, "n1", false).await;
+        // A larger budget than the default: this test's already run two full
+        // reconcile passes serially, so it needs more slack under real CPU
+        // contention than a single-pass test does.
+        await_reconcile_gate_within(&svc, "n1", false, 3000).await;
         assert!(
             svc.cluster.get_node("n1").expect("node").is_schedulable(),
             "the gate opens once every pass holding it has finished"
