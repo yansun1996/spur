@@ -147,12 +147,9 @@ impl<'de> Deserialize<'de> for LaunchIo {
     {
         use serde::de::Error as _;
 
-        // A struct field's `Option<T>` is implicitly optional to serde (present
-        // or absent, regardless of `deny_unknown_fields`), so matching the
-        // `{"Pty": ...}` shape with a derived struct would let `{}` or an
-        // unrelated `{"Something": ...}` decode as this variant with no window
-        // size, instead of failing. Going through a JSON value lets the exact
-        // key be checked for by hand.
+        // A derived struct's `Option<T>` field is implicitly optional to serde, so
+        // matching `{"Pty": ...}` that way would let `{}` decode as this variant
+        // with no window size. A JSON value lets the exact key be checked by hand.
         match serde_json::Value::deserialize(deserializer)? {
             serde_json::Value::String(s) if s == "File" => Ok(LaunchIo::File),
             serde_json::Value::String(s) if s == "Pty" => Ok(LaunchIo::Pty(None)),
