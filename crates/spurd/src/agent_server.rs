@@ -1887,12 +1887,12 @@ async fn settle_recovered_stepd(
         )
         .await;
     let epilog_failed = store
-        .epilog_failed(
+        .epilog_result(
             descriptor.job_id,
             descriptor.run_attempt,
             descriptor.step_id,
         )
-        .unwrap_or(false);
+        .unwrap_or(None);
     Some(crate::stepd::PendingStepdCompletion {
         job_id: descriptor.job_id,
         run_attempt: descriptor.run_attempt,
@@ -2046,9 +2046,7 @@ pub(crate) fn monitor_recovered_stepds(
                         signal: completion.signal,
                         run_attempt: completion.run_attempt,
                         reporting_node: &hostname,
-                        drain: completion.epilog_failed.then_some(&DrainRequest {
-                            reason: "epilog script failed".into(),
-                        }),
+                        drain: epilog_drain_request(completion.epilog_failed).as_ref(),
                         step_id: Some(completion.step_id),
                         payload: PayloadEvidence::Supervised(&store),
                     },
@@ -2066,11 +2064,11 @@ pub(crate) fn monitor_recovered_stepds(
                     } else {
                         // Only now may the slice go: the controller has it.
                         if let Some(run) = named_run(completion.job_id, completion.run_attempt) {
-                            record_run_epilog(
+                            record_completion_epilog(
                                 &admissions,
                                 run,
                                 completion.step_id,
-                                epilog_outcome(completion.epilog_failed),
+                                completion.epilog_failed,
                             );
                             settle_acknowledged_completion(
                                 &allocation,
@@ -2545,9 +2543,7 @@ pub async fn replay_unacknowledged_stepd_completions(
                 signal: completion.signal,
                 run_attempt: completion.run_attempt,
                 reporting_node,
-                drain: completion.epilog_failed.then_some(&DrainRequest {
-                    reason: "epilog script failed".into(),
-                }),
+                drain: epilog_drain_request(completion.epilog_failed).as_ref(),
                 step_id: Some(completion.step_id),
                 payload: PayloadEvidence::Supervised(store),
             },
@@ -2557,11 +2553,14 @@ pub async fn replay_unacknowledged_stepd_completions(
         {
             store.acknowledge_completion(&completion)?;
             if let Some(run) = named_run(completion.job_id, completion.run_attempt) {
-                record_run_epilog(
+                // An unresolved outcome leaves the ledger's epilog record
+                // in-flight; `resolve_supervised_epilogs`'s own sweep is what
+                // settles it once the supervisor is confirmed gone for good.
+                record_completion_epilog(
                     admissions,
                     run,
                     completion.step_id,
-                    epilog_outcome(completion.epilog_failed),
+                    completion.epilog_failed,
                 );
                 // A late delivery frees the slice here, like every other settled
                 // report: leaving it to a later sweep frees it with nothing said.
@@ -6026,6 +6025,30 @@ pub(crate) fn epilog_outcome(failed: bool) -> crate::admission::HookState {
     } else {
         crate::admission::HookState::Succeeded
     }
+}
+
+/// Record a completion's epilog outcome only once it is actually known. A
+/// completion whose exit is on record but whose hook never got to write its
+/// own outcome leaves the ledger's existing in-flight record untouched --
+/// `resolve_supervised_epilogs` is what eventually settles that case, once it
+/// can confirm the supervisor is gone for good.
+fn record_completion_epilog(
+    admissions: &crate::admission::AdmissionStore,
+    run: RunKey,
+    step_id: spur_core::step::StepId,
+    epilog_failed: Option<bool>,
+) {
+    if let Some(failed) = epilog_failed {
+        record_run_epilog(admissions, run, step_id, epilog_outcome(failed));
+    }
+}
+
+/// Whether a completion's epilog has earned a drain. An unresolved outcome
+/// never has: nothing yet says the hook failed.
+fn epilog_drain_request(epilog_failed: Option<bool>) -> Option<DrainRequest> {
+    matches!(epilog_failed, Some(true)).then(|| DrainRequest {
+        reason: "epilog script failed".into(),
+    })
 }
 
 /// Releases a launch reservation if the handler exits before commit (including
@@ -12664,7 +12687,7 @@ mod tests {
                 step_id: spur_core::step::STEP_BATCH,
                 exit_code: 0,
                 signal: 0,
-                epilog_failed: false,
+                epilog_failed: Some(false),
             })
             .expect("acknowledge completion");
 

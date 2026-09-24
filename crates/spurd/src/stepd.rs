@@ -2388,7 +2388,7 @@ pub async fn run_process(args: &[String]) -> anyhow::Result<i32> {
             step_id,
             exit_code,
             signal,
-            epilog_failed,
+            epilog_failed: Some(epilog_failed),
         })?;
     }
     Ok(exit_code)
@@ -2434,7 +2434,10 @@ pub struct PendingStepdCompletion {
     pub step_id: spur_core::step::StepId,
     pub exit_code: i32,
     pub signal: i32,
-    pub epilog_failed: bool,
+    /// `None` when the exit is on record but the epilog's own record never
+    /// followed it -- the supervisor died before it could say how the hook
+    /// ended, which is not the same thing as the hook having succeeded.
+    pub epilog_failed: Option<bool>,
 }
 
 #[derive(Clone)]
@@ -2629,7 +2632,10 @@ impl StepdStore {
             );
             let mut observed_exit = None;
             let mut acknowledged = false;
-            let mut epilog_failed = false;
+            // `None` until the hook's own record answers for it: a supervisor
+            // killed between its exit and that record leaves the hook's fate
+            // unresolved, and that must never be read as a quiet success.
+            let mut epilog_failed: Option<bool> = None;
             // Skipped like an unreadable descriptor above: this runs at startup, so
             // propagating one damaged session's error would stop the agent booting.
             let recorded = match obligations.read() {
@@ -2650,9 +2656,9 @@ impl StepdStore {
                     StepdObligation::ExitObserved { exit_code, signal } => {
                         observed_exit = Some((exit_code, signal));
                         acknowledged = false;
-                        epilog_failed = false;
+                        epilog_failed = None;
                     }
-                    StepdObligation::EpilogCompleted { failed } => epilog_failed = failed,
+                    StepdObligation::EpilogCompleted { failed } => epilog_failed = Some(failed),
                     StepdObligation::CompletionAcknowledged if observed_exit.is_some() => {
                         acknowledged = true;
                     }
@@ -2845,19 +2851,6 @@ impl StepdStore {
                 StepdObligation::ExitObserved { exit_code, signal } => Some((*exit_code, *signal)),
                 _ => None,
             }))
-    }
-
-    /// Epilog result recorded after the last observed exit. A late-reported
-    /// completion must still drain the node when its epilog failed.
-    pub(crate) fn epilog_failed(
-        &self,
-        job_id: u32,
-        run_attempt: u32,
-        step_id: spur_core::step::StepId,
-    ) -> io::Result<bool> {
-        Ok(self
-            .epilog_result(job_id, run_attempt, step_id)?
-            .unwrap_or(false))
     }
 
     /// How the supervisor's own ledger says its epilog ended, or `None` while it
@@ -4377,6 +4370,36 @@ mod tests {
         assert_eq!(pending[0].job_id, 11);
     }
 
+    // A supervisor SIGKILLed between recording the exit and recording how its
+    // epilog hook ended (mid-hook, or before even starting it) leaves the
+    // hook's fate unresolved. That must surface as "unknown", never as the
+    // quiet success a missing failure record would otherwise imply.
+    #[test]
+    fn a_supervisor_killed_mid_epilog_reports_an_unresolved_outcome() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = StepdStore::new(temp.path());
+        let descriptor = descriptor(12, 1, 999_999);
+        store.publish(&descriptor).expect("publish descriptor");
+        store
+            .obligations(12, 1, spur_core::step::STEP_BATCH)
+            .append(&StepdObligation::ExitObserved {
+                exit_code: 0,
+                signal: 0,
+            })
+            .expect("append exit observed");
+        // Deliberately no EpilogCompleted: the supervisor died before it
+        // could write one.
+
+        let pending = store
+            .discover_unacknowledged_completions()
+            .expect("discover unacknowledged completions");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].epilog_failed, None,
+            "a hook with no recorded outcome must not be reported as succeeded"
+        );
+    }
+
     #[test]
     fn observed_exit_remains_available_after_completion_acknowledgement() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -4406,7 +4429,7 @@ mod tests {
                 step_id: spur_core::step::STEP_BATCH,
                 exit_code: 7,
                 signal: 0,
-                epilog_failed: false,
+                epilog_failed: Some(false),
             })
             .expect("acknowledge completion");
         assert_eq!(
@@ -5198,31 +5221,6 @@ mod tests {
             Some(true),
             "and the supervisor's own word is the answer"
         );
-    }
-
-    #[test]
-    fn epilog_failure_survives_for_a_late_reported_completion() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = StepdStore::new(temp.path());
-        store
-            .prepare_session_dir(9, 2, spur_core::step::STEP_BATCH)
-            .expect("session dir");
-        let obligations = store.obligations(9, 2, spur_core::step::STEP_BATCH);
-        obligations
-            .append(&StepdObligation::ExitObserved {
-                exit_code: 0,
-                signal: 0,
-            })
-            .expect("append exit");
-        assert!(!store
-            .epilog_failed(9, 2, spur_core::step::STEP_BATCH)
-            .expect("epilog state"));
-        obligations
-            .append(&StepdObligation::EpilogCompleted { failed: true })
-            .expect("append epilog result");
-        assert!(store
-            .epilog_failed(9, 2, spur_core::step::STEP_BATCH)
-            .expect("epilog state"));
     }
 
     #[tokio::test]
