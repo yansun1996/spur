@@ -1170,7 +1170,9 @@ impl AdmissionStore {
             };
             // A release landing after the caller read its snapshot would otherwise
             // leave a record claiming to hold a core it has already given back.
-            if run.controller_ack.is_committed() {
+            // `is_committed()` alone misses a zero-index settled claim (no real
+            // commit, by design) whose slice has still gone back for good.
+            if run.slice_released || run.controller_ack.is_committed() {
                 return Ok(HoldOutcome::AlreadyReleased);
             }
             if run.conflict_hold.is_some() {
@@ -2868,6 +2870,33 @@ mod tests {
         assert_eq!(
             store
                 .take_conflict_hold(key(7, 1), "held with no tracked job")
+                .unwrap(),
+            HoldOutcome::AlreadyReleased
+        );
+        assert!(store.load_run(key(7, 1)).unwrap().conflict_hold.is_none());
+    }
+
+    #[test]
+    fn a_settled_and_released_run_takes_no_conflict_hold() {
+        // The settle path acks with release_raft_index=Some(0) -- a real commit
+        // in `is_committed()`'s eyes only above zero -- then a separate call
+        // hands the slice back. Once both have landed, a stale unbacked-
+        // allocations snapshot must not re-plant a hold nothing will ever clear:
+        // `ledger_cut` already drops a released run from what it reports.
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&dir);
+        store.admit_run(&run_with(7, 1, 1)).unwrap();
+        assert!(store.settle_acknowledged_run(key(7, 1)).unwrap());
+        assert!(store.record_slice_released(key(7, 1)).unwrap());
+
+        let settled = store.load_run(key(7, 1)).unwrap();
+        assert_eq!(settled.controller_ack.release_raft_index, Some(0));
+        assert!(!settled.controller_ack.is_committed());
+        assert!(settled.slice_released);
+
+        assert_eq!(
+            store
+                .take_conflict_hold(key(7, 1), "stale unbacked allocation")
                 .unwrap(),
             HoldOutcome::AlreadyReleased
         );
