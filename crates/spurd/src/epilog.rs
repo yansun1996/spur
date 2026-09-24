@@ -7,7 +7,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use tracing::error;
+use tracing::{error, warn};
 
 use spur_core::job::RunKey;
 
@@ -82,12 +82,16 @@ pub(crate) async fn run_job_epilog(
     if let Some(run) = run {
         // Marked before the hook: an agent that dies inside one leaves a
         // `Running` that reloads as unknowable.
-        let _ = admissions.record_epilog(run, HookState::Running);
+        if let Err(error) = admissions.record_epilog(run, HookState::Running) {
+            warn!(%run, %error, "failed to record an epilog's start");
+        }
     }
     let outcome = run_bounded(script, ctx, timeout_secs).await;
     if let Some(run) = run {
-        let _ =
-            admissions.record_epilog(run, crate::agent_server::epilog_outcome(outcome.is_err()));
+        let state = crate::agent_server::epilog_outcome(outcome.is_err());
+        if let Err(error) = admissions.record_epilog(run, state) {
+            warn!(%run, %error, "failed to record an epilog's outcome");
+        }
     }
     let fault = outcome.err()?;
     error!(
@@ -200,6 +204,65 @@ mod tests {
                 .cleanup
                 .epilog,
             HookState::Succeeded
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingWriter {
+        type Writer = CapturingWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    // Same rationale as agent_server.rs's record_run_epilog/settle_acknowledged_completion
+    // fix: a write failure here must leave a trace, not silently strand the slice.
+    #[tokio::test]
+    async fn a_failed_epilog_record_write_is_logged_not_silently_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let log = CapturingWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _trace_guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = AdmissionStore::new(dir.path(), "n1");
+        let run = admitted(&store, 9);
+        std::fs::set_permissions(
+            store.run_dir(run).expect("run dir"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .expect("drop write permission");
+
+        let script = write_script(dir.path(), "epilog.sh", "#!/bin/sh\nexit 0\n");
+        run_job_epilog(&store, &script, &hook_context(9, "/tmp"), Some(run), 30).await;
+
+        std::fs::set_permissions(
+            store.run_dir(run).expect("run dir"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("restore write permission");
+
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).expect("utf8 log");
+        assert!(
+            logged.contains("failed to record an epilog's start")
+                || logged.contains("failed to record an epilog's outcome"),
+            "a write failure here must be logged, not swallowed: {logged}"
         );
     }
 
