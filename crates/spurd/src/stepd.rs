@@ -277,9 +277,8 @@ impl StepdLaunchSpec {
             nodelist: self.nodelist,
             host_device_plan: self.host_device_plan,
             memlock: self.memlock.into(),
-            // `pty` predates `io_mode`; an old-format reload carries `pty` but no
-            // matching `io_mode`. Deriving from `pty` covers both, since `TryFrom`
-            // keeps them in sync for a fresh spec.
+            // `pty` is newer and, once set, authoritative; `io_mode` alone means a
+            // reload from before `pty` existed. `TryFrom` keeps both in sync on write.
             io_mode: match self.pty {
                 Some(winsize) => crate::executor::LaunchIo::Pty(
                     (winsize != crate::pty::WindowSize::default()).then_some(winsize),
