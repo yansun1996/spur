@@ -8760,6 +8760,8 @@ impl SlurmAgent for AgentService {
                     "stepd superseded by a newer attempt before it could be tracked; aborting"
                 );
                 discard_stepd_session(&descriptor).await;
+                reservation_guard.mark_reaped();
+                reservation_guard.release().await;
                 return Err(Status::failed_precondition(format!(
                     "job {} was superseded by a newer attempt on this node",
                     req.job_id
@@ -21860,6 +21862,87 @@ mod tests {
         drop(running);
 
         assert!(admissions.load_run(key(14, 1)).is_ok());
+    }
+
+    // The remedy `RegisterAllocation` and `LaunchJob` both apply once
+    // `claim_stepd_slot` reports a newer attempt already tracked: without it,
+    // `mark_spawned` (already set once the supervisor is live) permanently
+    // pins the reservation, since `Drop` refuses to release anything spawned.
+    #[tokio::test]
+    async fn a_stepd_claim_lost_to_a_newer_attempt_frees_the_reservation() {
+        let state = tempfile::tempdir().expect("state dir");
+        let svc = svc_with_state_dir(state.path()).await;
+        let admissions = svc.admissions();
+
+        let mut run = crate::admission::RunAdmission::new(
+            42,
+            1,
+            &svc.reporter.hostname,
+            crate::admission::AdmittedResources {
+                cpu_ids: vec![0],
+                memory_mb: 128,
+                gpu_devices: Vec::new(),
+            },
+            crate::admission::now_unix_ms(),
+        );
+        run.lifecycle_owner_step = Some(spur_core::step::STEP_EXTERN);
+        admissions.admit_run(&run).expect("admit run");
+
+        svc.allocation
+            .lock()
+            .await
+            .allocate_for_job(42, 1, 1, 128, &[])
+            .expect("reserve");
+        assert!(svc.allocation.lock().await.commit_job(42, 1));
+
+        // A concurrent redispatch already tracked its own (newer) session for
+        // this job's allocation-owning step before this attempt's claim landed.
+        let newer = crate::stepd::StepdDescriptor::new(
+            42,
+            2,
+            spur_core::step::STEP_EXTERN,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/spur-test-lost-claim-newer.sock"),
+            std::path::PathBuf::new(),
+        );
+        svc.stepds.lock().await.insert(stepd_key(&newer), newer);
+
+        let mut guard =
+            LaunchReservationGuard::new(svc.allocation.clone(), admissions.clone(), key(42, 1));
+        // A supervisor is live against this reservation, exactly as
+        // `RegisterAllocation`/`LaunchJob` mark it right after their own
+        // `launch_stepd` returns.
+        guard.mark_spawned();
+
+        let descriptor = crate::stepd::StepdDescriptor::new(
+            42,
+            1,
+            spur_core::step::STEP_EXTERN,
+            0,
+            0,
+            std::path::PathBuf::from("/tmp/spur-test-lost-claim-current.sock"),
+            std::path::PathBuf::new(),
+        );
+        claim_stepd_slot(&svc.stepds, descriptor)
+            .await
+            .expect_err("attempt 1 cannot clobber the already-tracked attempt 2");
+
+        // The fix under test: a lost claim must undo `mark_spawned`, or the
+        // guard's `Drop` reads the (already-dead) supervisor as still owed a
+        // slice.
+        guard.mark_reaped();
+        guard.release().await;
+
+        assert_eq!(
+            svc.allocation.lock().await.allocated_memory_mb,
+            0,
+            "a claim lost to a newer attempt must not strand the reservation"
+        );
+        assert!(
+            admissions.load_run(key(42, 1)).is_err(),
+            "a claim lost to a newer attempt must not leave a stray admission record"
+        );
     }
 
     fn a_test_reporter() -> Arc<NodeReporter> {
