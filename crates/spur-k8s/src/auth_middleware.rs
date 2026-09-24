@@ -1,8 +1,9 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Authenticates callers of the operator's cluster-wide-pod-create agent surface via the shared
-//! `spur_core::auth::authenticate_bearer` (mirrors spurd's `AgentAuthLayer`, duplicated since spurd is a binary crate).
+//! Authenticates callers of the operator's cluster-wide-pod-create agent surface via the
+//! shared `spur_core::auth::authenticate_bearer` (mirrors spurd's `AgentAuthLayer`,
+//! duplicated since spurd is a binary crate).
 //!
 //! On success the verified [`spur_core::auth::Identity`] is inserted into the request extensions,
 //! same as spurd, so the controller-only RPCs this agent hosts (`RequestNodeLedger`, `FenceRun`,

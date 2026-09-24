@@ -1175,7 +1175,8 @@ fn wait_and_mirror_exit_code(child: nix::unistd::Pid, exit_marker: Option<&Path>
 }
 
 /// Fork into a new PID namespace (child is PID 1, returns `Ok(())`; parent waits).
-/// The child also unshares mount ns so its pivot_root can't sever the parent's host access needed to write `exit_marker`.
+/// The child also unshares mount ns so its pivot_root can't sever the parent's
+/// host access needed to write `exit_marker`.
 fn fork_into_pid_namespace(exit_marker: Option<&Path>) -> anyhow::Result<()> {
     match unsafe { nix::unistd::fork().context("fork for PID namespace")? } {
         nix::unistd::ForkResult::Child => {
