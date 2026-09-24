@@ -168,9 +168,8 @@ class TestRequeueEpilogGate:
                 "holder job never reached RUNNING"
             )
 
-            # Cancel while the epilog is slow (still-gated but terminal), then requeue
-            # it: the exact hand-off this test covers (requeue used to free it too soon).
-            cluster.scancel(str(holder_id))
+            # Requeue while still RUNNING (not cancelled first): the exact hand-off
+            # this test covers (requeue used to free a still-epilog-gated node too soon).
             cluster.scontrol("requeue", str(holder_id))
 
             blocked_script = cluster.write_file(
