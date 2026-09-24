@@ -2878,8 +2878,9 @@ impl ClusterManager {
             hostname
         };
 
-        // Held across decide-then-propose so concurrent registrations of THIS node can't each act on
-        // a pre-write read of the other's state and propose conflicting/duplicate WAL ops.
+        // Held across decide-then-propose so concurrent registrations of THIS node can't
+        // each act on a pre-write read of the other's state and propose conflicting or
+        // duplicate WAL ops.
         let node_lock = self.node_registration_lock(&name);
         let _registration = node_lock.lock();
 
@@ -3666,10 +3667,10 @@ impl ClusterManager {
         Ok(())
     }
 
-    /// Grow a scoped k0s cluster's member set online: union `nodes` into `member_nodes` (idempotent).
-    /// The reconcile loop enrolls the newly-in-scope nodes on its next tick. Caller must ensure the
-    /// cluster is scoped (non-empty `member_nodes`) — adding to a whole-inventory cluster would
-    /// narrow it (see the `cluster_add_nodes` handler guard).
+    /// Grow a scoped k0s cluster's member set online: union `nodes` into `member_nodes`
+    /// (idempotent). The reconcile loop enrolls the newly-in-scope nodes on its next tick.
+    /// Caller must ensure the cluster is scoped (non-empty `member_nodes`) — adding to a
+    /// whole-inventory cluster would narrow it (see the `cluster_add_nodes` handler guard).
     pub fn add_k0s_member_nodes(&self, nodes: Vec<String>) -> anyhow::Result<()> {
         self.propose(WalOperation::K0sMemberNodesAdd { nodes })?;
         Ok(())
@@ -6608,8 +6609,8 @@ impl ClusterManager {
                 preempt_qos,
                 ..
             } => {
-                // Only a running job is preempted; on replay the job is already
-                // Pending, so this is a NoOp (no re-dealloc, no double requeue).
+                // Running -> Preempted the first time; Preempted -> Pending once its
+                // gates clear (may take several applies); a NoOp once already Pending.
                 let freed_nodes;
                 let allocated_resources;
                 let per_node_map;
@@ -7832,9 +7833,9 @@ impl ClusterManager {
                 let mut k0s = self.k0s.write();
                 k0s.phase = *phase;
                 k0s.reset_requested = *reset_requested;
-                // Teardown resets cluster identity so the next `up` starts clean (no stale scope/CP);
-                // the branches are exclusive so a non-empty field passed alongside Down can't be set
-                // then immediately wiped.
+                // Teardown resets cluster identity so the next `up` starts clean (no stale
+                // scope/CP); the branches are exclusive so a non-empty field passed alongside
+                // Down can't be set then immediately wiped.
                 if *phase == spur_core::k0s::K0sPhase::Down {
                     k0s.member_nodes.clear();
                     k0s.control_plane_node = None;
@@ -10549,9 +10550,10 @@ mod tests {
         );
     }
 
-    /// Register a node already on the WireGuard mesh: it advertises its real `spur0` address (what
-    /// `detect_node_address` reports when WireGuard is up) and a wg pubkey, so `provision_assignments`
-    /// adopts that real address as its `k0s_mesh_ip` instead of allocating from a pool.
+    /// Register a node already on the WireGuard mesh: it advertises its real `spur0`
+    /// address (what `detect_node_address` reports when WireGuard is up) and a wg pubkey,
+    /// so `provision_assignments` adopts that real address as its `k0s_mesh_ip` instead of
+    /// allocating from a pool.
     fn register_meshed_node(cm: &ClusterManager, name: &str, mesh_addr: &str) {
         cm.register_node(
             name.into(),
@@ -17765,7 +17767,8 @@ mod tests {
         crate::scheduler_loop::try_preempt(&cm, &partitions, &pending_refs, &cm.config().scheduler)
             .await;
 
-        // low job must still be running — it was started moments ago and is within the exempt window
+        // low job must still be running — it was started moments ago and is within the
+        // exempt window
         assert_eq!(
             cm.get_job(low_id).unwrap().state,
             JobState::Running,
@@ -22257,10 +22260,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provision_pools_node_with_underlay_comm_address() {
-        // A node whose advertised comm address is OUTSIDE mesh_cidr (e.g. a control plane advertising
-        // its routable underlay address, as real deployments do) is not reporting a mesh address — it
-        // must fall through to pool allocation, NOT be refused. Only an in-mesh address is adopted.
-        // (wg_cidr-vs-mesh_cidr config validation is a separate concern.)
+        // A node whose advertised comm address is OUTSIDE mesh_cidr (e.g. a control plane
+        // advertising its routable underlay address, as real deployments do) is not
+        // reporting a mesh address — it must fall through to pool allocation, NOT be
+        // refused. Only an in-mesh address is adopted. (wg_cidr-vs-mesh_cidr config
+        // validation is a separate concern.)
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_meshed_node(&cm, "n005", "198.51.100.5"); // underlay, outside 10.44.0.0/16
@@ -22288,10 +22292,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provision_refuses_conflicting_real_addresses() {
-        // Two unassigned meshed nodes advertising the same real address is a genuine operator mistake:
-        // assigning either would push an exclusive AllowedIPs entry for an address two peers claim. Both
-        // stay unprovisioned and both carry the reason, but the call still succeeds so any other node in
-        // the same tick provisions normally.
+        // Two unassigned meshed nodes advertising the same real address is a genuine
+        // operator mistake: assigning either would push an exclusive AllowedIPs entry for
+        // an address two peers claim. Both stay unprovisioned and both carry the reason,
+        // but the call still succeeds so any other node in the same tick provisions
+        // normally.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_meshed_node(&cm, "n005", "10.44.0.7");
@@ -22311,8 +22316,8 @@ mod tests {
             Some("10.44.0.9")
         );
 
-        // Neither conflicting node is assigned, and both name each other in an exact-shape reason so
-        // `spur k8s status` points at the whole conflict.
+        // Neither conflicting node is assigned, and both name each other in an exact-shape
+        // reason so `spur k8s status` points at the whole conflict.
         assert!(cm.get_node("n005").and_then(|n| n.k0s_role).is_none());
         assert!(cm.get_node("n006").and_then(|n| n.k0s_role).is_none());
         let want = "network mismatch: mesh address 10.44.0.7 claimed by n005, n006";
@@ -22331,8 +22336,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn provision_refuses_newcomer_colliding_with_assigned_node() {
-        // An already-assigned member owns its mesh IP. A newcomer advertising that same address is the
-        // one refused — the incumbent keeps its assignment, the newcomer stays out with a reason.
+        // An already-assigned member owns its mesh IP. A newcomer advertising that same
+        // address is the one refused — the incumbent keeps its assignment, the newcomer
+        // stays out with a reason.
         let dir = TempDir::new().unwrap();
         let cm = test_cluster(&dir).await;
         register_meshed_node(&cm, "n005", "10.44.0.7");
@@ -22941,8 +22947,9 @@ mod tests {
                 .iter()
                 .all(|n| cm.get_node(n).is_some())
         });
-        // HA set recorded bootstrap-first (cp-b) with the singular field unset. The first-of-set must
-        // hold `.1` — cp-b, NOT the sorted-first cp-a, so this fails if bootstrap ignores the set.
+        // HA set recorded bootstrap-first (cp-b) with the singular field unset. The
+        // first-of-set must hold `.1` — cp-b, NOT the sorted-first cp-a, so this fails if
+        // bootstrap ignores the set.
         cm.set_k0s_phase(
             K0sPhase::Provisioning,
             None,
