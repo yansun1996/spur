@@ -1939,7 +1939,9 @@ async fn confirm_dispatch_on_nodes(
     let mut successes = 0u32;
     let mut failures = 0u32;
     let mut prolog_failed: Vec<(String, String)> = Vec::new();
-    let mut reconcile_conflicts = 0u32;
+    // Failures the controller caused, not the job: a stale fence/expiry view or an
+    // unaccounted node claim. A batch of only these spares the job's requeue budget.
+    let mut controller_fault_failures = 0u32;
     let mut failure_categories: std::collections::BTreeMap<&'static str, u32> = Default::default();
     let total = dispatch_nodes.len() as u32;
 
@@ -2149,8 +2151,8 @@ async fn confirm_dispatch_on_nodes(
                 execution_credential: &execution_credential,
             };
             let dispatch = dispatch_to_agent(&agent_addr, &params);
-            // The join below drains every node, so one agent that accepts the call and never answers
-            // would otherwise hold the whole scheduler loop, not just this job.
+            // The join below drains every node, so one agent that accepts the call and
+            // never answers would otherwise hold the whole scheduler loop, not just this job.
             let result = match dispatch_timeout {
                 Some(limit) => match tokio::time::timeout(limit, dispatch).await {
                     Ok(result) => result,
@@ -2187,7 +2189,7 @@ async fn confirm_dispatch_on_nodes(
                     // The node holds something Raft cannot explain: look before
                     // sending it anything else.
                     DispatchError::NeedsReconcile(_) => {
-                        reconcile_conflicts += 1;
+                        controller_fault_failures += 1;
                         cluster.cool_down_node(&node_name);
                         // Paced: a node that refuses every dispatch would
                         // otherwise earn a pull per refusal.
@@ -2199,11 +2201,14 @@ async fn confirm_dispatch_on_nodes(
                             });
                         }
                     }
+                    // A stale fence/expiry view, per their own doc comments, is the
+                    // controller's fault too — the job's budget must not pay for it.
+                    DispatchError::Fenced(_) | DispatchError::Expired(_) => {
+                        controller_fault_failures += 1;
+                    }
                     // Retrying this attempt cannot succeed, and a fresh dispatch
                     // costs nothing; neither says anything about the node.
-                    DispatchError::Fenced(_)
-                    | DispatchError::Expired(_)
-                    | DispatchError::ConflictingDigest(_)
+                    DispatchError::ConflictingDigest(_)
                     | DispatchError::AgentRejected(_)
                     | DispatchError::Other(_) => {}
                 }
@@ -2286,7 +2291,7 @@ async fn confirm_dispatch_on_nodes(
     } else {
         // Only when nothing else went wrong: a run that also hit a real failure
         // has something to answer for, and the budget is what answers for it.
-        let charge = if reconcile_conflicts == failures {
+        let charge = if controller_fault_failures == failures {
             RequeueCharge::Spared
         } else {
             RequeueCharge::Charged
@@ -5615,6 +5620,35 @@ mod tests {
                     "refusal {refusal}: the job stays schedulable"
                 );
             }
+        }
+
+        // Fenced/Expired are documented as the controller's own fault (a stale
+        // view, its own latency) — same as NeedsReconcile, just not something
+        // pull_node_ledger can act on. Must be spared the same way.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_stale_fence_never_spends_the_job_s_requeue_budget() {
+            use spur_core::job::JobState;
+
+            let dir = TempDir::new().unwrap();
+            let cm = test_cluster(&dir).await;
+            let (addr, _) = spawn_mock_agent_rejecting(Some(
+                spur_proto::proto::LaunchFailureKind::LaunchFailureFenced,
+            ))
+            .await;
+            register_node_at(&cm, "n1", addr);
+            let mut spec = batch_spec("stale-fence-exempt", 1);
+            spec.nodelist = Some("n1".into());
+            let job_id = submit_and_wait(&cm, spec);
+
+            assert!(!process_assignment(cm.clone(), assignment(job_id, &["n1"])).await);
+
+            let job = cm.get_job(job_id).unwrap();
+            assert_eq!(job.state, JobState::Pending);
+            assert_eq!(job.requeue_count, 0, "a stale fence must not spend a retry");
+            assert_eq!(
+                job.spared_requeue_count, 1,
+                "a stale fence must be counted as spared, not charged"
+            );
         }
 
         // The terminator: with no drain to end it, only the bound stops a pinned
