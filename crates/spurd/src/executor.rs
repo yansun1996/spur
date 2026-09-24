@@ -145,21 +145,26 @@ impl<'de> Deserialize<'de> for LaunchIo {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Bare(String),
-            Tagged {
-                #[serde(rename = "Pty")]
-                pty: Option<crate::pty::WindowSize>,
-            },
-        }
+        use serde::de::Error as _;
 
-        match Repr::deserialize(deserializer)? {
-            Repr::Bare(s) if s == "File" => Ok(LaunchIo::File),
-            Repr::Bare(s) if s == "Pty" => Ok(LaunchIo::Pty(None)),
-            Repr::Bare(other) => Err(serde::de::Error::unknown_variant(&other, &["File", "Pty"])),
-            Repr::Tagged { pty } => Ok(LaunchIo::Pty(pty)),
+        // A struct field's `Option<T>` is implicitly optional to serde (present
+        // or absent, regardless of `deny_unknown_fields`), so matching the
+        // `{"Pty": ...}` shape with a derived struct would let `{}` or an
+        // unrelated `{"Something": ...}` decode as this variant with no window
+        // size, instead of failing. Going through a JSON value lets the exact
+        // key be checked for by hand.
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::String(s) if s == "File" => Ok(LaunchIo::File),
+            serde_json::Value::String(s) if s == "Pty" => Ok(LaunchIo::Pty(None)),
+            serde_json::Value::Object(mut map) if map.len() == 1 && map.contains_key("Pty") => {
+                let winsize: Option<crate::pty::WindowSize> =
+                    serde_json::from_value(map.remove("Pty").expect("checked above"))
+                        .map_err(D::Error::custom)?;
+                Ok(LaunchIo::Pty(winsize))
+            }
+            other => Err(D::Error::custom(format!(
+                "invalid LaunchIo representation: {other}"
+            ))),
         }
     }
 }
@@ -2851,6 +2856,41 @@ mod cgroup_files_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_io_round_trips_both_variants() {
+        for io in [
+            LaunchIo::File,
+            LaunchIo::Pty(None),
+            LaunchIo::Pty(Some(Default::default())),
+        ] {
+            let encoded = serde_json::to_string(&io).unwrap();
+            let decoded: LaunchIo = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, io, "round trip of {encoded}");
+        }
+    }
+
+    #[test]
+    fn launch_io_accepts_the_pre_window_size_bare_string() {
+        assert_eq!(
+            serde_json::from_str::<LaunchIo>("\"Pty\"").unwrap(),
+            LaunchIo::Pty(None)
+        );
+        assert_eq!(
+            serde_json::from_str::<LaunchIo>("\"File\"").unwrap(),
+            LaunchIo::File
+        );
+    }
+
+    #[test]
+    fn launch_io_rejects_shapes_that_are_not_really_pty_or_file() {
+        for bad in ["{}", r#"{"Something":{}}"#, "\"Bogus\"", "null", "42"] {
+            assert!(
+                serde_json::from_str::<LaunchIo>(bad).is_err(),
+                "{bad} must not silently decode as a valid LaunchIo"
+            );
+        }
+    }
 
     #[test]
     fn purging_one_step_leaves_its_siblings_output() {
