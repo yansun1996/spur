@@ -6581,11 +6581,15 @@ impl ClusterManager {
                     return ClientResponse::default();
                 }
                 // Free what the reservation charged before the requeue wipes
-                // the fields that say where it went.
+                // the fields that say where it went. `slices_to_keep`, not
+                // `slices_no_longer_held`: the job is still Pending here, and
+                // `is_held_on` only honors an epilog gate once a job is
+                // finalized, so the no-longer-held helper would hand back a
+                // node whose epilog is still running.
                 let freed_nodes = job.allocated_nodes.clone();
                 let allocated_resources = job.allocated_resources.clone();
                 let per_node_map = job.per_node_alloc.clone();
-                let already = Self::slices_no_longer_held(job);
+                let already = Self::slices_to_keep(job);
                 if *spare_requeue_budget {
                     Self::reset_job_for_spared_requeue(job, &nodes);
                 } else {
@@ -24488,6 +24492,12 @@ mod tests {
             "the record must keep naming the node its gate still binds"
         );
         drop(job);
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            6,
+            "the apply itself must not release a node its gate still binds, \
+             before any rebuild from job records ever runs"
+        );
         cm.recompute_node_allocations();
         assert_eq!(
             alloc_cpus(&cm, "n1"),
