@@ -6719,8 +6719,17 @@ impl ClusterManager {
                         return ClientResponse::default();
                     };
                     // Read before the requeue transition below, which rewrites the
-                    // state that decides where this run is still charged.
-                    keep_charged = Self::slices_no_longer_held(job);
+                    // state that decides where this run is still charged. A still-
+                    // live job needs `slices_to_keep` like the preempt arms, since
+                    // `slices_no_longer_held` ignores an epilog gate until finalized;
+                    // an already-terminal job needs `slices_no_longer_held` instead,
+                    // since its earlier JobComplete apply already cleared
+                    // node_completions and `slices_to_keep` would double-free it.
+                    keep_charged = if job.state.is_finalized() {
+                        Self::slices_no_longer_held(job)
+                    } else {
+                        Self::slices_to_keep(job)
+                    };
                     freed_nodes = job.allocated_nodes.clone();
                     allocated_resources = job.allocated_resources.clone();
                     per_node_map = job.per_node_alloc.clone();
@@ -24792,6 +24801,46 @@ mod tests {
             signal: 0,
         });
         assert_eq!(alloc_cpus(&cm, "n1"), 0);
+    }
+
+    // `scontrol requeue` (JobUserRequeue) can hit a job that is still Running or
+    // Suspended, not just a terminal one -- unlike the superseded-run test above,
+    // which cancels first and so only exercises the already-safe finalized branch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_user_requeue_of_a_running_job_keeps_the_slice_its_gate_is_still_holding() {
+        let dir = TempDir::new().unwrap();
+        let cm = ClusterManager::new(test_config(), dir.path()).unwrap();
+        register_epilog_node(&cm, "n1", true);
+        start_run_on(&cm, 1, &["n1"], scalar_alloc(6, 1000));
+        assert_eq!(cm.get_job(1).expect("job 1").state, JobState::Running);
+
+        cm.apply_operation(&WalOperation::JobUserRequeue {
+            at: None,
+            job_id: 1,
+            hold: false,
+            begin_time: None,
+        });
+        let job = cm.get_job(1).expect("job 1");
+        assert!(
+            job.epilog_gated_nodes.contains("n1"),
+            "the gate must survive a requeue of a still-running job"
+        );
+        drop(job);
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            6,
+            "the apply itself must not release a node its gate still binds, \
+             before any rebuild from job records ever runs"
+        );
+        cm.recompute_node_allocations();
+        assert_eq!(
+            alloc_cpus(&cm, "n1"),
+            6,
+            "a rebuild from job records must agree the slice is still held"
+        );
+
+        report_node_done(&cm, 1, "n1");
+        assert_eq!(alloc_cpus(&cm, "n1"), 0, "the node's own report frees it");
     }
 
     fn re_dispatch(
