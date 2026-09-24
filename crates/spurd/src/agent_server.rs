@@ -3998,10 +3998,9 @@ async fn run_containerized_step(
             // The spool-file fds belong to the child now; close our copies.
             drop(step_files);
 
-            container_parent_ready(child_pid, ready_r, cgroup_required, cgroup)?;
-
-            // Hard precondition, not best-effort: the sweep trusts a missing
-            // marker to mean a step never got this far.
+            // Hard precondition, not best-effort: the sweep trusts a missing marker to
+            // mean a step never got this far, so it must land before the readiness
+            // handshake below — the child can already be exec'd by the time that returns.
             if let Err(error) = crate::container::write_step_launch_marker(
                 &rootfs_base,
                 child_pid.as_raw(),
@@ -4016,6 +4015,8 @@ async fn run_containerized_step(
                     "failed to record the step's restart-recovery marker: {error}"
                 )));
             }
+
+            container_parent_ready(child_pid, ready_r, cgroup_required, cgroup)?;
 
             // Register PID for cancellation.
             let raw_pid = child_pid.as_raw() as u32;
