@@ -12,7 +12,7 @@ import time
 from cluster import parse_job_id, job_state, wait_job, wait_job_state, wait_until
 
 # The launch step of a batch job, mirroring STEP_BATCH in spur-core.
-STEP_BATCH = 0xFFFF_FFFE
+STEP_BATCH = 0xFFFF_FFFB
 
 
 def run_dir(cluster, job_id: int, attempt: int = 1) -> str:
@@ -248,7 +248,12 @@ class TestReleaseAfterAcknowledgement:
             )
             assert record["slice_released"] is False, record
             assert record["controller_ack"]["release_raft_index"] is None, record
-            assert record["controller_ack"]["settled_unrecorded_claim"] is False, record
+            # Never serialized when false (skip_serializing on the Rust side),
+            # so absent is the on-disk spelling of "not settled this way".
+            assert (
+                record["controller_ack"].get("settled_unrecorded_claim", False)
+                is False
+            ), record
 
         cluster.restart_controller()
 
