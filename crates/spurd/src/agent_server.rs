@@ -1705,9 +1705,9 @@ async fn release_stepd_tracking(
     descriptor: &crate::stepd::StepdDescriptor,
     reason: &'static str,
 ) -> bool {
-    // The allocation outlives the individual steps drawing on it, so only the
-    // job's last supervisor releases it. Held across the release so a step
-    // claimed meanwhile cannot have its allocation torn down underneath it.
+    // Only the job's last supervisor stops tracking the allocation (the slice
+    // itself is released later, on ack — see below). Held across the check so
+    // a step claimed meanwhile isn't read as the last one leaving.
     let mut sessions = stepds.lock().await;
     let removed_runtime = sessions
         .get(&stepd_key(descriptor))
@@ -6370,9 +6370,9 @@ struct LaunchPlan {
     apply_priv_in_child: bool,
 }
 
-/// Decides how to enter a job and run `command`, shared by `exec_in_job` and a supervised
-/// step's script: live namespaces enter via `nsenter`+`setpriv` ([`build_nsenter_argv`]);
-/// otherwise spawn directly.
+/// Decides how to enter a job and run `command`, shared by `run_command` and
+/// `supervised_step_script` (so `exec_in_job` reaches it too): live namespaces
+/// enter via `nsenter`+`setpriv` ([`build_nsenter_argv`]); otherwise spawn directly.
 fn build_launch_plan(
     entry: &crate::job_entry::JobEntry,
     priv_drop: Option<&crate::privdrop::PrivDrop>,
@@ -8131,7 +8131,6 @@ impl SlurmAgent for AgentService {
             let jobs = self.running.lock().await;
             jobs.get(&job_id).map(|tracked| tracked.run_attempt)
         };
-        let nothing_tracked = tracked_attempt.is_none();
 
         // An allocation ends here (not via completion teardown), so its cgroup node is removed
         // here too — steps only remove their own leaf. A cancel with no named attempt falls
@@ -8170,14 +8169,17 @@ impl SlurmAgent for AgentService {
             warn!(job_id, error = %err, "PMIx teardown on cancel failed");
         }
 
-        // Nothing tracked means the record is all that is left of the claim and
-        // its slice just went back; a tracked one is still tearing down.
+        // The doomed attempt, not just some attempt, must be what's tracked: a
+        // named cancel for an attempt a newer, tracked one has since superseded
+        // must settle it directly, not wait on a teardown nothing will ever run.
+        let doomed_attempt_is_tracked =
+            doomed_attempt.is_some() && tracked_attempt == doomed_attempt;
         if let Some(attempt) = doomed_attempt {
             if let Some(run) = named_run(job_id, attempt) {
-                if nothing_tracked {
-                    self.settle_cancelled_run(run).await;
-                } else {
+                if doomed_attempt_is_tracked {
                     self.mark_controller_cancelled(run).await;
+                } else {
+                    self.settle_cancelled_run(run).await;
                 }
             }
         }
@@ -10201,14 +10203,20 @@ impl SlurmAgent for AgentService {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<InteractiveOutput, Status>>(64);
 
         if parent_has_namespaces && !step_image.is_empty() {
-            // The parent job already provides a container; the step joins its namespaces via nsenter
-            // rather than building a new one — leave a trace rather than silently dropping the image.
+            // The parent job already provides a container; the step joins its
+            // namespaces via nsenter rather than building a new one — leave a
+            // trace rather than silently dropping the image.
             warn!(
                 job_id = init.job_id,
                 image = %step_image,
                 "step --container-image ignored: joining the parent job's running container"
             );
         }
+
+        // Held through the fresh-launch path's own `live_ptys` insert below, so a
+        // second attach racing this one blocks instead of racing it into a
+        // duplicate launch (`claim_stepd_slot` only refuses a strictly older attempt).
+        let lifecycle_guard = self.lifecycle.acquire(init.job_id).await;
 
         // Left by an agent that predates supervised terminals: its shell has no
         // supervisor of its own, so the job's holds the master on its behalf.
@@ -10268,6 +10276,10 @@ impl SlurmAgent for AgentService {
 
         let overlap = init.overlap;
         self.live_ptys.lock().await.insert(init.job_id);
+        // The decision-and-launch race this guards against is over: the bridge
+        // below outlives this call, and holding the id for that long would
+        // block unrelated launches/teardowns of the same job for no reason.
+        drop(lifecycle_guard);
         let live_ptys = self.live_ptys.clone();
         let running = self.running.clone();
         let stepds = self.stepds.clone();
@@ -23779,8 +23791,61 @@ mod tests {
         );
     }
 
+    // A *named* cancel for an attempt a newer, tracked one has since superseded
+    // must settle it directly -- nothing is running the old attempt any more to
+    // ever trigger the alternative (wait-for-teardown) path.
+    #[tokio::test]
+    async fn a_named_cancel_of_a_superseded_attempt_settles_it_directly() {
+        let svc = AgentService::new(
+            test_reporter(),
+            HooksConfig::default(),
+            Arc::new(Mutex::new(DeviceRegistry::new())),
+            spur_core::config::MemlockLimit::Unlimited,
+        );
+        let job_id = 971;
+        let doomed_attempt = 1;
+
+        // The doomed attempt has a real admission record, gone supervisor: its
+        // slice is instantly releasable once something asks to settle it.
+        admit_a_supervised_run(
+            &svc.admissions(),
+            "test-node",
+            job_id,
+            vec![0],
+            Some(a_gone_supervisor()),
+        );
+
+        // A newer attempt is what's actually tracked now.
+        let mut newer = TrackedJob::dummy(0);
+        newer.run_attempt = 2;
+        svc.insert_test_job(job_id, newer).await;
+
+        svc.cancel_job(Request::new(AgentCancelJobRequest {
+            job_id,
+            signal: 0,
+            run_attempt: doomed_attempt,
+        }))
+        .await
+        .expect("cancel_job");
+
+        assert_eq!(
+            svc.admissions()
+                .load_run(key(job_id, doomed_attempt))
+                .expect("record")
+                .state,
+            crate::admission::RunState::Cleaned,
+            "the doomed attempt must be settled directly, not left waiting on a \
+             teardown nothing will ever run"
+        );
+        assert!(
+            svc.running.lock().await.contains_key(&job_id),
+            "the newer, actually-tracked attempt must be untouched by this cancel"
+        );
+    }
+
     // A launching reservation with neither a `running` entry nor a stepd has only the allocation
-    // ledger to name its attempt; an attempt-less cancel must still find and release it through that.
+    // ledger to name its attempt; an attempt-less cancel must still find and release it
+    // through that.
     #[tokio::test]
     async fn cancel_with_no_named_attempt_and_no_tracking_releases_via_the_allocation_ledger() {
         let svc = AgentService::new(
