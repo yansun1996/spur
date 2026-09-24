@@ -299,33 +299,16 @@ const NAMED_CLAIMS_IN_REASON: usize = 16;
 /// `RECONCILE_BUDGET`, leaving time for the directions that do not depend on it.
 const CONTROLLER_CATCH_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Releases a node's reconcile gate however the reconcile ends, including a
-/// panic: a gate that only clears on success removes the node permanently.
-struct ReconcileGate {
-    cluster: Arc<ClusterManager>,
+/// Reuses an already-held gate, or acquires one, for the duration of a reconcile
+/// pass. `HeldReconcileGate` itself releases however the pass ends, including a
+/// panic, and is refcounted so a concurrent pass for the same node isn't
+/// un-gated out from under it.
+fn reconcile_gate(
+    cluster: &Arc<ClusterManager>,
     node: String,
-    _held: crate::cluster::HeldReconcileGate,
-}
-
-impl ReconcileGate {
-    fn new(
-        cluster: Arc<ClusterManager>,
-        node: String,
-        held: Option<crate::cluster::HeldReconcileGate>,
-    ) -> Self {
-        let held = held.unwrap_or_else(|| cluster.hold_reconcile_gate(node.clone()));
-        Self {
-            cluster,
-            node,
-            _held: held,
-        }
-    }
-}
-
-impl Drop for ReconcileGate {
-    fn drop(&mut self) {
-        self.cluster.set_reconcile_pending(&self.node, false);
-    }
+    held: Option<crate::cluster::HeldReconcileGate>,
+) -> crate::cluster::HeldReconcileGate {
+    held.unwrap_or_else(|| cluster.hold_reconcile_gate(node))
 }
 
 impl ControllerService {
@@ -3007,7 +2990,7 @@ impl SlurmController for ControllerService {
             // On its own task: tonic drops a handler future when the client
             // disconnects, and a gate left set removes the node for good.
             tokio::spawn(async move {
-                let _gate = ReconcileGate::new(cluster, node.clone(), held_gate);
+                let _gate = reconcile_gate(&cluster, node.clone(), held_gate);
                 if tokio::time::timeout(
                     RECONCILE_BUDGET,
                     reconcile_node_ledger(
@@ -9837,6 +9820,43 @@ mod tests {
             "the gate must open again once the reconcile is done"
         );
         assert!(node_reason(&svc, "n1").await.is_empty());
+    }
+
+    // A registration retry (the client never saw the first response, or two
+    // requests genuinely raced) starts a second reconcile pass for the same
+    // node before the first ends. Whichever finishes first must not un-gate a
+    // node a sibling pass is still reconciling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sibling_reconcile_pass_keeps_the_gate_until_both_finish() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with_token_admission(&dir).await;
+        let (addr1, release1) = spawn_gated_probe_agent().await;
+        let (addr2, release2) = spawn_gated_probe_agent().await;
+
+        register_with_a_blocking_cut(&svc, addr1)
+            .await
+            .expect("first registration");
+        register_with_a_blocking_cut(&svc, addr2)
+            .await
+            .expect("second, concurrent registration for the same node");
+
+        await_reconcile_gate(&svc, "n1", true).await;
+
+        release1.notify_one();
+        // Give the first pass every chance to (wrongly) clear the gate before
+        // asserting it hasn't: there is no event to await for "did not happen".
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            svc.cluster.get_node("n1").expect("node").reconcile_pending,
+            "a sibling pass is still reconciling; the first to finish must not release the gate"
+        );
+
+        release2.notify_one();
+        await_reconcile_gate(&svc, "n1", false).await;
+        assert!(
+            svc.cluster.get_node("n1").expect("node").is_schedulable(),
+            "the gate opens once every pass holding it has finished"
+        );
     }
 
     // The agent-restart case: the node is already in the cluster, so the gate

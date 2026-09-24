@@ -492,9 +492,11 @@ pub struct ClusterManager {
     /// Per-node locks serializing (re-)registration, so unrelated nodes don't block each other
     /// while a same-name racer can't act on a stale label diff (see `register_node`).
     node_registration_locks: parking_lot::Mutex<HashMap<String, Arc<parking_lot::Mutex<()>>>>,
-    /// Nodes a pass on this controller is gating right now. Leader-local: a gate this
-    /// process is not holding is one only the takeover sweep can still hand back.
-    reconciling_nodes: parking_lot::Mutex<HashSet<String>>,
+    /// Nodes a pass on this controller is gating right now, refcounted so two
+    /// concurrent passes for the same node don't let whichever finishes first
+    /// release the persisted gate out from under the other. Leader-local: a gate
+    /// this process is not holding is one only the takeover sweep can hand back.
+    reconciling_nodes: parking_lot::Mutex<HashMap<String, u32>>,
     raft: RwLock<Option<SpurRaft>>,
     /// Latch for `state_machine_ready`, keyed to the term it was taken in: a
     /// leader commits continuously, and a regained one replayed nothing.
@@ -687,7 +689,7 @@ impl ClusterManager {
             k0s_role_counts: K0sRoleCounts::default(),
             k0s_phase_accounting: parking_lot::Mutex::new(()),
             node_registration_locks: parking_lot::Mutex::new(HashMap::new()),
-            reconciling_nodes: parking_lot::Mutex::new(HashSet::new()),
+            reconciling_nodes: parking_lot::Mutex::new(HashMap::new()),
             raft: RwLock::new(None),
             state_machine_ready_term: AtomicU64::new(0),
             accounting: RwLock::new(None),
@@ -6258,9 +6260,14 @@ impl ClusterManager {
     }
 
     /// Note that a pass on this controller is holding `node`'s gate, so the takeover sweep
-    /// leaves it be. Cleared by the returned guard however the pass ends.
+    /// leaves it be. Refcounted: the persisted gate clears only once every holder for
+    /// this node has released it, however each pass ends.
     pub(crate) fn hold_reconcile_gate(self: &Arc<Self>, node: String) -> HeldReconcileGate {
-        self.reconciling_nodes.lock().insert(node.clone());
+        *self
+            .reconciling_nodes
+            .lock()
+            .entry(node.clone())
+            .or_insert(0) += 1;
         HeldReconcileGate {
             cluster: self.clone(),
             node,
@@ -6277,7 +6284,7 @@ impl ClusterManager {
             .values()
             .filter(|node| node.reconcile_pending)
             .map(|node| node.name.clone())
-            .filter(|name| !live.contains(name))
+            .filter(|name| !live.contains_key(name))
             .collect();
         for name in gated {
             warn!(node = %name, "releasing a reconcile gate left over from an earlier term");
@@ -9076,7 +9083,26 @@ pub(crate) struct HeldReconcileGate {
 
 impl Drop for HeldReconcileGate {
     fn drop(&mut self) {
-        self.cluster.reconciling_nodes.lock().remove(&self.node);
+        let last_holder = {
+            let mut counts = self.cluster.reconciling_nodes.lock();
+            match counts.get_mut(&self.node) {
+                Some(count) => {
+                    *count = count.saturating_sub(1);
+                    let last = *count == 0;
+                    if last {
+                        counts.remove(&self.node);
+                    }
+                    last
+                }
+                None => true,
+            }
+        };
+        // Only the holder that empties the refcount may un-gate the node: a
+        // sibling pass for the same node (a registration retry racing the
+        // first) is still relying on the gate to stand until it, too, ends.
+        if last_holder {
+            self.cluster.set_reconcile_pending(&self.node, false);
+        }
     }
 }
 
