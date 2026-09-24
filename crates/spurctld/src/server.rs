@@ -754,11 +754,12 @@ impl ControllerService {
 
     /// Bind a submitted spec to the authenticated caller.
     ///
-    /// Overwrites `user`/`uid`/`gid` from the verified identity rather than trusting what the client
-    /// sent. JWT identities re-resolve uid/gid through NSS on this host (the token's uid is
-    /// untrusted and it carries no gid). Native identities already carry mint-host uid/gid and
-    /// must not be looked up again. Unauthenticated callers are left as-is so `permissive` keeps
-    /// working; `required` never reaches here without an identity because the auth layer rejects first.
+    /// Overwrites `user`/`uid`/`gid` from the verified identity rather than trusting what the
+    /// client sent. JWT identities re-resolve uid/gid through NSS on this host (the token's
+    /// uid is untrusted and it carries no gid). Native identities already carry mint-host
+    /// uid/gid and must not be looked up again. Unauthenticated callers are left as-is so
+    /// `permissive` keeps working; `required` never reaches here without an identity because
+    /// the auth layer rejects first.
     fn bind_spec_to_identity(
         spec: &mut spur_core::job::JobSpec,
         identity: Option<&spur_core::auth::Identity>,
@@ -998,10 +999,11 @@ impl ControllerService {
         config.accounting.database_url.is_empty()
     }
 
-    /// Whether a caller is exempt from the non-admin restrictions (the priority ceiling): an admin,
-    /// or a caller with no verified identity. The latter keeps the pre-auth behaviour — `disabled`,
-    /// or `permissive` with no credential, trusts the client — so restricting it would break no-auth
-    /// deployments. `required` never reaches here without an identity, so real users are still bound.
+    /// Whether a caller is exempt from the non-admin restrictions (the priority ceiling):
+    /// an admin, or a caller with no verified identity. The latter keeps the pre-auth
+    /// behaviour — `disabled`, or `permissive` with no credential, trusts the client — so
+    /// restricting it would break no-auth deployments. `required` never reaches here
+    /// without an identity, so real users are still bound.
     fn caller_is_privileged(&self, identity: Option<&spur_core::auth::Identity>) -> bool {
         identity.is_none() || self.caller_is_admin(identity)
     }
@@ -1596,12 +1598,13 @@ impl ControllerService {
         reservation_manager_ruling(user, privileged)
     }
 
-    /// Clamp a non-privileged caller's base priority to `[scheduler] max_user_priority`, mirroring
-    /// Slurm's operator-only priority raising (an ordinary user may only lower it). Clamped down, not
-    /// rejected, so a fat-fingered `--priority` still runs. Privileged callers and an unset priority
-    /// are untouched. Returns a warning string; `submit_job` surfaces it in the response, and
-    /// `update_job` logs it (UpdateJob has no response field). Operates on the raw `Option<u32>` so
-    /// submit and `scontrol update` share one policy — the ceiling can't be dodged by boosting later.
+    /// Clamp a non-privileged caller's base priority to `[scheduler] max_user_priority`,
+    /// mirroring Slurm's operator-only priority raising (an ordinary user may only lower
+    /// it). Clamped down, not rejected, so a fat-fingered `--priority` still runs.
+    /// Privileged callers and an unset priority are untouched. Returns a warning string;
+    /// `submit_job` surfaces it in the response, and `update_job` logs it (UpdateJob has no
+    /// response field). Operates on the raw `Option<u32>` so submit and `scontrol update`
+    /// share one policy — the ceiling can't be dodged by boosting later.
     fn clamp_priority(
         priority: &mut Option<u32>,
         caller_is_privileged: bool,
@@ -1947,8 +1950,9 @@ impl SlurmController for ControllerService {
         let mut core_spec = proto_to_job_spec(spec)?;
         Self::bind_spec_to_identity(&mut core_spec, identity.as_ref())?;
 
-        // Clamp a non-privileged caller's base priority to the configured ceiling before it reaches
-        // the scheduler, so one submission cannot front-run the whole queue. Non-fatal: clamp + warn.
+        // Clamp a non-privileged caller's base priority to the configured ceiling before
+        // it reaches the scheduler, so one submission cannot front-run the whole queue.
+        // Non-fatal: clamp + warn.
         let priority_warning = Self::clamp_priority(
             &mut core_spec.priority,
             self.caller_is_privileged(identity.as_ref()),
@@ -2050,9 +2054,9 @@ impl SlurmController for ControllerService {
     async fn get_job(&self, request: Request<GetJobRequest>) -> Result<Response<JobInfo>, Status> {
         let forward = self.prepare_read(&request)?;
         let meta = request.metadata().clone();
-        // Capture identity before the forward so the serving node (leader or read-allowed follower)
-        // can scope the record to the caller; the credential is preserved on forward, so a forwarded
-        // read is scoped on the leader instead.
+        // Capture identity before the forward so the serving node (leader or read-allowed
+        // follower) can scope the record to the caller; the credential is preserved on
+        // forward, so a forwarded read is scoped on the leader instead.
         let identity = Self::verified_identity(&request).cloned();
         let req = request.into_inner();
         let job_id = req.job_id;
@@ -4714,8 +4718,9 @@ impl SlurmController for ControllerService {
             ));
         }
 
-        // Resolve the node scope fail-closed; a bare re-up of an assigned cluster keeps the recorded
-        // scope, a fresh up with no selection = whole inventory. CP candidates are the in-scope members.
+        // Resolve the node scope fail-closed; a bare re-up of an assigned cluster keeps
+        // the recorded scope, a fresh up with no selection = whole inventory. CP
+        // candidates are the in-scope members.
         let scope_requested =
             !req.nodes.is_empty() || !req.partition.is_empty() || !req.selector.is_empty();
         let member_nodes = if assigned && !scope_requested {
@@ -4747,8 +4752,9 @@ impl SlurmController for ControllerService {
             .control_plane_node
             .clone()
             .or_else(|| state.control_plane_node.clone());
-        // A bare re-up of an assigned cluster targets the recorded set, so it stays idempotent
-        // regardless of the config default; an explicit list/replica count is resolved and enforced.
+        // A bare re-up of an assigned cluster targets the recorded set, so it stays
+        // idempotent regardless of the config default; an explicit list/replica count is
+        // resolved and enforced.
         let cp_set = if assigned && !explicit_override {
             state.controllers()
         } else {
@@ -4839,9 +4845,10 @@ impl SlurmController for ControllerService {
                 "cluster is not up; use `spur k8s up` to start it",
             ));
         }
-        // A whole-inventory cluster (empty member_nodes) already enrolls every registered node, so a
-        // node added later is picked up automatically — narrowing to an explicit set here would drop
-        // the others. Direct the operator to the mechanism that already works.
+        // A whole-inventory cluster (empty member_nodes) already enrolls every registered
+        // node, so a node added later is picked up automatically — narrowing to an
+        // explicit set here would drop the others. Direct the operator to the mechanism
+        // that already works.
         if state.member_nodes.is_empty() {
             return Err(Status::failed_precondition(
                 "cluster enrolls all nodes; a newly-registered node joins automatically \
@@ -4915,9 +4922,9 @@ impl SlurmController for ControllerService {
                 "cluster is not up; nothing to remove",
             ));
         }
-        // A whole-inventory cluster (empty member_nodes) enrolls every registered node, so a removed
-        // node would just be re-enrolled by the next reconcile. Removal only makes sense for a scoped
-        // cluster, where the node can actually leave the member set.
+        // A whole-inventory cluster (empty member_nodes) enrolls every registered node, so
+        // a removed node would just be re-enrolled by the next reconcile. Removal only
+        // makes sense for a scoped cluster, where the node can actually leave the member set.
         if state.member_nodes.is_empty() {
             return Err(Status::failed_precondition(
                 "cluster enrolls all nodes; remove-nodes needs a scoped cluster \
@@ -4956,8 +4963,9 @@ impl SlurmController for ControllerService {
                     "node {n} is not a registered node"
                 )));
             }
-            // Only nodes actually enrolled in this (scoped) cluster can be removed — otherwise an
-            // out-of-scope registered node could be drained + `k0s reset` destructively for nothing.
+            // Only nodes actually enrolled in this (scoped) cluster can be removed —
+            // otherwise an out-of-scope registered node could be drained + `k0s reset`
+            // destructively for nothing.
             if !state.is_member(n) {
                 return Err(Status::invalid_argument(format!(
                     "node {n} is not a member of this cluster"
@@ -4978,10 +4986,11 @@ impl SlurmController for ControllerService {
             }
         }
 
-        // Drive removal per node. Drop each node from the member set BEFORE draining it, re-adding it
-        // only if removal fails: while a node is a member with no role, `provision_assignments` would
-        // re-enroll and restart the very component being torn down (RECONCILE_INTERVAL 30s vs a 120s
-        // drain makes that the norm, not a race — and a leader flip after the loop would strand it).
+        // Drive removal per node. Drop each node from the member set BEFORE draining it,
+        // re-adding it only if removal fails: while a node is a member with no role,
+        // `provision_assignments` would re-enroll and restart the very component being
+        // torn down (RECONCILE_INTERVAL 30s vs a 120s drain makes that the norm, not a
+        // race — and a leader flip after the loop would strand it).
         let timeout = req.drain_timeout_secs.unwrap_or(0);
         let mut removed: Vec<String> = Vec::new();
         let mut failures: Vec<String> = Vec::new();
@@ -5138,8 +5147,8 @@ impl SlurmController for ControllerService {
             ));
         }
 
-        // Scoped kubeconfig: resolve the target's account -> its namespace + per-user ServiceAccount,
-        // then have the control-plane agent mint a bound token there.
+        // Scoped kubeconfig: resolve the target's account -> its namespace + per-user
+        // ServiceAccount, then have the control-plane agent mint a bound token there.
         let (namespace, sa) = resolve_user_namespace_sa(self.cluster.association_cache(), &target)?;
         match crate::cluster_k8s::fetch_user_kubeconfig(&self.cluster, &target, &namespace, &sa)
             .await
@@ -6532,9 +6541,10 @@ mod tests {
 
     #[test]
     fn forwarded_metadata_carries_the_callers_credential_to_the_leader() {
-        // The leader authorizes the request, so a forwarded hop must arrive as the ORIGINAL caller.
-        // Building fresh metadata (the old behaviour) dropped the credential, which would make every
-        // forwarded call anonymous the moment HA + `auth.mode = required` were both on.
+        // The leader authorizes the request, so a forwarded hop must arrive as the
+        // ORIGINAL caller. Building fresh metadata (the old behaviour) dropped the
+        // credential, which would make every forwarded call anonymous the moment HA +
+        // `auth.mode = required` were both on.
         let mut orig = tonic::metadata::MetadataMap::new();
         orig.insert("authorization", "Bearer tok123".parse().unwrap());
 
@@ -13614,9 +13624,10 @@ mod tests {
         );
     }
 
-    // `is_internal` is derived from the verified identity (an admin), not the wire `user` string, so
-    // (a) an admin whose username is not literally "root" is still treated as internal, and (b) an
-    // unauthenticated caller cannot bypass ownership by claiming user = "root".
+    // `is_internal` is derived from the verified identity (an admin), not the wire `user`
+    // string, so (a) an admin whose username is not literally "root" is still treated as
+    // internal, and (b) an unauthenticated caller cannot bypass ownership by claiming
+    // user = "root".
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn update_job_admin_override_uses_verified_identity_not_wire_root() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -14251,7 +14262,8 @@ mod tests {
         for (i, n) in ["node-a", "node-b"].iter().enumerate() {
             register_plain_node(&svc, n, 6818 + i as u16).await;
         }
-        // Whole-inventory up (empty member_nodes) — new nodes auto-enroll, so add-nodes is rejected.
+        // Whole-inventory up (empty member_nodes) — new nodes auto-enroll, so add-nodes is
+        // rejected.
         svc.cluster
             .set_k0s_phase(
                 spur_core::k0s::K0sPhase::Ready,
@@ -14387,8 +14399,9 @@ mod tests {
     async fn cluster_remove_nodes_rejects_emptying_the_member_set() {
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
-        // Scoped to exactly {node-a (CP), node-b}; removing node-b alone is fine, but requesting the
-        // whole member set must be refused rather than flip the cluster to whole-inventory.
+        // Scoped to exactly {node-a (CP), node-b}; removing node-b alone is fine, but
+        // requesting the whole member set must be refused rather than flip the cluster to
+        // whole-inventory.
         scoped_assigned_cluster(&svc).await;
         let err = svc
             .cluster_remove_nodes(Request::new(ClusterRemoveNodesRequest {
@@ -14572,9 +14585,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_kubeconfig_admin_flag_denied_when_not_explicitly_enabled() {
-        // Default posture: serving the cluster-admin credential over RPC is off, so even a caller
-        // the association cache calls Admin is refused. `caller` is unauthenticated, so the opt-in —
-        // not the admin check — is what protects this credential.
+        // Default posture: serving the cluster-admin credential over RPC is off, so even a
+        // caller the association cache calls Admin is refused. `caller` is unauthenticated,
+        // so the opt-in — not the admin check — is what protects this credential.
         let dir = tempfile::TempDir::new().unwrap();
         let svc = test_service(&dir).await;
         svc.cluster
@@ -15588,11 +15601,12 @@ mod tests {
 
     // --- control-plane mutation authorization ---
     //
-    // Every RPC that defines cluster tenancy (partitions, node placement/labels, admission tokens,
-    // reservations) must reject an identified non-admin. An anonymous caller (no identity —
-    // `disabled`, or `permissive` with no credential) passes the gate, matching the auth model's
-    // non-enforcing modes; the gate binds real users in `required` mode. Enumerated as a table so the
-    // next handler added cannot quietly reopen the boundary to an identified non-admin.
+    // Every RPC that defines cluster tenancy (partitions, node placement/labels, admission
+    // tokens, reservations) must reject an identified non-admin. An anonymous caller (no
+    // identity — `disabled`, or `permissive` with no credential) passes the gate, matching
+    // the auth model's non-enforcing modes; the gate binds real users in `required` mode.
+    // Enumerated as a table so the next handler added cannot quietly reopen the boundary
+    // to an identified non-admin.
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn control_plane_mutations_deny_identified_non_admin() {
@@ -15614,14 +15628,18 @@ mod tests {
                     concat!(stringify!($method), " (non-admin) must be PermissionDenied")
                 );
 
-                // No verified identity (disabled, or permissive with no credential) passes the gate,
-                // keeping the non-enforcing modes working; the call then proceeds and may fail for
-                // unrelated reasons, but must never be rejected as PermissionDenied by the gate.
+                // No verified identity (disabled, or permissive with no credential) passes
+                // the gate, keeping the non-enforcing modes working; the call then
+                // proceeds and may fail for unrelated reasons, but must never be rejected
+                // as PermissionDenied by the gate.
                 if let Err(e) = svc.$method(Request::new($req)).await {
                     assert_ne!(
                         e.code(),
                         Code::PermissionDenied,
-                        concat!(stringify!($method), " (anonymous) must not be gate-rejected")
+                        concat!(
+                            stringify!($method),
+                            " (anonymous) must not be gate-rejected"
+                        )
                     );
                 }
             }};
