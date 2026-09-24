@@ -8883,6 +8883,14 @@ impl SlurmAgent for AgentService {
         if req.command.is_empty() {
             return Err(Status::invalid_argument("no command specified"));
         }
+        // A reserved id names the job's own supervisor, which this would then
+        // fence and replace.
+        if !spur_core::step::is_user_step(req.step_id) {
+            return Err(Status::invalid_argument(format!(
+                "step {} is reserved and cannot run a command",
+                req.step_id
+            )));
+        }
         let mut persist_cred = (String::new(), String::new(), String::new());
         if let Some(keys) = &self.cred_keys {
             if req.execution_credential.is_empty() {
@@ -18285,6 +18293,28 @@ mod tests {
         });
         let err = svc.run_command(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    // A reserved id names the job's own supervisor (e.g. STEP_EXTERN); letting an ordinary
+    // step-execution caller target it would let it fence and replace that supervisor, the same
+    // hazard `InteractiveSession` already guards against for pty attach.
+    #[tokio::test]
+    async fn run_command_rejects_a_reserved_step_id() {
+        let (svc, job_id) = run_command_test_setup().await;
+        let req = Request::new(RunCommandRequest {
+            command: vec!["true".into()],
+            uid: 0,
+            gid: 0,
+            work_dir: String::new(),
+            environment: HashMap::new(),
+            job_id,
+            step_id: spur_core::step::STEP_EXTERN,
+            num_tasks: 1,
+            ..Default::default()
+        });
+        let err = svc.run_command(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("reserved"), "got: {}", err.message());
     }
 
     /// Regression: a step carrying `container_image` must take the container path, not
