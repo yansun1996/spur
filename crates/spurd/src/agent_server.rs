@@ -707,7 +707,7 @@ fn run_hosts_only_its_client(
     match supervisors
         .iter()
         .map(|descriptor| descriptor.step_id)
-        .find(|step_id| !spur_core::step::is_user_step(*step_id))
+        .find(|step_id| spur_core::step::owns_job_lifetime(*step_id))
     {
         Some(own_step) => own_step == spur_core::step::STEP_EXTERN,
         None => tracked.job.is_allocation_only(),
@@ -8766,11 +8766,38 @@ impl SlurmAgent for AgentService {
         );
         // Commit under `running`, the order commit_job expects, so the job is
         // never committed while absent from the map a reclaim reads.
-        let _ = self
+        let committed = self
             .allocation
             .lock()
             .await
             .commit_job(req.job_id, req.run_attempt);
+        if !committed {
+            // Reconcile reclaimed the reservation while this registration was in
+            // flight (TTL exceeded) — same race `launch_job` guards against.
+            // Undo the insert rather than leave a tracked job with no backing
+            // reservation, which a reclaim would read as a live, unbacked claim.
+            jobs.remove(&req.job_id);
+            drop(jobs);
+            warn!(
+                job_id = req.job_id,
+                "reservation reclaimed during allocation registration; aborting"
+            );
+            if runtime_descriptor {
+                let removed = self
+                    .stepds
+                    .lock()
+                    .await
+                    .remove(&(req.job_id, spur_core::step::STEP_EXTERN));
+                if let Some(descriptor) = removed {
+                    discard_stepd_session(&descriptor).await;
+                }
+            }
+            reservation_guard.mark_reaped();
+            reservation_guard.release().await;
+            return Err(Status::unavailable(
+                "reservation reclaimed during allocation registration",
+            ));
+        }
         reservation_guard.disarm();
         drop(jobs);
 
@@ -22489,6 +22516,43 @@ mod tests {
         run_attempt: u32,
     ) -> (tokio::net::UnixListener, crate::stepd::StepdDescriptor) {
         a_run_supervisor(dir, job_id, run_attempt, spur_core::step::STEP_EXTERN)
+    }
+
+    // Order must not matter: an interactive attach listed before the owning step
+    // in the (HashMap-sourced, so unordered) supervisor slice must not be mistaken
+    // for it — only STEP_EXTERN/STEP_BATCH answer for the allocation's own lifetime.
+    fn descriptor_at(step_id: spur_core::step::StepId) -> crate::stepd::StepdDescriptor {
+        crate::stepd::StepdDescriptor::new(
+            920,
+            1,
+            step_id,
+            0,
+            0,
+            std::path::PathBuf::from("/nonexistent.sock"),
+            std::path::PathBuf::new(),
+        )
+    }
+
+    #[test]
+    fn run_hosts_only_its_client_ignores_step_order() {
+        let tracked = an_allocation_only_job(1);
+        let interactive_first = [
+            descriptor_at(spur_core::step::STEP_INTERACTIVE),
+            descriptor_at(spur_core::step::STEP_EXTERN),
+        ];
+        let extern_first = [
+            descriptor_at(spur_core::step::STEP_EXTERN),
+            descriptor_at(spur_core::step::STEP_INTERACTIVE),
+        ];
+
+        assert!(
+            run_hosts_only_its_client(&tracked, &interactive_first),
+            "an interactive attach listed first must not hide the owning STEP_EXTERN"
+        );
+        assert!(
+            run_hosts_only_its_client(&tracked, &extern_first),
+            "the same run, owning step listed first, must agree"
+        );
     }
 
     // A killed `srun --pty` client never reports its step, so the node is the only thing that can
