@@ -7501,12 +7501,32 @@ impl ClusterManager {
                 // not report, and the only thing that ends a hold it never ends.
                 for job in jobs.values_mut() {
                     job.epilog_gated_nodes.remove(name);
-                    // A Pending job pruned to "just the gated node" would otherwise name a
-                    // removed node forever — nothing else revisits `allocated_nodes`
-                    // outside a state transition.
-                    if job.state == JobState::Pending {
-                        job.allocated_nodes.retain(|n| n != name);
-                        job.per_node_alloc.remove(name);
+                    if job.state == JobState::Pending
+                        && job.allocated_nodes.iter().any(|n| n == name)
+                    {
+                        if job.holds_a_placement() {
+                            // A dispatch-in-flight reservation loses one node here; releasing
+                            // only that node and leaving the rest charged would strand the
+                            // survivors, since nothing else revisits a Pending job's
+                            // allocation outside a state transition.
+                            let freed_nodes = job.allocated_nodes.clone();
+                            let allocated_resources = job.allocated_resources.clone();
+                            let per_node_map = job.per_node_alloc.clone();
+                            let keep_charged = Self::slices_to_keep(job);
+                            let job_id = job.job_id;
+                            Self::reset_job_for_spared_requeue(job, &nodes);
+                            Self::deallocate_job_slices(
+                                &mut nodes,
+                                &freed_nodes,
+                                allocated_resources.as_ref(),
+                                &per_node_map,
+                                &keep_charged,
+                                job_id,
+                            );
+                        } else {
+                            job.allocated_nodes.retain(|n| n != name);
+                            job.per_node_alloc.remove(name);
+                        }
                     }
                 }
                 if let Some(node) = nodes.get(name) {
@@ -24274,6 +24294,60 @@ mod tests {
         assert!(
             !job.per_node_alloc.contains_key("n1"),
             "must not keep a per-node slice for a node that no longer exists"
+        );
+    }
+
+    // A dispatch-in-flight Pending job (reserve_placement, before it ever
+    // reaches Running) that loses one of its nodes must give the whole
+    // reservation back, not just stop naming the node that vanished —
+    // otherwise the surviving node stays charged forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removing_one_node_of_a_pending_multi_node_reservation_frees_the_rest() {
+        let dir = TempDir::new().unwrap();
+        let cm = test_cluster(&dir).await;
+        register_node(&cm, "n1", 8, 16000);
+        register_node(&cm, "n2", 8, 16000);
+        let id = submit_and_wait(&cm, basic_spec("j"));
+        let slice = scalar_alloc(4, 1000);
+        cm.reserve_placement(
+            id,
+            vec!["n1".into(), "n2".into()],
+            slice.clone(),
+            per_node_for(&["n1", "n2"], slice),
+            false,
+        )
+        .expect("reserve");
+
+        let job = cm.get_job(id).expect("job");
+        assert_eq!(job.state, JobState::Pending);
+        assert!(job.holds_a_placement(), "premise: a real reservation");
+        drop(job);
+        assert_eq!(alloc_cpus(&cm, "n2"), 4);
+
+        cm.apply_operation(&WalOperation::NodeRemove {
+            name: "n1".into(),
+            reason: Some("decommissioned".into()),
+            at: None,
+        });
+
+        let job = cm.get_job(id).expect("job");
+        assert_eq!(
+            job.state,
+            JobState::Pending,
+            "loses the reservation, not the job itself"
+        );
+        assert!(
+            job.allocated_nodes.is_empty(),
+            "the whole reservation must be given back, not just the removed node"
+        );
+        assert_eq!(
+            job.spared_requeue_count, 1,
+            "a node vanishing is not the job's fault"
+        );
+        assert_eq!(
+            alloc_cpus(&cm, "n2"),
+            0,
+            "the surviving node must not stay charged for a reservation that no longer exists"
         );
     }
 
