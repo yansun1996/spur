@@ -1068,7 +1068,8 @@ async fn teardown_completed_job(
             warn!(job_id, %error, "failed to settle the admission record after teardown");
         } else {
             // `Cleaned` alone doesn't mean idle cores: an owed epilog hook may still run on them.
-            // Free only where `settle_permit` also allows settling, the same gate `release_is_due` uses.
+            // Free only where `settle_permit` also allows settling, the same gate
+            // `release_is_due` uses.
             match admissions.settle_permit(run) {
                 Ok(crate::admission::SettlePermit::Due(_)) => {
                     let warrant = ReleaseWarrant::teardown_complete(run);
@@ -5127,7 +5128,8 @@ impl AgentService {
     }
 
     /// Resolves a step's own `--container-image` into a rootfs. Shared by `run_command`
-    /// and the interactive terminal path; a step joining a parent's running container never calls this.
+    /// and the interactive terminal path; a step joining a parent's running container never
+    /// calls this.
     #[allow(clippy::too_many_arguments)]
     async fn build_step_container(
         &self,
@@ -5316,7 +5318,8 @@ impl AgentService {
     }
 
     /// Spawns the release wait/force-reclaim escalation immediately, not after the stepd-socket
-    /// round trip: CancelJob's RPC deadline can abort this handler before a slow socket call returns.
+    /// round trip: CancelJob's RPC deadline can abort this handler before a slow socket call
+    /// returns.
     fn spawn_stepd_release_wait(
         &self,
         job_id: u32,
@@ -6203,7 +6206,8 @@ mod controller_rpc_tests {
         assert!(controller_rpc_retryable(&Status::internal("x")));
     }
 
-    /// Only `NotFound`/`NoSuchRun` settle a run (raft_index=0, not a real commit, but frees the slice);
+    /// Only `NotFound`/`NoSuchRun` settle a run (raft_index=0, not a real commit, but frees
+    /// the slice);
     /// every other error leaves it unsettled.
     #[test]
     fn raft_index_distinguishes_settlement_from_retry() {
@@ -6434,7 +6438,8 @@ impl<'a> ChildContainment<'a> {
         unsafe {
             cmd.pre_exec(move || {
                 // Before the drop: an unprivileged process cannot write another cgroup's
-                // `cgroup.procs`. Under `required` a failed join aborts rather than exec unfiltered.
+                // `cgroup.procs`. Under `required` a failed join aborts rather than exec
+                // unfiltered.
                 if let Some(ref join) = cgroup_join {
                     if !join.join() && required {
                         return Err(std::io::Error::other(
@@ -7112,7 +7117,8 @@ impl SlurmAgent for AgentService {
             }
         }
         let job_id = req.job_id;
-        // A launch names the node the controller scheduled it onto. If it does not name this host it
+        // A launch names the node the controller scheduled it onto. If it does not name this
+        // host it
         // was aimed at the wrong agent — refuse rather than run another node's allocation here.
         if !req.target_node.is_empty() && !self.agent_owns_node(&req.target_node) {
             return Ok(Response::new(LaunchJobResponse {
@@ -7174,12 +7180,14 @@ impl SlurmAgent for AgentService {
         let run_key = named_run(job_id, run_attempt)
             .ok_or_else(|| Status::invalid_argument("run attempt 0 names no run to launch"))?;
         // Every launch is spurstepd-supervised now, including the batch-fallback pty; its terminal
-        // takes custody the same way a numbered interactive step does, enabling `sattach`-style reclaim.
+        // takes custody the same way a numbered interactive step does, enabling
+        // `sattach`-style reclaim.
         let stepd_enabled = true;
         #[cfg(test)]
         let stepd_enabled = stepd_enabled && !self.force_legacy_launch;
 
-        // The uid is user-supplied; refuse root execution here before anything is spawned rather than
+        // The uid is user-supplied; refuse root execution here before anything is spawned
+        // rather than
         // relying on the privilege drop, which treats uid 0 as "nothing to drop".
         if let Err(msg) = crate::privdrop::check_root_execution_allowed(
             spec.uid,
@@ -9457,7 +9465,8 @@ impl SlurmAgent for AgentService {
         let maybe_status: Option<std::process::ExitStatus> = if let Some(step_cfg) =
             supervised_step_cfg.take()
         {
-            // Supervised: the step gets its own spurstepd, outliving an agent restart. Its script enters
+            // Supervised: the step gets its own spurstepd, outliving an agent restart. Its
+            // script enters
             // the parent's namespaces, if any, so the supervisor itself stays outside them.
             self.run_supervised_step_to_spool(
                 &step_cfg,
@@ -9568,7 +9577,8 @@ impl SlurmAgent for AgentService {
             let mut container_cfg = crate::container::ContainerConfig {
                 image: c.image.clone(),
                 mounts,
-                // --container-workdir wins; falls back to --chdir (req.work_dir) so `srun --chdir=/foo
+                // --container-workdir wins; falls back to --chdir (req.work_dir) so `srun
+                // --chdir=/foo
                 // --container-image=X` lands in /foo, not /tmp (container_init's default).
                 workdir: if !c.workdir.is_empty() {
                     Some(c.workdir.clone())
@@ -9620,7 +9630,8 @@ impl SlurmAgent for AgentService {
             let image_path = crate::container::resolve_image(&c.image, None, Some(step_uid))
                 .map_err(|e| Status::failed_precondition(e.to_string()))?;
 
-            // Per-step rootfs namespace, disjoint from the batch job's (`job_<id>`), so a step can never
+            // Per-step rootfs namespace, disjoint from the batch job's (`job_<id>`), so a step
+            // can never
             // resolve to or delete a batch rootfs, with no id arithmetic that could overflow.
             let step_base = crate::container::step_rootfs_base(job_id, step_id);
             let (rootfs, rootfs_mode) = crate::container::setup_rootfs(
@@ -9942,7 +9953,8 @@ impl SlurmAgent for AgentService {
                 // bytes (avoids O(n^2) re-reads for high-volume steps); a reconnecting
                 // reader resumes rather than repeating output.
                 let mut offset: u64 = start_offset;
-                // An offset past the end means this isn't the file the reader was reading, so replay it
+                // An offset past the end means this isn't the file the reader was reading, so
+                // replay it
                 // whole — reprinting output is recoverable, dropping it silently is not.
                 if matches!(file.metadata().await, Ok(meta) if meta.len() < offset) {
                     offset = 0;
@@ -10001,8 +10013,9 @@ impl SlurmAgent for AgentService {
             return Ok(Response::new(ReceiverStream::new(rx)));
         }
 
-        // No retry on a miss, same as run_command: a Running job is confirmed on every node. Callers
-        // here (srun --attach, sattach) hit the agent directly, inheriting their own job.state check.
+        // No retry on a miss, same as run_command: a Running job is confirmed on
+        // every node. Callers here (srun --attach, sattach) hit the agent directly,
+        // inheriting their own job.state check.
         let file_path = {
             let jobs = self.running.lock().await;
             match jobs.get(&job_id) {
@@ -10472,7 +10485,8 @@ impl SlurmAgent for AgentService {
         // CNI owns the FIB routes, so program_routes = false.
         let result =
             tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, usize, String)> {
-                // Identify self in the membership (so it's excluded from the peer set): prefer the local
+                // Identify self in the membership (so it's excluded from the peer set): prefer
+                // the local
                 // WireGuard public key, fall back to hostname.
                 let self_pubkey = spur_net::wireguard::interface_public_key(&iface).ok();
                 let self_mesh_ip = members
@@ -10502,7 +10516,8 @@ impl SlurmAgent for AgentService {
                         }
                         Err(_) => Default::default(),
                     };
-                // Reconcile: prune peers no longer in the membership, then add/update the desired peers.
+                // Reconcile: prune peers no longer in the membership, then add/update the
+                // desired peers.
                 let current = spur_net::wireguard::list_peers(&iface).unwrap_or_default();
                 let (added, pruned) = spur_net::mesh::reconcile_mesh(
                     &iface,
@@ -10868,7 +10883,8 @@ impl AgentService {
     /// Send a user-specified signal to a running job.
     async fn send_explicit_signal(&self, job_id: u32, run_attempt: u32, signal: i32) {
         // A signal naming an epoch this node no longer runs belongs to a superseded run; the
-        // processes here are the redispatch that replaced it, so killing them is worse than dropping it.
+        // processes here are the redispatch that replaced it, so killing them is worse than
+        // dropping it.
         if !self.runs_attempt(job_id, run_attempt).await {
             warn!(
                 job_id,
@@ -10877,7 +10893,8 @@ impl AgentService {
             return;
         }
         let Some(run_attempt) = self.resolve_cancel_attempt(job_id, run_attempt).await else {
-            // Neither stepds nor running names an attempt to scope to, but an orphaned unsupervised step
+            // Neither stepds nor running names an attempt to scope to, but an orphaned
+            // unsupervised step
             // can outlive both maps — reach it via the wildcard rather than stranding it.
             self.cancel_active_steps_for_job(job_id, 0, signal).await;
             return;
@@ -11045,8 +11062,9 @@ impl AgentService {
         for (_key, pid, _epoch) in &targets {
             signal_step_tree(*pid, signal);
         }
-        // Escalate to SIGKILL since a container-init step ignores the graceful signal; compare epochs
-        // (not pids) so a step that reused the (job, step) key with a recycled pid is never signalled.
+        // Escalate to SIGKILL since a container-init step ignores the graceful
+        // signal; compare epochs (not pids) so a step that reused the (job, step)
+        // key with a recycled pid is never signalled.
         let active_steps = self.active_steps.clone();
         tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -11075,7 +11093,8 @@ impl AgentService {
             return;
         }
         let Some(run_attempt) = self.resolve_cancel_attempt(job_id, run_attempt).await else {
-            // Neither stepds nor running names an attempt to scope to, but an orphaned unsupervised step
+            // Neither stepds nor running names an attempt to scope to, but an orphaned
+            // unsupervised step
             // can outlive both maps — reach it via the wildcard rather than stranding it.
             self.cancel_active_steps_for_job(job_id, 0, nix::sys::signal::Signal::SIGTERM as i32)
                 .await;
@@ -11240,8 +11259,9 @@ impl AgentService {
         });
     }
 
-    /// A cancel normally signals a supervised job's stepd and waits for teardown. If every stepd for
-    /// this attempt is already confirmed dead, no teardown is coming — release the ledger ourselves.
+    /// A cancel normally signals a supervised job's stepd and waits for teardown.
+    /// If every stepd for this attempt is already confirmed dead, no teardown is
+    /// coming — release the ledger ourselves.
     async fn reap_dead_supervised_stepds(&self, runtimes: &[crate::stepd::StepdDescriptor]) {
         if runtimes.is_empty() || !runtimes.iter().all(stepd_confirmed_dead) {
             return;
@@ -11491,7 +11511,8 @@ impl AgentService {
                                 break;
                             }
                             // Non-interactive stdin-EOF: client still wants output. Stop forwarding
-                            // input but keep draining until exit; a truly-gone client is caught by a
+                            // input but keep draining until exit; a truly-gone client is
+                            // caught by a
                             // failing tx.send below.
                             input_open = false;
                         }
@@ -11621,7 +11642,8 @@ impl AgentService {
         Self::read_proc_environ(target)
     }
 
-    /// Resolves a container's workload pid (PID 1) from the shepherd pid: the shepherd forks exactly
+    /// Resolves a container's workload pid (PID 1) from the shepherd pid: the shepherd forks
+    /// exactly
     /// one child to become the namespace init, so its sole `children` entry is that workload.
     fn container_workload_pid(shepherd: u32) -> Option<u32> {
         let content =
@@ -12100,7 +12122,8 @@ mod tests {
         );
 
         assert_eq!(displaced_runtime_attempt(&displaced, 8).unwrap(), 7);
-        // A same-attempt retry (spurctld re-dispatching after losing a LaunchJob ack) is idempotent,
+        // A same-attempt retry (spurctld re-dispatching after losing a LaunchJob ack) is
+        // idempotent,
         // not a displacement — must not fence/stop the still-current attempt.
         assert_eq!(displaced_runtime_attempt(&displaced, 7).unwrap(), 7);
         assert_eq!(
@@ -15038,7 +15061,8 @@ mod tests {
     async fn completion_notification_from_a_superseded_attempt_does_not_release_the_current_one() {
         let (context, running, sessions, _state_dir) =
             completion_listener_fixture("http://127.0.0.1:1").await;
-        // A redispatch bumped this job to a newer attempt after the fixture's old session was tracked;
+        // A redispatch bumped this job to a newer attempt after the fixture's old session was
+        // tracked;
         // the stale (but still-valid) capability must not touch the new one.
         let current = sessions
             .lock()
@@ -15157,7 +15181,8 @@ mod tests {
     }
 
     // Reproduces the gap between the launch gate opening and `run_supervisor` accepting
-    // connections: `launch_job` (openpty, rootfs staging, priv drop) runs in between, serving nothing.
+    // connections: `launch_job` (openpty, rootfs staging, priv drop) runs in between, serving
+    // nothing.
     #[tokio::test(start_paused = true)]
     async fn supervised_step_workload_pid_survives_a_supervisor_that_is_slow_to_start_serving() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -16178,8 +16203,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// An srun tail reconnecting mid-step carries the byte count already printed; honoring it avoids
-    /// reprinting early output, and clamping a nonsensical offset to the start avoids dropping output.
+    /// An srun tail reconnecting mid-step carries the byte count already printed;
+    /// honoring it avoids reprinting early output, and clamping a nonsensical
+    /// offset to the start avoids dropping output.
     #[tokio::test]
     async fn stream_job_output_resumes_a_reconnecting_reader_at_its_offset() {
         use tokio_stream::StreamExt as _;
@@ -16225,7 +16251,8 @@ mod tests {
                 .unwrap()
                 .into_inner();
 
-            // Let the tail resolve the spool file through active_steps (as for a re-adopted step) before
+            // Let the tail resolve the spool file through active_steps (as for a re-adopted
+            // step) before
             // the step settles and the stream eofs.
             let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
                 .await
@@ -17288,7 +17315,8 @@ mod tests {
     }
 
     /// The startup replay reports a stale session's exit before anything else runs, so by the time
-    /// it's settled the release is its last open obligation. Returns the descriptor and its directory.
+    /// it's settled the release is its last open obligation. Returns the descriptor and its
+    /// directory.
     fn acknowledged_stale_session(
         store: &crate::stepd::StepdStore,
         exit_code: i32,
@@ -17426,7 +17454,8 @@ mod tests {
         let state_dir = tempfile::tempdir().expect("state dir");
         let svc = restarted_agent(state_dir.path()).await;
         let store = crate::stepd::StepdStore::new(state_dir.path());
-        // A supervisor that died before observing an exit leaves a genuinely unknown outcome — must not
+        // A supervisor that died before observing an exit leaves a genuinely unknown outcome —
+        // must not
         // be answered as success, least of all with a sibling step's leftover exit code.
         let sibling = publish_session(&store, 4, Some(0));
         let descriptor = publish_session(&store, 3, None);
@@ -17546,7 +17575,8 @@ mod tests {
     }
 
     /// `interactive_session` (sattach/srun --pty) gates on `check_job_access`, but its handler
-    /// consumes a gRPC stream that can't be built in-process, so the gate is exercised directly here.
+    /// consumes a gRPC stream that can't be built in-process, so the gate is exercised
+    /// directly here.
     #[tokio::test]
     async fn check_job_access_gates_attach_by_owner() {
         let svc = AgentService::new(
@@ -17558,7 +17588,8 @@ mod tests {
         svc.insert_test_job(46, TrackedJob::dummy(std::process::id()))
             .await;
 
-        // Verified owner and a verified admin (the controller mints an admin credential) are allowed.
+        // Verified owner and a verified admin (the controller mints an admin credential) are
+        // allowed.
         svc.check_job_access(46, Some(&user_identity("testuser")), "", "attach to")
             .await
             .expect("the owner must be allowed to attach");
@@ -17623,7 +17654,8 @@ mod tests {
             .expect_err("empty-owner jobs run as root; a named user must be denied");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
-        // The removed bypass: an empty or literal-"root" asserted user (no verified identity) is now
+        // The removed bypass: an empty or literal-"root" asserted user (no verified identity)
+        // is now
         // rejected instead of silently authorized.
         for forged in ["", "root"] {
             let err = svc
@@ -17634,7 +17666,8 @@ mod tests {
         }
     }
 
-    /// The controller gate on controller-only RPCs: a verified user token is refused, the controller's
+    /// The controller gate on controller-only RPCs: a verified user token is refused, the
+    /// controller's
     /// own credential passes, and an unauthenticated caller falls through to the permissive path.
     #[test]
     fn require_controller_admits_only_the_controller() {
@@ -17923,7 +17956,8 @@ mod tests {
     }
 
     /// An unaccounted claim is only worth naming if it explains the shortfall. One holding no core
-    /// does not explain a core shortfall, and naming it would send the controller after the wrong job.
+    /// does not explain a core shortfall, and naming it would send the controller after the
+    /// wrong job.
     #[tokio::test]
     async fn a_core_shortfall_names_only_a_holder_that_holds_cores() {
         let svc = AgentService::new(
@@ -18709,7 +18743,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_command_uses_provided_work_dir() {
-        // Repro for `salloc; srun hostname`: hostname's cwd can't easily be asserted without mounting
+        // Repro for `salloc; srun hostname`: hostname's cwd can't easily be asserted without
+        // mounting
         // a tempdir as the agent's cwd, so use `pwd` and assert it matches the dir passed instead.
         let (svc, job_id) = run_command_test_setup().await;
         let tmp = std::env::temp_dir();
@@ -18742,7 +18777,8 @@ mod tests {
         });
         let resp = svc.run_command(req).await.unwrap().into_inner();
         assert_eq!(resp.exit_code, 0);
-        // The step's stdout must live in a spool file the agent can tail (StreamJobOutput follows this,
+        // The step's stdout must live in a spool file the agent can tail (StreamJobOutput
+        // follows this,
         // not the RPC response); step_id defaults to 0 here, so the file is step0.out.
         let contents = [
             std::path::PathBuf::from("/var/spool/spur"),
@@ -19058,7 +19094,8 @@ mod tests {
     }
 
     /// Like [`test_reporter_with_gpus`], but pointed at a real (mock) controller address — needed
-    /// by anything that must actually acknowledge a completion report instead of failing to connect.
+    /// by anything that must actually acknowledge a completion report instead of failing to
+    /// connect.
     fn test_reporter_with_gpus_and_controller(
         device_ids: &[u32],
         controller_addr: &str,
@@ -22226,8 +22263,9 @@ mod tests {
         let guard =
             LaunchReservationGuard::new(svc.allocation.clone(), svc.admissions(), key(11, 1));
 
-        // A cancel races the still-in-flight launch, releasing attempt 1's reservation; the controller
-        // redispatches attempt 2, which reserves and commits before attempt 1's guard is ever dropped.
+        // A cancel races the still-in-flight launch, releasing attempt 1's
+        // reservation; the controller redispatches attempt 2, which reserves and
+        // commits before attempt 1's guard is ever dropped.
         svc.allocation
             .lock()
             .await
@@ -22692,7 +22730,8 @@ mod tests {
     }
 
     // The other half: `sattach` to a batch job ends the terminal, not the job — its processes live
-    // in the supervisor, so the agent's own handle reads as allocation-only, same as an srun allocation.
+    // in the supervisor, so the agent's own handle reads as allocation-only, same as an srun
+    // allocation.
     #[tokio::test]
     async fn an_abandoned_terminal_leaves_a_job_with_its_own_payload_running() {
         let _unbounded = crate::stepd::UnboundedRequests::new();
