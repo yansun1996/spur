@@ -2966,12 +2966,10 @@ impl SlurmController for ControllerService {
             )
             // A rejected registration runs no reconcile, so a gate set for one above would
             // be held by nothing and take the node out until the next leadership change.
-            .map_err(|error| {
-                if known_before {
-                    self.cluster.set_reconcile_pending(&req.hostname, false);
-                }
-                register_node_rpc_status(error)
-            })?;
+            // `held_gate`'s own Drop (below, via `?`) clears it -- refcount-aware, unlike
+            // an unconditional clear here, which would un-gate a node a concurrent,
+            // still-live registration for the same node is relying on the gate for.
+            .map_err(register_node_rpc_status)?;
 
         // A first registration now carries its own gate atomically —
         // `reconcile_pending` lands in the same WAL entry that creates the
@@ -9882,6 +9880,72 @@ mod tests {
             svc.cluster.get_node("n1").expect("node").is_schedulable(),
             "the gate opens once every pass holding it has finished"
         );
+    }
+
+    // A registration that errors out must not clear a gate a sibling, still-live
+    // registration for the same node is relying on -- the error path used to call
+    // set_reconcile_pending(false) directly, bypassing the refcount entirely.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_registration_does_not_clear_a_siblings_gate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = test_service_with_token_admission(&dir).await;
+
+        // Establish "n1" as known with a label, unprivileged in every later call
+        // (no identity in extensions), so a later relabel attempt is refused.
+        let (setup_addr, _) = spawn_gated_probe_agent().await;
+        let (_token, join_token) = svc.cluster.create_token(None).expect("create join token");
+        let mut labels = std::collections::HashMap::new();
+        labels.insert("pool".to_string(), "a".to_string());
+        svc.register_agent(Request::new(RegisterAgentRequest {
+            join_token,
+            labels: labels.clone(),
+            ..registration("n1", setup_addr)
+        }))
+        .await
+        .expect("initial registration");
+        await_registered_node(&svc, "n1").await;
+
+        // B: matching label, slow reconcile -- stays live until released.
+        let (addr_b, release_b) = spawn_gated_probe_agent().await;
+        register_with_a_blocking_cut(&svc, addr_b)
+            .await
+            .expect("registration B");
+        await_reconcile_gate(&svc, "n1", true).await;
+
+        // A: a relabel attempt with no verified identity would actually be
+        // privileged (fail-open, no-auth-cluster default) -- forge one that
+        // is verified but not an admin, so sync_node_labels refuses it.
+        let (addr_a, _release_a) = spawn_gated_probe_agent().await;
+        let mut mismatched_labels = std::collections::HashMap::new();
+        mismatched_labels.insert("pool".to_string(), "b".to_string());
+        let (_token_a, join_token_a) = svc.cluster.create_token(None).expect("create join token");
+        let mut req_a = Request::new(RegisterAgentRequest {
+            join_token: join_token_a,
+            labels: mismatched_labels,
+            ledger: Some(ledger(true, vec![(98, 1)])),
+            ..registration("n1", addr_a)
+        });
+        req_a.extensions_mut().insert(spur_core::auth::Identity {
+            user: "unprivileged".into(),
+            uid: 1000,
+            gid: 1000,
+            is_admin: false,
+            trusted_unix: false,
+        });
+        let result_a = svc.register_agent(req_a).await;
+        assert!(
+            result_a.is_err(),
+            "a relabel by a non-admin caller must be refused"
+        );
+
+        // The premise: A's failure must not have cleared what B still holds.
+        assert!(
+            svc.cluster.get_node("n1").expect("node").reconcile_pending,
+            "B's reconcile is still live; A's failure must not release the gate"
+        );
+
+        release_b.notify_one();
+        await_reconcile_gate_within(&svc, "n1", false, 3000).await;
     }
 
     // The agent-restart case: the node is already in the cluster, so the gate
