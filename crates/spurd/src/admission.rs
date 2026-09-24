@@ -1168,10 +1168,9 @@ impl AdmissionStore {
                 }
                 Err(error) => return Err(error),
             };
-            // A release landing after the caller read its snapshot would otherwise
-            // leave a record claiming to hold a core it has already given back.
-            // `is_committed()` alone misses a zero-index settled claim (no real
-            // commit, by design) whose slice has still gone back for good.
+            // A release landing after the caller's snapshot would otherwise re-plant a
+            // hold on an already-freed slice. `is_committed()` alone misses a zero-index
+            // settled claim (no real commit, by design), hence the extra check.
             if run.slice_released || run.controller_ack.is_committed() {
                 return Ok(HoldOutcome::AlreadyReleased);
             }

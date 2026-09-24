@@ -2,13 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Authenticates callers of the operator's cluster-wide-pod-create agent surface via the
-//! shared `spur_core::auth::authenticate_bearer` (mirrors spurd's `AgentAuthLayer`,
-//! duplicated since spurd is a binary crate).
-//!
-//! On success the verified [`spur_core::auth::Identity`] is inserted into the request extensions,
-//! same as spurd, so the controller-only RPCs this agent hosts (`RequestNodeLedger`, `FenceRun`,
-//! `SettleRun`) can refuse a caller that merely holds a valid cluster credential but is not the
-//! controller itself.
+//! shared `spur_core::auth::authenticate_bearer` (mirrors spurd's `AgentAuthLayer`, duplicated
+//! since spurd is a binary crate). On success the verified [`spur_core::auth::Identity`] is
+//! inserted into the request extensions, so `RequestNodeLedger`/`FenceRun`/`SettleRun` can
+//! refuse a caller that merely holds a valid cluster credential but is not the controller.
 
 use std::future::Future;
 use std::pin::Pin;

@@ -3271,11 +3271,9 @@ mod launch_spec_compat {
         );
     }
 
-    /// Captured from the build that first shipped supervised terminals, before
-    /// `LaunchIo::Pty` carried a window size. `io_mode` was a bare `"Pty"` string
-    /// then; a supervisor re-reading this mid-upgrade needs it to keep decoding,
-    /// just with no remembered size.
-    /// Never regenerate this: its value is that it stays at the old shape.
+    /// Captured before `LaunchIo::Pty` carried a window size, when `io_mode` was a
+    /// bare `"Pty"` string. Never regenerate this: its value is that it stays at the
+    /// old shape, so a supervisor re-reading it mid-upgrade keeps decoding.
     const FROZEN_PTY_LAUNCH_JSON: &str = r##"{
         "job_id": 42,
         "script": "#!/bin/bash\necho hi\n",

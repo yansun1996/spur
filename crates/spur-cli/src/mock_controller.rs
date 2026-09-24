@@ -1,10 +1,9 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! In-process `SlurmController` mock for CLI paths holding a live
-//! [`SlurmControllerClient`]. Same shape as `spurctld`'s `MockAgent`: an
-//! ephemeral port, a handful of mocked RPCs, `unimplemented` for the rest
-//! so drift fails loudly.
+//! In-process `SlurmController` mock for CLI paths holding a live [`SlurmControllerClient`].
+//! Same shape as `spurctld`'s `MockAgent`: an ephemeral port, a handful of mocked RPCs,
+//! `unimplemented` for the rest so drift fails loudly.
 
 use std::collections::HashSet;
 use std::net::SocketAddr;

@@ -6580,12 +6580,9 @@ impl ClusterManager {
                 if job.state != JobState::Pending {
                     return ClientResponse::default();
                 }
-                // Free what the reservation charged before the requeue wipes
-                // the fields that say where it went. `slices_to_keep`, not
-                // `slices_no_longer_held`: the job is still Pending here, and
-                // `is_held_on` only honors an epilog gate once a job is
-                // finalized, so the no-longer-held helper would hand back a
-                // node whose epilog is still running.
+                // Free what the reservation charged before the requeue wipes where it
+                // went, via `slices_to_keep`: `is_held_on` only honors an epilog gate
+                // once finalized, and the job is still Pending here.
                 let freed_nodes = job.allocated_nodes.clone();
                 let allocated_resources = job.allocated_resources.clone();
                 let per_node_map = job.per_node_alloc.clone();
@@ -6718,12 +6715,9 @@ impl ClusterManager {
                     let Some(job) = jobs.get_mut(job_id) else {
                         return ClientResponse::default();
                     };
-                    // Read before the requeue transition below, which rewrites the
-                    // state that decides where this run is still charged. A still-
-                    // live job needs `slices_to_keep` like the preempt arms, since
-                    // `slices_no_longer_held` ignores an epilog gate until finalized;
-                    // an already-terminal job needs `slices_no_longer_held` instead,
-                    // since its earlier JobComplete apply already cleared
+                    // Read before requeue rewrites job.state: a live job needs the
+                    // epilog-gate-aware `slices_to_keep`; a terminal one needs
+                    // `slices_no_longer_held`, since JobComplete already cleared
                     // node_completions and `slices_to_keep` would double-free it.
                     keep_charged = if job.state.is_finalized() {
                         Self::slices_no_longer_held(job)

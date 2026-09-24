@@ -1,10 +1,9 @@
 // Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! In-process `SlurmAgent` mock for CLI paths that talk to a compute node
-//! directly (tailing a step's output, opening a terminal). Same shape as
-//! [`crate::mock_controller`]: an ephemeral port, a handful of mocked RPCs,
-//! `unimplemented` for the rest so drift fails loudly.
+//! In-process `SlurmAgent` mock for CLI paths that talk to a compute node directly
+//! (tailing a step's output, opening a terminal). Same shape as [`crate::mock_controller`]:
+//! an ephemeral port, a handful of mocked RPCs, `unimplemented` for the rest so drift fails loudly.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
