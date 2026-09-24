@@ -2261,8 +2261,9 @@ async fn confirm_dispatch_on_nodes(
     };
     let _ = cluster.set_job_launch_failure_detail(job_id, confirmation_detail.clone());
 
-    // Every dispatched node, not just the confirmed ones: a node that timed out may have launched
-    // anyway and is the likeliest to be orphaned. CancelJob is idempotent, so cancelling wide is safe.
+    // Every dispatched node, not just the confirmed ones: a node that timed out may have
+    // launched anyway and is the likeliest to be orphaned. CancelJob is idempotent, so
+    // cancelling wide is safe.
     cancel_job_on_nodes(&cluster, job_id, run_attempt, &dispatch_nodes, 9).await;
 
     // Drain before deciding the job's fate, so the failing node is already out
@@ -6411,8 +6412,9 @@ mod tests {
             );
         }
 
-        // The other half of the settlement fence (server.rs's AllDone arm calls exactly this
-        // on the last node's report) -- proves it reaches the node a real batch job actually ran on.
+        // The other half of the settlement fence (server.rs's AllDone arm calls exactly
+        // this on the last node's report) -- proves it reaches the node a real batch job
+        // actually ran on.
         #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
         async fn fence_run_on_nodes_reaches_the_node_a_batch_job_settled_on() {
             let dir = TempDir::new().unwrap();
