@@ -5391,8 +5391,8 @@ impl AgentService {
                     }
                 }
 
-                // Stays under `jobs`: release_job is job_id-keyed with no generation tag, so dropping
-                // the lock first risks a redispatch's new attempt being torn down by this cleanup.
+                // Stays under `jobs`: `running` is keyed by job_id alone, so dropping the lock
+                // first risks a redispatch's new attempt being torn down by this cleanup.
                 for c in &completed {
                     jobs.remove(&c.job_id);
                 }
@@ -20376,8 +20376,8 @@ mod tests {
         );
     }
 
-    // The heartbeat's held-job source must report an allocation-only job so the controller can reconcile the strand this fix addresses.
-    /// The two trees a restart reads: `runtime/` (liveness) and `admission/` (entitlement), built with a real store so replay walks real files.
+    /// The two trees a restart reads: `runtime/` (liveness) and `admission/`
+    /// (entitlement), built with a real store so replay walks real files.
     async fn svc_with_state_dir(state: &std::path::Path) -> AgentService {
         let running = new_running_jobs();
         let reporter = Arc::new(NodeReporter::new(
